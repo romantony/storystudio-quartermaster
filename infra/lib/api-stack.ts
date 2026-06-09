@@ -5,7 +5,7 @@ import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
-import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
+
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
@@ -93,39 +93,10 @@ export class ApiStack extends Stack {
       },
     });
 
-    const waf = new wafv2.CfnWebACL(this, 'ApiWAF', {
-      scope: 'CLOUDFRONT',
-      defaultAction: { allow: {} },
-      rules: [
-        {
-          name: 'RateLimit',
-          priority: 1,
-          action: { block: {} },
-          statement: {
-            rateBasedStatement: {
-              limit: 1000,
-              aggregateKeyType: 'IP',
-            },
-          },
-          visibilityConfig: {
-            cloudWatchMetricsEnabled: true,
-            metricName: 'QMApiRateLimit',
-            sampledRequestsEnabled: true,
-          },
-        },
-      ],
-      visibilityConfig: {
-        cloudWatchMetricsEnabled: true,
-        metricName: 'QMApiWAF',
-        sampledRequestsEnabled: false,
-      },
-    });
-
     const apiOrigin = new origins.FunctionUrlOrigin(fnUrl);
 
     this.distribution = new cloudfront.Distribution(this, 'ApiDistribution', {
       comment: 'Quartermaster API',
-      webAclId: waf.attrArn,
       defaultBehavior: {
         origin: apiOrigin,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,

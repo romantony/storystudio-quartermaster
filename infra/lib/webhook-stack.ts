@@ -5,7 +5,7 @@ import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
-import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
+
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as path from 'path';
@@ -70,39 +70,10 @@ export class WebhookStack extends Stack {
       },
     });
 
-    const waf = new wafv2.CfnWebACL(this, 'WebhookWAF', {
-      scope: 'CLOUDFRONT',
-      defaultAction: { allow: {} },
-      rules: [
-        {
-          name: 'StrictRateLimit',
-          priority: 1,
-          action: { block: {} },
-          statement: {
-            rateBasedStatement: {
-              limit: 100,
-              aggregateKeyType: 'IP',
-            },
-          },
-          visibilityConfig: {
-            cloudWatchMetricsEnabled: true,
-            metricName: 'QMWebhookRateLimit',
-            sampledRequestsEnabled: true,
-          },
-        },
-      ],
-      visibilityConfig: {
-        cloudWatchMetricsEnabled: true,
-        metricName: 'QMWebhookWAF',
-        sampledRequestsEnabled: false,
-      },
-    });
-
     const webhookOrigin = new origins.FunctionUrlOrigin(fnUrl);
 
     const webhookDistribution = new cloudfront.Distribution(this, 'WebhookDistribution', {
       comment: 'Quartermaster Webhooks',
-      webAclId: waf.attrArn,
       defaultBehavior: {
         origin: webhookOrigin,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
