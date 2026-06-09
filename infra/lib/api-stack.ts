@@ -8,7 +8,6 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as path from 'path';
 
 interface ApiStackProps extends StackProps {
@@ -74,21 +73,14 @@ export class ApiStack extends Stack {
       ],
     }));
 
+    // NONE auth: application-level auth (x-gateway-key header + JWT cookies) is the security boundary.
+    // IAM/OAC was causing InvalidSignatureException on POST requests due to SigV4 body-hash issues.
     const fnUrl = this.apiFunction.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.AWS_IAM,
+      authType: lambda.FunctionUrlAuthType.NONE,
       cors: {
         allowedOrigins: ['*'],
         allowedMethods: [lambda.HttpMethod.ALL],
         allowedHeaders: ['*'],
-      },
-    });
-
-    const oac = new cloudfront.CfnOriginAccessControl(this, 'ApiOAC', {
-      originAccessControlConfig: {
-        name: 'quartermaster-api-oac',
-        originAccessControlOriginType: 'lambda',
-        signingBehavior: 'always',
-        signingProtocol: 'sigv4',
       },
     });
 
@@ -104,18 +96,6 @@ export class ApiStack extends Stack {
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
       },
     });
-
-    // Allow CloudFront to invoke the Lambda URL via OAC
-    this.apiFunction.addPermission('CloudFrontInvoke', {
-      principal: new iam.ServicePrincipal('cloudfront.amazonaws.com'),
-      action: 'lambda:InvokeFunctionUrl',
-      sourceArn: `arn:aws:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,
-    });
-
-    // Attach OAC to origin (L1 escape hatch — CDK doesn't have L2 support for Lambda OAC yet)
-    const cfnDistribution = this.distribution.node.defaultChild as cloudfront.CfnDistribution;
-    cfnDistribution.addPropertyOverride('DistributionConfig.Origins.0.OriginAccessControlId', oac.attrId);
-    cfnDistribution.addPropertyOverride('DistributionConfig.Origins.0.CustomOriginConfig.OriginSSLProtocols', ['TLSv1.2']);
 
     // CloudWatch alarms
     new cloudwatch.Alarm(this, 'HighInflightAlarm', {

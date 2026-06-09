@@ -14,8 +14,12 @@ const DOMAIN = 'quartermaster.ai-storystudio.com';
 const ZONE_NAME = 'ai-storystudio.com';
 const ZONE_ID = 'Z0979315393R4P99R1E74';
 
+interface DashboardStackProps extends StackProps {
+  apiDistributionDomain: string;
+}
+
 export class DashboardStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {
+  constructor(scope: Construct, id: string, props: DashboardStackProps) {
     super(scope, id, props);
 
     const zone = route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
@@ -56,7 +60,6 @@ export class DashboardStack extends Stack {
       },
       errorResponses: [
         { httpStatus: 404, responseHttpStatus: 200, responsePagePath: '/index.html' },
-        { httpStatus: 403, responseHttpStatus: 200, responsePagePath: '/index.html' },
       ],
     });
 
@@ -74,6 +77,24 @@ export class DashboardStack extends Stack {
     const cfnDist = distribution.node.defaultChild as cloudfront.CfnDistribution;
     cfnDist.addPropertyOverride('DistributionConfig.Origins.0.OriginAccessControlId', oac.attrId);
     cfnDist.addPropertyOverride('DistributionConfig.Origins.0.S3OriginConfig.OriginAccessIdentity', '');
+
+    // Proxy /api/* to the API CloudFront distribution so all requests stay
+    // same-origin (quartermaster.ai-storystudio.com), which is required for
+    // SameSite=Strict JWT cookies to be forwarded back on each request.
+    const apiProxyOrigin = new origins.HttpOrigin(props.apiDistributionDomain, {
+      protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+    });
+    const passthrough = cloudfront.CachePolicy.CACHING_DISABLED;
+    const allHeaders = cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER;
+
+    for (const pattern of ['/api/*', '/jobs*', '/acquire', '/release', '/heartbeat', '/sweeper']) {
+      distribution.addBehavior(pattern, apiProxyOrigin, {
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+        cachePolicy: passthrough,
+        originRequestPolicy: allHeaders,
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+      });
+    }
 
     new route53.ARecord(this, 'DashboardAlias', {
       zone,

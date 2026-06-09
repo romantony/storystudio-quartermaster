@@ -58,6 +58,10 @@ const schedulerStack = new SchedulerStack(app, 'QMSchedulerStack', {
 schedulerStack.addDependency(apiStack);
 
 // --- Admin SPA (S3 + CloudFront) ---
-new DashboardStack(app, 'QMDashboardStack', { env });
+const dashboardStack = new DashboardStack(app, 'QMDashboardStack', {
+  env,
+  apiDistributionDomain: apiStack.distribution.distributionDomainName,
+});
+dashboardStack.addDependency(apiStack);
 
 app.synth();

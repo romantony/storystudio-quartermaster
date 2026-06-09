@@ -59,16 +59,7 @@ export class WebhookStack extends Stack {
     }));
 
     const fnUrl = webhookFn.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.AWS_IAM,
-    });
-
-    const oac = new cloudfront.CfnOriginAccessControl(this, 'WebhookOAC', {
-      originAccessControlConfig: {
-        name: 'quartermaster-webhook-oac',
-        originAccessControlOriginType: 'lambda',
-        signingBehavior: 'always',
-        signingProtocol: 'sigv4',
-      },
+      authType: lambda.FunctionUrlAuthType.NONE,
     });
 
     const webhookOrigin = new origins.FunctionUrlOrigin(fnUrl);
@@ -83,15 +74,6 @@ export class WebhookStack extends Stack {
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
       },
     });
-
-    webhookFn.addPermission('CloudFrontInvoke', {
-      principal: new iam.ServicePrincipal('cloudfront.amazonaws.com'),
-      action: 'lambda:InvokeFunctionUrl',
-      sourceArn: `arn:aws:cloudfront::${this.account}:distribution/${webhookDistribution.distributionId}`,
-    });
-
-    const cfnDist = webhookDistribution.node.defaultChild as cloudfront.CfnDistribution;
-    cfnDist.addPropertyOverride('DistributionConfig.Origins.0.OriginAccessControlId', oac.attrId);
 
     new CfnOutput(this, 'WebhookDistributionDomain', { value: webhookDistribution.distributionDomainName });
     new CfnOutput(this, 'WebhookFunctionArn', { value: webhookFn.functionArn });

@@ -52,6 +52,15 @@
     "@aws-cdk/aws-rds:clusterChangeScopeOfInstanceParameterGroupWithEachParameters": true,
     "@aws-cdk/aws-appsync:useArnForSourceApiAssociationIdentifier": true,
     "@aws-cdk/aws-rds:preventRenderingDeprecatedCredentials": true,
-    "@aws-cdk/aws-codepipeline-actions:useNewDefaultBranchForCodeCommitSource": true
+    "@aws-cdk/aws-codepipeline-actions:useNewDefaultBranchForCodeCommitSource": true,
+    "GATEWAY_STATIC_KEY_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/gateway-key-J5hN6o",
+    "JWT_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/jwt-secret-5KFuTs",
+    "ADMIN_PASSWORD_HASH_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/admin-password-hash-NcObOi",
+    "MODELSLAB_API_KEY_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/modelslab-api-key-LjGoUZ",
+    "REPLICATE_API_TOKEN_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/replicate-api-token-bFiOOH",
+    "KIE_AI_API_KEY_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/kie-api-key-YSJ4Jq",
+    "RUNPOD_API_KEY_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/runpod-api-key-pT4dTx",
+    "KIE_WEBHOOK_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/kie-webhook-secret-FChuIu",
+    "REPLICATE_WEBHOOK_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/replicate-webhook-secret-T13YjM"
   }
 }
