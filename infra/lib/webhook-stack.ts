@@ -7,7 +7,7 @@ import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+
 import * as path from 'path';
 
 interface WebhookStackProps extends StackProps {
@@ -43,13 +43,14 @@ export class WebhookStack extends Stack {
 
     props.table.grantReadWriteData(webhookFn);
 
-    const gatewayKeySecret = secretsmanager.Secret.fromSecretPartialArn(this, 'GatewayKeySecret', props.gatewayKeySecretArn);
-    const kieWebhookSecret = secretsmanager.Secret.fromSecretPartialArn(this, 'KieWebhookSecret', props.kieWebhookSecretArn);
-    const replicateWebhookSecret = secretsmanager.Secret.fromSecretPartialArn(this, 'ReplicateWebhookSecret', props.replicateWebhookSecretArn);
-
-    gatewayKeySecret.grantRead(webhookFn);
-    kieWebhookSecret.grantRead(webhookFn);
-    replicateWebhookSecret.grantRead(webhookFn);
+    webhookFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [
+        props.gatewayKeySecretArn,
+        props.kieWebhookSecretArn,
+        props.replicateWebhookSecretArn,
+      ],
+    }));
 
     // Allow sending SFN task tokens (Phase 2 stub)
     webhookFn.addToRolePolicy(new iam.PolicyStatement({

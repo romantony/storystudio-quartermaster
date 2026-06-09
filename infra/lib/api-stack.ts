@@ -61,19 +61,18 @@ export class ApiStack extends Stack {
 
     props.table.grantReadWriteData(this.apiFunction);
 
-    const secretArns = [
-      props.gatewayKeySecretArn,
-      props.jwtSecretArn,
-      props.adminPasswordHashSecretArn,
-      props.modeslabKeySecretArn,
-      props.replicateKeySecretArn,
-      props.kieKeySecretArn,
-      props.runpodKeySecretArn,
-    ];
-    secretArns.forEach((arn, i) => {
-      secretsmanager.Secret.fromSecretPartialArn(this, `SecretRef${i}`, arn)
-        .grantRead(this.apiFunction);
-    });
+    this.apiFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [
+        props.gatewayKeySecretArn,
+        props.jwtSecretArn,
+        props.adminPasswordHashSecretArn,
+        props.modeslabKeySecretArn,
+        props.replicateKeySecretArn,
+        props.kieKeySecretArn,
+        props.runpodKeySecretArn,
+      ],
+    }));
 
     const fnUrl = this.apiFunction.addFunctionUrl({
       authType: lambda.FunctionUrlAuthType.AWS_IAM,

@@ -1,5 +1,3 @@
-const GATEWAY_KEY = import.meta.env.VITE_GATEWAY_KEY ?? '';
-
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
     super(message);
@@ -12,7 +10,6 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
-      'X-Gateway-Key': GATEWAY_KEY,
       ...(options.headers ?? {}),
     },
   });

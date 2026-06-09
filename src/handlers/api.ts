@@ -44,13 +44,33 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
   const path = evt.rawPath;
 
   try {
-    // Gateway key gate (coarse, §30.7)
+    // ── Admin routes: JWT-only auth (no gateway key in browser) ──────────────
+    if (path.startsWith('/api/')) {
+      if (method === 'POST' && path === '/api/auth/login') return handleLogin(evt);
+      if (method === 'POST' && path === '/api/auth/logout') return handleLogout();
+
+      const jwtSecret = await getSecret(process.env.JWT_SECRET_ARN ?? '');
+      const authResult = verifyJwt(evt, jwtSecret);
+      if (!authResult.ok) return json(401, { error: 'Unauthorized' });
+      const actor = authResult.sub ?? 'unknown';
+
+      if (method === 'GET' && path.startsWith('/api/catalog/')) return handleGetCatalog(evt);
+      if (method === 'PUT' && path.match(/^\/api\/catalog\/[^/]+\/ladders\/.+/)) return handlePutLadder(evt, actor);
+      if (method === 'GET' && path === '/api/providers') return handleGetProviders();
+      if (method === 'PUT' && path.match(/^\/api\/providers\/[^/]+$/)) return handlePutProvider(evt, actor);
+      if (method === 'POST' && path.match(/^\/api\/providers\/[^/]+\/rotate-key$/)) return handleRotateKey(evt, actor);
+      if (method === 'GET' && path === '/api/cost') return handleGetCost(evt);
+      if (method === 'GET' && path === '/api/balances') return handleGetBalances();
+      if (method === 'PUT' && path.match(/^\/api\/balances\/[^/]+$/)) return handlePutBalance(evt, actor);
+      if (method === 'GET' && path === '/api/audit') return handleGetAudit(evt);
+
+      return json(404, { error: 'Not found' });
+    }
+
+    // ── Broker/job routes: gateway key required ───────────────────────────────
     const gatewayKey = await getSecret(process.env.GATEWAY_STATIC_KEY_ARN ?? '');
     if (evt.headers['x-gateway-key'] !== gatewayKey) {
-      // Allow non-admin routes without the gateway key (broker endpoints are internal)
-      if (path.startsWith('/api/')) {
-        return json(401, { error: 'Unauthorized' });
-      }
+      return json(401, { error: 'Unauthorized' });
     }
 
     // ── Broker endpoints ─────────────────────────────────────────────────────
@@ -62,26 +82,6 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
     // ── Job queue endpoints ──────────────────────────────────────────────────
     if (method === 'POST' && path === '/jobs') return handleIngest(evt);
     if (method === 'GET' && path.startsWith('/jobs/')) return handleStatus(evt);
-
-    // ── Admin auth ───────────────────────────────────────────────────────────
-    if (method === 'POST' && path === '/api/auth/login') return handleLogin(evt);
-    if (method === 'POST' && path === '/api/auth/logout') return handleLogout();
-
-    // ── Admin routes (JWT required) ──────────────────────────────────────────
-    const jwtSecret = await getSecret(process.env.JWT_SECRET_ARN ?? '');
-    const authResult = verifyJwt(evt, jwtSecret);
-    if (!authResult.ok) return json(401, { error: 'Unauthorized' });
-    const actor = authResult.sub ?? 'unknown';
-
-    if (method === 'GET' && path.startsWith('/api/catalog/')) return handleGetCatalog(evt);
-    if (method === 'PUT' && path.match(/^\/api\/catalog\/[^/]+\/ladders\/.+/)) return handlePutLadder(evt, actor);
-    if (method === 'GET' && path === '/api/providers') return handleGetProviders();
-    if (method === 'PUT' && path.match(/^\/api\/providers\/[^/]+$/)) return handlePutProvider(evt, actor);
-    if (method === 'POST' && path.match(/^\/api\/providers\/[^/]+\/rotate-key$/)) return handleRotateKey(evt, actor);
-    if (method === 'GET' && path === '/api/cost') return handleGetCost(evt);
-    if (method === 'GET' && path === '/api/balances') return handleGetBalances();
-    if (method === 'PUT' && path.match(/^\/api\/balances\/[^/]+$/)) return handlePutBalance(evt, actor);
-    if (method === 'GET' && path === '/api/audit') return handleGetAudit(evt);
 
     return json(404, { error: 'Not found' });
   } catch (err) {
