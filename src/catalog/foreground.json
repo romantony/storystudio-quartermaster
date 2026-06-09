@@ -1,0 +1,70 @@
+{
+  "version": "2026-06-09.1",
+  "providers": {
+    "kie":       { "limit": 10, "floors": { "video": 6, "rest": 4 }, "secretEnv": "KIE_AI_API_KEY" },
+    "replicate": { "limit": 20, "secretEnv": "REPLICATE_API_TOKEN" },
+    "google":    { "limit": 8,  "secretEnv": "GOOGLE_API_KEY" },
+    "anthropic": { "limit": 8,  "secretEnv": "ANTHROPIC_API_KEY" },
+    "openai":    { "limit": 8,  "secretEnv": "OPENAI_API_KEY" },
+    "runpod":    { "limit": 10, "secretEnv": "RUNPOD_API_KEY",
+                   "note": "10 parallel InfiniteTalk workers; Documentary Premium lip-sync, lane:video" }
+  },
+  "circuit": {
+    "errorThreshold": 0.5,
+    "windowSeconds": 60,
+    "minSamples": 5,
+    "openCooldownSeconds": 30,
+    "halfOpenProbes": 2
+  },
+  "ladders": {
+    "image.premium.t2i": [
+      { "provider": "kie",      "model": "nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "replicate","model": "google/nano-banana",                                   "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "image.premium.i2i": [
+      { "provider": "kie",      "model": "nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "replicate","model": "google/nano-banana",                                   "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "video.premium.i2v": [
+      { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video" }
+    ],
+    "lipsync.premium.video": [
+      { "provider": "runpod",   "model": "infinitetalk", "endpoint": "v2/infinitetalk/run", "routingMode": "direct", "lane": "video",
+        "needs": ["image", "audio"], "resolution": "720p",
+        "note": "Documentary Premium 1 (spokesperson) & Premium 2 (full)" },
+      { "provider": "consumer", "model": "static-spokesperson", "routingMode": "render", "lane": "none", "fb": true }
+    ],
+    "movie.basic.image.t2i":  { "aliasOf": "image.premium.t2i" },
+    "movie.basic.image.i2i":  { "aliasOf": "image.premium.i2i" },
+    "movie.basic.video.i2v": [
+      { "provider": "kie",      "model": "bytedance/seedance-1.5-pro", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "video" },
+      { "provider": "replicate","model": "bytedance/seedance-1.5-pro",                                   "routingMode": "aggregated", "lane": "video", "fb": true }
+    ],
+    "movie.premium.image.t2i": { "aliasOf": "image.premium.t2i" },
+    "movie.premium.image.i2i": { "aliasOf": "image.premium.i2i" },
+    "movie.premium.video.i2v": [
+      { "provider": "kie",      "model": "bytedance/seedance-2-fast",  "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "video" },
+      { "provider": "replicate","model": "bytedance/seedance-2.0-fast",                                  "routingMode": "aggregated", "lane": "video", "fb": true }
+    ],
+    "voice.basic.tts": [
+      { "provider": "replicate", "model": "jaaari/kokoro-82m", "routingMode": "aggregated", "lane": "rest" }
+    ],
+    "voice.premium.tts": [
+      { "provider": "google", "model": "gemini-3.1-flash-tts-preview", "routingMode": "direct", "lane": "rest" }
+    ],
+    "sfx": [
+      { "provider": "replicate", "model": "sepal/audiogen", "routingMode": "aggregated", "lane": "rest" }
+    ],
+    "bgm.basic": [
+      { "provider": "google", "model": "lyria-3-pro-preview", "routingMode": "direct", "lane": "rest" }
+    ],
+    "bgm.premium": [
+      { "provider": "kie", "model": "suno", "modelId": "V4_5", "endpoint": "v1/generate", "routingMode": "aggregated", "lane": "rest" }
+    ],
+    "llm": [
+      { "provider": "anthropic", "model": "claude", "routingMode": "direct", "lane": "rest" },
+      { "provider": "google",    "model": "gemini", "routingMode": "direct", "lane": "rest", "fb": true },
+      { "provider": "openai",    "model": "gpt",    "routingMode": "direct", "lane": "rest", "fb": true }
+    ]
+  }
+}

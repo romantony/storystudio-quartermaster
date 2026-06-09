@@ -1,0 +1,88 @@
+{
+  "version": "2026-06-09.1",
+  "providers": {
+    "modelslab": { "limit": 15, "floors": { "video": 8, "rest": 7 }, "secretEnv": "MODELSLAB_API_KEY" },
+    "replicate": { "limit": 20, "secretEnv": "REPLICATE_API_TOKEN" },
+    "kie":       { "limit": 10, "floors": { "video": 6, "rest": 4 }, "secretEnv": "KIE_AI_API_KEY" },
+    "google":    { "limit": 8,  "secretEnv": "GOOGLE_API_KEY" },
+    "anthropic": { "limit": 8,  "secretEnv": "ANTHROPIC_API_KEY" },
+    "openai":    { "limit": 8,  "secretEnv": "OPENAI_API_KEY" }
+  },
+  "circuit": {
+    "errorThreshold": 0.5,
+    "windowSeconds": 60,
+    "minSamples": 5,
+    "openCooldownSeconds": 30,
+    "halfOpenProbes": 2
+  },
+  "ladders": {
+    "image.basic.t2i": [
+      { "provider": "modelslab", "model": "qwen-text-to-image",                "modelId": "qwen",           "endpoint": "v6/text2img",        "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "flux-klien-9B",                     "modelId": "flux-klein",      "endpoint": "v6/text2img",        "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "image.basic.i2i": [
+      { "provider": "modelslab", "model": "qwen-Image-to-Image",               "modelId": "qwen",           "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "flux-klien-9B-image-to-image",      "modelId": "flux-klein",      "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "google/nano-banana-2-text2image",   "modelId": "gemini-3.1-i2i", "endpoint": "v7/image-to-image",  "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "image.premium.t2i": [
+      { "provider": "modelslab", "model": "qwen-text-to-image",                                              "modelId": "qwen",                "endpoint": "v6/text2img",       "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "alibaba_cloud/qwen-image-2.0-pro-text-to-image", "modelId": "qwen-image-2.0-pro-t2i", "endpoint": "v7/text-to-image",  "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "google/nano-banana-2-image-edit",   "modelId": "gemini-3.1-t2i", "endpoint": "v7/text-to-image",  "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "kie",       "model": "nano-banana-2",                                                   "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "image.premium.i2i": [
+      { "provider": "modelslab", "model": "qwen-Image-to-Image",               "modelId": "qwen",           "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "alibaba_cloud/qwen-image-2.0-pro",  "modelId": "qwen-image-2.0-pro-i2i", "endpoint": "v7/image-to-image", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "kie",       "model": "nano-banana-2",                                                   "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "video.basic": [
+      { "provider": "consumer", "model": "stock-footage",    "routingMode": "stock",  "lane": "none", "note": "Documentary Basic: free Pexels/Pixabay footage" },
+      { "provider": "consumer", "model": "ken-burns",        "routingMode": "render", "lane": "none", "fb": true },
+      { "provider": "consumer", "model": "basic-animation",  "routingMode": "render", "lane": "none", "fb": true }
+    ],
+    "video.premium.i2v": [
+      { "provider": "modelslab", "model": "wan-2.2-i2v", "endpoint": "v6/video/img2video_ultra", "routingMode": "aggregated", "lane": "video",
+        "fixed": { "num_frames": "82", "fps": "16" } },
+      { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video", "fb": true }
+    ],
+    "movie.basic.image.t2i":  { "aliasOf": "image.premium.t2i" },
+    "movie.basic.image.i2i":  { "aliasOf": "image.premium.i2i" },
+    "movie.basic.video.i2v": [
+      { "provider": "kie",      "model": "bytedance/seedance-1.5-pro", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "video" },
+      { "provider": "replicate","model": "bytedance/seedance-1.5-pro",                                   "routingMode": "aggregated", "lane": "video", "fb": true }
+    ],
+    "movie.premium.image.t2i": [
+      { "provider": "modelslab", "model": "google/nano-banana-2-image-edit", "modelId": "gemini-3.1-t2i", "endpoint": "v7/text-to-image", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "kie",       "model": "nano-banana-2",                                                "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "movie.premium.image.i2i": { "aliasOf": "movie.premium.image.t2i" },
+    "movie.premium.video.i2v": [
+      { "provider": "kie",      "model": "bytedance/seedance-2-fast",  "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "video" },
+      { "provider": "replicate","model": "bytedance/seedance-2.0-fast",                                  "routingMode": "aggregated", "lane": "video", "fb": true }
+    ],
+    "voice.basic.tts": [
+      { "provider": "modelslab", "model": "text-to-speech", "modelId": "inworld-tts-1", "endpoint": "v7/voice/text-to-speech", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "replicate", "model": "jaaari/kokoro-82m",                                             "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "voice.premium.tts": [
+      { "provider": "google", "model": "gemini-3.1-flash-tts-preview", "routingMode": "direct", "lane": "rest" }
+    ],
+    "sfx": [
+      { "provider": "modelslab", "model": "sfx", "endpoint": "v6/voice/sfx", "routingMode": "aggregated", "lane": "rest" }
+    ],
+    "bgm.basic": [
+      { "provider": "modelslab", "model": "ai-music-generator", "endpoint": "v6/voice/music", "routingMode": "aggregated", "lane": "rest" }
+    ],
+    "bgm.premium": [
+      { "provider": "kie", "model": "suno", "modelId": "V4_5", "endpoint": "v1/generate", "routingMode": "aggregated", "lane": "rest" }
+    ],
+    "llm": [
+      { "provider": "anthropic", "model": "claude", "routingMode": "direct", "lane": "rest" },
+      { "provider": "google",    "model": "gemini", "routingMode": "direct", "lane": "rest", "fb": true },
+      { "provider": "openai",    "model": "gpt",    "routingMode": "direct", "lane": "rest", "fb": true }
+    ]
+  }
+}

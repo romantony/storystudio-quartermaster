@@ -1,0 +1,42 @@
+node_modules/
+dist/
+*.js
+*.d.ts
+*.d.ts.map
+*.js.map
+!jest.config.js
+!*.config.js
+!*.config.mjs
+!*.config.cjs
+cdk.out/
+.env
+.env.*
+*.local
+
+# admin build output
+admin/dist/
+admin/node_modules/
+
+# sdk build outputs
+sdk/typescript/dist/
+sdk/typescript/node_modules/
+
+# Python
+sdk/python/__pycache__/
+sdk/python/.venv/
+sdk/python/dist/
+sdk/python/*.egg-info/
+sdk/python/.pytest_cache/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# infra
+infra/node_modules/
+infra/dist/
+infra/cdk.out/
+
+# misc
+.DS_Store
+*.log
+coverage/

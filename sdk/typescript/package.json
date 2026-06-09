@@ -1,0 +1,15 @@
+{
+  "name": "@quartermaster/sdk",
+  "version": "0.1.0",
+  "description": "Quartermaster TypeScript client SDK",
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.2",
+    "@types/node": "^20.14.0"
+  }
+}
