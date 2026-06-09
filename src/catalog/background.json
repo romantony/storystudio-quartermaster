@@ -1,5 +1,5 @@
 {
-  "version": "2026-06-09.1",
+  "version": "2026-06-09.2",
   "providers": {
     "modelslab": { "limit": 15, "floors": { "video": 8, "rest": 7 }, "secretEnv": "MODELSLAB_API_KEY" },
     "replicate": { "limit": 20, "secretEnv": "REPLICATE_API_TOKEN" },
@@ -22,7 +22,7 @@
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.basic.i2i": [
-      { "provider": "modelslab", "model": "qwen-Image-to-Image",               "modelId": "qwen",           "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "qwen-edit",                          "modelId": "qwen-edit",      "endpoint": "v6/image_editing/qwen_edit", "routingMode": "aggregated", "lane": "rest" },
       { "provider": "modelslab", "model": "flux-klien-9B-image-to-image",      "modelId": "flux-klein",      "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
       { "provider": "modelslab", "model": "google/nano-banana-2-text2image",   "modelId": "gemini-3.1-i2i", "endpoint": "v7/image-to-image",  "routingMode": "aggregated", "lane": "rest" },
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
@@ -34,8 +34,8 @@
       { "provider": "kie",       "model": "nano-banana-2",                                                   "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.premium.i2i": [
-      { "provider": "modelslab", "model": "qwen-Image-to-Image",               "modelId": "qwen",           "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "modelslab", "model": "alibaba_cloud/qwen-image-2.0-pro",  "modelId": "qwen-image-2.0-pro-i2i", "endpoint": "v7/image-to-image", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "qwen-edit",                                    "modelId": "qwen-edit",              "endpoint": "v6/image_editing/qwen_edit", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "modelslab", "model": "alibaba_cloud/qwen-image-2.0-pro-text-to-image", "modelId": "qwen-image-2.0-pro-i2i", "endpoint": "v7/image-to-image",          "routingMode": "aggregated", "lane": "rest" },
       { "provider": "kie",       "model": "nano-banana-2",                                                   "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "video.basic": [

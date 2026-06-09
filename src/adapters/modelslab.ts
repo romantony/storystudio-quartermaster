@@ -29,6 +29,17 @@ export const modelslab: Adapter = {
       url = `${ML}/v6/images/text2img`;
       body = { ...base, width: '1024', height: '1024', samples: '1' };
 
+    } else if (ep.startsWith('v6/image_editing/qwen_edit')) {
+      // Qwen Image Edit — transformer-based pixel+semantic editing, up to 4 source images.
+      // API: POST /v6/image_editing/qwen_edit  { key, model_id:"qwen-edit", prompt, init_image:[...] }
+      url = `${ML}/v6/image_editing/qwen_edit`;
+      body = {
+        key,
+        model_id: 'qwen-edit',
+        prompt: job.prompt,
+        init_image: job.initImageUrls ?? [],
+      };
+
     } else if (ep.startsWith('v6/img2img')) {
       url = `${ML}/v6/images/img2img`;
       body = {

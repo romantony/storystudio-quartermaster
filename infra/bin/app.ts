@@ -6,6 +6,7 @@ import { ApiStack } from '../lib/api-stack';
 import { WebhookStack } from '../lib/webhook-stack';
 import { SchedulerStack } from '../lib/scheduler-stack';
 import { DashboardStack } from '../lib/dashboard-stack';
+import { PipelineStack } from '../lib/pipeline-stack';
 
 const app = new cdk.App();
 
@@ -63,5 +64,13 @@ const dashboardStack = new DashboardStack(app, 'QMDashboardStack', {
   apiDistributionDomain: apiStack.distribution.distributionDomainName,
 });
 dashboardStack.addDependency(apiStack);
+
+// --- QM-broker-call Lambda + E2E-VideoGenerationPipeline-Basic-QM Step Function ---
+const pipelineStack = new PipelineStack(app, 'QMPipelineStack', {
+  env,
+  gatewayKeySecretArn: ctx('GATEWAY_STATIC_KEY_ARN'),
+  qmApiDomain: apiStack.distribution.distributionDomainName,
+});
+pipelineStack.addDependency(apiStack);
 
 app.synth();
