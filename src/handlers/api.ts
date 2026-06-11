@@ -5,7 +5,7 @@ import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import * as bcrypt from 'bcryptjs';
 import * as jwt from 'jsonwebtoken';
 import { z } from 'zod';
-import { acquire, heartbeat, reclaimExpired, reclaimExpiredLeases, release } from '../gate/dynamo-gate';
+import { acquire, heartbeat, reclaimExpired, reclaimExpiredLeases, reconcileCounter, release } from '../gate/dynamo-gate';
 import type {
   AcquireRequest,
   AuditItem,
@@ -131,8 +131,11 @@ async function handleHeartbeat(evt: LambdaFunctionUrlEvent): Promise<LambdaFunct
 // ─── Sweeper: /sweeper ───────────────────────────────────────────────────────
 
 async function handleSweeper(): Promise<LambdaFunctionUrlResponse> {
+  // Run reclaim and reconcile in parallel; reconcile after reclaim so the final
+  // counter reflects truth after all expired leases have been cleaned up.
   const [jobs, leases] = await Promise.all([reclaimExpired(), reclaimExpiredLeases()]);
-  const result = { ...jobs, leasesReclaimed: leases.reclaimed };
+  const counter = await reconcileCounter();
+  const result = { ...jobs, leasesReclaimed: leases.reclaimed, counter };
   console.info('[sweeper] result', result);
   return json(200, result);
 }

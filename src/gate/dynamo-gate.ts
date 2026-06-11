@@ -65,25 +65,41 @@ export async function acquire(
       ? '(attribute_not_exists(total_inflight) OR total_inflight < :limit) AND (video_inflight < :myfloor OR rest_inflight <= :otherfloor)'
       : '(attribute_not_exists(total_inflight) OR total_inflight < :limit) AND (rest_inflight < :myfloor OR video_inflight <= :otherfloor)';
 
-  try {
-    await client.send(new UpdateItemCommand({
-      TableName: TABLE,
-      Key: marshall({ pk: 'COUNTER#modelslab', sk: 'SEMAPHORE' }),
-      UpdateExpression: `ADD #field :one, total_inflight :one`,
-      ConditionExpression: conditionExpr,
-      ExpressionAttributeNames: { '#field': field },
-      ExpressionAttributeValues: marshall({
-        ':one': 1,
-        ':limit': SAFE_LIMIT,
-        ':myfloor': lane === 'video' ? VIDEO_FLOOR : REST_FLOOR,
-        ':otherfloor': lane === 'video' ? REST_FLOOR : VIDEO_FLOOR,
-      }),
-    }));
-  } catch (err: unknown) {
-    if (isConditionalCheckFailed(err)) {
-      return { granted: false, retryAfterMs: 5_000 };
+  const attemptAcquire = async (): Promise<boolean> => {
+    try {
+      await client.send(new UpdateItemCommand({
+        TableName: TABLE,
+        Key: marshall({ pk: 'COUNTER#modelslab', sk: 'SEMAPHORE' }),
+        UpdateExpression: `ADD #field :one, total_inflight :one`,
+        ConditionExpression: conditionExpr,
+        ExpressionAttributeNames: { '#field': field },
+        ExpressionAttributeValues: marshall({
+          ':one': 1,
+          ':limit': SAFE_LIMIT,
+          ':myfloor': lane === 'video' ? VIDEO_FLOOR : REST_FLOOR,
+          ':otherfloor': lane === 'video' ? REST_FLOOR : VIDEO_FLOOR,
+        }),
+      }));
+      return true;
+    } catch (err: unknown) {
+      if (isConditionalCheckFailed(err)) return false;
+      throw err;
     }
-    throw err;
+  };
+
+  let granted = await attemptAcquire();
+
+  // Self-healing: on first rejection, reclaim any expired leases and retry once.
+  // This prevents a crashed Lambda from blocking the pool until the next sweeper tick.
+  if (!granted) {
+    const { reclaimed } = await reclaimExpiredLeases();
+    if (reclaimed > 0) {
+      granted = await attemptAcquire();
+    }
+  }
+
+  if (!granted) {
+    return { granted: false, retryAfterMs: 5_000 };
   }
 
   // Record lease for heartbeat + sweeper tracking
@@ -377,6 +393,50 @@ export async function reclaimExpired(): Promise<{
   }
 
   return { reclaimed, requeued, dead };
+}
+
+// ─── Counter Reconciliation ───────────────────────────────────────────────────
+
+/**
+ * Recompute video_inflight and rest_inflight from the ground truth (actual
+ * non-deleted, non-expired LEASE# records) and overwrite the COUNTER item.
+ *
+ * Called by the sweeper so any incremental drift (double-increment bugs,
+ * lost decrement from Lambda OOM, etc.) is corrected every 2 minutes.
+ */
+export async function reconcileCounter(): Promise<{ video: number; rest: number }> {
+  const now = Date.now();
+  let video = 0;
+  let rest = 0;
+  let lastKey: Record<string, AttributeValue> | undefined;
+
+  do {
+    const result = await client.send(new ScanCommand({
+      TableName: TABLE,
+      FilterExpression:
+        'begins_with(pk, :pfx) AND leaseExpiry >= :now AND attribute_not_exists(deleted)',
+      ExpressionAttributeValues: marshall({ ':pfx': 'LEASE#', ':now': now }),
+      ProjectionExpression: 'lane',
+      ExclusiveStartKey: lastKey,
+    }));
+
+    for (const raw of result.Items ?? []) {
+      const item = unmarshall(raw) as Pick<LeaseItem, 'lane'>;
+      if (item.lane === 'video') video++;
+      else rest++;
+    }
+
+    lastKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined;
+  } while (lastKey);
+
+  await client.send(new UpdateItemCommand({
+    TableName: TABLE,
+    Key: marshall({ pk: 'COUNTER#modelslab', sk: 'SEMAPHORE' }),
+    UpdateExpression: 'SET video_inflight = :v, rest_inflight = :r, total_inflight = :t',
+    ExpressionAttributeValues: marshall({ ':v': video, ':r': rest, ':t': video + rest }),
+  }));
+
+  return { video, rest };
 }
 
 // ─── Reclaim Expired Broker Leases ────────────────────────────────────────────
