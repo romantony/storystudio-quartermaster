@@ -896,9 +896,9 @@ function buildPremiumDefinition(brokerArn: string): object {
               },
               GenerateAllFrames: {
                 Type: 'Map',
-                Comment: 'Per-frame: TTS → AcquireImageSlot → Image → ReleaseImageSlot → AcquireVideoSlot → I2V → ReleaseVideoSlot → AudioMerge. MaxConcurrency=15 matches pool; QM gates actual API calls per lane.',
+                Comment: 'Per-frame: TTS → AcquireImageSlot → Image → ReleaseImageSlot → AcquireVideoSlot → I2V → ReleaseVideoSlot → AudioMerge. MaxConcurrency=5 prevents Lambda/API burst throttle at startup.',
                 ItemsPath: '$$.Execution.Input.frames',
-                MaxConcurrency: 15,
+                MaxConcurrency: 5,
                 Iterator: {
                   StartAt: 'CheckPreGeneratedAudio',
                   States: {
@@ -933,6 +933,7 @@ function buildPremiumDefinition(brokerArn: string): object {
                       },
                       TimeoutSeconds: 60,
                       ResultPath: '$.ttsResult',
+                      Retry: [{ ErrorEquals: ['Lambda.TooManyRequestsException'], IntervalSeconds: 15, MaxAttempts: 4, BackoffRate: 2.0, JitterStrategy: 'FULL' }],
                       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'GenerateFrameTTSFallback' }],
                       Next: 'CheckImageCache',
                     },
@@ -994,10 +995,14 @@ function buildPremiumDefinition(brokerArn: string): object {
                         'userId.$': '$$.Execution.Input.userId',
                         'referenceImageUrls.$': '$.referenceImageUrls',
                         strength: 0.75,
+                        'genre.$': '$$.Execution.Input.genre',
                       },
                       ResultPath: '$.imageResult',
                       TimeoutSeconds: 300,
-                      Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+                      Retry: [
+                        { ErrorEquals: ['Lambda.TooManyRequestsException'], IntervalSeconds: 20, MaxAttempts: 5, BackoffRate: 2.0, JitterStrategy: 'FULL' },
+                        { ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 },
+                      ],
                       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'ReleaseImageSlotOnError' }],
                       Next: 'StoreImageMeta',
                     },
@@ -1034,7 +1039,7 @@ function buildPremiumDefinition(brokerArn: string): object {
                       },
                       ResultPath: '$.fallbackImageResult',
                       TimeoutSeconds: 600,
-                      Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 2.0 }],
+                      Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 5, BackoffRate: 2.0, JitterStrategy: 'FULL' }],
                       Next: 'BuildFramePayloadFallback',
                     },
                     BuildFramePayload: {

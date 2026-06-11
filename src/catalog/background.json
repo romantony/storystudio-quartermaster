@@ -21,6 +21,10 @@
       { "provider": "modelslab", "model": "flux-klien-9B",                     "modelId": "flux-klein",      "endpoint": "v6/text2img",        "routingMode": "aggregated", "lane": "rest" },
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
+    "image.explainer.t2i": [
+      { "provider": "modelslab", "model": "google/nano-banana-t2i", "modelId": "nano-banana-t2i", "endpoint": "v7/text-to-image", "routingMode": "aggregated", "lane": "rest",
+        "note": "Google nano-banana-t2i — supports text rendering in images. Used for explainer videos. Always txt2img." }
+    ],
     "image.basic.i2i": [
       { "provider": "modelslab", "model": "qwen-edit",                          "modelId": "qwen-edit",      "endpoint": "v6/image_editing/qwen_edit", "routingMode": "aggregated", "lane": "rest" },
       { "provider": "modelslab", "model": "flux-klien-9B-image-to-image",      "modelId": "flux-klein",      "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
