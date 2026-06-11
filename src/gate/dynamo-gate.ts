@@ -1,9 +1,11 @@
 import {
+  AttributeValue,
   DynamoDBClient,
   UpdateItemCommand,
   QueryCommand,
   GetItemCommand,
   PutItemCommand,
+  ScanCommand,
   TransactWriteItemsCommand,
 } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
@@ -56,16 +58,18 @@ export async function acquire(
   // Floor conditions:
   //   video: total < SAFE_LIMIT AND (video < VIDEO_FLOOR OR rest <= REST_FLOOR)
   //   rest:  total < SAFE_LIMIT AND (rest < REST_FLOOR   OR video <= VIDEO_FLOOR)
+  // DynamoDB ConditionExpression does not support arithmetic (video_inflight + rest_inflight),
+  // so we maintain a total_inflight counter alongside the per-lane counters.
   const conditionExpr =
     lane === 'video'
-      ? '(video_inflight + rest_inflight) < :limit AND (video_inflight < :myfloor OR rest_inflight <= :otherfloor)'
-      : '(video_inflight + rest_inflight) < :limit AND (rest_inflight < :myfloor OR video_inflight <= :otherfloor)';
+      ? '(attribute_not_exists(total_inflight) OR total_inflight < :limit) AND (video_inflight < :myfloor OR rest_inflight <= :otherfloor)'
+      : '(attribute_not_exists(total_inflight) OR total_inflight < :limit) AND (rest_inflight < :myfloor OR video_inflight <= :otherfloor)';
 
   try {
     await client.send(new UpdateItemCommand({
       TableName: TABLE,
       Key: marshall({ pk: 'COUNTER#modelslab', sk: 'SEMAPHORE' }),
-      UpdateExpression: `ADD #field :one`,
+      UpdateExpression: `ADD #field :one, total_inflight :one`,
       ConditionExpression: conditionExpr,
       ExpressionAttributeNames: { '#field': field },
       ExpressionAttributeValues: marshall({
@@ -116,7 +120,7 @@ export async function release(lane: Lane, leaseId: string): Promise<ReleaseRespo
     await client.send(new UpdateItemCommand({
       TableName: TABLE,
       Key: marshall({ pk: 'COUNTER#modelslab', sk: 'SEMAPHORE' }),
-      UpdateExpression: `ADD #field :neg`,
+      UpdateExpression: `ADD #field :neg, total_inflight :neg`,
       ConditionExpression: '#field > :zero',
       ExpressionAttributeNames: { '#field': field },
       ExpressionAttributeValues: marshall({ ':neg': -1, ':zero': 0 }),
@@ -241,18 +245,18 @@ async function inlineAdmit(job: JobItem, lane: Lane): Promise<boolean> {
 
   const conditionExpr =
     lane === 'video'
-      ? '(video_inflight + rest_inflight) < :limit AND (video_inflight < :myfloor OR rest_inflight <= :otherfloor)'
-      : '(video_inflight + rest_inflight) < :limit AND (rest_inflight < :myfloor OR video_inflight <= :otherfloor)';
+      ? '(attribute_not_exists(total_inflight) OR total_inflight < :limit) AND (video_inflight < :myfloor OR rest_inflight <= :otherfloor)'
+      : '(attribute_not_exists(total_inflight) OR total_inflight < :limit) AND (rest_inflight < :myfloor OR video_inflight <= :otherfloor)';
 
   try {
     await client.send(new TransactWriteItemsCommand({
       TransactItems: [
-        // 1. Acquire slot
+        // 1. Acquire slot (total_inflight maintained alongside per-lane counter)
         {
           Update: {
             TableName: TABLE,
             Key: marshall({ pk: 'COUNTER#modelslab', sk: 'SEMAPHORE' }),
-            UpdateExpression: `ADD #field :one`,
+            UpdateExpression: `ADD #field :one, total_inflight :one`,
             ConditionExpression: conditionExpr,
             ExpressionAttributeNames: { '#field': field },
             ExpressionAttributeValues: marshall({
@@ -373,6 +377,65 @@ export async function reclaimExpired(): Promise<{
   }
 
   return { reclaimed, requeued, dead };
+}
+
+// ─── Reclaim Expired Broker Leases ────────────────────────────────────────────
+
+/**
+ * Scan for LEASE# records that have expired but were never released (Lambda crash
+ * or timeout before calling /release). Decrement the counter for each and mark
+ * them deleted so the semaphore stays accurate.
+ *
+ * Called at the end of the main sweeper run so counters are always reconciled.
+ */
+export async function reclaimExpiredLeases(): Promise<{ reclaimed: number }> {
+  const now = Date.now();
+  let reclaimed = 0;
+  let lastKey: Record<string, AttributeValue> | undefined;
+
+  do {
+    const result = await client.send(new ScanCommand({
+      TableName: TABLE,
+      FilterExpression:
+        'begins_with(pk, :pfx) AND leaseExpiry < :now AND attribute_not_exists(deleted)',
+      ExpressionAttributeValues: marshall({ ':pfx': 'LEASE#', ':now': now }),
+      ExclusiveStartKey: lastKey,
+    }));
+
+    for (const raw of result.Items ?? []) {
+      const item = unmarshall(raw) as LeaseItem;
+      const lane: Lane = (item.lane === 'video' ? 'video' : 'rest');
+      const field = lane === 'video' ? 'video_inflight' : 'rest_inflight';
+
+      // Decrement the counter (ignore if already at 0)
+      await client.send(new UpdateItemCommand({
+        TableName: TABLE,
+        Key: marshall({ pk: 'COUNTER#modelslab', sk: 'SEMAPHORE' }),
+        UpdateExpression: 'ADD #field :neg, total_inflight :neg',
+        ConditionExpression: '#field > :zero',
+        ExpressionAttributeNames: { '#field': field },
+        ExpressionAttributeValues: marshall({ ':neg': -1, ':zero': 0 }),
+      })).catch(() => { /* already at 0, that's fine */ });
+
+      // Mark as deleted so subsequent sweeper runs skip it
+      await client.send(new UpdateItemCommand({
+        TableName: TABLE,
+        Key: marshall({ pk: item.pk, sk: item.sk }),
+        UpdateExpression: 'SET deleted = :t',
+        ExpressionAttributeValues: marshall({ ':t': true }),
+      }));
+
+      reclaimed++;
+    }
+
+    lastKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined;
+  } while (lastKey);
+
+  if (reclaimed > 0) {
+    console.info(`[lease-sweeper] reclaimed ${reclaimed} expired broker leases`);
+  }
+
+  return { reclaimed };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import * as bcrypt from 'bcryptjs';
 import * as jwt from 'jsonwebtoken';
 import { z } from 'zod';
-import { acquire, heartbeat, reclaimExpired, release } from '../gate/dynamo-gate';
+import { acquire, heartbeat, reclaimExpired, reclaimExpiredLeases, release } from '../gate/dynamo-gate';
 import type {
   AcquireRequest,
   AuditItem,
@@ -131,7 +131,8 @@ async function handleHeartbeat(evt: LambdaFunctionUrlEvent): Promise<LambdaFunct
 // ─── Sweeper: /sweeper ───────────────────────────────────────────────────────
 
 async function handleSweeper(): Promise<LambdaFunctionUrlResponse> {
-  const result = await reclaimExpired();
+  const [jobs, leases] = await Promise.all([reclaimExpired(), reclaimExpiredLeases()]);
+  const result = { ...jobs, leasesReclaimed: leases.reclaimed };
   console.info('[sweeper] result', result);
   return json(200, result);
 }
