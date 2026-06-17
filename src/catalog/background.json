@@ -3,7 +3,7 @@
   "providers": {
     "modelslab": { "limit": 15, "floors": { "video": 8, "rest": 7 }, "secretEnv": "MODELSLAB_API_KEY" },
     "replicate": { "limit": 20, "secretEnv": "REPLICATE_API_TOKEN" },
-    "kie":       { "limit": 10, "floors": { "video": 6, "rest": 4 }, "secretEnv": "KIE_AI_API_KEY" },
+    "kie":       { "limit": 30, "floors": { "video": 15, "rest": 15 }, "secretEnv": "KIE_AI_API_KEY" },
     "google":    { "limit": 8,  "secretEnv": "GOOGLE_API_KEY" },
     "anthropic": { "limit": 8,  "secretEnv": "ANTHROPIC_API_KEY" },
     "openai":    { "limit": 8,  "secretEnv": "OPENAI_API_KEY" }
@@ -32,15 +32,12 @@
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.premium.t2i": [
-      { "provider": "modelslab", "model": "qwen-text-to-image",                                              "modelId": "qwen",                "endpoint": "v6/text2img",       "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "modelslab", "model": "alibaba_cloud/qwen-image-2.0-pro-text-to-image", "modelId": "qwen-image-2.0-pro-t2i", "endpoint": "v7/text-to-image",  "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "modelslab", "model": "google/nano-banana-2-image-edit",   "modelId": "gemini-3.1-t2i", "endpoint": "v7/text-to-image",  "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "kie",       "model": "nano-banana-2",                                                   "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fixed": { "rendering_speed": "TURBO" } }
     ],
     "image.premium.i2i": [
-      { "provider": "modelslab", "model": "qwen-edit",                                    "modelId": "qwen-edit",              "endpoint": "v6/image_editing/qwen_edit", "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "modelslab", "model": "alibaba_cloud/qwen-image-2.0-pro-text-to-image", "modelId": "qwen-image-2.0-pro-i2i", "endpoint": "v7/image-to-image",          "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "kie",       "model": "nano-banana-2",                                                   "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "kie", "model": "google/nano-banana-edit", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "kie", "model": "qwen/image-edit",         "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" }
     ],
     "video.basic": [
       { "provider": "consumer", "model": "stock-footage",    "routingMode": "stock",  "lane": "none", "note": "Documentary Basic: free Pexels/Pixabay footage" },
@@ -48,8 +45,8 @@
       { "provider": "consumer", "model": "basic-animation",  "routingMode": "render", "lane": "none", "fb": true }
     ],
     "video.premium.i2v": [
-      { "provider": "modelslab", "model": "wan-2.2-i2v", "endpoint": "v6/video/img2video_ultra", "routingMode": "aggregated", "lane": "video",
-        "fixed": { "num_frames": "82", "fps": "16" } },
+      { "provider": "kie", "model": "wan/2-2-a14b-image-to-video-turbo", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "video",
+        "fixed": { "resolution": "480p" } },
       { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video", "fb": true }
     ],
     "movie.basic.image.t2i":  { "aliasOf": "image.premium.t2i" },

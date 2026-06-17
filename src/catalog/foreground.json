@@ -1,7 +1,7 @@
 {
   "version": "2026-06-09.1",
   "providers": {
-    "kie":       { "limit": 10, "floors": { "video": 6, "rest": 4 }, "secretEnv": "KIE_AI_API_KEY" },
+    "kie":       { "limit": 30, "floors": { "video": 15, "rest": 15 }, "secretEnv": "KIE_AI_API_KEY" },
     "replicate": { "limit": 20, "secretEnv": "REPLICATE_API_TOKEN" },
     "google":    { "limit": 8,  "secretEnv": "GOOGLE_API_KEY" },
     "anthropic": { "limit": 8,  "secretEnv": "ANTHROPIC_API_KEY" },
@@ -18,15 +18,16 @@
   },
   "ladders": {
     "image.premium.t2i": [
-      { "provider": "kie",      "model": "nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "replicate","model": "google/nano-banana",                                   "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fixed": { "rendering_speed": "TURBO" } }
     ],
     "image.premium.i2i": [
-      { "provider": "kie",      "model": "nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "replicate","model": "google/nano-banana",                                   "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "kie", "model": "google/nano-banana-edit", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
+      { "provider": "kie", "model": "qwen/image-edit",         "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" }
     ],
     "video.premium.i2v": [
-      { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video" }
+      { "provider": "kie", "model": "wan/2-2-a14b-image-to-video-turbo", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "video",
+        "fixed": { "resolution": "480p" } }
     ],
     "lipsync.premium.video": [
       { "provider": "runpod",   "model": "infinitetalk", "endpoint": "v2/infinitetalk/run", "routingMode": "direct", "lane": "video",
