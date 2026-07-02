@@ -135,7 +135,16 @@ async function handleSweeper(): Promise<LambdaFunctionUrlResponse> {
   // counter reflects truth after all expired leases have been cleaned up.
   const [jobs, leases] = await Promise.all([reclaimExpired(), reclaimExpiredLeases()]);
   const counter = await reconcileCounter();
-  const result = { ...jobs, leasesReclaimed: leases.reclaimed, counter };
+
+  // RunPod worker-lifecycle tick (shadow mode by default — logs/audits the
+  // scale decision without touching RunPod).
+  const { runProvisioner } = await import('./provisioner');
+  const provisioning = await runProvisioner().catch(e => {
+    console.error('[sweeper] provisioner error', e);
+    return [];
+  });
+
+  const result = { ...jobs, leasesReclaimed: leases.reclaimed, counter, provisioning };
   console.info('[sweeper] result', result);
   return json(200, result);
 }
@@ -164,9 +173,11 @@ const canonicalJobSchema = z.object({
   manifestRef: z.string().optional(),
   platform: z.string().optional(),
   projectId: z.string().optional(),
+  frameId: z.string().optional(),
   userId: z.string().optional(),
   priority: z.enum(['P0', 'P1', 'P2']).optional(),
   lane: z.enum(['video', 'rest', 'none']).optional(),
+  jobType: z.enum(['batch', 'realtime']).optional(),
 });
 
 async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunctionUrlResponse> {
@@ -213,23 +224,50 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
     leaseExpiry: undefined,
     platform: input.platform,
     projectId: input.projectId,
+    frameId: input.frameId,
     userId: input.userId,
     requestId: input.requestId,
     jobId,
+    jobType: input.jobType,
+    assetType: input.assetType,
+    tier: input.tier,
+    operation: input.operation,
+    queue: input.queue,
     createdAt: now,
     updatedAt: now,
   };
 
+  let isNew = true;
   await db.send(new PutItemCommand({
     TableName: TABLE,
     Item: marshall(jobItem, { removeUndefinedValues: true }),
     ConditionExpression: 'attribute_not_exists(pk)',
   })).catch(e => {
-    // If item already exists (duplicate submit) that's fine
+    // If item already exists (duplicate submit) that's fine — don't re-dispatch.
     if (e.name !== 'ConditionalCheckFailedException') throw e;
+    isNew = false;
   });
 
+  // Hand off to the executor asynchronously so POST /jobs returns immediately
+  // (the executor can run for minutes on a RunPod cold start).
+  if (isNew) await dispatchExecutor(input.requestId, jobId);
+
   return json(202, { jobId, requestId: input.requestId, status: 'QUEUED' });
+}
+
+async function dispatchExecutor(requestId: string, jobId: string): Promise<void> {
+  const fn = process.env.EXECUTOR_FUNCTION_NAME;
+  if (!fn) {
+    console.warn('[api] EXECUTOR_FUNCTION_NAME unset — job queued but not dispatched');
+    return;
+  }
+  const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
+  const lambda = new LambdaClient({});
+  await lambda.send(new InvokeCommand({
+    FunctionName: fn,
+    InvocationType: 'Event',
+    Payload: Buffer.from(JSON.stringify({ requestId, jobId })),
+  })).catch(e => console.error('[api] executor dispatch failed', e));
 }
 
 // ─── Job queue: GET /jobs/{requestId} ────────────────────────────────────────

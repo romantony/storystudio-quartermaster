@@ -20,6 +20,8 @@ export type ErrClass =
 
 export type Queue = 'background' | 'foreground';
 
+export type JobType = 'batch' | 'realtime';
+
 // ─── Catalog / Adapter types ─────────────────────────────────────────────────
 
 export interface Rung {
@@ -34,6 +36,15 @@ export interface Rung {
   needs?: string[];
   resolution?: string;
   note?: string;
+  // RunPod-internal rungs only: the Flux-TTS-S2T mode (image|tts|bgm|transcribe)
+  // or standalone-endpoint marker. Drives request shaping in the runpod adapter.
+  mode?: string;
+  // RunPod-internal rungs only: the serverless endpoint ID (e.g. rnqxi6c0mlq517)
+  // and the QM per-endpoint semaphore counter key (e.g. "runpod:flux-tts-s2t").
+  endpointId?: string;
+  counterKey?: string;
+  // RunPod-internal rungs only: engine selector for tts (kokoro|qwen).
+  engine?: string;
 }
 
 export interface CatalogLadder {
@@ -73,6 +84,12 @@ export interface CanonicalJobParams {
   voice?: string;
   width?: string;
   height?: string;
+  // TTS: reference-voice fields for Qwen voice-clone / instruct design
+  voiceUrl?: string;
+  voiceTranscript?: string;
+  instruct?: string;
+  speaker?: string;
+  language?: string;
 }
 
 export interface CanonicalJob {
@@ -93,8 +110,14 @@ export interface CanonicalJob {
   // attribution (§20)
   platform?: string;
   projectId?: string;
+  frameId?: string;
   userId?: string;
   priority?: Priority;
+  // batch → internal RunPod first (absorbs cold start); realtime → internal
+  // only if warm+free slot, else external. Absent → ladder order unchanged.
+  jobType?: JobType;
+  // rung keys already attempted (so retries/failover don't repeat a dead rung).
+  triedRungs?: string[];
 }
 
 // ─── DynamoDB Job Item ────────────────────────────────────────────────────────
@@ -122,9 +145,16 @@ export interface JobItem {
   leaseExpiry?: number; // epoch ms
   platform?: string;
   projectId?: string;
+  frameId?: string;
   userId?: string;
   requestId: string;
   jobId: string;
+  jobType?: JobType;
+  triedRungs?: string[];
+  assetType?: string;
+  tier?: string;
+  operation?: string;
+  queue?: Queue;
   createdAt: number;    // epoch ms
   updatedAt: number;    // epoch ms
   degraded?: Array<{ jobId: string; reason: string }>;
@@ -150,6 +180,9 @@ export interface LeaseItem {
   tenant: string;
   leaseExpiry: number;
   acquiredAt: number;
+  // Set for RunPod-style single-counter leases (COUNTER#runpod:*). When absent,
+  // the lease belongs to the modelslab video/rest floor semaphore.
+  counterKey?: string;
 }
 
 // ─── Webhook Token Map ────────────────────────────────────────────────────────
@@ -164,6 +197,11 @@ export interface ProviderTaskItem {
   createdAt: number;
   ttl: number;      // Unix epoch seconds for DynamoDB TTL auto-delete
   claimed?: boolean;
+  // Slot-release + failover context so webhook.ts can free the semaphore slot
+  // and (on failure) re-invoke the executor to try the next rung.
+  provider?: string;
+  leaseId?: string;
+  leaseCounterKey?: string;   // COUNTER#{key} the slot was taken from
 }
 
 // ─── Circuit Breaker Item ─────────────────────────────────────────────────────
@@ -235,6 +273,42 @@ export interface MeteringItem {
   pk: string;         // USAGE:{projectId}:{yyyymmdd}
   sk: string;         // {model}:count | {model}:slot_ms
   value: number;
+}
+
+// ─── RunPod endpoint provisioning state (§Pillar 2) ──────────────────────────
+
+/**
+ * One item per RunPod serverless endpoint QM provisions. Caches the last-known
+ * workersMin/Max so the provisioner can compute deltas, and records the last
+ * time the endpoint had a non-empty queue (drives the scale-to-zero cooldown).
+ */
+export interface RunPodEndpointItem {
+  pk: 'RUNPODENDPOINT';
+  sk: string;             // counterKey, e.g. "runpod:flux-tts-s2t"
+  endpointId: string;     // RunPod endpoint id, e.g. "rnqxi6c0mlq517"
+  workersMin: number;
+  workersMax: number;
+  lastBusyAt?: number;    // epoch ms — last tick with queued+inflight > 0
+  updatedAt: number;
+}
+
+/**
+ * Shadow-mode audit of a scale decision the provisioner *would* have made.
+ * Written instead of calling RunPod's management PATCH until provisioning goes live.
+ */
+export interface ProvisionShadowItem {
+  pk: 'PROVISION_SHADOW';
+  sk: string;             // {timestamp}#{counterKey}
+  counterKey: string;
+  endpointId: string;
+  reason: string;         // e.g. "prewarm", "scale-up", "scale-to-zero", "hold"
+  fromWorkersMax: number;
+  toWorkersMax: number;
+  fromWorkersMin: number;
+  toWorkersMin: number;
+  queued: number;
+  inflight: number;
+  timestamp: number;
 }
 
 // ─── Broker API shapes ────────────────────────────────────────────────────────

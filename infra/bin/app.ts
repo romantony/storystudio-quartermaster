@@ -37,6 +37,9 @@ const apiStack = new ApiStack(app, 'QMApiStack', {
   kieKeySecretArn: ctx('KIE_AI_API_KEY_ARN'),
   runpodKeySecretArn: ctx('RUNPOD_API_KEY_ARN'),
   s3CacheBucket: app.node.tryGetContext('S3_CACHE_BUCKET') ?? process.env['S3_CACHE_BUCKET'] ?? '',
+  // Base URL external providers call back to (set after the webhook stack's
+  // first deploy, or a custom domain). Empty is fine for internal-only flows.
+  webhookBaseUrl: app.node.tryGetContext('WEBHOOK_BASE_URL') ?? process.env['WEBHOOK_BASE_URL'] ?? '',
 });
 apiStack.addDependency(dbStack);
 
@@ -47,8 +50,10 @@ const webhookStack = new WebhookStack(app, 'QMWebhookStack', {
   gatewayKeySecretArn: ctx('GATEWAY_STATIC_KEY_ARN'),
   kieWebhookSecretArn: ctx('KIE_WEBHOOK_SECRET_ARN'),
   replicateWebhookSecretArn: ctx('REPLICATE_WEBHOOK_SECRET_ARN'),
+  executorFunction: apiStack.executorFunction,
 });
 webhookStack.addDependency(dbStack);
+webhookStack.addDependency(apiStack);
 
 // --- EventBridge Scheduler → /sweeper every 2 min ---
 const schedulerStack = new SchedulerStack(app, 'QMSchedulerStack', {

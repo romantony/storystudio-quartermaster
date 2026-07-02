@@ -1,12 +1,13 @@
 {
-  "version": "2026-06-09.2",
+  "version": "2026-07-02.1",
   "providers": {
-    "modelslab": { "limit": 15, "floors": { "video": 8, "rest": 7 }, "secretEnv": "MODELSLAB_API_KEY" },
     "replicate": { "limit": 20, "secretEnv": "REPLICATE_API_TOKEN" },
     "kie":       { "limit": 30, "floors": { "video": 15, "rest": 15 }, "secretEnv": "KIE_AI_API_KEY" },
     "google":    { "limit": 8,  "secretEnv": "GOOGLE_API_KEY" },
     "anthropic": { "limit": 8,  "secretEnv": "ANTHROPIC_API_KEY" },
-    "openai":    { "limit": 8,  "secretEnv": "OPENAI_API_KEY" }
+    "openai":    { "limit": 8,  "secretEnv": "OPENAI_API_KEY" },
+    "runpod":    { "limit": 10, "secretEnv": "RUNPOD_API_KEY",
+                   "note": "Self-hosted RunPod-serverless models (Flux-TTS-S2T, qwen-image-gen/edit). Concurrency is gated per-endpoint (COUNTER#runpod:*), not by this global limit; account-wide worker cap is 10 (20 post-$200)." }
   },
   "circuit": {
     "errorThreshold": 0.5,
@@ -17,19 +18,14 @@
   },
   "ladders": {
     "image.basic.t2i": [
-      { "provider": "modelslab", "model": "qwen-text-to-image",                "modelId": "qwen",           "endpoint": "v6/text2img",        "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "modelslab", "model": "flux-klien-9B",                     "modelId": "flux-klein",      "endpoint": "v6/text2img",        "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest" }
     ],
     "image.explainer.t2i": [
-      { "provider": "modelslab", "model": "google/nano-banana-t2i", "modelId": "nano-banana-t2i", "endpoint": "v7/text-to-image", "routingMode": "aggregated", "lane": "rest",
-        "note": "Google nano-banana-t2i — supports text rendering in images. Used for explainer videos. Always txt2img." }
+      { "provider": "kie", "model": "google/nano-banana", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest",
+        "note": "Explainer videos — Google nano-banana supports text rendering in images." }
     ],
     "image.basic.i2i": [
-      { "provider": "modelslab", "model": "qwen-edit",                          "modelId": "qwen-edit",      "endpoint": "v6/image_editing/qwen_edit", "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "modelslab", "model": "flux-klien-9B-image-to-image",      "modelId": "flux-klein",      "endpoint": "v6/img2img",         "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "modelslab", "model": "google/nano-banana-2-text2image",   "modelId": "gemini-3.1-i2i", "endpoint": "v7/image-to-image",  "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b",                               "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest" }
     ],
     "image.premium.t2i": [
       { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
@@ -39,6 +35,61 @@
       { "provider": "kie", "model": "google/nano-banana-edit", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
       { "provider": "kie", "model": "qwen/image-edit",         "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" }
     ],
+
+    "image.narrationBasic.t2i": [
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Basic image T2I — self-hosted Flux Klein 4B (Flux-TTS-S2T mode:image)." },
+      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "image.narrationBasic.i2i": [
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Basic image I2I — Flux Klein 4B with reference_images (Flux-TTS-S2T mode:image)." },
+      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "voice.narrationBasic.tts": [
+      { "provider": "runpod", "model": "kokoro", "mode": "tts", "engine": "kokoro", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Basic TTS — self-hosted Kokoro-82M (Flux-TTS-S2T mode:tts engine:kokoro)." },
+      { "provider": "replicate", "model": "jaaari/kokoro-82m", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+
+    "image.narrationPremium.t2i": [
+      { "provider": "runpod", "model": "qwen-image-gen", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Premium image T2I — self-hosted Qwen-Image (qwen-image-gen endpoint)." },
+      { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true },
+      { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true, "fixed": { "rendering_speed": "TURBO" } }
+    ],
+    "image.narrationPremium.i2i": [
+      { "provider": "runpod", "model": "qwen-image-edit", "mode": "i2i", "endpointId": "oxwx8o879qwtla", "endpoint": "v2/oxwx8o879qwtla", "counterKey": "runpod:qwen-image-edit", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Premium image I2I — self-hosted Qwen-Image-Edit (qwen-image-edit endpoint)." },
+      { "provider": "kie", "model": "google/nano-banana-edit", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true },
+      { "provider": "kie", "model": "qwen/image-edit",         "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "voice.narrationPremium.tts": [
+      { "provider": "runpod", "model": "qwen-voice-design", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Premium TTS — self-hosted Qwen Voice Design (Flux-TTS-S2T mode:tts engine:qwen)." },
+      { "provider": "google", "model": "gemini-3.1-flash-tts-preview", "routingMode": "direct", "lane": "rest", "fb": true }
+    ],
+
+    "bgm.narration": [
+      { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration BGM (both tiers) — self-hosted ACE-Step (Flux-TTS-S2T mode:bgm)." },
+      { "provider": "kie", "model": "suno", "modelId": "V4_5", "endpoint": "v1/generate", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "srt.narration": [
+      { "provider": "runpod", "model": "whisper-large-v3-turbo", "mode": "transcribe", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration SRT (both tiers) — self-hosted Whisper large-v3-turbo (Flux-TTS-S2T mode:transcribe)." },
+      { "provider": "replicate", "model": "openai/whisper", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "video.narrationBasic.animate": [
+      { "provider": "runpod", "model": "flux-animate", "mode": "animate", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "fixed": { "effect": "ken_burns" },
+        "note": "Narration Basic animation — Flux-TTS-S2T animate (smooth Ken Burns), replaces the jittery local i2v render." }
+    ],
+    "video.narrationBasic.merge": [
+      { "provider": "runpod", "model": "flux-merge", "mode": "merge", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Basic per-frame audio merge — Flux-TTS-S2T merge (animated video + TTS voice)." }
+    ],
+
     "video.basic": [
       { "provider": "consumer", "model": "stock-footage",    "routingMode": "stock",  "lane": "none", "note": "Documentary Basic: free Pexels/Pixabay footage" },
       { "provider": "consumer", "model": "ken-burns",        "routingMode": "render", "lane": "none", "fb": true },
@@ -56,8 +107,7 @@
       { "provider": "replicate","model": "bytedance/seedance-1.5-pro",                                   "routingMode": "aggregated", "lane": "video", "fb": true }
     ],
     "movie.premium.image.t2i": [
-      { "provider": "modelslab", "model": "google/nano-banana-2-image-edit", "modelId": "gemini-3.1-t2i", "endpoint": "v7/text-to-image", "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "kie",       "model": "nano-banana-2",                                                "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "kie", "model": "nano-banana-2", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" }
     ],
     "movie.premium.image.i2i": { "aliasOf": "movie.premium.image.t2i" },
     "movie.premium.video.i2v": [
@@ -65,18 +115,15 @@
       { "provider": "replicate","model": "bytedance/seedance-2.0-fast",                                  "routingMode": "aggregated", "lane": "video", "fb": true }
     ],
     "voice.basic.tts": [
-      { "provider": "modelslab", "model": "text-to-speech", "modelId": "inworld-tts-1", "endpoint": "v7/voice/text-to-speech", "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "replicate", "model": "jaaari/kokoro-82m",                                             "routingMode": "aggregated", "lane": "rest", "fb": true }
+      { "provider": "replicate", "model": "jaaari/kokoro-82m", "routingMode": "aggregated", "lane": "rest" }
     ],
     "voice.premium.tts": [
       { "provider": "google", "model": "gemini-3.1-flash-tts-preview", "routingMode": "direct", "lane": "rest" }
     ],
     "sfx": [
-      { "provider": "modelslab", "model": "sfx", "endpoint": "v6/voice/sfx", "routingMode": "aggregated", "lane": "rest" }
+      { "provider": "replicate", "model": "sepal/audiogen", "routingMode": "aggregated", "lane": "rest" }
     ],
-    "bgm.basic": [
-      { "provider": "modelslab", "model": "ai-music-generator", "endpoint": "v6/voice/music", "routingMode": "aggregated", "lane": "rest" }
-    ],
+    "bgm.basic": { "aliasOf": "bgm.narration" },
     "bgm.premium": [
       { "provider": "kie", "model": "suno", "modelId": "V4_5", "endpoint": "v1/generate", "routingMode": "aggregated", "lane": "rest" }
     ],

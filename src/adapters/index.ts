@@ -1,15 +1,14 @@
 import type { Adapter } from '../types';
-import { modelslab } from './modelslab';
 import { kie } from './kie';
 import { replicate } from './replicate';
 import { runpod } from './runpod';
 
-export { modelslab, kie, replicate, runpod };
+export { kie, replicate, runpod };
 
 export const ADAPTERS: Record<string, Adapter> = {
-  modelslab,
   kie,
   replicate,
   runpod,
+  // modelslab decommissioned (2026-07-02) — no longer in any catalog ladder.
   // google, anthropic, openai — added when those direct-provider routes are needed
 };

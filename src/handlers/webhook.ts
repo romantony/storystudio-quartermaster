@@ -3,8 +3,8 @@ import { DynamoDBClient, GetItemCommand, UpdateItemCommand } from '@aws-sdk/clie
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { ADAPTERS } from '../adapters';
+import { releaseSimple } from '../gate/dynamo-gate';
 import type {
-  JobStatus,
   LambdaFunctionUrlEvent,
   LambdaFunctionUrlResponse,
   ProviderTaskItem,
@@ -78,22 +78,36 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
       return ok;
     }
 
-    // 7. Phase 1 (no SFN): update job status directly in DynamoDB
-    const now = Date.now();
-    const newStatus: JobStatus = failed ? 'FAILED' : 'COMPLETE';
-    const assetKey = outputUrls?.[0];
+    // 7. Release the semaphore slot the executor held for this async task.
+    if (map.leaseCounterKey && map.leaseId) {
+      await releaseSimple(map.leaseCounterKey, map.leaseId).catch(e =>
+        console.warn('[webhook] slot release failed', e));
+    }
 
-    await db.send(new UpdateItemCommand({
-      TableName: TABLE,
-      Key: marshall({ pk: `REQ#${map.requestId}`, sk: `JOB#${map.jobId}` }),
-      UpdateExpression: 'SET #status = :s, updatedAt = :now' + (assetKey ? ', assetKey = :ak' : ''),
-      ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: marshall({
-        ':s': newStatus,
-        ':now': now,
-        ...(assetKey ? { ':ak': assetKey } : {}),
-      }),
-    }));
+    const now = Date.now();
+
+    if (failed) {
+      // Don't dead-end the request — hand back to the executor, which will try
+      // the next untried rung (the failed rung is already in triedRungs) and
+      // only mark FAILED once the ladder is exhausted.
+      await dispatchExecutor(map.requestId, map.jobId).catch(e =>
+        console.warn('[webhook] executor re-dispatch failed', e));
+      console.info('[webhook] provider failed → failover', provider, taskRef);
+    } else {
+      const assetKey = outputUrls?.[0];
+      await db.send(new UpdateItemCommand({
+        TableName: TABLE,
+        Key: marshall({ pk: `REQ#${map.requestId}`, sk: `JOB#${map.jobId}` }),
+        UpdateExpression: 'SET #status = :s, updatedAt = :now' + (assetKey ? ', assetKey = :ak' : ''),
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: marshall({
+          ':s': 'COMPLETE',
+          ':now': now,
+          ...(assetKey ? { ':ak': assetKey } : {}),
+        }),
+      }));
+      console.info('[webhook] resolved', provider, taskRef, 'COMPLETE');
+    }
 
     // Phase 2 stub: if a taskToken is present, resume the Step Function
     if (map.taskToken) {
@@ -102,7 +116,6 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
       );
     }
 
-    console.info('[webhook] resolved', provider, taskRef, newStatus);
     return ok;
   } catch (err) {
     console.error('[webhook] error', err);
@@ -167,6 +180,23 @@ async function claimWebhookOnce(pk: string): Promise<boolean> {
     if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
     throw err;
   }
+}
+
+// ─── Executor re-dispatch (failover) ─────────────────────────────────────────
+
+async function dispatchExecutor(requestId: string, jobId: string): Promise<void> {
+  const fn = process.env.EXECUTOR_FUNCTION_NAME;
+  if (!fn) {
+    console.warn('[webhook] EXECUTOR_FUNCTION_NAME unset — cannot fail over');
+    return;
+  }
+  const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
+  const lambda = new LambdaClient({});
+  await lambda.send(new InvokeCommand({
+    FunctionName: fn,
+    InvocationType: 'Event',
+    Payload: Buffer.from(JSON.stringify({ requestId, jobId })),
+  }));
 }
 
 // ─── Step Functions stub (Phase 2) ───────────────────────────────────────────

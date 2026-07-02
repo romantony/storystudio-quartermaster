@@ -15,6 +15,7 @@ interface WebhookStackProps extends StackProps {
   gatewayKeySecretArn: string;
   kieWebhookSecretArn: string;
   replicateWebhookSecretArn: string;
+  executorFunction: lambda.IFunction;
 }
 
 export class WebhookStack extends Stack {
@@ -38,10 +39,13 @@ export class WebhookStack extends Stack {
         GATEWAY_STATIC_KEY_ARN: props.gatewayKeySecretArn,
         KIE_WEBHOOK_SECRET_ARN: props.kieWebhookSecretArn,
         REPLICATE_WEBHOOK_SECRET_ARN: props.replicateWebhookSecretArn,
+        EXECUTOR_FUNCTION_NAME: props.executorFunction.functionName,
       },
     });
 
     props.table.grantReadWriteData(webhookFn);
+    // On provider failure the webhook re-dispatches the executor to fail over.
+    props.executorFunction.grantInvoke(webhookFn);
 
     webhookFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],

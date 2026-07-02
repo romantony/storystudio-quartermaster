@@ -42,11 +42,38 @@ export class PipelineStack extends Stack {
       action: 'lambda:InvokeFunction',
     });
 
+    // ── QM-generate Lambda (SFN ↔ Quartermaster gateway task) ────────────────
+    // Submits a canonical job to QM and polls it to completion; QM owns provider
+    // selection, internal↔external failover, and concurrency. Replaces the
+    // per-asset "acquire → provider Lambda → release" cluster.
+    const qmGenerateFn = new nodejs.NodejsFunction(this, 'QMGenerateFunction', {
+      functionName: 'QM-generate',
+      entry: path.join(__dirname, '../../src/handlers/qm-generate.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(300),
+      memorySize: 256,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+      environment: {
+        QM_BASE_URL: `https://${props.qmApiDomain}`,
+        GATEWAY_STATIC_KEY_ARN: props.gatewayKeySecretArn,
+      },
+    });
+    qmGenerateFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [props.gatewayKeySecretArn],
+    }));
+    qmGenerateFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
     // ── State machine definition ─────────────────────────────────────────────
     const brokerArn = brokerFn.functionArn;
 
-    // Re-uses all existing E2E Lambda ARNs; only the GenerateImages iterator
-    // gains acquire/release states wrapping image-basic-generator.
+    // Basic-QM stays exactly as deployed today (broker semaphore around
+    // image-basic-generator). The new gateway flow lives in QM-new below so we
+    // can test it without touching production.
     const definition = buildDefinition(brokerArn);
 
     const sfnRole = iam.Role.fromRoleArn(this, 'E2ESfnRole',
@@ -77,7 +104,317 @@ export class PipelineStack extends Stack {
     });
 
     new CfnOutput(this, 'PremiumStateMachineArn', { value: premiumStateMachine.attrArn });
+
+    // ── QM-new pipeline (test rig) ──────────────────────────────────────────
+    // Same Basic downstream (i2v → concat → SRT → finalize) but each frame's
+    // image (t2i or i2i on referenceImageUrl) AND TTS are generated through the
+    // Quartermaster gateway (QM-generate). Separate machine so we can validate
+    // the gateway end-to-end without altering Basic-QM/Premium-QM.
+    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn);
+
+    const qmNewStateMachine = new sfn.CfnStateMachine(this, 'QMNewPipeline', {
+      stateMachineName: 'E2E-VideoGenerationPipeline-QM-new',
+      stateMachineType: 'STANDARD',
+      roleArn: sfnRole.roleArn,
+      definitionString: JSON.stringify(qmNewDefinition),
+      tags: [{ key: 'batchjob', value: 'true' }, { key: 'qmGateway', value: 'true' }],
+    });
+
+    new CfnOutput(this, 'QMNewStateMachineArn', { value: qmNewStateMachine.attrArn });
   }
+}
+
+// ---------------------------------------------------------------------------
+// QM-new SFN definition — image (t2i/i2i) + TTS through the QM gateway
+// ---------------------------------------------------------------------------
+// Reuses the entire Basic definition (validate → …map… → i2v → concat → SRT →
+// finalize) and swaps ONLY the per-frame GenerateImages Map for a QM-generate
+// version. Because the acquire/release broker states live exclusively inside
+// that Map, replacing it removes every broker reference — the cloned brokerArn
+// never survives into the QM-new definition.
+// ---------------------------------------------------------------------------
+function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object {
+  const def = JSON.parse(JSON.stringify(buildDefinition(brokerArn))) as {
+    Comment: string;
+    States: Record<string, any>;
+  };
+  def.Comment = 'E2E Video Generation Pipeline - QM-new — per-frame image (t2i/i2i) + TTS + Flux animate + merge via Quartermaster gateway';
+
+  // The QM frame Map now produces the finished per-frame video (image → TTS →
+  // Flux animate → Flux merge), so it emits $.videoResults directly and the
+  // local Ken Burns Map (GenerateI2VBasic) is no longer needed.
+  def.States.GenerateImages = qmFrameAssetsMap(qmGenerateArn);
+
+  // Repurpose DropFrameData to carry videoResults (not imageResults) straight
+  // to concat, and skip the now-removed local i2v stage.
+  def.States.DropFrameData = {
+    Type: 'Pass',
+    Comment: 'Drop $.frames to stay within the 256KB SFN state limit; carry per-frame videoResults to concat.',
+    Parameters: {
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'bgmUrl.$': '$.bgmUrl',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+      'apiKey.$': '$.apiKey',
+      'videoResults.$': '$.videoResults',
+    },
+    Next: 'UpdateStatusConcatenating',
+  };
+  delete def.States.UpdateStatusGeneratingVideos;
+  delete def.States.GenerateI2VBasic;
+
+  return def;
+}
+
+/**
+ * Per-frame Map that builds the finished frame video entirely through the QM
+ * gateway: image (t2i, or i2i when the frame carries a UI `referenceImageUrl`
+ * character) → TTS (`narrationText`, voice by `voiceGender`) → Flux `animate`
+ * (smooth Ken Burns, replaces the jittery local render) → Flux `merge` (voice
+ * onto the animation). Emits the item shape the concat step consumes:
+ * `videoUrl` + `frameNumber` (+ `duration`, `frameId`).
+ */
+function qmFrameAssetsMap(qmGenerateArn: string): object {
+  return {
+    Type: 'Map',
+    Comment: 'Per-frame video via Quartermaster gateway: image (t2i/i2i) → TTS → Flux animate → Flux merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency.',
+    ItemsPath: '$.frames',
+    MaxConcurrency: 15,
+    ResultPath: '$.videoResults',
+    Iterator: {
+      StartAt: 'CheckImageCache',
+      States: {
+        CheckImageCache: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-asset-cache-check',
+          Comment: 'Check S3 metadata cache — skip image generation if it already exists',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            assetType: 'image',
+          },
+          ResultPath: '$.imageCacheResult',
+          TimeoutSeconds: 10,
+          Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 2, MaxAttempts: 1, BackoffRate: 1.5 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.cacheError', Next: 'RouteImageGen' }],
+          Next: 'CheckImageCacheResult',
+        },
+        CheckImageCacheResult: {
+          Type: 'Choice',
+          Comment: 'Cached image → skip straight to TTS; otherwise generate the image',
+          Choices: [{ Variable: '$.imageCacheResult.cached', BooleanEquals: true, Next: 'UseImageCache' }],
+          Default: 'RouteImageGen',
+        },
+        UseImageCache: {
+          Type: 'Pass',
+          Comment: 'Image already in S3 — use cached CDN URL, still (re)generate TTS',
+          Parameters: {
+            'cdnUrl.$': '$.imageCacheResult.cdnUrl',
+            's3Key.$': '$.imageCacheResult.s3Key',
+            'width.$': '$.imageCacheResult.width',
+            'height.$': '$.imageCacheResult.height',
+          },
+          ResultPath: '$.imageResult',
+          Next: 'RouteTTS',
+        },
+        RouteImageGen: {
+          Type: 'Choice',
+          Comment: 'Character reference from the UI → image-to-image; otherwise text-to-image',
+          Choices: [{
+            And: [
+              { Variable: '$.referenceImageUrl', IsPresent: true },
+              { Variable: '$.referenceImageUrl', IsString: true },
+              { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateImageI2I',
+          }],
+          Default: 'QMGenerateImageT2I',
+        },
+        QMGenerateImageT2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Text-to-image via QM (image.narrationBasic.t2i: Flux Klein 4B internal → Replicate fallback)',
+          Parameters: {
+            assetType: 'image',
+            tier: 'narrationBasic',
+            operation: 't2i',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
+          Next: 'StoreImageMeta',
+        },
+        QMGenerateImageI2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Image-to-image via QM (image.narrationBasic.i2i) using the UI character reference',
+          Parameters: {
+            assetType: 'image',
+            tier: 'narrationBasic',
+            operation: 'i2i',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'initImageUrls.$': 'States.Array($.referenceImageUrl)',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
+          Next: 'StoreImageMeta',
+        },
+        StoreImageMeta: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-store-asset-meta',
+          Comment: 'Persist image metadata to S3 for cache reuse',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            assetType: 'image',
+            'cdnUrl.$': '$.imageResult.cdnUrl',
+            's3Key.$': '$.imageResult.s3Key',
+            'width.$': '$.imageResult.width',
+            'height.$': '$.imageResult.height',
+          },
+          ResultPath: null,
+          TimeoutSeconds: 10,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.metaStoreError', Next: 'RouteTTS' }],
+          Next: 'RouteTTS',
+        },
+        RouteTTS: {
+          Type: 'Choice',
+          Comment: 'Frame already carries a voiceUrl → reuse it; otherwise generate TTS from narrationText',
+          Choices: [{
+            And: [
+              { Variable: '$.voiceUrl', IsPresent: true },
+              { Variable: '$.voiceUrl', IsString: true },
+              { Not: { Variable: '$.voiceUrl', StringEquals: '' } },
+            ],
+            Next: 'UseProvidedVoice',
+          }],
+          Default: 'QMGenerateTTS',
+        },
+        UseProvidedVoice: {
+          Type: 'Pass',
+          Comment: 'A voiceUrl was supplied upstream — reuse it, skip TTS generation',
+          Parameters: { 'cdnUrl.$': '$.voiceUrl' },
+          ResultPath: '$.ttsResult',
+          Next: 'QMAnimate',
+        },
+        QMGenerateTTS: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'TTS via QM (voice.narrationBasic.tts: Kokoro internal → Replicate fallback). Voice chosen by voiceGender (male→am_adam, female→af_bella, default am_adam).',
+          Parameters: {
+            assetType: 'voice',
+            tier: 'narrationBasic',
+            operation: 'tts',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.narrationText',
+            'voiceGender.$': '$$.Execution.Input.voiceGender',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.ttsResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'QMFrameFailed' }],
+          Next: 'QMAnimate',
+        },
+        QMAnimate: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Animate the frame image via QM (video.narrationBasic.animate → Flux Ken Burns). Silent MP4.',
+          Parameters: {
+            assetType: 'video',
+            tier: 'narrationBasic',
+            operation: 'animate',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'durationS.$': '$.duration',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.animateResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.animateError', Next: 'QMFrameFailed' }],
+          Next: 'QMMerge',
+        },
+        QMMerge: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Merge the TTS voice onto the animated frame via QM (video.narrationBasic.merge → Flux merge). MP4 with audio.',
+          Parameters: {
+            assetType: 'video',
+            tier: 'narrationBasic',
+            operation: 'merge',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.animateResult.cdnUrl)',
+            'audioUrl.$': '$.ttsResult.cdnUrl',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.mergeResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeError', Next: 'QMFrameFailed' }],
+          Next: 'BuildFrameVideo',
+        },
+        QMFrameFailed: {
+          Type: 'Pass',
+          Comment: 'QM exhausted all rungs for image/TTS/animate/merge — propagate a graceful frame failure',
+          Parameters: {
+            failed: true,
+            error: 'QMFrameFailed',
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+          },
+          End: true,
+        },
+        BuildFrameVideo: {
+          Type: 'Pass',
+          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = merged animation+voice).',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'videoUrl.$': '$.mergeResult.cdnUrl',
+            'duration.$': '$.duration',
+          },
+          End: true,
+        },
+      },
+    },
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'DropFrameData',
+  };
 }
 
 // ---------------------------------------------------------------------------

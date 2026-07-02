@@ -20,14 +20,51 @@ interface ApiStackProps extends StackProps {
   kieKeySecretArn: string;
   runpodKeySecretArn: string;
   s3CacheBucket: string;
+  webhookBaseUrl: string;
 }
 
 export class ApiStack extends Stack {
   public readonly apiFunction: nodejs.NodejsFunction;
+  public readonly executorFunction: nodejs.NodejsFunction;
   public readonly distribution: cloudfront.Distribution;
 
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
+
+    const providerSecretArns = [
+      props.modeslabKeySecretArn,
+      props.replicateKeySecretArn,
+      props.kieKeySecretArn,
+      props.runpodKeySecretArn,
+    ];
+    const providerSecretEnv = {
+      MODELSLAB_API_KEY_ARN: props.modeslabKeySecretArn,
+      REPLICATE_API_TOKEN_ARN: props.replicateKeySecretArn,
+      KIE_AI_API_KEY_ARN: props.kieKeySecretArn,
+      RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
+    };
+
+    // ── Executor: execute-with-failover loop. Longer timeout for RunPod cold
+    //    starts (2.5–4 min). Invoked asynchronously by the API Lambda.
+    this.executorFunction = new nodejs.NodejsFunction(this, 'ExecutorFunction', {
+      functionName: 'quartermaster-executor',
+      entry: path.join(__dirname, '../../src/handlers/executor.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(300),
+      memorySize: 512,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+      environment: {
+        TABLE_NAME: props.table.tableName,
+        WEBHOOK_BASE_URL: props.webhookBaseUrl,
+        ...providerSecretEnv,
+      },
+    });
+    props.table.grantReadWriteData(this.executorFunction);
+    this.executorFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: providerSecretArns,
+    }));
 
     this.apiFunction = new nodejs.NodejsFunction(this, 'ApiFunction', {
       functionName: 'quartermaster-api',
@@ -55,10 +92,13 @@ export class ApiStack extends Stack {
         VIDEO_FLOOR: '8',
         REST_FLOOR: '7',
         MAX_ATTEMPTS: '5',
+        EXECUTOR_FUNCTION_NAME: this.executorFunction.functionName,
       },
     });
 
     props.table.grantReadWriteData(this.apiFunction);
+    // API Lambda dispatches jobs to the executor asynchronously.
+    this.executorFunction.grantInvoke(this.apiFunction);
 
     this.apiFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],

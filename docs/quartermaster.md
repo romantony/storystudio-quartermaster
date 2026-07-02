@@ -1915,6 +1915,57 @@ Notes:
 * `(fb)` rungs are cross-provider; the breaker (§27.4) skips an unhealthy rung so a
   new job starts directly on the next one.
 
+### 28.2.1 Narration Basic/Premium — self-hosted RunPod ladders (**IMPLEMENTED**)
+
+> **Status:** the execute-with-failover loop (§28.4), the `jobType` routing rule,
+> and the RunPod worker-lifecycle provisioner are now **implemented** in this
+> repo (`src/handlers/executor.ts`, `src/handlers/router.ts`,
+> `src/handlers/provisioner.ts`) — not just proposed. `POST /jobs` writes the
+> job then asynchronously invokes the executor Lambda; the executor resolves the
+> ladder, routes internal-vs-external, calls the provider, and writes the asset
+> URL + status back to DynamoDB, which the caller reads via `GET /jobs/{id}`.
+
+To escape external-provider concurrency limits, Narration Basic/Premium route
+**primarily to self-hosted RunPod models** (see `/home/roman-antony/runpod/API.md`),
+with the old external providers demoted to **circuit-broken fallback rungs**.
+These live under **isolated tier names** so Documentary/Movie (which share the
+generic `image.*`/`voice.*`/`bgm.*` keys) are untouched:
+
+| Asset | Ladder key | 1 (primary, internal) | Fallback |
+|---|---|---|---|
+| Image T2I Basic | `image.narrationBasic.t2i` | runpod **Flux Klein 4B** (`Flux-TTS-S2T` mode:image) | modelslab → replicate |
+| Image I2I Basic | `image.narrationBasic.i2i` | runpod **Flux Klein 4B** (mode:image + `reference_images`) | modelslab → replicate |
+| TTS Basic | `voice.narrationBasic.tts` | runpod **Kokoro** (mode:tts engine:kokoro) | replicate kokoro |
+| Image T2I Premium | `image.narrationPremium.t2i` | runpod **Qwen-Image** (`qwen-image-gen`) | kie nano-banana → ideogram |
+| Image I2I Premium | `image.narrationPremium.i2i` | runpod **Qwen-Image-Edit** (`qwen-image-edit`) | kie nano-banana-edit → qwen |
+| TTS Premium | `voice.narrationPremium.tts` | runpod **Qwen Voice Design** (mode:tts engine:qwen) | google gemini-tts |
+| BGM (both tiers) | `bgm.narration` | runpod **ACE-Step** (mode:bgm) | kie suno |
+| SRT (both tiers) | `srt.narration` | runpod **Whisper large-v3-turbo** (mode:transcribe) | replicate whisper |
+
+**RunPod endpoints (adapter resolves URL from `rung.endpointId`):**
+
+| Endpoint | ID | counterKey | Serves |
+|---|---|---|---|
+| `Flux-TTS-S2T` | `rnqxi6c0mlq517` | `runpod:flux-tts-s2t` | Flux-Klein image, Kokoro/Qwen TTS, ACE-Step BGM, Whisper SRT |
+| `qwen-image-gen` | `e165se4r3eo5hp` | `runpod:qwen-image-gen` | Premium image T2I |
+| `qwen-image-edit` | `oxwx8o879qwtla` | `runpod:qwen-image-edit` | Premium image I2I |
+
+**`jobType` routing (§Pillar 1 / `router.ts:selectRungOrder`):**
+* `batch` → internal RunPod rung first, always (the batch amortizes the one
+  ~5-min cold start across all its jobs); external only if internal fails.
+* `realtime` → internal first **only** if that endpoint has warm free capacity
+  (`inflight > 0 && inflight < REALTIME_INTERNAL_MAX`); a cold/saturated endpoint
+  routes straight to external so a live UI user never waits on a cold load.
+* absent → ladder order unchanged (Documentary/Movie unaffected).
+
+**Worker-lifecycle provisioner (§Pillar 2 / `provisioner.ts`, runs on the 2-min
+sweeper):** reads per-endpoint in-flight + queued depth, computes desired
+`workersMin`/`workersMax` under the shared 10-worker account cap (demand-weighted
+rebalance), pre-warms on demand and scales to zero after a cooldown. Ships in
+**shadow mode** (`RUNPOD_PROVISION_LIVE` unset) — it logs the PATCH it would make
+and writes a `PROVISION_SHADOW#` audit item; setting `RUNPOD_PROVISION_LIVE=true`
+flips it to real `PATCH rest.runpod.io/v1/endpoints/{id}` calls.
+
 ### 28.3 Canonical request → per-provider adapter
 
 The Lambda sends **one provider-agnostic request**; Quartermaster never makes the

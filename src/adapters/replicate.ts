@@ -75,6 +75,14 @@ export const replicate: Adapter = {
         prompt: job.prompt,
         duration: job.params.durationS ?? 3,
       };
+    } else if (rung.model.includes('whisper')) {
+      // Transcription fallback — transcribe the (already-generated) audio.
+      input = {
+        audio: job.audioUrl,
+        model: 'large-v3',
+        transcription: 'srt',
+        language: 'en',
+      };
     }
 
     // URL: /v1/models/{owner}/{name}/predictions

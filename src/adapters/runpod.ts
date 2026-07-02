@@ -6,13 +6,17 @@ import type {
 const RUNPOD = 'https://api.runpod.ai/v2';
 const env = (k: string) => process.env[k] ?? '';
 
-// Dig a video URL out of RunPod's variable output shape
+// Dig an asset URL out of RunPod's variable output shape. Extended beyond video
+// to cover the Flux-TTS-S2T / qwen endpoints (image, audio, srt).
 function runpodOutUrl(p: unknown): string | undefined {
   const dig = (x: unknown): string | undefined => {
     if (typeof x === 'string' && x.startsWith('http')) return x;
     if (Array.isArray(x)) return x.map(dig).find(Boolean);
     if (x && typeof x === 'object') {
-      const keys = ['video_url', 'videoUrl', 'output_url', 'url', 'output', 'result', 'video', 'artifacts'];
+      const keys = [
+        'image', 'image_url', 'imageUrl', 'audio', 'audio_url', 'srt', 'srt_url',
+        'video_url', 'videoUrl', 'output_url', 'url', 'output', 'result', 'video', 'artifacts',
+      ];
       return keys.map(k => dig((x as Record<string, unknown>)[k])).find(Boolean);
     }
     return undefined;
@@ -22,41 +26,179 @@ function runpodOutUrl(p: unknown): string | undefined {
 
 const TERMINAL_STATUSES = new Set(['FAILED', 'ERROR', 'CANCELLED', 'TIMED_OUT']);
 
+/**
+ * Base URL for a rung's RunPod endpoint. Self-hosted Flux-TTS-S2T / qwen rungs
+ * carry an explicit `endpointId` (the serverless endpoint id, e.g.
+ * rnqxi6c0mlq517); the legacy lipsync rung uses the named `/infinitetalk` route.
+ */
+function endpointBase(rung: Rung): string {
+  if (rung.endpointId) return `${RUNPOD}/${rung.endpointId}`;
+  return `${RUNPOD}/infinitetalk`;
+}
+
+// Build the `input` object for a self-hosted Flux-TTS-S2T / qwen generation,
+// keyed on the rung's `mode`. Mirrors /home/roman-antony/runpod/API.md.
+function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown> {
+  const p = job.params;
+  const attribution: Record<string, unknown> = {};
+  if (job.projectId) attribution.project_id = job.projectId;
+  if (job.frameId) attribution.frame_id = job.frameId;
+
+  switch (rung.mode) {
+    case 'image': {
+      // Flux-TTS-S2T image mode — T2I / I2I (reference_images).
+      return {
+        mode: 'image',
+        image_prompt: job.prompt,
+        aspect_ratio: p.aspectRatio ?? '16:9',
+        reference_images: job.initImageUrls ?? [],
+        img_steps: 4,
+        img_guidance: 1.0,
+        ...attribution,
+      };
+    }
+    case 't2i': {
+      // Standalone qwen-image-gen endpoint.
+      return {
+        prompt: job.prompt,
+        aspect_ratio: p.aspectRatio ?? '16:9',
+        ...attribution,
+      };
+    }
+    case 'i2i': {
+      // Standalone qwen-image-edit endpoint.
+      return {
+        image_url: job.initImageUrls?.[0],
+        prompt: job.prompt,
+        ...attribution,
+      };
+    }
+    case 'tts': {
+      if (rung.engine === 'qwen') {
+        // Qwen3-TTS design / voice-clone.
+        const input: Record<string, unknown> = {
+          mode: 'tts',
+          engine: 'qwen',
+          text: job.prompt,
+          language: p.language ?? 'English',
+          instruct: p.instruct ?? '',
+          ...attribution,
+        };
+        if (p.voiceUrl) {
+          input.voice_url = p.voiceUrl;
+          input.voice_transcript = p.voiceTranscript ?? '';
+        } else {
+          input.speaker = p.speaker ?? 'Ryan';
+        }
+        return input;
+      }
+      // Kokoro (default).
+      return {
+        mode: 'tts',
+        engine: 'kokoro',
+        text: job.prompt,
+        voice: p.voice ?? 'am_michael',
+        speed: 1.0,
+        lang_code: 'a',
+        ...attribution,
+      };
+    }
+    case 'bgm': {
+      return {
+        mode: 'bgm',
+        prompt: job.prompt,
+        duration_s: p.durationS ?? 30.0,
+        steps: 20,
+        guidance: 7.0,
+        ...attribution,
+      };
+    }
+    case 'transcribe': {
+      return {
+        mode: 'transcribe',
+        audio_url: job.audioUrl,
+        task: 'transcribe',
+        language: 'en',
+        return_timestamps: 'word',
+        ...attribution,
+      };
+    }
+    case 'animate': {
+      // Ken Burns zoom/pan on a still image → silent MP4. `ken_burns` is the
+      // smooth cinematic effect (replaces the jittery local render).
+      return {
+        mode: 'animate',
+        image_url: job.initImageUrls?.[0],
+        duration_s: p.durationS ?? 5,
+        effect: rung.fixed?.effect ?? 'ken_burns',
+        fps: 24,
+        ...attribution,
+      };
+    }
+    case 'merge': {
+      // Combine a (silent) video with an audio track → MP4 with audio.
+      // initImageUrls[0] carries the video URL; audioUrl carries the voice.
+      return {
+        mode: 'merge',
+        video_url: job.initImageUrls?.[0],
+        audio_url: job.audioUrl,
+        ...attribution,
+      };
+    }
+    default:
+      // Fallback: pass the prompt through untouched.
+      return { prompt: job.prompt, ...attribution };
+  }
+}
+
 export const runpod: Adapter = {
   supportsWebhook: true,
 
   buildRequest(job: CanonicalJob, rung: Rung, callbackUrl?: string): BuiltRequest {
+    const headers = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${env('RUNPOD_API_KEY')}`,
+    };
+
+    // Self-hosted Flux-TTS-S2T / qwen endpoints (identified by endpointId).
+    if (rung.endpointId) {
+      const input = buildRunpodInput(job, rung);
+      const body: Record<string, unknown> = { input };
+      if (callbackUrl) body.webhook = callbackUrl;
+      return { url: `${endpointBase(rung)}/run`, method: 'POST', headers, body };
+    }
+
+    // Legacy InfiniteTalk lipsync (Documentary Premium) — unchanged.
     const body: Record<string, unknown> = {
       input: {
         prompt: job.prompt,
         image: job.initImageUrls?.[0],    // spokesperson image (must be COMPLETE)
         audio: job.audioUrl,              // TTS output URL (must be COMPLETE)
-        resolution: (rung as Record<string, unknown>).resolution ?? job.params.resolution ?? '720p',
+        resolution: rung.resolution ?? job.params.resolution ?? '720p',
         enable_safety_checker: true,
       },
     };
     if (callbackUrl) body.webhook = callbackUrl;
 
-    return {
-      url: `${RUNPOD}/infinitetalk/run`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${env('RUNPOD_API_KEY')}`,
-      },
-      body,
-    };
+    return { url: `${RUNPOD}/infinitetalk/run`, method: 'POST', headers, body };
   },
 
   parseSubmit(raw: unknown): SubmitResult {
+    // RunPod /run may return a completed job synchronously (warm, fast modes)
+    // with `output` already populated, or just an id for async polling.
+    const r = raw as Record<string, unknown>;
+    const status = String(r.status ?? '').toUpperCase();
+    if (status === 'COMPLETED') {
+      const url = runpodOutUrl(r);
+      if (url) return { outputUrls: [url], raw };
+    }
     const url = runpodOutUrl(raw);
     if (url) return { outputUrls: [url], raw };
-    const r = raw as Record<string, unknown>;
     return { taskRef: String(r.id ?? ''), raw };
   },
 
-  async poll(taskRef: string, _rung: Rung): Promise<PollResult> {
-    const resp = await fetch(`${RUNPOD}/infinitetalk/status/${encodeURIComponent(taskRef)}`, {
+  async poll(taskRef: string, rung: Rung): Promise<PollResult> {
+    const resp = await fetch(`${endpointBase(rung)}/status/${encodeURIComponent(taskRef)}`, {
       headers: { Authorization: `Bearer ${env('RUNPOD_API_KEY')}` },
     });
     const json = (await resp.json()) as Record<string, unknown>;
