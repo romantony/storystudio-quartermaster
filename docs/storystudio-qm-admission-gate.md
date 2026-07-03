@@ -1,14 +1,20 @@
-# StoryStudio ↔ Quartermaster — Project Admission Gate (Build-Planning Doc)
+# StoryStudio ↔ Quartermaster — Project Admission Gate
 
 **Audience:** StoryStudio backend (Convex / MCP batch pipeline)
-**Purpose:** So StoryStudio can plan its side of the build. This defines the **admission
-handshake** StoryStudio calls *before* starting a project, the request/response contract, and
-exactly what StoryStudio must implement vs. what Quartermaster (QM) implements. Once
-StoryStudio's plan is ready, QM begins its implementation against this contract.
-**Status:** Contract **agreed in principle**; QM-side build not started. Two inputs still
-open (§10). Endpoints/loads reflect the current RunPod fleet as of 2026-07-03.
-**Companion:** `storystudio-qm-new-sfn-trigger.md` (the SFN payload — unchanged except a new
-`admissionId` field).
+**Purpose:** This defines the **admission handshake** StoryStudio calls *before* starting a
+project — the request/response contract, and what StoryStudio must implement.
+**Status (2026-07-03): QM's side is built and deployed** — `POST /admission` +
+`/admission/{admissionId}/release` are live in the `quartermaster-api` Lambda, running real
+decision logic (grant/defer), not a stub. The reservation-aware capacity manager and
+pre-warm-on-grant are also live (shadow mode — see `storystudio-qm-new-sfn-trigger.md` §6).
+**What's still approximate:** the gen-time baselines behind the wait-estimate math are
+freshly seeded from documented RunPod figures, not yet learned from real traffic (QM hasn't
+processed a real project yet) — decisions are structurally correct, but early ETAs may be
+off until baselines converge from real jobs. This does **not** change the contract below.
+Two non-blocking inputs still open (§10). Endpoints/loads reflect the current RunPod fleet
+as of 2026-07-03.
+**Companion:** `storystudio-qm-new-sfn-trigger.md` (both SFN payloads — Basic §3, Premium §9
+— `admissionId` threads into either).
 
 ---
 

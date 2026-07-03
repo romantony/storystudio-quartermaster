@@ -1,110 +1,88 @@
-# StoryStudio → QM-New Step Function — Integration Guide
+# StoryStudio → QM-New Step Functions — Integration Guide
 
 **Audience:** StoryStudio backend (Convex / MCP batch pipeline)
-**Subject:** The new Quartermaster-gated pipeline `E2E-VideoGenerationPipeline-Narration-Basic-QM-New`,
-what StoryStudio must send to it, and how the QM slot/admission + capacity-manager
-handshake fits around it.
-**Status:** SFN + capacity manager are **live in code** (capacity manager runs in
-shadow mode). The project-level **admission handshake is a proposed contract, not yet
-implemented** — see §2. Where a field or endpoint is a proposal it is called out inline.
-**Companion docs:** `docs/storystudio-mcp-sfn-trigger.md` (legacy Basic-QM/Premium-QM),
-`storystudio-unified/docs/quartermaster/QM_NEW_PIPELINE_DESIGN.md` (design rationale).
+**Subject:** The two Quartermaster-gated narration pipelines —
+`E2E-VideoGenerationPipeline-Narration-Basic-QM-New` and
+`E2E-VideoGenerationPipeline-Narration-Premium-QM-New` — what StoryStudio must send to
+each, and how the admission gate + capacity manager fit around them.
+**Status (2026-07-03):** Both state machines are **built, deployed, `ACTIVE`**, and pass
+AWS's own ASL validator with zero diagnostics. The orchestrator (QM-generate + executor +
+catalog) and capacity manager are live. **The admission gate is built and live too** — see
+§2, and the full contract in `docs/storystudio-qm-admission-gate.md`. **Neither machine has
+run a real end-to-end project yet** — that's the next step, and it's on StoryStudio's side
+(wire a request, `StartExecution`, watch it through).
+**Companion docs:** `docs/storystudio-qm-admission-gate.md` (the admission contract, full
+detail), `docs/storystudio-mcp-sfn-trigger.md` (legacy Basic-QM/Premium-QM, being
+superseded by these two), `storystudio-unified/docs/quartermaster/QM_NEW_PIPELINE_DESIGN.md`
+(design rationale).
 
 ---
 
 ## 1. The big picture
 
 ```
-                      (2) [proposed] admission check
+                           (2) admission check (live)
 StoryStudio  ─────────────────────────────────────────▶  Quartermaster (QM)
-  (Convex /   POST {QM}/v1/admission  → granted/denied            │
-   MCP)                                                            │  checks queue depth
-     │  (1) build compact sfInput                                  │  + fleet headroom
-     │                                                             ▼
-     │  (3) StartExecution                                   grants a slot
-     ▼
-E2E-VideoGenerationPipeline-Narration-Basic-QM-New   (STANDARD SFN, tags batchjob=true qmGateway=true)
+  (Convex /   POST {QM}/admission  → granted/deferred             │
+   MCP)                                                            │  checks queue depth,
+     │  (1) build compact sfInput                                  │  reservations, cap,
+     │                                                             ▼  gen-time baselines
+     │  (3) StartExecution                                   grants a slot (or defers
+     ▼                                                         with an ETA)
+E2E-VideoGenerationPipeline-Narration-{Basic|Premium}-QM-New   (STANDARD SFN, tags batchjob=true qmGateway=true)
      │
      │  per frame (Map, MaxConcurrency=15):
-     │     image (t2i / i2i) → TTS → Flux animate → Flux merge      each step is a
-     │        every step is a QM-generate task ───────────────────▶ POST {QM}/jobs
-     │                                                               + poll GET /jobs/{id}
-     ▼                                                                     │
-  concat → Whisper SRT → finalize (Fargate: merge + captions + BGM)       │  QM owns:
-     │                                                                     │   • provider pick
-     │  status callbacks → Convex (jobId + jwtToken + convexEndpoint)      │   • internal→external
-     ▼                                                                     │     failover
-  Complete                                                                 │   • per-endpoint
-                                                                           │     concurrency
-                    (4) capacity manager (sweeper every 2 min) ───────────┘
-                        scales RunPod workers UP on demand,
+     │     Basic:   image (t2i/i2i) → TTS → Flux animate → Flux merge      each step is a
+     │     Premium: image (t2i/i2i) → TTS → Wan2 i2v      → merge          QM-generate task
+     │        every step ─────────────────────────────────────────────▶ POST {QM}/jobs
+     │                                                                     + poll GET /jobs/{id}
+     ▼                                                                           │
+  concat → Whisper SRT → finalize (Fargate: merge/upscale + captions + BGM)     │  QM owns:
+     │                                                                           │   • provider pick
+     │  status callbacks → Convex (jobId + jwtToken + convexEndpoint)            │   • internal→external
+     ▼                                                                           │     failover
+  Complete                                                                       │   • per-endpoint
+                                                                                 │     concurrency
+                    (4) capacity manager (sweeper every 2 min) ─────────────────┘
+                        scales RunPod workers UP on demand + reservations,
                         DOWN (scale-to-zero) after 5-min idle
 ```
 
-**Key point for StoryStudio:** you do **not** call QM per asset. The SFN calls the
-`QM-generate` gateway for every image/TTS/animate/merge automatically. StoryStudio's only
-direct responsibilities are **(a)** [proposed] the pre-flight admission check and **(b)**
-`StartExecution` with the payload in §3.
+**Key point for StoryStudio:** you do **not** call QM per asset. Each SFN calls the
+`QM-generate` gateway for every image/TTS/video/merge automatically. Your direct
+responsibilities are **(a)** the pre-flight admission check (§2) and **(b)** `StartExecution`
+with the right payload (§3 for Basic, §9 for Premium).
 
 ---
 
-## 2. The slot / admission handshake
+## 2. The admission handshake — live, not a proposal
 
-> **This is the piece you described as "check with Quartermaster to get a slot before
-> starting the project."** It is the intended pre-flight gate. It is **not yet built** in
-> QM — QM today has no `/admission` route. Until it ships, StoryStudio should `StartExecution`
-> directly; QM applies back-pressure per asset (see §5) and auto-provisions workers (§6), so
-> nothing overruns the fleet — the admission call only adds *earlier* backpressure (deny at
-> project start instead of queueing per asset).
+**This is the piece you described as "check with Quartermaster to get a slot before
+starting the project."** It's built and deployed. Full contract, request/response shapes,
+load model, and long-video handling are documented in **`docs/storystudio-qm-admission-gate.md`**
+— read that before wiring this. Summary:
 
-### 2.1 Proposed contract — `POST {QM}/v1/admission`
+- `POST {QM}/admission` with `{requestId, projectType, tier, durationSeconds, userId}` →
+  `{decision:"granted", admissionId, expiresAt, warmedEndpoints, estimatedReadySeconds}` or
+  `{decision:"deferred", reason, estimatedWaitSeconds, retryAfterSeconds}`.
+- **granted** → thread `admissionId` into the SFN input (§3.2/§9.2) and `StartExecution`.
+- **deferred** → leave the row queued, retry after `retryAfterSeconds`. No strict TAT here
+  (see the admission doc §1.1) — deferrals are the expected, safe path under load, not an
+  error case.
+- On the project's terminal state (completed or failed), call
+  `POST {QM}/admission/{admissionId}/release` from your own `onJobTerminated` hook — **the
+  SFN does not release the reservation itself.**
 
-Call this once, **before** `StartExecution`, to reserve fleet headroom for the whole project.
-
-```jsonc
-// request  (StoryStudio → QM)
-{
-  "requestId":       "mcp_abc123",          // idempotency key = mcpRequests.requestId
-  "userId":          "user_111",
-  "projectType":     "narration-basic",
-  "tier":            "basic",
-  "durationSeconds": 90,
-  "projectedLoad":   { "image": 20, "tts": 20, "video": 20, "srt": 1, "bgm": 1 },
-  "plannedDate":     1751500000000
-}
-```
-```jsonc
-// response
-{ "decision": "granted", "admissionId": "qm_adm_…", "expiresAt": 1751500600000 }
-// or
-{ "decision": "denied",  "reason": "fleet_saturated", "retryAfterSeconds": 300 }
-```
-
-- **granted** → thread `admissionId` into the SFN input and `StartExecution`.
-- **denied** → leave the `mcpRequests` row `queued`, retry after `retryAfterSeconds`
-  (batch is pre-planned, so re-queue rather than fall back to external APIs).
-
-`projectedLoad` is a deterministic function of `projectType` + `duration`
-(`frameCount ≈ round(duration / 4.5)`, clamped per type). Keep this in **one shared module**
-so StoryStudio's request and QM's capacity math never drift.
-
-### 2.2 What exists today instead
-
-QM's live "slot" primitives are lower-level and used **internally** by the pipeline, not by
-StoryStudio:
-
-| Endpoint | Auth | Who calls it | Purpose |
-|---|---|---|---|
-| `POST {QM}/jobs` | `x-gateway-key` | `QM-generate` Lambda (inside the SFN) | submit one asset job; QM queues, meters, and dispatches it |
-| `GET  {QM}/jobs/{requestId}` | `x-gateway-key` | `QM-generate` Lambda | poll that job to COMPLETE/FAILED |
-| `POST {QM}/acquire` · `/release` · `/heartbeat` | `x-gateway-key` | legacy Basic-QM / Premium-QM broker states | per-asset lane semaphore (QM-new does **not** use these — it uses `/jobs`) |
-
-So today, admission is effectively "per asset, at `/jobs`," not "per project, up front."
-The §2.1 endpoint is the agreed next step if you want project-start backpressure.
+**Reality check on decision quality today:** the gen-time baselines admission uses to
+estimate wait are freshly seeded from documented RunPod figures, not yet learned from real
+traffic (QM has never processed a real project). Early ETAs will be reasonable but
+approximate; they self-correct as real jobs complete. This doesn't change the contract or
+what you implement — just don't be surprised if an early `estimatedWaitSeconds` is off by a
+factor of 2.
 
 ---
 
-## 3. What to send to the SF (`E2E-VideoGenerationPipeline-Narration-Basic-QM-New`)
+## 3. What to send to the SF — Narration-Basic (`...-Narration-Basic-QM-New`)
 
 **State machine ARN**
 ```
@@ -113,9 +91,9 @@ arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-N
 Tags: `batchjob=true`, `qmGateway=true`. Start executions with the existing
 `arn:aws:iam::929075264324:role/E2E-StepFunction-Role`.
 
-The payload is **much smaller than Premium-QM**: no `voiceUrls`, `voiceAudioUrl`,
-`captionsUrl`, `hookConfig`, `characterBible`, or `synopsis`. QM-new generates images and
-per-frame TTS internally and derives the SRT from the concatenated audio with Whisper.
+The payload is **much smaller than the legacy Premium-QM**: no `voiceUrls`, `voiceAudioUrl`,
+`captionsUrl`, `hookConfig`, `characterBible`, or `synopsis`. This pipeline generates images
+and per-frame TTS internally and derives the SRT from the concatenated audio with Whisper.
 
 ### 3.1 Execution input
 
@@ -153,14 +131,14 @@ per-frame TTS internally and derives the SRT from the concatenated audio with Wh
 | `projectId` | string | **yes** | Threaded to every QM-generate call + status updates |
 | `jobId` | string | **yes** | Used for Convex status callbacks |
 | `userId` | string | **yes** | Passed to QM-generate for attribution/metering |
-| `projectType` | string | **yes** | e.g. `"narration-basic"`; carried to Fargate finalize |
+| `projectType` | string | **yes** | `"narration-basic"`; carried to Fargate finalize |
 | `aspectRatio` | string | **yes** | `"16:9"`, `"9:16"`, or `"1:1"` — sets image dims + clip aspect |
 | `voiceGender` | string | **yes (key must be present)** | `"male"`→`am_adam`, `"female"`→`af_bella`, anything else→`am_adam`. **Empty string `""` is safe; a missing key errors the TTS state at runtime** — always include it. Project-level (not per-frame). |
 | `bgmUrl` | string | **yes** | BGM CDN URL; pass `""` for none |
 | `apiKey` | string | **yes** | Internal StoryStudio key used by `E2E-video-concat-premium` |
 | `jwtToken` | string | **yes** | Short-lived Convex JWT for status callbacks |
 | `convexEndpoint` | string | **yes** | `https://<deployment>.convex.cloud` |
-| `admissionId` | string | no (proposed) | From §2.1; carry it through so QM can tie asset jobs to the reservation. Ignored today. |
+| `admissionId` | string | no | From §2, if you're calling admission. Threaded through for correlation/audit; not currently read back by any state in this SFN. **You** release it (§2), not the SFN. |
 
 ### 3.3 Frame object (`frames[]`, one per frame)
 
@@ -170,20 +148,20 @@ per-frame TTS internally and derives the SRT from the concatenated audio with Wh
 | `frameNumber` | number | **yes** | 1-based; drives concat ordering |
 | `imagePrompt` | string | **yes** | Prompt for the image step (t2i, or i2i if `referenceImageUrl` set) |
 | `narrationText` | string | **yes** (unless `voiceUrl` set) | TTS text for the per-frame voice |
-| `referenceImageUrl` | string | no | **Singular string.** Non-empty ⇒ image goes **i2i** using this UI character reference; empty/absent ⇒ **t2i**. ⚠️ Note this differs from Premium-QM's `referenceImageUrls` (array) — QM-new expects the **singular** field. |
+| `referenceImageUrl` | string | no | **Singular string.** Non-empty ⇒ image goes **i2i** using this UI character reference; empty/absent ⇒ **t2i**. ⚠️ Differs from the legacy Premium-QM's `referenceImageUrls` (array) — this field is **singular**. |
 | `voiceUrl` | string | no | If non-empty, TTS is **skipped** and this audio is reused. Empty/absent ⇒ TTS generated from `narrationText`. |
 | `duration` | number | **yes** | Seconds; drives the Flux animate clip length |
 
-### 3.4 Fields you must NOT send (vs. Premium-QM)
+### 3.4 Fields you must NOT send (vs. legacy Premium-QM)
 
-QM-new ignores or does not need: `voiceUrls`, `voiceAudioUrl`, `captionsUrl`,
+This pipeline ignores or does not need: `voiceUrls`, `voiceAudioUrl`, `captionsUrl`,
 `generateShorts`, `shortsRenderStyle`, `mode`, `characterBible`, `synopsis`, `hookConfig`,
 and per-frame `voiceName` / `ttsModel` / `referenceImageUrls`. Leaving them in is harmless
 but they have no effect — voice is selected by the top-level `voiceGender`.
 
 ---
 
-## 4. Pipeline flow (what happens after StartExecution)
+## 4. Basic pipeline flow (what happens after StartExecution)
 
 ```
 ValidateInput → CheckValidation
@@ -219,46 +197,56 @@ legacy pipelines' per-frame resilience. Top-level unrecoverable errors route
 
 ## 5. How QM meters each asset (per-frame backpressure)
 
-Every `QMGenerate*` state is a `QM-generate` Lambda task that:
+Every `QMGenerate*` state (in either pipeline) is a `QM-generate` Lambda task that:
 
 1. `POST {QM}/jobs` with a canonical job — QM **de-dupes by `requestId`**
    (`projectId:frameId:assetType:operation`), so retries and cache hits are free.
-2. Polls `GET {QM}/jobs/{requestId}` every ~3 s (deadline ~290 s) until
+2. Polls `GET {QM}/jobs/{requestId}` every ~3 s until
    `COMPLETE` / `COMPLETE_WITH_FALLBACKS` / `FAILED` / `DEAD`.
 3. QM internally: picks the provider by the catalog **ladder** (internal RunPod first for
    batch, external KIE/Replicate as circuit-broken fallback), holds a per-endpoint semaphore
    slot, uploads to S3/CDN, and returns the asset key.
 
-Because QM owns the per-endpoint concurrency, the SFN's `MaxConcurrency=15` is a ceiling, not
-a fleet load — QM queues beyond real capacity instead of blasting RunPod. This is the
+Because QM owns the per-endpoint concurrency, each SFN's `MaxConcurrency=15` is a ceiling,
+not a fleet load — QM queues beyond real capacity instead of blasting RunPod. This is the
 "back-pressure is transparent" property: the execution keeps running; only individual frame
 steps wait.
 
 ---
 
-## 6. Capacity manager (workers up on demand, down when idle)
+## 6. Capacity manager (workers up on demand + reservations, down when idle)
 
-> **This is the piece you described as "enable new active workers when the request flow rises
-> and bring them down when it goes down."** It is live in code, currently in **shadow mode**
-> (`RUNPOD_PROVISION_LIVE` unset) — it computes and audits the scale decision every tick but
-> does not yet PATCH RunPod. Flip the flag to enforce.
+> **This is the piece you described as "enable new active workers when the request flow
+> rises and bring them down when it goes down."** It's live in code and running in
+> production (verified — see below), currently in **shadow mode**
+> (`RUNPOD_PROVISION_LIVE=false`) — it computes and audits the scale decision every tick,
+> including reservation pre-warm, but doesn't yet PATCH RunPod. Going live is a deploy-time
+> flag (`cdk deploy --context RUNPOD_PROVISION_LIVE=true`), a decision QM's side makes once
+> the shadow log is trusted — no action on your side either way.
 
 - **Driver:** the `/sweeper` route runs every **2 minutes** (EventBridge Scheduler). Besides
   reclaiming expired jobs/leases and reconciling the in-flight counter, it runs the
-  **provisioner**.
-- **Per RunPod endpoint** (image-gen, image-edit, TTS/S2T today), it reads
-  `demand = inflight + queued` from DynamoDB and sets:
-  - `workersMax = ceil(demand / JOBS_PER_WORKER)` (default 4 jobs/worker),
-  - `workersMin = 1` (**pre-warm**) while any work exists,
-  - **scale-to-zero** once demand is 0 **and** a **5-minute cooldown** has elapsed since the
-    endpoint was last busy.
-- **Shared account cap:** the sum of `workersMax` across endpoints is clamped to
-  `RUNPOD_ACCOUNT_CAP` (10, rising to 20 once RunPod balance ≥ $200), allocated
-  demand-weighted with leftover headroom handed to the hungriest endpoint.
+  **provisioner** and expires stale admission reservations.
+- **Per RunPod endpoint** (4 today: `flux-tts-s2t`, `qwen-image-gen`, `qwen-image-edit`,
+  `wan2-i2v`), it combines **organic demand** (`inflight + queued`) with **active admission
+  reservations' committed workers** (whichever is larger — not summed, since a reservation's
+  promise and the jobs it later submits are the same demand) and sets:
+  - `workersMax` sized to that combined demand,
+  - `workersMin ≥ 1` (**pre-warm**) while any demand exists — including reservations that
+    haven't submitted a single real job yet,
+  - **scale-to-zero** to each endpoint's own confirmed idle floor (not a uniform default —
+    `flux-tts-s2t` and `wan2-i2v` idle to 3, the other two to 2) once demand is 0 **and** a
+    **5-minute cooldown** has elapsed.
+- **On an admission grant** (§2), QM also **pre-warms synchronously** — it doesn't wait for
+  the next sweeper tick — so RunPod's cold start (2.5–4 min) overlaps the ~2–3 min you spend
+  building frames/prompts, not starts after it.
+- **Shared account cap:** the sum of `workersMax` across the 4 endpoints is clamped to
+  `RUNPOD_ACCOUNT_CAP` (10 today, rising to 20 once RunPod balance ≥ $200).
 
-**Net effect for StoryStudio:** when a batch of projects hits QM, workers spin up within a
-sweeper tick or two (≈ first job pays a cold-start; there's a pre-warm min of 1); when the
-batch drains, workers scale back to zero after the cooldown. No action required on your side.
+**Net effect for StoryStudio:** call admission (§2) and it pre-warms immediately; even
+without admission, workers still spin up within a sweeper tick or two once real jobs land.
+No action required on your side beyond calling `/admission` if you want the earlier,
+synchronous pre-warm.
 
 ---
 
@@ -269,16 +257,22 @@ import { SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
 
 const sfn = new SFNClient({ region: 'us-east-1' });
 
-// (proposed) const { admissionId } = await requestAdmission(payload);  // §2.1, else omit
-
-const res = await sfn.send(new StartExecutionCommand({
-  stateMachineArn:
-    'arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
-  name:  `${projectId}-${jobId}`,          // unique per execution; ≤ 80 chars
-  input: JSON.stringify(payload),          // §3.1
-}));
-
-console.log('executionArn:', res.executionArn);
+// Admission — see §2 / storystudio-qm-admission-gate.md for the full contract.
+const admission = await requestAdmission({
+  requestId: mcpRequestId, projectType, tier, durationSeconds, userId,
+});
+if (admission.decision === 'deferred') {
+  // leave the row queued, retry after admission.retryAfterSeconds
+} else {
+  const res = await sfn.send(new StartExecutionCommand({
+    stateMachineArn: isPremium
+      ? 'arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Narration-Premium-QM-New'
+      : 'arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
+    name:  `${projectId}-${jobId}`,          // unique per execution; ≤ 80 chars
+    input: JSON.stringify({ ...payload, admissionId: admission.admissionId }), // §3.1 / §9.1
+  }));
+  console.log('executionArn:', res.executionArn);
+}
 ```
 
 Set `name` to `${projectId}-${jobId}` for easy CloudWatch correlation; append a suffix on
@@ -288,14 +282,130 @@ retry since names must be unique within the state machine.
 
 ## 8. Rollout status & open items
 
-- **narration-basic** is the first target (this doc). **narration-premium** will follow as a
-  separate premium QM-new machine once basic is validated end-to-end.
-- `Basic-QM` / `Premium-QM` are untouched — non-QM-new projects keep their current path.
-- **Open confirmations** (see `QM_NEW_PIPELINE_DESIGN.md §12` and QM memory):
-  1. Does StoryStudio want the §2.1 project-level admission gate now, or is per-asset
-     metering (§5) + auto-provisioning (§6) sufficient for phase 1?
-  2. `voiceGender` must be present as a key in the execution input (empty string OK).
-  3. Confirm TTS is per-frame from `narrationText` (current behavior) rather than a single
-     whole-script pass — switch to a pre-Map TTS step if narration is produced whole-script
-     upstream.
+- **Both narration-basic and narration-premium QM-New machines are built and deployed**
+  (`ACTIVE`). Neither has run a real project yet — that's the next step, and it's yours:
+  wire narration-basic first (simpler payload), validate end-to-end, then repeat for premium.
+- `Basic-QM` / `Premium-QM` (legacy, non-QM-New) are untouched — projects not routed through
+  these two new machines keep their current path unaffected.
+- **Confirmed / resolved:**
+  1. Admission (§2) is built — your call whether to start using it now or validate the raw
+     generation path first (§4/§10) and add admission after.
+  2. `voiceGender` must be present as a key in the execution input (empty string OK) — confirmed.
+  3. TTS is per-frame from `narrationText` (current behavior), not a single whole-script pass
+     — confirmed as final for this pipeline.
+- **Still open on QM's side** (doesn't block you starting): a DR-fallback regression test for
+  the internal→external circuit-breaker path, a UI-traffic-backfill routing policy (affects
+  the UI path only, not this batch pipeline), and a consumption/balance-runway signal. None
+  of these change the contract in this doc.
+
+---
+
+## 9. What to send to the SF — Narration-Premium (`...-Narration-Premium-QM-New`)
+
+**State machine ARN**
 ```
+arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Narration-Premium-QM-New
+```
+Tags: `batchjob=true`, `qmGateway=true`. Same execution role as Basic.
+
+Same philosophy as Basic-QM-New — a compact payload, images/TTS generated internally, SRT
+derived from concat audio via Whisper — but premium-tier models throughout: **Qwen**
+image generation (vs. Flux Klein), **Qwen3-TTS voice-design** (vs. Kokoro), and **Wan 2.2
+i2v** for actual camera motion (vs. Flux's Ken Burns pan/zoom on a still). Finalize
+additionally **upscales 480p → 1080p** (Wan2's native output is 480p).
+
+### 9.1 Execution input
+
+```json
+{
+  "projectId":      "proj_abc123",
+  "jobId":          "job_xyz789",
+  "userId":         "user_111",
+  "projectType":    "narration-premium",
+  "aspectRatio":    "9:16",
+  "voiceSpeaker":   "Ryan",
+  "voiceInstruct":  "calm, warm documentary narrator",
+  "voiceLanguage":  "English",
+  "bgmUrl":         "https://cdn-v2.ai-storystudio.com/bgm/track.mp3",
+  "apiKey":         "<storystudio-internal-api-key>",
+  "jwtToken":       "<convex-jwt>",
+  "convexEndpoint": "https://your-deployment.convex.cloud",
+  "admissionId":    "qm_adm_…",
+  "frames": [
+    {
+      "frameId":           "frame_001",
+      "frameNumber":       1,
+      "imagePrompt":       "A cozy living room at dusk, warm lighting, photorealistic",
+      "narrationText":     "Every evening, the house settles into a quiet golden glow.",
+      "referenceImageUrl": "",
+      "voiceUrl":          "",
+      "duration":          4.2
+    }
+  ]
+}
+```
+
+Notice the frame object is **identical** to Basic's (§3.3) — only three new **top-level**
+voice fields replace `voiceGender`, and the underlying models differ.
+
+### 9.2 Top-level fields (deltas from Basic — §3.2 fields not listed here are identical)
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `projectType` | string | **yes** | `"narration-premium"` |
+| `voiceSpeaker` | string | **yes (key must be present)** | Qwen3-TTS speaker name. Defaults to `"Ryan"` server-side if empty, but the key must exist — same gotcha as `voiceGender`. |
+| `voiceInstruct` | string | **yes (key must be present)** | Tone/style instruction for the voice-design model (e.g. `"calm authoritative documentary tone"`). Empty string is safe. |
+| `voiceLanguage` | string | **yes (key must be present)** | e.g. `"English"`. Empty string is safe (defaults server-side). |
+| `admissionId` | string | no | Same as Basic (§3.2) — pass `tier:"premium"` to admission when requesting this. |
+
+All other top-level fields (`projectId`, `jobId`, `userId`, `aspectRatio`, `bgmUrl`,
+`apiKey`, `jwtToken`, `convexEndpoint`) are identical to §3.2.
+
+### 9.3 Frame object
+
+**Identical to Basic's (§3.3)** — same fields, same singular `referenceImageUrl` convention,
+same "TTS skipped if `voiceUrl` non-empty" behavior. One added nuance:
+
+> ⚠️ **`narrationText` doubles as the Wan2 motion prompt.** It's used both for the TTS voice
+> track *and* as the description of camera/scene motion for the Wan2 i2v step (matching the
+> convention the legacy Premium-QM pipeline already uses). If you want narration text that
+> reads naturally but describes poor visual motion, that's a known tension — not something
+> to fix in this contract, just something to be aware of when authoring narration for
+> premium projects.
+
+### 9.4 Premium pipeline flow
+
+```
+ValidateInput → CheckValidation
+→ UpdateStatusGeneratingImages
+→ GenerateImages  (Map over frames, MaxConcurrency=15)   ── all via QM-generate ──
+     per frame:
+       CheckImageCache → [hit] UseImageCache
+                      → [miss] RouteImageGen
+                                 → QMGenerateImageT2I   (image.narrationPremium.t2i — Qwen-Image-Gen)
+                                 → QMGenerateImageI2I   (image.narrationPremium.i2i — Qwen-Image-Edit, if referenceImageUrl)
+                                 → StoreImageMeta
+       RouteTTS → [voiceUrl present] UseProvidedVoice
+                → QMGenerateTTS      (voice.narrationPremium.tts — Qwen3-TTS voice-design; speaker/instruct/language from top-level input)
+       QMGenerateVideo (video.narrationPremium.i2v → Wan 2.2 I2V-A14B; narrationText = motion prompt; silent MP4)
+       QMMerge         (video.narrationPremium.merge → voice onto the Wan2 video, MP4 w/ audio; same generic mux Basic uses)
+       BuildFrameVideo → { frameId, frameNumber, videoUrl, duration }
+→ DropFrameData
+→ UpdateStatusConcatenating
+→ ConcatenateVideos           (E2E-video-concat-premium)
+→ TranscribeAudio             (Whisper SRT from concat audio)
+→ BuildMergedVoiceResult
+→ UpdateStatusApplyingBgm → ValidateFinalizeInputsPremium → PrepareFinalizePremium
+→ FinalizeVideoPremium         (Fargate: 480p→1080p upscale + audio merge + captions + BGM)
+→ Complete
+```
+
+Same per-frame resilience and top-level failure routing as Basic (§4) — a frame that
+exhausts all rungs fails gracefully without aborting the whole Map.
+
+### 9.5 Fields you must NOT send
+
+Same exclusion list as Basic (§3.4), **plus** don't send `voiceGender` — premium ignores it;
+use `voiceSpeaker`/`voiceInstruct`/`voiceLanguage` instead.
+
+---
