@@ -89,6 +89,7 @@
       { "provider": "runpod", "model": "flux-merge", "mode": "merge", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
         "note": "Narration Basic per-frame audio merge — Flux-TTS-S2T merge (animated video + TTS voice)." }
     ],
+    "video.narrationPremium.merge": { "aliasOf": "video.narrationBasic.merge" },
 
     "video.basic": [
       { "provider": "consumer", "model": "stock-footage",    "routingMode": "stock",  "lane": "none", "note": "Documentary Basic: free Pexels/Pixabay footage" },
@@ -101,6 +102,7 @@
         "note": "Premium video I2V — self-hosted Wan 2.2 I2V-A14B 4-step Lightning (RunPod nd7wloyvj09xwy). Aspect ratio inherits from the input image." },
       { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video", "fb": true }
     ],
+    "video.narrationPremium.i2v": { "aliasOf": "video.premium.i2v" },
     "movie.basic.image.t2i":  { "aliasOf": "image.premium.t2i" },
     "movie.basic.image.i2i":  { "aliasOf": "image.premium.i2i" },
     "movie.basic.video.i2v": [

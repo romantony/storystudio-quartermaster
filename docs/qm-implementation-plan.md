@@ -53,7 +53,7 @@ every 2 min) · `QMDashboardStack` (admin SPA) · `QMPipelineStack` (`QM-broker-
 
 | Role | Status | What's there | What's missing |
 |---|---|---|---|
-| **1 QM-New SF** | **Built (test rig), unvalidated** | `E2E-VideoGenerationPipeline-Narration-Basic-QM-New` (`pipeline-stack.ts` `buildQmNewDefinition`/`qmFrameAssetsMap`): per-frame image(t2i/i2i)→TTS→Flux animate→Flux merge → concat → Whisper SRT → finalize | Not wired to StoryStudio's narration-basic MCP flow; no E2E validation; **premium** QM-new not built |
+| **1 QM-New SF** | **Both basic + premium built and deployed, unvalidated** | `E2E-VideoGenerationPipeline-Narration-Basic-QM-New` (Flux image/TTS/animate/merge) and `E2E-VideoGenerationPipeline-Narration-Premium-QM-New` (Qwen image/TTS + Wan2 i2v + merge) — both ACTIVE in production, both pass AWS's own ASL validator with zero diagnostics | Neither wired to StoryStudio's MCP flow; no real E2E validation on either |
 | **2 Orchestrator** | **Built, working** | `QM-generate` (`POST /jobs`+poll), `executor` (ladder resolve, internal-first, circuit breaker, fallback), `catalog/background.json`, adapters (runpod/kie/replicate); modelslab decommissioned; `video.premium.i2v` now RunPod Wan2 primary → Replicate fallback | **UI-backfill** routing policy not implemented; DR-fallback path not regression-tested post-changes |
 | **3 Capacity Manager** | **Built, reservation-aware, pre-warm on grant wired; PATCH default OFF** | `provisioner.ts`: per-endpoint demand (organic + reservation-committed via `getReservedWorkersByEndpoint`) → workers, prewarm, scale-to-zero, cap-weighted rebalance; `prewarmEndpoints()` called synchronously from admission's `grant()`; live-PATCH path fixed (was silently broken — `RUNPOD_API_KEY` was never hydrated in the API Lambda) and gated by a deploy-time flag (`cdk deploy --context RUNPOD_PROVISION_LIVE=true`), defaulting off; 4th endpoint `runpod:wan2-i2v` | `RUNPOD_PROVISION_LIVE` not yet flipped in any deploy (ops decision, not a code gap — validate shadow log in staging first) |
 | **4 Gatekeeper** | **Decision logic + pre-warm actuation built** | `src/shared/assetLoad.ts`; gen-time baselines in `executor.ts` (seeded from real `runpod/API.md` figures); `POST /admission` + `/admission/{id}/release`, wired into `api.ts` + the sweeper; reservation state (`RESERVATION#`/`RESERVATIONREQ#`); grant now synchronously pre-warms its endpoints (§WS-C3) — 12 tests in `admission.test.ts` | StoryStudio not yet calling it; no real-traffic validation; `RUNPOD_PROVISION_LIVE` still off so pre-warm is shadow-only in practice until an ops decision flips it |
@@ -73,9 +73,18 @@ key; frame `referenceImageUrl` singular. *(StoryStudio-side; QM provides the con
 **A2. Single-project E2E + fixes.** Run one narration-basic project end-to-end through QM-new;
 fix issues (frame item shape into concat, SRT-from-concat audio, finalize). No gate yet —
 orchestrator + shadow capacity, proves the generation path.
-**A3. Premium QM-new SF.** Author the premium machine: per-frame image (Qwen t2i/i2i) → premium
-TTS → **Wan2 i2v** (not Flux animate/merge) → concat → SRT → finalize; add
-`video.narrationPremium.i2v` ladder key. Validate E2E.
+**A3. ✅ DONE (SF built + deployed) — Premium QM-new SF.** `E2E-VideoGenerationPipeline-
+Narration-Premium-QM-New` (`pipeline-stack.ts` `buildNarrationPremiumQmNewDefinition`/
+`qmPremiumFrameAssetsMap`): per-frame image (Qwen t2i/i2i) → premium TTS (Qwen voice-design)
+→ **Wan2 i2v** (not Flux animate/merge) → merge (reuses the generic Flux-TTS-S2T merge rung
+via a `video.narrationPremium.merge` alias) → concat → Whisper SRT → finalize (1080p upscale,
+mirrors legacy `FinalizeVideoPremium` exactly). Catalog gained `video.narrationPremium.i2v`
+(alias of `video.premium.i2v`) and `video.narrationPremium.merge` (alias of
+`video.narrationBasic.merge`). `assetLoad.ts`'s premium load spec corrected — merge lands on
+`flux-tts-s2t` too (2 jobs/frame there: tts+merge, not 1). Validated: AWS's own
+`validate-state-machine-definition` API returned zero diagnostics; deployed and confirmed
+`ACTIVE` in production, siblings (Basic-QM, Premium-QM, Narration-Basic-QM-New) untouched.
+**Not yet done:** no real E2E run (needs StoryStudio wiring, same as Narration-Basic-QM-New).
 
 ### WS-B — Orchestrator (role 2)
 **B1. ✅ DONE — Repoint `video.premium.i2v` → RunPod Wan2** (`background.json`): runpod primary

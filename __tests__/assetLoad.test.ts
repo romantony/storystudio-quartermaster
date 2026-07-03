@@ -34,12 +34,12 @@ describe('projectAssetLoad — narration-basic (all on flux-tts-s2t)', () => {
 });
 
 describe('projectAssetLoad — narration-premium (three endpoints)', () => {
-  it('splits image / tts+srt+bgm / video across three endpoints', () => {
+  it('splits image / tts+merge+srt+bgm / video across three endpoints', () => {
     const load = projectAssetLoad('narration-premium', 100); // 20 frames
-    expect(load.perEndpoint[QWEN_IMAGE_GEN]).toBe(20);   // images
-    expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(20 + 2); // tts + srt + bgm
-    expect(load.perEndpoint[WAN2_I2V]).toBe(20);         // video
-    expect(load.total).toBe(20 + 22 + 20);
+    expect(load.perEndpoint[QWEN_IMAGE_GEN]).toBe(20);        // images
+    expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(20 * 2 + 2);  // (tts + merge)*frames + srt + bgm
+    expect(load.perEndpoint[WAN2_I2V]).toBe(20);              // video
+    expect(load.total).toBe(20 + 42 + 20);
     expect(load.tier).toBe('premium');
   });
 });

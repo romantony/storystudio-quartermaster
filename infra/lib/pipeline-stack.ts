@@ -123,6 +123,23 @@ export class PipelineStack extends Stack {
     });
 
     new CfnOutput(this, 'QMNewStateMachineArn', { value: qmNewStateMachine.attrArn });
+
+    // ── Narration-Premium-QM-New pipeline ────────────────────────────────────
+    // Sibling of Narration-Basic-QM-New: per-frame image (Qwen t2i/i2i) → TTS
+    // (Qwen voice-design) → Wan2 i2v → merge, all through the Quartermaster
+    // gateway. Finalize is Premium-flavored (1080p upscale), mirroring
+    // buildPremiumDefinition's FinalizeVideoPremium exactly.
+    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn);
+
+    const narrationPremiumQmNewStateMachine = new sfn.CfnStateMachine(this, 'NarrationPremiumQMNewPipeline', {
+      stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Premium-QM-New',
+      stateMachineType: 'STANDARD',
+      roleArn: sfnRole.roleArn,
+      definitionString: JSON.stringify(narrationPremiumQmNewDefinition),
+      tags: [{ key: 'batchjob', value: 'true' }, { key: 'qmGateway', value: 'true' }],
+    });
+
+    new CfnOutput(this, 'NarrationPremiumQMNewStateMachineArn', { value: narrationPremiumQmNewStateMachine.attrArn });
   }
 }
 
@@ -404,6 +421,359 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
         BuildFrameVideo: {
           Type: 'Pass',
           Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = merged animation+voice).',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'videoUrl.$': '$.mergeResult.cdnUrl',
+            'duration.$': '$.duration',
+          },
+          End: true,
+        },
+      },
+    },
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'DropFrameData',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Narration-Premium-QM-New SFN definition
+// ---------------------------------------------------------------------------
+// Sibling of buildQmNewDefinition: same downstream shape (concat → SRT →
+// finalize), but the per-frame Map generates image (Qwen t2i/i2i) + TTS (Qwen
+// voice-design) + Wan2 i2v + merge instead of Flux image/TTS/animate/merge, and
+// the finalize section is Premium-flavored (1080p upscale), matching
+// buildPremiumDefinition's FinalizeVideoPremium exactly.
+// ---------------------------------------------------------------------------
+function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string): object {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn))) as {
+    Comment: string;
+    States: Record<string, any>;
+  };
+  def.Comment = 'E2E Video Generation Pipeline - Narration-Premium-QM-New — per-frame image (Qwen t2i/i2i) + TTS (Qwen voice-design) + Wan2 i2v + merge via Quartermaster gateway';
+
+  // Swap the Basic per-frame Map (Flux image/TTS/animate/merge) for the Premium
+  // one (Qwen image, Qwen TTS, Wan2 i2v, generic merge).
+  def.States.GenerateImages = qmPremiumFrameAssetsMap(qmGenerateArn);
+
+  // Finalize becomes Premium-flavored (1080p upscale, longer Fargate timeout),
+  // renaming the Basic finalize states to match buildPremiumDefinition's own
+  // naming convention exactly (FinalizeVideoPremium etc.) rather than running a
+  // "Basic"-named state with premium content.
+  def.States.UpdateStatusApplyingBgm.Catch = [
+    { ErrorEquals: ['States.ALL'], ResultPath: '$.statusError', Next: 'FinalizeVideoPremium' },
+  ];
+  def.States.UpdateStatusApplyingBgm.Next = 'ValidateFinalizeInputsPremium';
+
+  def.States.ValidateFinalizeInputsPremium = {
+    Type: 'Choice',
+    Comment: 'Verify required fields exist before finalize; fail fast on missing data',
+    Choices: [{ Variable: '$.mergedVoiceResult.mergedVideoUrl', IsPresent: true, Next: 'PrepareFinalizePremium' }],
+    Default: 'FinalizeInputsMissingPremium',
+  };
+  delete def.States.ValidateFinalizeInputsBasic;
+
+  def.States.FinalizeInputsMissingPremium = {
+    Type: 'Fail',
+    Error: 'FinalizeInputsMissing',
+    Cause: 'Required finalize input(s) missing: $.mergedVoiceResult.mergedVideoUrl',
+  };
+  delete def.States.FinalizeInputsMissingBasic;
+
+  def.States.PrepareFinalizePremium = {
+    Type: 'Pass',
+    Comment: 'Prepare a small payload for the Fargate finalize task (Premium: 480p→1080p upscale)',
+    Parameters: {
+      mode: 'premium',
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'videoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
+      'voiceAudioUrl.$': '$.mergedVoiceResult.audioUrl',
+      'captionsUrl.$': '$.mergedVoiceResult.captionsUrl',
+      'bgmUrl.$': '$.bgmUrl',
+      targetResolution: '1080p',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+    },
+    ResultPath: '$.finalizeTaskInput',
+    Next: 'FinalizeVideoPremium',
+  };
+  delete def.States.PrepareFinalizeBasic;
+
+  def.States.FinalizeVideoPremium = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::ecs:runTask.sync',
+    Comment: 'Finalize on Fargate (no Lambda timeout ceiling): 480p→1080p upscale + captions + BGM',
+    Parameters: {
+      Cluster: 'arn:aws:ecs:us-east-1:929075264324:cluster/storystudio-e2e',
+      LaunchType: 'FARGATE',
+      TaskDefinition: 'e2e-finalize',
+      NetworkConfiguration: {
+        AwsvpcConfiguration: {
+          Subnets: ['subnet-02557f42e07118380', 'subnet-0389bf7ebb5a497ac'],
+          SecurityGroups: ['sg-0c2549fa2cb194dc6'],
+          AssignPublicIp: 'ENABLED',
+        },
+      },
+      Overrides: {
+        ContainerOverrides: [{
+          Name: 'finalize',
+          Environment: [{ Name: 'PAYLOAD_JSON', 'Value.$': 'States.JsonToString($.finalizeTaskInput)' }],
+        }],
+      },
+    },
+    ResultPath: '$.finalizeEcs',
+    TimeoutSeconds: 5400,
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'Complete',
+  };
+  delete def.States.FinalizeVideoBasic;
+
+  return def;
+}
+
+/**
+ * Per-frame Map for Narration-Premium-QM-New: image (Qwen t2i, or i2i when the
+ * frame carries a UI `referenceImageUrl` character) → TTS (Qwen voice-design,
+ * speaker/instruct/language from execution input) → Wan2 i2v (narrationText
+ * doubles as the motion prompt, matching the legacy Premium-QM convention) →
+ * merge (voice onto the Wan2 video — the SAME generic Flux-TTS-S2T merge rung
+ * narration-basic uses, via the video.narrationPremium.merge alias; merge is a
+ * model-agnostic audio+video mux, not tied to how the silent video was made).
+ * Emits the item shape the concat step consumes: `videoUrl` + `frameNumber`
+ * (+ `duration`, `frameId`) — identical to the Basic map's output shape.
+ */
+function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
+  return {
+    Type: 'Map',
+    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen t2i/i2i) → TTS (Qwen voice-design) → Wan2 i2v → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency.',
+    ItemsPath: '$.frames',
+    MaxConcurrency: 15,
+    ResultPath: '$.videoResults',
+    Iterator: {
+      StartAt: 'CheckImageCache',
+      States: {
+        CheckImageCache: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-asset-cache-check',
+          Comment: 'Check S3 metadata cache — skip image generation if it already exists',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            assetType: 'image',
+          },
+          ResultPath: '$.imageCacheResult',
+          TimeoutSeconds: 10,
+          Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 2, MaxAttempts: 1, BackoffRate: 1.5 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.cacheError', Next: 'RouteImageGen' }],
+          Next: 'CheckImageCacheResult',
+        },
+        CheckImageCacheResult: {
+          Type: 'Choice',
+          Comment: 'Cached image → skip straight to TTS; otherwise generate the image',
+          Choices: [{ Variable: '$.imageCacheResult.cached', BooleanEquals: true, Next: 'UseImageCache' }],
+          Default: 'RouteImageGen',
+        },
+        UseImageCache: {
+          Type: 'Pass',
+          Comment: 'Image already in S3 — use cached CDN URL, still (re)generate TTS',
+          Parameters: {
+            'cdnUrl.$': '$.imageCacheResult.cdnUrl',
+            's3Key.$': '$.imageCacheResult.s3Key',
+            'width.$': '$.imageCacheResult.width',
+            'height.$': '$.imageCacheResult.height',
+          },
+          ResultPath: '$.imageResult',
+          Next: 'RouteTTS',
+        },
+        RouteImageGen: {
+          Type: 'Choice',
+          Comment: 'Character reference from the UI → image-to-image; otherwise text-to-image',
+          Choices: [{
+            And: [
+              { Variable: '$.referenceImageUrl', IsPresent: true },
+              { Variable: '$.referenceImageUrl', IsString: true },
+              { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateImageI2I',
+          }],
+          Default: 'QMGenerateImageT2I',
+        },
+        QMGenerateImageT2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Text-to-image via QM (image.narrationPremium.t2i: self-hosted Qwen-Image-Gen → KIE fallback)',
+          Parameters: {
+            assetType: 'image',
+            tier: 'narrationPremium',
+            operation: 't2i',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
+          Next: 'StoreImageMeta',
+        },
+        QMGenerateImageI2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Image-to-image via QM (image.narrationPremium.i2i: self-hosted Qwen-Image-Edit) using the UI character reference',
+          Parameters: {
+            assetType: 'image',
+            tier: 'narrationPremium',
+            operation: 'i2i',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'initImageUrls.$': 'States.Array($.referenceImageUrl)',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
+          Next: 'StoreImageMeta',
+        },
+        StoreImageMeta: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-store-asset-meta',
+          Comment: 'Persist image metadata to S3 for cache reuse',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            assetType: 'image',
+            'cdnUrl.$': '$.imageResult.cdnUrl',
+            's3Key.$': '$.imageResult.s3Key',
+            'width.$': '$.imageResult.width',
+            'height.$': '$.imageResult.height',
+          },
+          ResultPath: null,
+          TimeoutSeconds: 10,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.metaStoreError', Next: 'RouteTTS' }],
+          Next: 'RouteTTS',
+        },
+        RouteTTS: {
+          Type: 'Choice',
+          Comment: 'Frame already carries a voiceUrl → reuse it; otherwise generate TTS from narrationText',
+          Choices: [{
+            And: [
+              { Variable: '$.voiceUrl', IsPresent: true },
+              { Variable: '$.voiceUrl', IsString: true },
+              { Not: { Variable: '$.voiceUrl', StringEquals: '' } },
+            ],
+            Next: 'UseProvidedVoice',
+          }],
+          Default: 'QMGenerateTTS',
+        },
+        UseProvidedVoice: {
+          Type: 'Pass',
+          Comment: 'A voiceUrl was supplied upstream — reuse it, skip TTS generation',
+          Parameters: { 'cdnUrl.$': '$.voiceUrl' },
+          ResultPath: '$.ttsResult',
+          Next: 'QMGenerateVideo',
+        },
+        QMGenerateTTS: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'TTS via QM (voice.narrationPremium.tts: self-hosted Qwen3-TTS voice-design → Google fallback). Speaker/instruct/language come from execution input (project-level, not per-frame).',
+          Parameters: {
+            assetType: 'voice',
+            tier: 'narrationPremium',
+            operation: 'tts',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.narrationText',
+            'speaker.$': '$$.Execution.Input.voiceSpeaker',
+            'instruct.$': '$$.Execution.Input.voiceInstruct',
+            'language.$': '$$.Execution.Input.voiceLanguage',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.ttsResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'QMFrameFailed' }],
+          Next: 'QMGenerateVideo',
+        },
+        QMGenerateVideo: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Image-to-video via QM (video.narrationPremium.i2v: self-hosted Wan 2.2 I2V-A14B 4-step Lightning → Replicate fallback). Silent MP4; narrationText doubles as the motion prompt (matches the legacy Premium-QM convention). Cold start ~170-190s, so a longer timeout than the other steps.',
+          Parameters: {
+            assetType: 'video',
+            tier: 'narrationPremium',
+            operation: 'i2v',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'prompt.$': '$.narrationText',
+            'durationS.$': '$.duration',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.videoResult',
+          TimeoutSeconds: 420,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'QMFrameFailed' }],
+          Next: 'QMMerge',
+        },
+        QMMerge: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Merge the TTS voice onto the Wan2-generated video via QM (video.narrationPremium.merge → aliases the same Flux-TTS-S2T merge rung narration-basic uses). MP4 with audio.',
+          Parameters: {
+            assetType: 'video',
+            tier: 'narrationPremium',
+            operation: 'merge',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.videoResult.cdnUrl)',
+            'audioUrl.$': '$.ttsResult.cdnUrl',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.mergeResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeError', Next: 'QMFrameFailed' }],
+          Next: 'BuildFrameVideo',
+        },
+        QMFrameFailed: {
+          Type: 'Pass',
+          Comment: 'QM exhausted all rungs for image/TTS/video/merge — propagate a graceful frame failure',
+          Parameters: {
+            failed: true,
+            error: 'QMFrameFailed',
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+          },
+          End: true,
+        },
+        BuildFrameVideo: {
+          Type: 'Pass',
+          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = merged Wan2 video + voice).',
           Parameters: {
             'frameId.$': '$.frameId',
             'frameNumber.$': '$.frameNumber',

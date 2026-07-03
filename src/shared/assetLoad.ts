@@ -60,12 +60,15 @@ const LOAD_SPECS: Record<string, LoadSpec> = {
     perFrame: { [FLUX_TTS_S2T]: 4 },
     perProject: { [FLUX_TTS_S2T]: 2 },
   },
-  // Premium: image (Qwen, t2i assumed) + TTS + Wan2 video per frame, plus 1 SRT +
-  // 1 BGM (on flux-tts-s2t). i2i frames would shift the image job to
-  // qwen-image-edit; projection assumes t2i (qwen-image-gen) as the dominant case.
+  // Premium: image (Qwen, t2i assumed) + TTS + Wan2 i2v + a per-frame merge step
+  // (silent Wan2 video + TTS voice, on flux-tts-s2t — same generic Flux-TTS-S2T
+  // merge rung narration-basic uses, via the video.narrationPremium.merge alias)
+  // per frame, plus 1 SRT + 1 BGM for the project. i2i frames would shift the
+  // image job to qwen-image-edit; projection assumes t2i (qwen-image-gen) as the
+  // dominant case.
   'narration-premium': {
     tier: 'premium',
-    perFrame: { [QWEN_IMAGE_GEN]: 1, [FLUX_TTS_S2T]: 1, [WAN2_I2V]: 1 },
+    perFrame: { [QWEN_IMAGE_GEN]: 1, [FLUX_TTS_S2T]: 2, [WAN2_I2V]: 1 },
     perProject: { [FLUX_TTS_S2T]: 2 },
   },
 };
