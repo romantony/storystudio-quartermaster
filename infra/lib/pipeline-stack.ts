@@ -164,17 +164,25 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object 
   // local Ken Burns Map (GenerateI2VBasic) is no longer needed.
   def.States.GenerateImages = qmFrameAssetsMap(qmGenerateArn);
 
-  // Repurpose DropFrameData to carry videoResults (not imageResults) straight
-  // to concat, and skip the now-removed local i2v stage.
+  // BGM is now generated from a prompt (bgmPrompt), not passed in as a
+  // pre-existing URL. Route through it right after the frame Map — $.frames
+  // is still present at this point (DropFrameData is what discards it below),
+  // and QM-generate needs the full frames array to sum durations (§bgmStates).
+  def.States.GenerateImages.Next = 'RouteBGM';
+  Object.assign(def.States, bgmStates(qmGenerateArn, 'narrationBasic'));
+
+  // Repurpose DropFrameData to carry videoResults (not imageResults) and the
+  // generated bgmResult straight to concat, and skip the now-removed local
+  // i2v stage.
   def.States.DropFrameData = {
     Type: 'Pass',
-    Comment: 'Drop $.frames to stay within the 256KB SFN state limit; carry per-frame videoResults to concat.',
+    Comment: 'Drop $.frames to stay within the 256KB SFN state limit; carry per-frame videoResults + bgmResult to concat.',
     Parameters: {
       'jobId.$': '$.jobId',
       'projectId.$': '$.projectId',
       'projectType.$': '$.projectType',
       'aspectRatio.$': '$.aspectRatio',
-      'bgmUrl.$': '$.bgmUrl',
+      'bgmResult.$': '$.bgmResult',
       'jwtToken.$': '$.jwtToken',
       'convexEndpoint.$': '$.convexEndpoint',
       'apiKey.$': '$.apiKey',
@@ -185,7 +193,76 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object 
   delete def.States.UpdateStatusGeneratingVideos;
   delete def.States.GenerateI2VBasic;
 
+  // The generated BGM's URL now comes from bgmResult, not a passed-in bgmUrl.
+  def.States.PrepareFinalizeBasic.Parameters['bgmUrl.$'] = '$.bgmResult.cdnUrl';
+
   return def;
+}
+
+/**
+ * BGM states shared by both Narration-Basic-QM-New and Narration-Premium-QM-New
+ * (the premium machine re-assigns this block with tier:'narrationPremium' after
+ * cloning the basic definition — see buildNarrationPremiumQmNewDefinition).
+ * Project-level (once per project, not per-frame): generates a track from
+ * `bgmPrompt` when supplied, otherwise skips BGM entirely (silent final video).
+ * Runs BEFORE DropFrameData so $.frames (needed to sum durations) is still
+ * present — Step Functions' ASL has no native array-sum intrinsic, so
+ * QM-generate does the summing itself from the raw frames array (see
+ * qm-generate.ts). A frame that exhausts all BGM rungs proceeds without music
+ * rather than failing the whole project.
+ */
+function bgmStates(qmGenerateArn: string, tier: string): Record<string, unknown> {
+  return {
+    RouteBGM: {
+      Type: 'Choice',
+      Comment: 'Generate BGM only when a prompt was supplied; otherwise skip (silent final video, no BGM)',
+      Choices: [{
+        And: [
+          { Variable: '$.bgmPrompt', IsPresent: true },
+          { Variable: '$.bgmPrompt', IsString: true },
+          { Not: { Variable: '$.bgmPrompt', StringEquals: '' } },
+        ],
+        Next: 'QMGenerateBGM',
+      }],
+      Default: 'SkipBgm',
+    },
+    SkipBgm: {
+      Type: 'Pass',
+      Comment: 'No bgmPrompt supplied — proceed without background music',
+      Parameters: { cdnUrl: '' },
+      ResultPath: '$.bgmResult',
+      Next: 'DropFrameData',
+    },
+    QMGenerateBGM: {
+      Type: 'Task',
+      Resource: qmGenerateArn,
+      Comment: `Generate background music via QM (bgm.${tier}: self-hosted ACE-Step → Suno/KIE fallback). Duration = sum of all frame durations (computed by QM-generate — ASL has no array-sum intrinsic).`,
+      Parameters: {
+        assetType: 'bgm',
+        tier,
+        operation: 'generate',
+        product: 'narration',
+        queue: 'background',
+        jobType: 'batch',
+        'prompt.$': '$.bgmPrompt',
+        'frames.$': '$.frames',
+        'projectId.$': '$.projectId',
+        'userId.$': '$.userId',
+      },
+      ResultPath: '$.bgmResult',
+      TimeoutSeconds: 300,
+      Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.bgmError', Next: 'BgmGenerationFailed' }],
+      Next: 'DropFrameData',
+    },
+    BgmGenerationFailed: {
+      Type: 'Pass',
+      Comment: 'BGM generation exhausted all rungs — proceed without music rather than failing the whole project',
+      Parameters: { cdnUrl: '' },
+      ResultPath: '$.bgmResult',
+      Next: 'DropFrameData',
+    },
+  };
 }
 
 /**
@@ -453,8 +530,16 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   def.Comment = 'E2E Video Generation Pipeline - Narration-Premium-QM-New — per-frame image (Qwen t2i/i2i) + TTS (Qwen voice-design) + Wan2 i2v + merge via Quartermaster gateway';
 
   // Swap the Basic per-frame Map (Flux image/TTS/animate/merge) for the Premium
-  // one (Qwen image, Qwen TTS, Wan2 i2v, generic merge).
+  // one (Qwen image, Qwen TTS, Wan2 i2v, generic merge). Re-point its Next back
+  // to RouteBGM (qmPremiumFrameAssetsMap sets Next:'DropFrameData' internally,
+  // matching the Basic map's shape) and re-tier the cloned BGM states — the
+  // clone above inherited buildQmNewDefinition's tier:'narrationBasic' BGM
+  // block, which must not silently persist into a premium project's job
+  // records (wrong billing/audit attribution even though it's the same
+  // physical ACE-Step rung).
   def.States.GenerateImages = qmPremiumFrameAssetsMap(qmGenerateArn);
+  def.States.GenerateImages.Next = 'RouteBGM';
+  Object.assign(def.States, bgmStates(qmGenerateArn, 'narrationPremium'));
 
   // Finalize becomes Premium-flavored (1080p upscale, longer Fargate timeout),
   // renaming the Basic finalize states to match buildPremiumDefinition's own
@@ -492,7 +577,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
       'videoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
       'voiceAudioUrl.$': '$.mergedVoiceResult.audioUrl',
       'captionsUrl.$': '$.mergedVoiceResult.captionsUrl',
-      'bgmUrl.$': '$.bgmUrl',
+      'bgmUrl.$': '$.bgmResult.cdnUrl',
       targetResolution: '1080p',
       'jwtToken.$': '$.jwtToken',
       'convexEndpoint.$': '$.convexEndpoint',

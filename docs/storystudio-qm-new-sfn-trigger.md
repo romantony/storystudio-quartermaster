@@ -11,6 +11,10 @@ catalog) and capacity manager are live. **The admission gate is built and live t
 §2, and the full contract in `docs/storystudio-qm-admission-gate.md`. **Neither machine has
 run a real end-to-end project yet** — that's the next step, and it's on StoryStudio's side
 (wire a request, `StartExecution`, watch it through).
+**Confirmed/added this session:** character-reference-image support was already fully live
+(per-frame `referenceImageUrl`, no change needed). **BGM is now generated from a prompt**
+(`bgmPrompt`, project-level) instead of accepted as a pre-existing URL — `bgmUrl` is
+**removed** from both payloads; see §3.2/§9.2 and the updated flow diagrams (§4/§9.4).
 **Companion docs:** `docs/storystudio-qm-admission-gate.md` (the admission contract, full
 detail), `docs/storystudio-mcp-sfn-trigger.md` (legacy Basic-QM/Premium-QM, being
 superseded by these two), `storystudio-unified/docs/quartermaster/QM_NEW_PIPELINE_DESIGN.md`
@@ -105,7 +109,7 @@ and per-frame TTS internally and derives the SRT from the concatenated audio wit
   "projectType":    "narration-basic",
   "aspectRatio":    "9:16",
   "voiceGender":    "female",
-  "bgmUrl":         "https://cdn-v2.ai-storystudio.com/bgm/track.mp3",
+  "bgmPrompt":      "cinematic orchestral, warm and reflective, no vocals",
   "apiKey":         "<storystudio-internal-api-key>",
   "jwtToken":       "<convex-jwt>",
   "convexEndpoint": "https://your-deployment.convex.cloud",
@@ -134,7 +138,7 @@ and per-frame TTS internally and derives the SRT from the concatenated audio wit
 | `projectType` | string | **yes** | `"narration-basic"`; carried to Fargate finalize |
 | `aspectRatio` | string | **yes** | `"16:9"`, `"9:16"`, or `"1:1"` — sets image dims + clip aspect |
 | `voiceGender` | string | **yes (key must be present)** | `"male"`→`am_adam`, `"female"`→`af_bella`, anything else→`am_adam`. **Empty string `""` is safe; a missing key errors the TTS state at runtime** — always include it. Project-level (not per-frame). |
-| `bgmUrl` | string | **yes** | BGM CDN URL; pass `""` for none |
+| `bgmPrompt` | string | no | Text description for BGM generation (e.g. `"cinematic orchestral, warm and reflective, no vocals"`), generated via QM (ACE-Step → Suno/KIE fallback). **Key can be omitted or empty** — unlike `voiceGender`, this is a `Choice`-gated field, not a direct reference, so a missing key does **not** error; it just skips BGM (silent final video). Project-level (not per-frame). Length = sum of all frame `duration`s, computed automatically. **`bgmUrl` no longer exists in this contract** — BGM is always generated, never passed as a pre-existing URL. |
 | `apiKey` | string | **yes** | Internal StoryStudio key used by `E2E-video-concat-premium` |
 | `jwtToken` | string | **yes** | Short-lived Convex JWT for status callbacks |
 | `convexEndpoint` | string | **yes** | `https://<deployment>.convex.cloud` |
@@ -159,6 +163,11 @@ This pipeline ignores or does not need: `voiceUrls`, `voiceAudioUrl`, `captionsU
 and per-frame `voiceName` / `ttsModel` / `referenceImageUrls`. Leaving them in is harmless
 but they have no effect — voice is selected by the top-level `voiceGender`.
 
+> ⚠️ **Breaking change (2026-07-03): `bgmUrl` is gone, not just unused.** Earlier versions of
+> this doc had you pass a pre-existing `bgmUrl`. That field **no longer exists** in this
+> contract — send `bgmPrompt` instead (§3.2). If you send `bgmUrl`, it's silently ignored,
+> and you'll get a silent final video unless `bgmPrompt` is also present.
+
 ---
 
 ## 4. Basic pipeline flow (what happens after StartExecution)
@@ -178,7 +187,12 @@ ValidateInput → CheckValidation
        QMAnimate  (video.narrationBasic.animate → Flux Ken Burns, silent MP4)
        QMMerge    (video.narrationBasic.merge   → voice onto animation, MP4 w/ audio)
        BuildFrameVideo → { frameId, frameNumber, videoUrl, duration }
-→ DropFrameData  (carry videoResults, drop frames to stay < 256 KB)
+→ RouteBGM → [bgmPrompt present] QMGenerateBGM  (bgm.narrationBasic → ACE-Step → Suno/KIE fallback;
+                                                  duration = sum of all frame durations)
+           → [absent/empty]      SkipBgm         (bgmResult.cdnUrl = "", silent final video)
+   (BGM runs here — before frames is dropped below — because QM-generate needs the full
+    frames array to sum durations; ASL has no native array-sum function)
+→ DropFrameData  (carry videoResults + bgmResult, drop frames to stay < 256 KB)
 → UpdateStatusConcatenating
 → ConcatenateVideos           (E2E-video-concat-premium; reads videoUrl + frameNumber)
 → TranscribeAudio             (Whisper SRT from concat audio — no upstream SRT needed)
@@ -326,7 +340,7 @@ additionally **upscales 480p → 1080p** (Wan2's native output is 480p).
   "voiceSpeaker":   "Ryan",
   "voiceInstruct":  "calm, warm documentary narrator",
   "voiceLanguage":  "English",
-  "bgmUrl":         "https://cdn-v2.ai-storystudio.com/bgm/track.mp3",
+  "bgmPrompt":      "cinematic orchestral, warm and reflective, no vocals",
   "apiKey":         "<storystudio-internal-api-key>",
   "jwtToken":       "<convex-jwt>",
   "convexEndpoint": "https://your-deployment.convex.cloud",
@@ -358,8 +372,10 @@ voice fields replace `voiceGender`, and the underlying models differ.
 | `voiceLanguage` | string | **yes (key must be present)** | e.g. `"English"`. Empty string is safe (defaults server-side). |
 | `admissionId` | string | no | Same as Basic (§3.2) — pass `tier:"premium"` to admission when requesting this. |
 
-All other top-level fields (`projectId`, `jobId`, `userId`, `aspectRatio`, `bgmUrl`,
-`apiKey`, `jwtToken`, `convexEndpoint`) are identical to §3.2.
+All other top-level fields (`projectId`, `jobId`, `userId`, `aspectRatio`, `bgmPrompt`,
+`apiKey`, `jwtToken`, `convexEndpoint`) are identical to §3.2 — including BGM: same
+`bgmPrompt`-generates-via-ACE-Step behavior (catalog key `bgm.narrationPremium`, same
+underlying rung as Basic's `bgm.narrationBasic`).
 
 ### 9.3 Frame object
 
@@ -390,7 +406,9 @@ ValidateInput → CheckValidation
        QMGenerateVideo (video.narrationPremium.i2v → Wan 2.2 I2V-A14B; narrationText = motion prompt; silent MP4)
        QMMerge         (video.narrationPremium.merge → voice onto the Wan2 video, MP4 w/ audio; same generic mux Basic uses)
        BuildFrameVideo → { frameId, frameNumber, videoUrl, duration }
-→ DropFrameData
+→ RouteBGM → [bgmPrompt present] QMGenerateBGM  (bgm.narrationPremium → ACE-Step → Suno/KIE fallback)
+           → [absent/empty]      SkipBgm         (bgmResult.cdnUrl = "", silent final video)
+→ DropFrameData  (carry videoResults + bgmResult)
 → UpdateStatusConcatenating
 → ConcatenateVideos           (E2E-video-concat-premium)
 → TranscribeAudio             (Whisper SRT from concat audio)

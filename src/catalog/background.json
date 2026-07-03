@@ -75,6 +75,8 @@
         "note": "Narration BGM (both tiers) — self-hosted ACE-Step (Flux-TTS-S2T mode:bgm)." },
       { "provider": "kie", "model": "suno", "modelId": "V4_5", "endpoint": "v1/generate", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
+    "bgm.narrationBasic": { "aliasOf": "bgm.narration" },
+    "bgm.narrationPremium": { "aliasOf": "bgm.narration" },
     "srt.narration": [
       { "provider": "runpod", "model": "whisper-large-v3-turbo", "mode": "transcribe", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
         "note": "Narration SRT (both tiers) — self-hosted Whisper large-v3-turbo (Flux-TTS-S2T mode:transcribe)." },

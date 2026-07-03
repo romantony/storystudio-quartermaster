@@ -46,6 +46,13 @@ interface QMGenerateEvent {
   language?: string;
   initImageUrls?: string[];
   audioUrl?: string;
+  // BGM only: the project's frames, used to compute the generated track's
+  // length (sum of frame durations) — ASL has no native array-sum function,
+  // and by the time BGM would otherwise run near finalize, the pipeline has
+  // already dropped $.frames to stay under the 256KB state-size limit, so the
+  // SFN passes the full array here (while it's still available) and lets this
+  // Lambda do the sum. Ignored unless durationS is omitted.
+  frames?: Array<{ duration?: number }>;
   projectId: string;
   frameId?: string;
   userId?: string;
@@ -88,6 +95,8 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
     ?? `${event.projectId}:${event.frameId ?? 'na'}:${event.assetType}:${operation}`;
   const s3Target = event.s3Target
     ?? `storystudio/${event.assetType}s/${event.projectId}_${event.frameId ?? 'na'}_${operation}`;
+  const durationS = event.durationS
+    ?? (event.frames?.length ? event.frames.reduce((sum, f) => sum + (f.duration ?? 0), 0) : undefined);
 
   const body = {
     assetType: event.assetType,
@@ -103,7 +112,7 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
     params: {
       aspectRatio: event.aspectRatio,
       resolution: event.resolution,
-      durationS: event.durationS,
+      durationS,
       voice: event.voice ?? genderToVoice(event.voiceGender),
       voiceUrl: event.voiceUrl,
       voiceTranscript: event.voiceTranscript,
