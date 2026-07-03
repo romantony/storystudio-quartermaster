@@ -7,7 +7,7 @@ import {
 } from '../gate/reservation-gate';
 import { projectAssetLoad } from '../shared/assetLoad';
 import type { AssetLoad } from '../shared/assetLoad';
-import { ENDPOINTS, gatherQueuedByEndpoint, getEndpointWorkersMax } from './provisioner';
+import { ENDPOINTS, gatherQueuedByEndpoint, getEndpointWorkersMax, prewarmEndpoints } from './provisioner';
 import type { BaselineItem, LambdaFunctionUrlEvent, LambdaFunctionUrlResponse, ReservationItem } from '../types';
 
 /**
@@ -233,6 +233,12 @@ async function grant(
     createdAt: now, expiresAt: now + BRAIN_WINDOW_MS + drainEstMs + RESERVATION_BUFFER_MS,
   };
   await saveReservation(reservation);
+  // Best-effort, synchronous pre-warm (§WS-C3) — the next sweeper tick (≤2 min)
+  // would eventually reach the same state via the reservation-aware demand this
+  // save just created (§WS-C2), but doing it here lets RunPod's cold start
+  // overlap the brain window instead of starting after it. Never blocks or
+  // fails the admission response.
+  await prewarmEndpoints(neededWorkers).catch(e => console.error('[admission] prewarm failed', e));
   return reservation;
 }
 

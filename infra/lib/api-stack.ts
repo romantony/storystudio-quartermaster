@@ -21,6 +21,14 @@ interface ApiStackProps extends StackProps {
   runpodKeySecretArn: string;
   s3CacheBucket: string;
   webhookBaseUrl: string;
+  /**
+   * Capacity manager go-live switch (§WS-C3). When true, provisioner.ts PATCHes
+   * RunPod's worker counts for real; when false/omitted, it only writes the
+   * PROVISION_SHADOW audit trail. Defaults OFF — flip explicitly via
+   * `cdk deploy --context RUNPOD_PROVISION_LIVE=true` once the shadow log is
+   * trusted, so going live is one documented deploy-time flag, not a code change.
+   */
+  runpodProvisionLive?: boolean;
 }
 
 export class ApiStack extends Stack {
@@ -93,6 +101,7 @@ export class ApiStack extends Stack {
         REST_FLOOR: '7',
         MAX_ATTEMPTS: '5',
         EXECUTOR_FUNCTION_NAME: this.executorFunction.functionName,
+        RUNPOD_PROVISION_LIVE: props.runpodProvisionLive ? 'true' : 'false',
       },
     });
 

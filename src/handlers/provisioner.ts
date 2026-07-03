@@ -1,4 +1,5 @@
 import { DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand } from '@aws-sdk/client-dynamodb';
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { CatalogResolver } from '../catalog/resolver';
 import { getInflight } from '../gate/dynamo-gate';
@@ -17,6 +18,7 @@ const COOLDOWN_MS = Number(process.env.RUNPOD_SCALEDOWN_COOLDOWN_MS ?? 300_000);
 const LIVE = process.env.RUNPOD_PROVISION_LIVE === 'true';
 
 const db = new DynamoDBClient({});
+const sm = new SecretsManagerClient({});
 
 // The RunPod serverless endpoints QM provisions. counterKey mirrors the
 // per-endpoint semaphore in dynamo-gate; endpointId is the RunPod id from
@@ -117,6 +119,47 @@ export async function runProvisioner(): Promise<Plan[]> {
   }
 
   return plans;
+}
+
+/**
+ * Immediately raise capacity for a just-granted reservation's touched endpoints
+ * (§WS-C3), rather than waiting for the next 2-min sweeper tick — RunPod's cold
+ * start (2.5–4 min, see runpod/API.md) should overlap Convex's brain window, not
+ * start after it. Monotonic: only raises workersMin/workersMax for the given
+ * endpoints, never lowers anything, and never touches endpoints outside
+ * `neededWorkers`. Skips endpoints already at or above the target (no redundant
+ * PATCH when multiple reservations land on an already-warm pool).
+ *
+ * Deliberately does NOT re-run the account-cap rebalance across all endpoints —
+ * admission.ts's decide() already validated the fleet-wide cap before granting.
+ * The next full sweeper tick (§WS-C2's reservation-aware demand) reconciles any
+ * transient over-commitment from concurrent grants, the same eventually-
+ * consistent convergence the rest of this module already relies on.
+ */
+export async function prewarmEndpoints(neededWorkers: Record<string, number>): Promise<void> {
+  const now = Date.now();
+  for (const [counterKey, workers] of Object.entries(neededWorkers)) {
+    const ep = ENDPOINTS.find(e => e.counterKey === counterKey);
+    if (!ep || workers <= 0) continue;
+
+    const state = await readEndpoint(counterKey, ep.endpointId);
+    const toMin = Math.max(state.workersMin, 1);
+    const toMax = Math.max(state.workersMax, workers);
+    if (toMin === state.workersMin && toMax === state.workersMax) continue; // already sufficient
+
+    const plan: Plan = {
+      counterKey, endpointId: ep.endpointId,
+      demand: { inflight: 0, queued: 0, reserved: workers },
+      fromMin: state.workersMin, fromMax: state.workersMax,
+      toMin, toMax, reason: 'reservation-prewarm-immediate',
+    };
+    await writeEndpoint(plan, now);
+    await writeShadow(plan, now);
+    if (LIVE) await patchRunPod(plan);
+    console.info('[provisioner]', LIVE ? 'PATCH' : 'SHADOW', counterKey,
+      `max ${plan.fromMax}→${plan.toMax} min ${plan.fromMin}→${plan.toMin}`,
+      `(immediate pre-warm on grant, reserved=${workers})`);
+  }
 }
 
 /**
@@ -245,10 +288,35 @@ async function writeShadow(p: Plan, now: number): Promise<void> {
   await db.send(new PutItemCommand({ TableName: TABLE, Item: marshall(item) }));
 }
 
+let cachedRunpodKey: string | undefined;
+
+/**
+ * Resolve the RunPod API key. `executor.ts` hydrates RUNPOD_API_KEY from
+ * RUNPOD_API_KEY_ARN into its own process env, but the API Lambda (where the
+ * sweeper — and thus this function — runs) never does; only the ARN is set
+ * there. Without this, `RUNPOD_PROVISION_LIVE=true` would silently no-op every
+ * PATCH. IAM grant for the secret already exists on the API Lambda's role
+ * (infra/lib/api-stack.ts) since it's shared with the other provider secrets.
+ */
+async function getRunpodKey(): Promise<string | undefined> {
+  if (cachedRunpodKey) return cachedRunpodKey;
+  if (process.env.RUNPOD_API_KEY) return (cachedRunpodKey = process.env.RUNPOD_API_KEY);
+  const arn = process.env.RUNPOD_API_KEY_ARN;
+  if (!arn) return undefined;
+  try {
+    const res = await sm.send(new GetSecretValueCommand({ SecretId: arn }));
+    cachedRunpodKey = res.SecretString;
+    return cachedRunpodKey;
+  } catch (e) {
+    console.error('[provisioner] failed to hydrate RUNPOD_API_KEY', e);
+    return undefined;
+  }
+}
+
 /** Live-mode RunPod management PATCH. Only called when RUNPOD_PROVISION_LIVE=true. */
 async function patchRunPod(p: Plan): Promise<void> {
-  const key = process.env.RUNPOD_API_KEY;
-  if (!key) { console.warn('[provisioner] RUNPOD_API_KEY unset — cannot PATCH'); return; }
+  const key = await getRunpodKey();
+  if (!key) { console.warn('[provisioner] RUNPOD_API_KEY unavailable — cannot PATCH'); return; }
   await fetch(`https://rest.runpod.io/v1/endpoints/${p.endpointId}`, {
     method: 'PATCH',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },

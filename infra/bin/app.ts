@@ -22,6 +22,12 @@ function ctx(key: string): string {
   return app.node.tryGetContext(key) ?? process.env[key] ?? `arn:aws:secretsmanager:us-east-1:000000000000:secret:${key}-placeholder`;
 }
 
+// Boolean deploy-time flags — distinct from ctx() since a missing flag must
+// default to false, not a placeholder string. `cdk deploy --context KEY=true`.
+function ctxBool(key: string): boolean {
+  return (app.node.tryGetContext(key) ?? process.env[key]) === 'true';
+}
+
 // --- Database ---
 const dbStack = new DatabaseStack(app, 'QMDatabaseStack', { env });
 
@@ -40,6 +46,9 @@ const apiStack = new ApiStack(app, 'QMApiStack', {
   // Base URL external providers call back to (set after the webhook stack's
   // first deploy, or a custom domain). Empty is fine for internal-only flows.
   webhookBaseUrl: app.node.tryGetContext('WEBHOOK_BASE_URL') ?? process.env['WEBHOOK_BASE_URL'] ?? '',
+  // Capacity manager go-live (§WS-C3) — off unless explicitly deployed with
+  // --context RUNPOD_PROVISION_LIVE=true.
+  runpodProvisionLive: ctxBool('RUNPOD_PROVISION_LIVE'),
 });
 apiStack.addDependency(dbStack);
 

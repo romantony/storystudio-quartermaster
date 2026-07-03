@@ -32,6 +32,7 @@ function evt(body: unknown, rawPath = '/admission'): LambdaFunctionUrlEvent {
 interface Scenario {
   inflight?: Record<string, number>;
   workersMax?: Record<string, number>;
+  workersMin?: Record<string, number>;
   baselines?: Record<string, number[]>;   // counterKey -> ewmaMs samples
   activeReservations?: unknown[];         // pre-marshalled-friendly plain objects
   existingByRequestId?: { admissionId: string } | null;
@@ -49,7 +50,17 @@ function mockScenario(s: Scenario) {
         return { Item: marshall({ inflight: s.inflight?.[ck] ?? 0 }) };
       }
       if (key?.pk === 'RUNPODENDPOINT') {
-        return { Item: marshall({ workersMax: s.workersMax?.[key.sk] ?? 0 }) };
+        // Real reads are either ProjectionExpression:workersMax (getEndpointWorkersMax)
+        // or the full item (readEndpoint, used by prewarmEndpoints/§WS-C3) — always
+        // return the full shape so both call sites get a valid item.
+        return {
+          Item: marshall({
+            pk: 'RUNPODENDPOINT', sk: key.sk, endpointId: key.sk,
+            workersMax: s.workersMax?.[key.sk] ?? 0,
+            workersMin: s.workersMin?.[key.sk] ?? 0,
+            updatedAt: 0,
+          }),
+        };
       }
       if (typeof key?.pk === 'string' && key.pk.startsWith('RESERVATIONREQ#')) {
         return s.existingByRequestId ? { Item: marshall(s.existingByRequestId) } : {};
@@ -113,6 +124,21 @@ describe('handleAdmission — grant on an empty fleet', () => {
     expect(body.admissionId).toMatch(/^qm_adm_/);
     expect(body.warmedEndpoints).toEqual(['runpod:flux-tts-s2t']);
     expect(body.expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it('synchronously pre-warms the touched endpoint on grant (§WS-C3), not just on the next sweeper tick', async () => {
+    mockScenario({ inflight: {}, workersMax: {}, workersMin: {}, baselines: {} });
+    await handleAdmission(evt({
+      requestId: 'r-prewarm', projectType: 'narration-basic', tier: 'basic', durationSeconds: 100,
+    }));
+
+    const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
+    const endpointWrite = putCalls
+      .map(c => unmarshall((c[0] as any).input.Item))
+      .find(item => item.pk === 'RUNPODENDPOINT' && item.sk === 'runpod:flux-tts-s2t');
+    expect(endpointWrite).toBeDefined();
+    expect(endpointWrite!.workersMin).toBeGreaterThanOrEqual(1); // pre-warmed, not left cold
+    expect(endpointWrite!.workersMax).toBeGreaterThanOrEqual(4); // concurrency-sized (§D2 correction)
   });
 });
 

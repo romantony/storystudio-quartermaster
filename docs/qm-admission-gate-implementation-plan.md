@@ -177,16 +177,42 @@ real end-to-end validation against StoryStudio's integration (needs their WS-A w
   a reservation-only endpoint still keeps a non-zero share (`toMax:2`) rather than 0.
   `ProvisionShadowItem` gained a `reserved` field for audit visibility.
   2 tests in `__tests__/provisioner.test.ts`.
-- ☐ **Pre-warm actuation (WS-C3, still open):** on a granted admission, raise `workersMin` for
-  the reserved endpoints *right now* (not just on the next 2-min sweeper tick) — write intended
-  state + `patchRunPod` when live. Flip **`RUNPOD_PROVISION_LIVE=true`** (validate the shadow
-  log first). Idle cooldown (existing 5-min) scales back after release. This is the step that
-  makes admission's `warmedEndpoints` response field actually true — today it's aspirational
-  (the *next* sweeper tick will pre-warm via C2, but nothing pre-warms synchronously on grant).
+- ✅ **Pre-warm actuation — DONE (WS-C3).** `provisioner.ts` gained
+  `prewarmEndpoints(neededWorkers)`, called synchronously from `admission.ts`'s `grant()`
+  right after `saveReservation()` (best-effort — `.catch()`'d, never blocks or fails the
+  admission response). Monotonic: only raises `workersMin`/`workersMax` for the endpoints in
+  `neededWorkers`, skips any already at/above target (no redundant PATCH when multiple
+  reservations land on an already-warm pool), and deliberately does **not** re-run the
+  fleet-wide cap rebalance — `decide()` already validated the cap before granting; the next
+  sweeper tick (≤2 min, via WS-C2) reconciles any transient over-commitment from concurrent
+  grants, the same eventually-consistent convergence the rest of the module already relies on.
+  Reuses `writeEndpoint`/`writeShadow`/`patchRunPod` exactly as the sweeper does, so the audit
+  trail and live-PATCH path are identical code, not a parallel implementation.
+  - **Real bug caught and fixed along the way:** `patchRunPod()` read
+    `process.env.RUNPOD_API_KEY` directly, but nothing in the API Lambda (where `/sweeper` and
+    now `/admission` both run) ever hydrated that from `RUNPOD_API_KEY_ARN` — only
+    `executor.ts` did that hydration, for its own process. Flipping `RUNPOD_PROVISION_LIVE=true`
+    today would have silently no-opped every PATCH. Added `getRunpodKey()` (lazy
+    Secrets-Manager fetch + module-level cache, same pattern as `api.ts`'s `getSecret`) so live
+    mode actually works. The IAM grant for the secret already existed on the API Lambda's role.
+  - **Go-live is now a deploy-time flag, not a code change:** `RUNPOD_PROVISION_LIVE` threaded
+    through `ApiStackProps.runpodProvisionLive` (`infra/lib/api-stack.ts`) and a new `ctxBool()`
+    helper in `infra/bin/app.ts`, read from CDK context/env, **defaulting to `false`**. Going
+    live is `cdk deploy --context RUNPOD_PROVISION_LIVE=true` — explicit, documented,
+    reversible by redeploying without the flag. **Not flipped by this change** — validate the
+    shadow log in staging first; that decision is deliberately left to whoever owns the RunPod
+    account and its spend.
+  - **Tests:** 3 new cases in `__tests__/provisioner.test.ts` — shadow-mode raise (no `fetch`
+    call), skip-when-already-warm, and a full LIVE-mode PATCH test (mocks Secrets Manager +
+    `fetch`, asserts the exact URL/`endpointId`, `Authorization` header from the hydrated
+    secret, and PATCH body). Plus 1 new case in `__tests__/admission.test.ts` asserting a
+    grant synchronously writes the raised `RUNPODENDPOINT` state, not just on the next tick.
 
-**Exit:** ✅ reservation-aware provisioning verified (a granted project's endpoints hold warm
-without waiting for real job traffic, and survive cap contention from other demand). **Not yet
-done:** synchronous pre-warm actuation on grant (C3) and the `RUNPOD_PROVISION_LIVE` flip.
+**Exit:** ✅ full pre-warm mechanism built and tested — reservation-aware demand (C2),
+synchronous actuation on grant (C3), and a safe, explicit go-live switch. **What remains is
+purely an ops decision, not code:** validate the shadow log in a staging deploy, then
+`cdk deploy --context RUNPOD_PROVISION_LIVE=true` when ready to spend real RunPod worker-time
+on pre-warming.
 
 ---
 

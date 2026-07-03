@@ -1,14 +1,20 @@
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 
 const sendMock = jest.fn();
+const smSendMock = jest.fn();
 
 jest.mock('@aws-sdk/client-dynamodb', () => {
   const actual = jest.requireActual('@aws-sdk/client-dynamodb');
   return { ...actual, DynamoDBClient: jest.fn(() => ({ send: sendMock })) };
 });
 
+jest.mock('@aws-sdk/client-secrets-manager', () => {
+  const actual = jest.requireActual('@aws-sdk/client-secrets-manager');
+  return { ...actual, SecretsManagerClient: jest.fn(() => ({ send: smSendMock })) };
+});
+
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-import { runProvisioner } from '../src/handlers/provisioner';
+import { runProvisioner, prewarmEndpoints } from '../src/handlers/provisioner';
 
 const cmdName = (c: unknown) => (c as { constructor: { name: string } }).constructor.name;
 const keyOf = (c: any) => (c.input?.Key ? unmarshall(c.input.Key) : undefined);
@@ -16,6 +22,7 @@ const keyOf = (c: any) => (c.input?.Key ? unmarshall(c.input.Key) : undefined);
 interface Scenario {
   inflight?: Record<string, number>;       // counterKey -> inflight
   activeReservations?: unknown[];          // plain ReservationItem-shaped objects
+  endpointState?: Record<string, { workersMin: number; workersMax: number }>;
 }
 
 function mockScenario(s: Scenario) {
@@ -38,7 +45,9 @@ function mockScenario(s: Scenario) {
         return { Item: marshall({ inflight: s.inflight?.[ck] ?? 0 }) };
       }
       if (key?.pk === 'RUNPODENDPOINT') {
-        return {}; // no prior state — readEndpoint defaults to workersMin:0, workersMax:0
+        const prior = s.endpointState?.[key.sk];
+        if (!prior) return {}; // no prior state — readEndpoint defaults to workersMin:0, workersMax:0
+        return { Item: marshall({ pk: 'RUNPODENDPOINT', sk: key.sk, endpointId: key.sk, updatedAt: 0, ...prior }) };
       }
       return {};
     }
@@ -101,5 +110,71 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(flux.toMax).toBeGreaterThan(0);          // not starved to zero
     expect(flux.toMin).toBe(1);                      // still pre-warmed
     expect(qwenGen.toMax).toBeGreaterThan(flux.toMax); // heavier organic demand still wins more share
+  });
+});
+
+describe('prewarmEndpoints — immediate pre-warm on grant (WS-C3)', () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    smSendMock.mockReset();
+    delete process.env.RUNPOD_PROVISION_LIVE;
+    delete process.env.RUNPOD_API_KEY;
+    delete process.env.RUNPOD_API_KEY_ARN;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.resetModules();
+  });
+
+  it('raises workersMin/workersMax for a cold endpoint in shadow mode, without calling fetch', async () => {
+    mockScenario({});
+    const fetchMock = jest.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    await prewarmEndpoints({ 'runpod:flux-tts-s2t': 4 });
+
+    const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
+    const endpointWrite = putCalls
+      .map(c => unmarshall((c[0] as any).input.Item))
+      .find(item => item.pk === 'RUNPODENDPOINT' && item.sk === 'runpod:flux-tts-s2t');
+    expect(endpointWrite?.workersMin).toBe(1);
+    expect(endpointWrite?.workersMax).toBe(4);
+    expect(fetchMock).not.toHaveBeenCalled(); // LIVE unset -> shadow only
+  });
+
+  it('skips an endpoint already at or above the target — no redundant write', async () => {
+    mockScenario({ endpointState: { 'runpod:flux-tts-s2t': { workersMin: 1, workersMax: 6 } } });
+
+    await prewarmEndpoints({ 'runpod:flux-tts-s2t': 4 }); // 4 <= already-provisioned 6
+
+    const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
+    expect(putCalls).toHaveLength(0);
+  });
+
+  it('PATCHes RunPod with the raised worker counts when RUNPOD_PROVISION_LIVE=true, hydrating the key from Secrets Manager', async () => {
+    // LIVE and the SecretsManagerClient instance are captured at module import
+    // time (same convention as ADMISSION_STUB elsewhere), so a fresh module
+    // instance is required after setting the env vars.
+    process.env.RUNPOD_PROVISION_LIVE = 'true';
+    process.env.RUNPOD_API_KEY_ARN = 'arn:aws:secretsmanager:us-east-1:000000000000:secret:runpod-key';
+    smSendMock.mockResolvedValue({ SecretString: 'test-runpod-key' });
+    mockScenario({});
+    const fetchMock = jest.fn().mockResolvedValue({ ok: true });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    jest.resetModules();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const live = require('../src/handlers/provisioner') as typeof import('../src/handlers/provisioner');
+    await live.prewarmEndpoints({ 'runpod:wan2-i2v': 2 });
+
+    expect(smSendMock).toHaveBeenCalledTimes(1); // key hydrated once (then cached)
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toContain('nd7wloyvj09xwy'); // wan2-i2v's endpointId
+    expect(opts.method).toBe('PATCH');
+    expect(opts.headers.Authorization).toBe('Bearer test-runpod-key');
+    expect(JSON.parse(opts.body)).toEqual({ workersMin: 1, workersMax: 2 });
   });
 });

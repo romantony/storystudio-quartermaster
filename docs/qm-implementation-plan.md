@@ -55,8 +55,8 @@ every 2 min) · `QMDashboardStack` (admin SPA) · `QMPipelineStack` (`QM-broker-
 |---|---|---|---|
 | **1 QM-New SF** | **Built (test rig), unvalidated** | `E2E-VideoGenerationPipeline-QM-new` (`pipeline-stack.ts` `buildQmNewDefinition`/`qmFrameAssetsMap`): per-frame image(t2i/i2i)→TTS→Flux animate→Flux merge → concat → Whisper SRT → finalize | Not wired to StoryStudio's narration-basic MCP flow; no E2E validation; **premium** QM-new not built |
 | **2 Orchestrator** | **Built, working** | `QM-generate` (`POST /jobs`+poll), `executor` (ladder resolve, internal-first, circuit breaker, fallback), `catalog/background.json`, adapters (runpod/kie/replicate); modelslab decommissioned; `video.premium.i2v` now RunPod Wan2 primary → Replicate fallback | **UI-backfill** routing policy not implemented; DR-fallback path not regression-tested post-changes |
-| **3 Capacity Manager** | **Built, SHADOW mode** | `provisioner.ts` in `/sweeper`: per-endpoint demand → workers, prewarm, scale-to-zero, cap rebalance; audits decisions; 4th endpoint `runpod:wan2-i2v` added | `RUNPOD_PROVISION_LIVE` off (never PATCHes); **not reservation-aware** (admission's reservations aren't folded into `runProvisioner()`'s demand yet); no pre-warm-on-grant hook |
-| **4 Gatekeeper** | **Decision logic built, not live-integrated** | `src/shared/assetLoad.ts`; gen-time baselines captured in `executor.ts` (seeded from real `runpod/API.md` figures); `POST /admission` + `/admission/{id}/release` in `admission.ts`, wired into `api.ts` + the sweeper; reservation state (`RESERVATION#`/`RESERVATIONREQ#`); grant/defer/idempotency/expiry — 11 tests passing | No live pre-warm on grant (by design, deferred to align with WS-C3); StoryStudio not yet calling it; no real-traffic validation |
+| **3 Capacity Manager** | **Built, reservation-aware, pre-warm on grant wired; PATCH default OFF** | `provisioner.ts`: per-endpoint demand (organic + reservation-committed via `getReservedWorkersByEndpoint`) → workers, prewarm, scale-to-zero, cap-weighted rebalance; `prewarmEndpoints()` called synchronously from admission's `grant()`; live-PATCH path fixed (was silently broken — `RUNPOD_API_KEY` was never hydrated in the API Lambda) and gated by a deploy-time flag (`cdk deploy --context RUNPOD_PROVISION_LIVE=true`), defaulting off; 4th endpoint `runpod:wan2-i2v` | `RUNPOD_PROVISION_LIVE` not yet flipped in any deploy (ops decision, not a code gap — validate shadow log in staging first) |
+| **4 Gatekeeper** | **Decision logic + pre-warm actuation built** | `src/shared/assetLoad.ts`; gen-time baselines in `executor.ts` (seeded from real `runpod/API.md` figures); `POST /admission` + `/admission/{id}/release`, wired into `api.ts` + the sweeper; reservation state (`RESERVATION#`/`RESERVATIONREQ#`); grant now synchronously pre-warms its endpoints (§WS-C3) — 12 tests in `admission.test.ts` | StoryStudio not yet calling it; no real-traffic validation; `RUNPOD_PROVISION_LIVE` still off so pre-warm is shadow-only in practice until an ops decision flips it |
 
 **Cross-cutting gaps:** consumption/balance runway signal not built (baselines now exist, but
 no `MeteringItem` writer or balance-runway alert yet).
@@ -106,10 +106,17 @@ extracted from `admission.ts` into `src/gate/reservation-gate.ts` (mirrors `dyna
 so the provisioner can read `getReservedWorkersByEndpoint()` without an
 `admission.ts` ↔ `provisioner.ts` import cycle. `ProvisionShadowItem` gained a `reserved`
 field for observability. 2 new tests in `__tests__/provisioner.test.ts`; 33/33 suite-wide.
-**C3. Go LIVE + pre-warm-on-grant.** Validate the shadow log, flip `RUNPOD_PROVISION_LIVE=true`;
-on a granted admission raise `workersMin` for reserved endpoints immediately. Idle cooldown
-scales back after release. *(Admission already reports `warmedEndpoints` in its response —
-this task is the actuation that makes it real.)*
+**C3. ✅ DONE — pre-warm-on-grant + go-live mechanism.** `provisioner.prewarmEndpoints()`
+raises `workersMin`/`workersMax` for a granted reservation's endpoints synchronously (not
+waiting for the next sweeper tick); admission's `grant()` calls it right after saving the
+reservation. Fixed a real latent bug found along the way: the live-PATCH path never had a
+`RUNPOD_API_KEY` to authenticate with in the API Lambda (only the ARN was present) — added
+lazy Secrets-Manager hydration. **Go-live is now a deploy-time flag**
+(`cdk deploy --context RUNPOD_PROVISION_LIVE=true`, threaded through `ApiStackProps` +
+`infra/bin/app.ts`), defaulting **off** — not flipped by this change; that's an explicit ops
+decision once the shadow log is validated in staging. 3 new tests in `provisioner.test.ts`
+(shadow raise, skip-when-warm, full LIVE-mode PATCH with mocked Secrets Manager + fetch) + 1
+in `admission.test.ts`.
 **C4. Cap lever.** Keep `RUNPOD_ACCOUNT_CAP=10`; move to 20 once the 10-worker workflow is proven.
 
 ### WS-D — Gatekeeper (role 4)  ✅ **decision logic built** → **detailed in `qm-admission-gate-implementation-plan.md`**
@@ -175,13 +182,20 @@ Exit: premium narration E2E; ramped batch traffic; runway alerting.
    `qm-admission-gate-implementation-plan.md` for the detail, including the worker-sizing
    correction found during implementation).
 3. **WS-A1/A2** — StoryStudio wires narration-basic to QM-new; run the first E2E (M1).
-   *(Still open — StoryStudio-side.)*
+   *(Still open — StoryStudio-side. This is the only thing blocking M1/M2 validation now.)*
 4. ✅ **WS-C2** — active reservations now fold into `runProvisioner()`'s own demand (done —
    see §3 WS-C above). The two capacity views (admission's decision math and the
    provisioner's organic scaling) now share one signal via `getReservedWorkersByEndpoint()`.
-5. **WS-C3** — go live: flip `RUNPOD_PROVISION_LIVE=true` and wire admission's grant response
-   (`warmedEndpoints`) into an actual `workersMin` raise. Now unblocked — C2 landed, so a
-   pre-warmed pool won't get clawed back by the sweeper before the SFN's jobs arrive.
+5. ✅ **WS-C3** — `prewarmEndpoints()` built and wired into admission's `grant()`; live-PATCH
+   bug fixed (RunPod key hydration); go-live is now `cdk deploy --context
+   RUNPOD_PROVISION_LIVE=true` (defaulting off — see §3 WS-C above). **The remaining step is
+   an explicit ops decision**, not code: deploy to staging, watch the `PROVISION_SHADOW` audit
+   trail for a few real admission grants, then flip the context flag when trusted.
+
+**M1/M2 status:** all of QM's own control-plane code (roles 2–4) is now built and unit-tested.
+What remains for M1 (narration-basic E2E) is entirely on StoryStudio's side (WS-A); what
+remains for M2 (control plane live) is StoryStudio's wiring plus the ops decision to flip
+`RUNPOD_PROVISION_LIVE`.
 
 ---
 
