@@ -86,6 +86,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
     const internal = isInternalRung(rung);
 
     try {
+      const rungStart = Date.now();
       const callbackUrl = internal ? undefined : `${WEBHOOK_BASE}/webhooks/${rung.provider}`;
       const raw = await submit(adapter, job, rung, callbackUrl);
       const result = adapter.parseSubmit(raw);
@@ -93,6 +94,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
       // Sync completion (provider returned URLs immediately).
       if (result.outputUrls?.length) {
         await complete(job, result.outputUrls[0], rung.fb);
+        await recordBaseline(rung, job, Date.now() - rungStart);
         await releaseSimple(counterKey, leaseId);
         await feedCircuit(key, true, cfg);
         return;
@@ -103,6 +105,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
         await releaseSimple(counterKey, leaseId);
         if (url) {
           await complete(job, url, rung.fb);
+          await recordBaseline(rung, job, Date.now() - rungStart);
           await feedCircuit(key, true, cfg);
           return;
         }
@@ -205,6 +208,37 @@ async function complete(job: JobItem, assetKey: string, fallback?: boolean): Pro
     }),
   }));
   console.info('[executor] COMPLETE', job.requestId, job.jobId, assetKey);
+}
+
+/**
+ * Fold a successful internal generation's wall time (submit→complete) into the
+ * per-asset EWMA baseline: BASELINE#{counterKey} / {assetType}.{tier}.{operation}.
+ * Internal RunPod rungs only (guarded by counterKey — external rungs have none).
+ * Best-effort: baselines are advisory (drive admission ETAs), never fail the job.
+ */
+async function recordBaseline(rung: Rung, job: JobItem, genMs: number): Promise<void> {
+  if (!rung.counterKey || genMs <= 0) return;
+  const asset = `${job.assetType}.${job.tier ?? 'na'}.${job.operation ?? 'na'}`;
+  const alpha = Number(process.env.BASELINE_EWMA_ALPHA ?? 0.2);
+  const pk = `BASELINE#${rung.counterKey}`;
+  try {
+    const cur = await db.send(new GetItemCommand({
+      TableName: TABLE,
+      Key: marshall({ pk, sk: asset }),
+      ProjectionExpression: 'ewmaMs',
+    }));
+    const prev = cur.Item ? (unmarshall(cur.Item) as { ewmaMs?: number }) : {};
+    const ewmaMs = prev.ewmaMs == null ? genMs : Math.round(alpha * genMs + (1 - alpha) * prev.ewmaMs);
+    await db.send(new UpdateItemCommand({
+      TableName: TABLE,
+      Key: marshall({ pk, sk: asset }),
+      UpdateExpression:
+        'SET ewmaMs = :e, samples = if_not_exists(samples, :zero) + :one, lastMs = :l, updatedAt = :u',
+      ExpressionAttributeValues: marshall({ ':e': ewmaMs, ':zero': 0, ':one': 1, ':l': genMs, ':u': Date.now() }),
+    }));
+  } catch (e) {
+    console.warn('[executor] baseline record failed', pk, asset, (e as Error).message);
+  }
 }
 
 async function markFailed(job: JobItem, reason: string): Promise<void> {

@@ -275,6 +275,21 @@ export interface MeteringItem {
   value: number;
 }
 
+/**
+ * Self-updating per-asset generation-time baseline (EWMA of PROCESSING→COMPLETE
+ * wall time), keyed per internal RunPod endpoint. Written by the executor on each
+ * successful internal generation; read by the admission gate to estimate drain/wait.
+ */
+export interface BaselineItem {
+  pk: string;         // BASELINE#{counterKey}   e.g. BASELINE#runpod:flux-tts-s2t
+  sk: string;         // {assetType}.{tier}.{operation}   e.g. image.narrationBasic.t2i
+  ewmaMs: number;     // exponentially-weighted mean generation time
+  samples: number;    // number of observations folded in
+  lastMs: number;     // most recent observation
+  updatedAt: number;  // epoch ms
+  p95Ms?: number;     // reserved for later
+}
+
 // ─── RunPod endpoint provisioning state (§Pillar 2) ──────────────────────────
 
 /**

@@ -96,8 +96,9 @@
       { "provider": "consumer", "model": "basic-animation",  "routingMode": "render", "lane": "none", "fb": true }
     ],
     "video.premium.i2v": [
-      { "provider": "kie", "model": "wan/2-2-a14b-image-to-video-turbo", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "video",
-        "fixed": { "resolution": "480p" } },
+      { "provider": "runpod", "model": "wan-2.2-i2v", "mode": "i2v", "endpointId": "nd7wloyvj09xwy", "endpoint": "v2/nd7wloyvj09xwy", "counterKey": "runpod:wan2-i2v", "routingMode": "direct", "lane": "video",
+        "fixed": { "resolution": "480p" },
+        "note": "Premium video I2V — self-hosted Wan 2.2 I2V-A14B 4-step Lightning (RunPod nd7wloyvj09xwy). Aspect ratio inherits from the input image." },
       { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video", "fb": true }
     ],
     "movie.basic.image.t2i":  { "aliasOf": "image.premium.t2i" },

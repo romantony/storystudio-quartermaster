@@ -24,6 +24,7 @@ const ENDPOINTS: Array<{ counterKey: string; endpointId: string }> = [
   { counterKey: 'runpod:flux-tts-s2t',   endpointId: 'rnqxi6c0mlq517' },
   { counterKey: 'runpod:qwen-image-gen', endpointId: 'e165se4r3eo5hp' },
   { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla' },
+  { counterKey: 'runpod:wan2-i2v',       endpointId: 'nd7wloyvj09xwy' },
 ];
 
 interface Demand { inflight: number; queued: number; }
