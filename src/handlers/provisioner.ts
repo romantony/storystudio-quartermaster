@@ -10,7 +10,10 @@ import type { JobItem, ProvisionShadowItem, Queue, RunPodEndpointItem } from '..
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
 // Shared account-wide worker cap (10; rises to 20 once balance ≥ $200).
 const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 10);
-const BASELINE_MAX = Number(process.env.RUNPOD_BASELINE_MAX ?? 2);
+// Fallback idle floor for any endpoint that doesn't specify its own
+// `baselineMax` below. Endpoints listed in ENDPOINTS should each set a real
+// value confirmed against the account (never guess — see per-endpoint note).
+const DEFAULT_BASELINE_MAX = Number(process.env.RUNPOD_BASELINE_MAX ?? 2);
 const JOBS_PER_WORKER = Number(process.env.RUNPOD_JOBS_PER_WORKER ?? 4);
 const COOLDOWN_MS = Number(process.env.RUNPOD_SCALEDOWN_COOLDOWN_MS ?? 300_000);
 // Shadow mode: log/audit the decision but never PATCH RunPod. Flip to false
@@ -22,12 +25,17 @@ const sm = new SecretsManagerClient({});
 
 // The RunPod serverless endpoints QM provisions. counterKey mirrors the
 // per-endpoint semaphore in dynamo-gate; endpointId is the RunPod id from
-// /home/roman-antony/runpod/API.md.
-export const ENDPOINTS: Array<{ counterKey: string; endpointId: string }> = [
-  { counterKey: 'runpod:flux-tts-s2t',   endpointId: 'rnqxi6c0mlq517' },
-  { counterKey: 'runpod:qwen-image-gen', endpointId: 'e165se4r3eo5hp' },
-  { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla' },
-  { counterKey: 'runpod:wan2-i2v',       endpointId: 'nd7wloyvj09xwy' },
+// /home/roman-antony/runpod/API.md. `baselineMax` is each endpoint's real,
+// account-confirmed idle floor (2026-07-03) — NOT a uniform guess. Using one
+// global constant here previously caused the provisioner's shadow model to
+// silently diverge from RunPod's actual config on flux-tts-s2t and wan2-i2v
+// (both really provisioned to 3, while the old global default assumed 2),
+// which the periodic scale-to-zero tick would have kept re-asserting forever.
+export const ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [
+  { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 3 },
+  { counterKey: 'runpod:qwen-image-gen',  endpointId: 'e165se4r3eo5hp', baselineMax: 2 },
+  { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla', baselineMax: 2 },
+  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 3 },
 ];
 
 // `reserved` = worker-units committed by active admission-gate reservations for
@@ -71,12 +79,13 @@ export async function runProvisioner(): Promise<Plan[]> {
     // larger — real traffic or a still-unrealized reservation — wins.
     const organicWorkers = total > 0 ? Math.max(1, Math.ceil(total / JOBS_PER_WORKER)) : 0;
     const effectiveWorkers = Math.max(organicWorkers, reserved);
+    const baselineMax = ep.baselineMax ?? DEFAULT_BASELINE_MAX;
 
-    let toMax = BASELINE_MAX;
+    let toMax = baselineMax;
     let toMin = 0;
     let reason = 'idle';
     if (effectiveWorkers > 0) {
-      toMax = effectiveWorkers;
+      toMax = Math.max(effectiveWorkers, baselineMax);
       toMin = 1;                       // pre-warm: keep at least one worker up while there's work
       reason = reserved > organicWorkers
         ? (state.workersMax === 0 ? 'reservation-prewarm' : 'reservation-hold')
@@ -86,11 +95,11 @@ export async function runProvisioner(): Promise<Plan[]> {
       // the cooldown has elapsed.
       const busyRecently = state.lastBusyAt && now - state.lastBusyAt < COOLDOWN_MS;
       if (busyRecently) {
-        toMax = Math.max(state.workersMax, BASELINE_MAX);
+        toMax = Math.max(state.workersMax, baselineMax);
         toMin = state.workersMin;      // hold warm through the cooldown
         reason = 'cooldown';
       } else {
-        toMax = BASELINE_MAX; toMin = 0; reason = 'scale-to-zero';
+        toMax = baselineMax; toMin = 0; reason = 'scale-to-zero';
       }
     }
 

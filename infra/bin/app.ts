@@ -69,6 +69,7 @@ const schedulerStack = new SchedulerStack(app, 'QMSchedulerStack', {
   env,
   apiFunction: apiStack.apiFunction,
   apiBaseUrl: `https://${apiStack.distribution.distributionDomainName}`,
+  gatewayKeySecretArn: ctx('GATEWAY_STATIC_KEY_ARN'),
 });
 schedulerStack.addDependency(apiStack);
 
