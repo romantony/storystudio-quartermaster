@@ -105,15 +105,17 @@ export class PipelineStack extends Stack {
 
     new CfnOutput(this, 'PremiumStateMachineArn', { value: premiumStateMachine.attrArn });
 
-    // ── QM-new pipeline (test rig) ──────────────────────────────────────────
-    // Same Basic downstream (i2v → concat → SRT → finalize) but each frame's
-    // image (t2i or i2i on referenceImageUrl) AND TTS are generated through the
-    // Quartermaster gateway (QM-generate). Separate machine so we can validate
-    // the gateway end-to-end without altering Basic-QM/Premium-QM.
+    // ── Narration-Basic-QM-New pipeline ──────────────────────────────────────
+    // Narration-basic ONLY (a narration-premium QM-new machine is separate,
+    // not yet built). Same Basic downstream (i2v → concat → SRT → finalize)
+    // but each frame's image (t2i or i2i on referenceImageUrl) AND TTS are
+    // generated through the Quartermaster gateway (QM-generate). Separate
+    // machine so we can validate the gateway end-to-end without altering
+    // Basic-QM/Premium-QM.
     const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn);
 
     const qmNewStateMachine = new sfn.CfnStateMachine(this, 'QMNewPipeline', {
-      stateMachineName: 'E2E-VideoGenerationPipeline-QM-new',
+      stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
       stateMachineType: 'STANDARD',
       roleArn: sfnRole.roleArn,
       definitionString: JSON.stringify(qmNewDefinition),
@@ -138,7 +140,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object 
     Comment: string;
     States: Record<string, any>;
   };
-  def.Comment = 'E2E Video Generation Pipeline - QM-new — per-frame image (t2i/i2i) + TTS + Flux animate + merge via Quartermaster gateway';
+  def.Comment = 'E2E Video Generation Pipeline - Narration-Basic-QM-New — per-frame image (t2i/i2i) + TTS + Flux animate + merge via Quartermaster gateway. Narration-basic only; narration-premium is a separate state machine.';
 
   // The QM frame Map now produces the finished per-frame video (image → TTS →
   // Flux animate → Flux merge), so it emits $.videoResults directly and the

@@ -1,7 +1,7 @@
 # StoryStudio → QM-New Step Function — Integration Guide
 
 **Audience:** StoryStudio backend (Convex / MCP batch pipeline)
-**Subject:** The new Quartermaster-gated pipeline `E2E-VideoGenerationPipeline-QM-new`,
+**Subject:** The new Quartermaster-gated pipeline `E2E-VideoGenerationPipeline-Narration-Basic-QM-New`,
 what StoryStudio must send to it, and how the QM slot/admission + capacity-manager
 handshake fits around it.
 **Status:** SFN + capacity manager are **live in code** (capacity manager runs in
@@ -23,7 +23,7 @@ StoryStudio  ──────────────────────�
      │                                                             ▼
      │  (3) StartExecution                                   grants a slot
      ▼
-E2E-VideoGenerationPipeline-QM-new   (STANDARD SFN, tags batchjob=true qmGateway=true)
+E2E-VideoGenerationPipeline-Narration-Basic-QM-New   (STANDARD SFN, tags batchjob=true qmGateway=true)
      │
      │  per frame (Map, MaxConcurrency=15):
      │     image (t2i / i2i) → TTS → Flux animate → Flux merge      each step is a
@@ -104,11 +104,11 @@ The §2.1 endpoint is the agreed next step if you want project-start backpressur
 
 ---
 
-## 3. What to send to the SF (`E2E-VideoGenerationPipeline-QM-new`)
+## 3. What to send to the SF (`E2E-VideoGenerationPipeline-Narration-Basic-QM-New`)
 
 **State machine ARN**
 ```
-arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-QM-new
+arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Narration-Basic-QM-New
 ```
 Tags: `batchjob=true`, `qmGateway=true`. Start executions with the existing
 `arn:aws:iam::929075264324:role/E2E-StepFunction-Role`.
@@ -273,7 +273,7 @@ const sfn = new SFNClient({ region: 'us-east-1' });
 
 const res = await sfn.send(new StartExecutionCommand({
   stateMachineArn:
-    'arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-QM-new',
+    'arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
   name:  `${projectId}-${jobId}`,          // unique per execution; ≤ 80 chars
   input: JSON.stringify(payload),          // §3.1
 }));

@@ -3,7 +3,7 @@
 **Audience:** Quartermaster engineers (this repo) + StoryStudio integration owners.
 **Scope:** Bring Quartermaster to production across its four roles:
 
-1. **QM-New SF** — the isolated batch generation pipeline (`E2E-VideoGenerationPipeline-QM-new`).
+1. **QM-New SF** — the isolated batch generation pipeline (`E2E-VideoGenerationPipeline-Narration-Basic-QM-New`).
 2. **QM as Orchestrator** — the provider gateway: route every asset internal-first, fail over,
    meter (`QM-generate` → `POST /jobs` → executor → catalog ladders → adapters).
 3. **QM as Capacity Manager** — provision/retire RunPod workers to match load under the account cap.
@@ -53,7 +53,7 @@ every 2 min) · `QMDashboardStack` (admin SPA) · `QMPipelineStack` (`QM-broker-
 
 | Role | Status | What's there | What's missing |
 |---|---|---|---|
-| **1 QM-New SF** | **Built (test rig), unvalidated** | `E2E-VideoGenerationPipeline-QM-new` (`pipeline-stack.ts` `buildQmNewDefinition`/`qmFrameAssetsMap`): per-frame image(t2i/i2i)→TTS→Flux animate→Flux merge → concat → Whisper SRT → finalize | Not wired to StoryStudio's narration-basic MCP flow; no E2E validation; **premium** QM-new not built |
+| **1 QM-New SF** | **Built (test rig), unvalidated** | `E2E-VideoGenerationPipeline-Narration-Basic-QM-New` (`pipeline-stack.ts` `buildQmNewDefinition`/`qmFrameAssetsMap`): per-frame image(t2i/i2i)→TTS→Flux animate→Flux merge → concat → Whisper SRT → finalize | Not wired to StoryStudio's narration-basic MCP flow; no E2E validation; **premium** QM-new not built |
 | **2 Orchestrator** | **Built, working** | `QM-generate` (`POST /jobs`+poll), `executor` (ladder resolve, internal-first, circuit breaker, fallback), `catalog/background.json`, adapters (runpod/kie/replicate); modelslab decommissioned; `video.premium.i2v` now RunPod Wan2 primary → Replicate fallback | **UI-backfill** routing policy not implemented; DR-fallback path not regression-tested post-changes |
 | **3 Capacity Manager** | **Built, reservation-aware, pre-warm on grant wired; PATCH default OFF** | `provisioner.ts`: per-endpoint demand (organic + reservation-committed via `getReservedWorkersByEndpoint`) → workers, prewarm, scale-to-zero, cap-weighted rebalance; `prewarmEndpoints()` called synchronously from admission's `grant()`; live-PATCH path fixed (was silently broken — `RUNPOD_API_KEY` was never hydrated in the API Lambda) and gated by a deploy-time flag (`cdk deploy --context RUNPOD_PROVISION_LIVE=true`), defaulting off; 4th endpoint `runpod:wan2-i2v` | `RUNPOD_PROVISION_LIVE` not yet flipped in any deploy (ops decision, not a code gap — validate shadow log in staging first) |
 | **4 Gatekeeper** | **Decision logic + pre-warm actuation built** | `src/shared/assetLoad.ts`; gen-time baselines in `executor.ts` (seeded from real `runpod/API.md` figures); `POST /admission` + `/admission/{id}/release`, wired into `api.ts` + the sweeper; reservation state (`RESERVATION#`/`RESERVATIONREQ#`); grant now synchronously pre-warms its endpoints (§WS-C3) — 12 tests in `admission.test.ts` | StoryStudio not yet calling it; no real-traffic validation; `RUNPOD_PROVISION_LIVE` still off so pre-warm is shadow-only in practice until an ops decision flips it |
@@ -68,7 +68,7 @@ no `MeteringItem` writer or balance-runway alert yet).
 ### WS-A — QM-New SF (role 1)
 **A1. Wire narration-basic (storystudio-unified).** In StoryStudio: build the compact
 `sfInput` (per `storystudio-qm-new-sfn-trigger.md`) and `StartExecution` on
-`E2E-VideoGenerationPipeline-QM-new`. Confirm the two known gotchas: `voiceGender` present as a
+`E2E-VideoGenerationPipeline-Narration-Basic-QM-New`. Confirm the two known gotchas: `voiceGender` present as a
 key; frame `referenceImageUrl` singular. *(StoryStudio-side; QM provides the contract.)*
 **A2. Single-project E2E + fixes.** Run one narration-basic project end-to-end through QM-new;
 fix issues (frame item shape into concat, SRT-from-concat audio, finalize). No gate yet —

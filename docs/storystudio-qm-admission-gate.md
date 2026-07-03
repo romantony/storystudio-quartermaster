@@ -65,7 +65,7 @@ mcp-request-queue-processor (2-min cron)
     │
     └─ granted ─▶ (2) QM pre-warms reserved endpoints (raises workersMin now)
                   (3) run the "brain": script + frames + prompts  (~2–3 min)   [Convex, unchanged]
-                  (4) StartExecution E2E-VideoGenerationPipeline-QM-new
+                  (4) StartExecution E2E-VideoGenerationPipeline-Narration-Basic-QM-New
                         input = compact sfInput + admissionId          [see companion doc]
                   (5) SFN runs; every asset goes through QM-generate → RunPod (now warm)
                   (6) onJobTerminated → POST {QM}/admission/{admissionId}/release
@@ -331,4 +331,4 @@ per-asset jobs to the reservation.
 - **Release:** `POST {QM}/admission/{admissionId}/release` `{outcome}`
 - **Auth:** `x-gateway-key` header.
 - **StoryStudio handles two outcomes:** granted → brain + StartExecution(+admissionId); deferred → re-queue, retry after `retryAfterSeconds`.
-- **SFN:** `arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-QM-new` (payload per companion doc + `admissionId`).
+- **SFN:** `arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Narration-Basic-QM-New` (payload per companion doc + `admissionId`).
