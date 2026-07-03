@@ -156,7 +156,7 @@ async function handleSweeper(): Promise<LambdaFunctionUrlResponse> {
 
   // Expire admission reservations past their TTL (granted-but-never-started
   // projects shouldn't pin fleet capacity forever).
-  const { expireStaleReservations } = await import('./admission');
+  const { expireStaleReservations } = await import('../gate/reservation-gate');
   const reservations = await expireStaleReservations().catch(e => {
     console.error('[sweeper] reservation expiry error', e);
     return { expired: 0 };

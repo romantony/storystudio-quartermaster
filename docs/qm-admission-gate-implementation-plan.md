@@ -160,20 +160,33 @@ real end-to-end validation against StoryStudio's integration (needs their WS-A w
   premium QM-new machine lands, add the `video.narrationPremium.i2v` key too.)
 - ✅ **Provisioner `ENDPOINTS`** — `runpod:wan2-i2v` added (4 endpoints now share the cap;
   `rebalanceUnderCap` already handles N).
-- ☐ **Reservation-aware demand** — **not yet done.** `runProvisioner()`'s own demand
-  (`gatherQueuedByEndpoint` + `getInflight`) doesn't yet add active reservations' committed
-  worker share, so a pre-warmed pool could still be scaled down by the sweeper before the SFN's
-  jobs land. Admission's own decision math (§3) already accounts for other reservations when
-  deciding grant/defer — this gap is specifically about the *provisioner's* organic scaling
-  loop not yet seeing that same commitment.
-- **Pre-warm on grant:** on a granted admission, raise `workersMin` for the reserved endpoints
-  now (write intended state + `patchRunPod` when live). Flip **`RUNPOD_PROVISION_LIVE=true`**
-  (validate the shadow log first). Idle cooldown (existing 5-min) scales back after release.
-- **Tests:** provisioner rebalance with 4 endpoints; reservation demand prevents premature
-  scale-down; pre-warm raises `workersMin` within cap.
+- ✅ **Reservation-aware demand — DONE (WS-C2).** Reservation persistence extracted from
+  `admission.ts` into `src/gate/reservation-gate.ts` (mirrors `dynamo-gate.ts`), avoiding an
+  `admission.ts` ↔ `provisioner.ts` import cycle. `runProvisioner()` now calls the new
+  `getReservedWorkersByEndpoint()` and combines it with organic demand as
+  `effectiveWorkers = max(organicWorkers, reserved)` per endpoint (max, not sum — a
+  reservation's promise and the jobs it later submits are the same demand; summing would
+  double-count once its SFN starts running). A reservation-only endpoint (zero live
+  inflight/queued) now pre-warms (`toMin:1`, reason `reservation-prewarm`/`reservation-hold`)
+  instead of scaling to zero. `rebalanceUnderCap`'s proportional-share weighting
+  (`demandWeight()`) was extended to convert `reserved` (worker-units) through
+  `JOBS_PER_WORKER` so it stays comparable with `inflight+queued` (job-count-units) —
+  otherwise a reservation-only endpoint would weigh ~1-10 against tens of queued jobs
+  elsewhere and get starved to 0 by rebalancing, defeating the pre-warm it's owed. Verified
+  by test: with heavy organic load on one endpoint pushing the fleet over the 10-worker cap,
+  a reservation-only endpoint still keeps a non-zero share (`toMax:2`) rather than 0.
+  `ProvisionShadowItem` gained a `reserved` field for audit visibility.
+  2 tests in `__tests__/provisioner.test.ts`.
+- ☐ **Pre-warm actuation (WS-C3, still open):** on a granted admission, raise `workersMin` for
+  the reserved endpoints *right now* (not just on the next 2-min sweeper tick) — write intended
+  state + `patchRunPod` when live. Flip **`RUNPOD_PROVISION_LIVE=true`** (validate the shadow
+  log first). Idle cooldown (existing 5-min) scales back after release. This is the step that
+  makes admission's `warmedEndpoints` response field actually true — today it's aspirational
+  (the *next* sweeper tick will pre-warm via C2, but nothing pre-warms synchronously on grant).
 
-**Exit:** granting a project warms its endpoints during the brain window; workers scale down
-after release/idle. `wan2-i2v` provisioned like the others.
+**Exit:** ✅ reservation-aware provisioning verified (a granted project's endpoints hold warm
+without waiting for real job traffic, and survive cap contention from other demand). **Not yet
+done:** synchronous pre-warm actuation on grant (C3) and the `RUNPOD_PROVISION_LIVE` flip.
 
 ---
 

@@ -2,6 +2,7 @@ import { DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand } from '@a
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { CatalogResolver } from '../catalog/resolver';
 import { getInflight } from '../gate/dynamo-gate';
+import { getReservedWorkersByEndpoint } from '../gate/reservation-gate';
 import { isInternalRung } from './router';
 import type { JobItem, ProvisionShadowItem, Queue, RunPodEndpointItem } from '../types';
 
@@ -27,7 +28,10 @@ export const ENDPOINTS: Array<{ counterKey: string; endpointId: string }> = [
   { counterKey: 'runpod:wan2-i2v',       endpointId: 'nd7wloyvj09xwy' },
 ];
 
-interface Demand { inflight: number; queued: number; }
+// `reserved` = worker-units committed by active admission-gate reservations for
+// this endpoint (§WS-C2) — a project the gatekeeper has granted but that hasn't
+// submitted any real jobs yet still needs its pool held warm.
+interface Demand { inflight: number; queued: number; reserved: number; }
 interface Plan {
   counterKey: string;
   endpointId: string;
@@ -43,26 +47,41 @@ interface Plan {
  * mode — records the scale decision it *would* make without touching RunPod.
  */
 export async function runProvisioner(): Promise<Plan[]> {
-  const queued = await gatherQueuedByEndpoint();
+  const [queued, reservedWorkers] = await Promise.all([
+    gatherQueuedByEndpoint(),
+    getReservedWorkersByEndpoint(),
+  ]);
   const now = Date.now();
 
   // 1. Raw demand + a first-pass desired workersMax per endpoint.
   const plans: Plan[] = [];
   for (const ep of ENDPOINTS) {
     const inflight = await getInflight(ep.counterKey);
-    const demand: Demand = { inflight, queued: queued[ep.counterKey] ?? 0 };
+    const reserved = reservedWorkers[ep.counterKey] ?? 0;
+    const demand: Demand = { inflight, queued: queued[ep.counterKey] ?? 0, reserved };
     const state = await readEndpoint(ep.counterKey, ep.endpointId);
     const total = demand.inflight + demand.queued;
+
+    // Combine organic (live job) sizing with the admission gate's reservation
+    // commitment via max, not sum — a reservation's promised workers and the
+    // jobs it eventually submits describe the SAME demand, so summing them
+    // would double-count once its SFN starts running. Whichever signal is
+    // larger — real traffic or a still-unrealized reservation — wins.
+    const organicWorkers = total > 0 ? Math.max(1, Math.ceil(total / JOBS_PER_WORKER)) : 0;
+    const effectiveWorkers = Math.max(organicWorkers, reserved);
 
     let toMax = BASELINE_MAX;
     let toMin = 0;
     let reason = 'idle';
-    if (total > 0) {
-      toMax = Math.max(1, Math.ceil(total / JOBS_PER_WORKER));
+    if (effectiveWorkers > 0) {
+      toMax = effectiveWorkers;
       toMin = 1;                       // pre-warm: keep at least one worker up while there's work
-      reason = state.workersMax === 0 || state.workersMin === 0 ? 'prewarm' : 'scale-up';
+      reason = reserved > organicWorkers
+        ? (state.workersMax === 0 ? 'reservation-prewarm' : 'reservation-hold')
+        : (state.workersMax === 0 || state.workersMin === 0 ? 'prewarm' : 'scale-up');
     } else {
-      // Demand is zero — only scale to zero once the cooldown has elapsed.
+      // No organic demand AND no active reservation — only scale to zero once
+      // the cooldown has elapsed.
       const busyRecently = state.lastBusyAt && now - state.lastBusyAt < COOLDOWN_MS;
       if (busyRecently) {
         toMax = Math.max(state.workersMax, BASELINE_MAX);
@@ -80,13 +99,13 @@ export async function runProvisioner(): Promise<Plan[]> {
   }
 
   // 2. Rebalance to respect the shared account cap (sum of workersMax ≤ cap),
-  //    proportional to each endpoint's demand share.
+  //    proportional to each endpoint's demand share (organic + reserved).
   rebalanceUnderCap(plans);
 
   // 3. Persist intended state + record the shadow decision. (Live mode would
   //    additionally PATCH rest.runpod.io here.)
   for (const p of plans) {
-    const busy = p.demand.inflight + p.demand.queued > 0;
+    const busy = p.demand.inflight + p.demand.queued + p.demand.reserved > 0;
     await writeEndpoint(p, busy ? now : undefined);
     if (p.toMin !== p.fromMin || p.toMax !== p.fromMax) {
       await writeShadow(p, now);
@@ -100,15 +119,26 @@ export async function runProvisioner(): Promise<Plan[]> {
   return plans;
 }
 
+/**
+ * Weight for proportional cap allocation, in job-count units. `reserved` is
+ * worker-units, so it's converted through JOBS_PER_WORKER to stay comparable
+ * with inflight+queued — otherwise a reservation-only endpoint (organic demand
+ * still zero) would weigh ~1-10 against others' tens of queued jobs and get
+ * starved down by rebalancing, defeating the pre-warm it's owed.
+ */
+function demandWeight(p: Plan): number {
+  return p.demand.inflight + p.demand.queued + p.demand.reserved * JOBS_PER_WORKER;
+}
+
 /** Clamp total workersMax across endpoints to ACCOUNT_CAP, demand-weighted. */
 function rebalanceUnderCap(plans: Plan[]): void {
   const sum = plans.reduce((a, p) => a + p.toMax, 0);
   if (sum <= ACCOUNT_CAP) return;
 
-  const totalDemand = plans.reduce((a, p) => a + p.demand.inflight + p.demand.queued, 0);
+  const totalDemand = plans.reduce((a, p) => a + demandWeight(p), 0);
   let allocated = 0;
   for (const p of plans) {
-    const d = p.demand.inflight + p.demand.queued;
+    const d = demandWeight(p);
     // At least 1 for any endpoint with demand; otherwise proportional share.
     const share = totalDemand > 0
       ? Math.max(d > 0 ? 1 : 0, Math.floor((d / totalDemand) * ACCOUNT_CAP))
@@ -120,8 +150,7 @@ function rebalanceUnderCap(plans: Plan[]): void {
   // Hand any leftover headroom to the hungriest endpoint.
   let leftover = ACCOUNT_CAP - allocated;
   if (leftover > 0) {
-    const sorted = [...plans].sort(
-      (a, b) => (b.demand.inflight + b.demand.queued) - (a.demand.inflight + a.demand.queued));
+    const sorted = [...plans].sort((a, b) => demandWeight(b) - demandWeight(a));
     for (const p of sorted) {
       if (leftover <= 0) break;
       p.toMax += 1; leftover -= 1;
@@ -211,7 +240,7 @@ async function writeShadow(p: Plan, now: number): Promise<void> {
     counterKey: p.counterKey, endpointId: p.endpointId, reason: p.reason,
     fromWorkersMax: p.fromMax, toWorkersMax: p.toMax,
     fromWorkersMin: p.fromMin, toWorkersMin: p.toMin,
-    queued: p.demand.queued, inflight: p.demand.inflight, timestamp: now,
+    queued: p.demand.queued, inflight: p.demand.inflight, reserved: p.demand.reserved, timestamp: now,
   };
   await db.send(new PutItemCommand({ TableName: TABLE, Item: marshall(item) }));
 }

@@ -91,11 +91,21 @@ circuit opens (no regression from the internal-first bias). Failure-inject one e
 **C1. ✅ DONE — Add `runpod:wan2-i2v`** to `provisioner.ts` `ENDPOINTS` (4 endpoints share the
 cap; `rebalanceUnderCap` already handles N). Also exported `gatherQueuedByEndpoint` and a new
 `getEndpointWorkersMax(counterKey)` for WS-D's admission math to reuse.
-**C2. Reservation-aware demand.** *(Still open.)* Fold active-reservation worker commitments
-into `runProvisioner()` demand so pre-warmed pools aren't scaled down before the SFN arrives.
-Note: admission's own grant/defer decision (WS-D) already accounts for other active
-reservations independently — this task is specifically about the provisioner's organic
-scaling loop seeing the same commitment, so the two don't drift apart.
+**C2. ✅ DONE — Reservation-aware demand.** `runProvisioner()` now folds active reservations'
+committed worker share into its own sizing: `effectiveWorkers = max(organicWorkers, reserved)`
+per endpoint (max, not sum — a reservation's promise and the jobs it eventually submits are
+the same demand, so summing would double-count once its SFN starts running). A
+reservation-only endpoint (zero live inflight/queued) now pre-warms (`toMin:1`,
+reason `reservation-prewarm`/`reservation-hold`) instead of scaling to zero, and
+`rebalanceUnderCap`'s proportional-share weighting was extended (`demandWeight()`,
+`reserved × JOBS_PER_WORKER` to stay unit-comparable with job counts) so a reservation-only
+endpoint isn't starved to 0 when organic demand elsewhere pushes the fleet over the cap —
+verified by test with hand-derived numbers (flux-tts-s2t keeps `toMax:2` despite qwen-image-gen's
+heavy live traffic taking `toMax:8` of the 10-worker cap). Reservation persistence was
+extracted from `admission.ts` into `src/gate/reservation-gate.ts` (mirrors `dynamo-gate.ts`)
+so the provisioner can read `getReservedWorkersByEndpoint()` without an
+`admission.ts` ↔ `provisioner.ts` import cycle. `ProvisionShadowItem` gained a `reserved`
+field for observability. 2 new tests in `__tests__/provisioner.test.ts`; 33/33 suite-wide.
 **C3. Go LIVE + pre-warm-on-grant.** Validate the shadow log, flip `RUNPOD_PROVISION_LIVE=true`;
 on a granted admission raise `workersMin` for reserved endpoints immediately. Idle cooldown
 scales back after release. *(Admission already reports `warmedEndpoints` in its response —
@@ -150,7 +160,8 @@ workers; reservation releases and workers scale down.
 
 **Milestone M3 — premium + ramp.**
 WS-A3 (premium SF) + B1/C1 (wan2) + E1 (consumption/balance). Premium narration E2E through the
-gate; ramp MCP % behind `ADMISSION_ENABLED`; move cap 10→20 when proven. Later: split
+gate; ramp MCP % (remove `ADMISSION_STUB` from staging, roll to production traffic gradually);
+move cap 10→20 when proven. Later: split
 `flux-tts-s2t` (Flux→qwen-image-gen endpoint; keep TTS+BGM+SRT together).
 Exit: premium narration E2E; ramped batch traffic; runway alerting.
 
@@ -165,12 +176,12 @@ Exit: premium narration E2E; ramped batch traffic; runway alerting.
    correction found during implementation).
 3. **WS-A1/A2** — StoryStudio wires narration-basic to QM-new; run the first E2E (M1).
    *(Still open — StoryStudio-side.)*
-4. **WS-C2** — fold active reservations into `runProvisioner()`'s own demand, so the two
-   capacity views (admission's decision math and the provisioner's organic scaling) don't
-   silently diverge. Natural next QM-side step now that both D2 and C1 exist.
+4. ✅ **WS-C2** — active reservations now fold into `runProvisioner()`'s own demand (done —
+   see §3 WS-C above). The two capacity views (admission's decision math and the
+   provisioner's organic scaling) now share one signal via `getReservedWorkersByEndpoint()`.
 5. **WS-C3** — go live: flip `RUNPOD_PROVISION_LIVE=true` and wire admission's grant response
-   (`warmedEndpoints`) into an actual `workersMin` raise. Depends on C2 landing first so the
-   pre-warm doesn't get clawed back by the sweeper before the SFN's jobs arrive.
+   (`warmedEndpoints`) into an actual `workersMin` raise. Now unblocked — C2 landed, so a
+   pre-warmed pool won't get clawed back by the sweeper before the SFN's jobs arrive.
 
 ---
 

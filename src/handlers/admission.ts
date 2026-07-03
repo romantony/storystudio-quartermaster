@@ -1,15 +1,14 @@
 import { randomUUID } from 'crypto';
-import {
-  AttributeValue, DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand, ScanCommand, UpdateItemCommand,
-} from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, QueryCommand } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { getInflight } from '../gate/dynamo-gate';
+import {
+  getReservationByRequestId, listActiveReservations, releaseReservation, saveReservation,
+} from '../gate/reservation-gate';
 import { projectAssetLoad } from '../shared/assetLoad';
 import type { AssetLoad } from '../shared/assetLoad';
 import { ENDPOINTS, gatherQueuedByEndpoint, getEndpointWorkersMax } from './provisioner';
-import type {
-  BaselineItem, LambdaFunctionUrlEvent, LambdaFunctionUrlResponse, ReservationItem,
-} from '../types';
+import type { BaselineItem, LambdaFunctionUrlEvent, LambdaFunctionUrlResponse, ReservationItem } from '../types';
 
 /**
  * Quartermaster as Gatekeeper — project admission (§D2 of
@@ -22,9 +21,12 @@ import type {
  * past a fleet-protection ceiling, and otherwise returns an honest ETA rather than
  * admitting into an overloaded queue.
  *
- * Live worker provisioning on grant (pre-warm) is a separate step (WS-C3, not yet
- * wired here) — this module only decides + reserves; `warmedEndpoints` in the
- * response names the endpoints a future pre-warm call should target.
+ * Reservation persistence lives in ../gate/reservation-gate.ts (shared with the
+ * capacity manager — see provisioner.ts's reservation-aware demand, §WS-C2).
+ * Live worker provisioning on grant (pre-warm actuation) is a separate step
+ * (WS-C3, not yet wired here) — this module only decides + reserves;
+ * `warmedEndpoints` in the response names the endpoints a future pre-warm call
+ * should target.
  */
 
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
@@ -121,41 +123,10 @@ export async function handleAdmissionRelease(evt: LambdaFunctionUrlEvent): Promi
   if (!admissionId) return json(400, { error: 'admissionId required' });
   const body = parseBody<{ outcome?: string }>(evt) ?? {};
 
-  const reservation = await getReservationByAdmissionId(admissionId);
-  if (!reservation) return json(404, { released: false, error: 'not found' });
-
-  if (reservation.status === 'active') {
-    await db.send(new UpdateItemCommand({
-      TableName: TABLE,
-      Key: marshall({ pk: reservation.pk, sk: 'META' }),
-      UpdateExpression: 'SET #s = :released, releasedAt = :now, outcome = :o',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: marshall({ ':released': 'released', ':now': Date.now(), ':o': body.outcome ?? 'unknown' }),
-    }));
-  }
+  const result = await releaseReservation(admissionId, body.outcome);
+  if (result.notFound) return json(404, { released: false, error: 'not found' });
   // Idempotent: already released/expired still reports released:true.
   return json(200, { released: true });
-}
-
-// ─── Sweeper hook ─────────────────────────────────────────────────────────────
-
-/** Expire active reservations past their TTL. Called from the 2-min sweeper. */
-export async function expireStaleReservations(): Promise<{ expired: number }> {
-  const now = Date.now();
-  const active = await listActiveReservations();
-  let expired = 0;
-  for (const r of active) {
-    if (r.expiresAt >= now) continue;
-    await db.send(new UpdateItemCommand({
-      TableName: TABLE,
-      Key: marshall({ pk: r.pk, sk: 'META' }),
-      UpdateExpression: 'SET #s = :expired',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: marshall({ ':expired': 'expired' }),
-    }));
-    expired++;
-  }
-  return { expired };
 }
 
 // ─── Decision ──────────────────────────────────────────────────────────────────
@@ -245,7 +216,7 @@ function retryAfterSeconds(drainMs: number): number {
   return Math.min(RETRY_MAX_S, Math.max(RETRY_MIN_S, Math.round(drainMs / 1000 / 3)));
 }
 
-// ─── Reservation persistence ────────────────────────────────────────────────────
+// ─── Grant ─────────────────────────────────────────────────────────────────────
 
 async function grant(
   body: AdmissionRequest, load: AssetLoad, neededWorkers: Record<string, number>, drainEstMs: number,
@@ -261,52 +232,8 @@ async function grant(
     status: 'active', drainEstMs,
     createdAt: now, expiresAt: now + BRAIN_WINDOW_MS + drainEstMs + RESERVATION_BUFFER_MS,
   };
-
-  await db.send(new PutItemCommand({ TableName: TABLE, Item: marshall(reservation, { removeUndefinedValues: true }) }));
-  await db.send(new PutItemCommand({
-    TableName: TABLE,
-    Item: marshall({ pk: `RESERVATIONREQ#${body.requestId}`, sk: 'META', admissionId }, { removeUndefinedValues: true }),
-  }));
+  await saveReservation(reservation);
   return reservation;
-}
-
-async function getReservationByRequestId(requestId: string): Promise<ReservationItem | null> {
-  const ptr = await db.send(new GetItemCommand({
-    TableName: TABLE, Key: marshall({ pk: `RESERVATIONREQ#${requestId}`, sk: 'META' }),
-  }));
-  if (!ptr.Item) return null;
-  const { admissionId } = unmarshall(ptr.Item) as { admissionId: string };
-  return getReservationByAdmissionId(admissionId);
-}
-
-async function getReservationByAdmissionId(admissionId: string): Promise<ReservationItem | null> {
-  const r = await db.send(new GetItemCommand({
-    TableName: TABLE, Key: marshall({ pk: `RESERVATION#${admissionId}`, sk: 'META' }),
-  }));
-  return r.Item ? (unmarshall(r.Item) as ReservationItem) : null;
-}
-
-/**
- * Active reservations are few (concurrent MCP projects, not per-asset jobs), so a
- * filtered Scan is cheap — mirrors the existing LEASE# reclaim pattern in
- * src/gate/dynamo-gate.ts. `RESERVATION#` never matches the `RESERVATIONREQ#`
- * pointer items (the character after "RESERVATION" differs: '#' vs 'R').
- */
-async function listActiveReservations(): Promise<ReservationItem[]> {
-  const items: ReservationItem[] = [];
-  let lastKey: Record<string, AttributeValue> | undefined;
-  do {
-    const result = await db.send(new ScanCommand({
-      TableName: TABLE,
-      FilterExpression: 'begins_with(pk, :pfx) AND #s = :active',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: marshall({ ':pfx': 'RESERVATION#', ':active': 'active' }),
-      ExclusiveStartKey: lastKey,
-    }));
-    for (const raw of result.Items ?? []) items.push(unmarshall(raw) as ReservationItem);
-    lastKey = result.LastEvaluatedKey as Record<string, AttributeValue> | undefined;
-  } while (lastKey);
-  return items;
 }
 
 function grantedResponse(r: ReservationItem) {

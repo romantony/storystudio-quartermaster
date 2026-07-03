@@ -350,6 +350,7 @@ export interface ProvisionShadowItem {
   toWorkersMin: number;
   queued: number;
   inflight: number;
+  reserved: number;       // worker-units committed by active admission-gate reservations (§WS-C2)
   timestamp: number;
 }
 

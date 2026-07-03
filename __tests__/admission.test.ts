@@ -8,7 +8,8 @@ jest.mock('@aws-sdk/client-dynamodb', () => {
 });
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-import { handleAdmission, handleAdmissionRelease, expireStaleReservations } from '../src/handlers/admission';
+import { handleAdmission, handleAdmissionRelease } from '../src/handlers/admission';
+import { expireStaleReservations } from '../src/gate/reservation-gate';
 import type { LambdaFunctionUrlEvent } from '../src/types';
 
 const cmdName = (c: unknown) => (c as { constructor: { name: string } }).constructor.name;
