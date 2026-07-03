@@ -57,7 +57,7 @@ New types in `src/types.ts`: `ReservationItem`, `BaselineItem`. (`MeteringItem` 
 
 ---
 
-## 2. Phase 1 — Projected-load module + gen-time baselines  *(no behavior change, ship first)*
+## 2. Phase 1 — Projected-load module + gen-time baselines  ✅ **DONE**  *(no behavior change, ship first)*
 
 **Why first:** admission's ETA is only as good as the baselines; and this phase is pure
 telemetry — zero risk to the live path.
@@ -72,58 +72,100 @@ telemetry — zero risk to the live path.
   - `complete()` → `genMs = now − processingStartedAt`; upsert `BASELINE#{counterKey}` /
     `{assetType}.{tier}.{operation}` with EWMA (`ewma = α·genMs + (1−α)·ewma`, α≈0.2), bump
     `samples`, track `p95` (approx). Skip on cache hits.
-- **Seed** priors (from §10 open item, else conservative defaults) so ETAs work on day one.
-- **Tests:** `__tests__/assetLoad.test.ts` (load math at 90/300/600, both tiers);
-  `__tests__/baseline.test.ts` (EWMA convergence, first-sample seed).
+- **Seed** priors — sourced from real measured warm-inference figures in
+  `/home/roman-antony/runpod/API.md` (flux-tts-s2t ≈12.5s blended, qwen-image-gen 8s,
+  qwen-image-edit 15s, wan2-i2v 92s), not guesses. Closes the earlier "baseline seed" open item.
+- **Tests:** `__tests__/assetLoad.test.ts` (load math, both tiers, unsupported types).
+  EWMA convergence covered indirectly via `__tests__/admission.test.ts`'s baseline-driven
+  defer case; no standalone `baseline.test.ts` yet (executor's `recordBaseline` is
+  integration-shaped — would need a fuller executor harness than exists today).
 
-**Exit:** `BASELINE#*` rows populate from real jobs; `projectAssetLoad()` unit-tested.
+**Exit:** `projectAssetLoad()` unit-tested; `recordBaseline()` wired into `executor.ts`'s two
+completion paths (sync + polled). Baselines are unpopulated until real jobs run — admission
+falls back to the seeds above until then.
 
 ---
 
-## 3. Phase 2 — `POST /admission` + `/release` + reservation-aware capacity  *(flagged)*
+## 3. Phase 2 — `POST /admission` + `/release` + reservation-aware capacity  ✅ **DONE** *(flagged)*
 
 - **Routes in `src/handlers/api.ts`** (gateway-key section, next to `/jobs`):
   - `POST /admission` → `handleAdmission(evt)`
   - `POST /admission/{admissionId}/release` → `handleAdmissionRelease(evt)`
-- **`src/handlers/admission.ts`** (new) — decision logic:
-  1. Validate `{requestId, projectType, tier, durationSeconds, userId?}`.
-  2. **Idempotency:** if `RESERVATION#{requestId}` exists and not expired → return its decision.
+- **`src/handlers/admission.ts`** — decision logic actually implemented:
+  1. Validate `{requestId, projectType, tier, durationSeconds, userId?}` → 400 if missing;
+     400 if `projectType` unsupported (`projectAssetLoad().supported === false`).
+  2. **Idempotency:** a pointer item `RESERVATIONREQ#{requestId}` → `admissionId` resolves to
+     the primary `RESERVATION#{admissionId}` record; if `status:active` and unexpired, its
+     decision is returned unchanged (no re-decision, verified by test).
   3. `load = projectAssetLoad(...)`.
-  4. Per endpoint the project needs: read `inflight` (`getInflight`), `queued`
-     (`gatherQueuedByEndpoint`), `committedWorkers` (sum active reservations), `ewmaMs`
-     (baseline, weighted over the endpoint's asset mix).
-  5. `headroom = ACCOUNT_CAP − Σ committedWorkers`. **No-TAT decision:** grant if the endpoint
-     can be given a worker share within `headroom` **and** projected drain stays under the
-     **fleet-protection ceiling** (`ADMISSION_MAX_DRAIN_MS`); else **defer**. Big loads
-     serialize per endpoint (an endpoint already committed to another project defers the next).
-  6. **Grant:** write `RESERVATION#{requestId}` (`status:active`, dynamic `expiresAt`),
-     return `{decision:"granted", admissionId, expiresAt, warmedEndpoints, estimatedReadySeconds}`.
-     **Defer:** return `{decision:"deferred", reason, estimatedWaitSeconds, retryAfterSeconds}`
-     (`estimatedWaitSeconds = (backlog+committed)·ewma ÷ workers`).
-  7. **Release:** mark reservation `released` → frees committed workers immediately.
-- **Flag:** `ADMISSION_ENABLED`. When off (or `ADMISSION_STUB=granted`), always return
-  `granted` so StoryStudio can integrate against the wire shape before the math lands.
-- **Sweeper (`handleSweeper`)**: expire `status:active` reservations past `expiresAt` →
-  `status:expired`, free their workers (so a granted-but-never-started project can't pin the cap).
-- **Tests:** `__tests__/admission.test.ts` — grant when headroom, defer when endpoint
-  committed, idempotent re-POST, deferred ETA math, release frees workers.
+  4. Per touched endpoint: `inflight` (`getInflight`), `queued` (`gatherQueuedByEndpoint`,
+     exported from `provisioner.ts`), `workersMax` (`getEndpointWorkersMax`, new export),
+     `ewmaMs` (average of `BASELINE#{counterKey}` rows, seed fallback), plus **other active
+     reservations'** `perEndpointJobs`/`neededWorkers` for that same endpoint (so a second
+     granted-but-not-yet-started project on a hot endpoint is accounted for, not just live
+     `inflight`/`queued`).
+  5. **Worker sizing correction (caught during implementation):** sizing must use the
+     project's **peak concurrency**, not its lifetime job total — a narration-basic project's
+     82 total jobs ÷ `JOBS_PER_WORKER=4` ≈ 21 workers would alone exceed the entire account cap,
+     which is wrong. Concurrency is bounded by the SFN Map's `MaxConcurrency=15`
+     (`pipeline-stack.ts`), so `neededWorkers = ceil(min(frameCount,15) / JOBS_PER_WORKER)` —
+     e.g. a 20-frame basic project needs ~4 workers, matching the account cap's real documented
+     split in `runpod/API.md` (`flux-tts-s2t:5, qwen-image-edit:2, wan2:2, qwen-image-gen:1`).
+     Drain/ETA still correctly uses the full job total amortized over those workers.
+  6. **Decision:** two independent checks — (a) fleet-wide worker cap (`Σ workersMax` vs
+     `Σ other-reservations’ workers`, whichever is larger, plus this project's need, vs
+     `ACCOUNT_CAP`) and (b) per-endpoint drain vs `ADMISSION_MAX_DRAIN_MS` (fleet-protection
+     ceiling, not a deadline). `reason` is `cap_committed` / `queue_busy` / `fleet_saturated`
+     depending on which check(s) fail. **Verified:** a solo narration-premium project (3
+     endpoints × ~4 workers = 12 > cap 10) correctly defers with `cap_committed` even against
+     an otherwise-empty fleet — this is expected/documented behavior (premium defers sooner),
+     not a bug.
+  7. **Grant:** writes `RESERVATION#{admissionId}` (`status:active`, dynamic
+     `expiresAt = now + brainWindow + drainEstMs + buffer`) + the requestId pointer; returns
+     `{decision:"granted", admissionId, expiresAt, warmedEndpoints, estimatedReadySeconds}`.
+     `warmedEndpoints` names the endpoints a future pre-warm call (WS-C3) should target — no
+     actual RunPod PATCH happens yet, by design (kept separate from WS-C3).
+  8. **Defer:** `{decision:"deferred", reason, estimatedWaitSeconds, retryAfterSeconds}`
+     (`retryAfterSeconds` is a fraction of the ETA, clamped, so the cron re-checks sooner than
+     the full worst-case wait).
+  9. **Release:** `POST /admission/{admissionId}/release` flips `status→released`; idempotent
+     (already-released or unknown-but-existing returns `released:true`); 404 only if the
+     admissionId was never granted.
+- **Flag:** implemented as **`ADMISSION_STUB=granted`** only (no separate `ADMISSION_ENABLED` —
+  unset env means real decision logic runs immediately; the stub is purely for StoryStudio to
+  integrate against the wire shape without depending on capacity state).
+- **Sweeper (`handleSweeper` in `api.ts`)**: calls `expireStaleReservations()` — scans
+  `status:active` reservations past `expiresAt` → `status:expired`, freeing their committed
+  worker share from subsequent decisions. Result surfaced as `reservationsExpired` in the
+  sweeper's response, alongside the existing `provisioning` shadow-audit.
+- **Tests:** `__tests__/admission.test.ts` (11 cases) — validation 400s, grant on an empty
+  fleet, defer on cap contention (the premium 12-vs-10 case), defer on a drain-ceiling
+  breach with cap headroom, idempotent re-POST (asserts only lookup calls fire, no
+  re-decision), `ADMISSION_STUB` bypass, release (fresh/idempotent/404), reservation expiry.
+  31/31 across the full suite; `tsc --noEmit` clean.
 
-**Exit:** grant/deferred/release correct against a stubbed fleet; StoryStudio integrating.
+**Exit:** ✅ grant/deferred/release verified against a mocked DynamoDB fleet, including the
+worker-sizing correction. **Not yet done:** live pre-warm on grant (WS-C3, deliberately out of
+scope here), reservation-aware demand folded into the provisioner's own scaling (WS-C2), and
+real end-to-end validation against StoryStudio's integration (needs their WS-A wiring).
 
 ---
 
 ## 4. Phase 3 — Proactive live pre-warm + `wan2-i2v` wiring
 
-- **Catalog (`background.json`)** — repoint `video.premium.i2v` from KIE → **runpod primary**:
-  `{ provider:"runpod", model:"wan-2.2-i2v", mode:"i2v", endpointId:"nd7wloyvj09xwy",
-     endpoint:"v2/nd7wloyvj09xwy", counterKey:"runpod:wan2-i2v", routingMode:"direct",
-     lane:"video", fixed:{resolution:"480p"} }` then Replicate `fb:true`. (When the premium
-  QM-new machine lands, add the `video.narrationPremium.i2v` key too.)
-- **Provisioner `ENDPOINTS`** — add `{ counterKey:"runpod:wan2-i2v", endpointId:"nd7wloyvj09xwy" }`
-  (4 endpoints now share the cap; `rebalanceUnderCap` already handles N).
-- **Reservation-aware demand:** in `runProvisioner()`, add each active reservation's
-  `perEndpoint.workers` to that endpoint's demand so a pre-warmed pool isn't scaled down before
-  the SFN arrives, and reservations count toward the cap.
+- ✅ **Catalog (`background.json`)** — `video.premium.i2v` repointed to **runpod primary**
+  (`endpointId nd7wloyvj09xwy`, `counterKey runpod:wan2-i2v`, `lane video`, 480p) → Replicate
+  `fb:true` (KIE rung dropped per the confirmed fallback). Adapter gained the missing `i2v`
+  mode case (`runpod.ts`) — the repoint alone would've hit the `default` fallthrough. (When the
+  premium QM-new machine lands, add the `video.narrationPremium.i2v` key too.)
+- ✅ **Provisioner `ENDPOINTS`** — `runpod:wan2-i2v` added (4 endpoints now share the cap;
+  `rebalanceUnderCap` already handles N).
+- ☐ **Reservation-aware demand** — **not yet done.** `runProvisioner()`'s own demand
+  (`gatherQueuedByEndpoint` + `getInflight`) doesn't yet add active reservations' committed
+  worker share, so a pre-warmed pool could still be scaled down by the sweeper before the SFN's
+  jobs land. Admission's own decision math (§3) already accounts for other reservations when
+  deciding grant/defer — this gap is specifically about the *provisioner's* organic scaling
+  loop not yet seeing that same commitment.
 - **Pre-warm on grant:** on a granted admission, raise `workersMin` for the reserved endpoints
   now (write intended state + `patchRunPod` when live). Flip **`RUNPOD_PROVISION_LIVE=true`**
   (validate the shadow log first). Idle cooldown (existing 5-min) scales back after release.
@@ -166,18 +208,25 @@ after release/idle. `wan2-i2v` provisioned like the others.
 
 ## 7. Env / config summary
 
+**Implemented** (`src/handlers/admission.ts`):
+
 | Var | Purpose | Default |
 |---|---|---|
-| `ADMISSION_ENABLED` | master flag for the gate | off |
-| `ADMISSION_STUB` | `granted` → always grant (StoryStudio integration) | unset |
-| `ADMISSION_MAX_DRAIN_MS` | fleet-protection ceiling (defer above this) | tune (~30 min) |
-| `RUNPOD_ACCOUNT_CAP` | shared worker cap | 10 (→20) |
-| `RUNPOD_PROVISION_LIVE` | shadow → live PATCH for pre-warm | unset (shadow) |
-| `BASELINE_EWMA_ALPHA` | gen-time smoothing | 0.2 |
-| existing: `JOBS_PER_WORKER`, `RUNPOD_SCALEDOWN_COOLDOWN_MS`, `SAFE_LIMIT`, lease TTLs | — | — |
+| `ADMISSION_STUB` | `granted` → always grant, skip capacity math (StoryStudio integration) | unset (real logic runs) |
+| `ADMISSION_MAX_DRAIN_MS` | fleet-protection ceiling (defer above this) | 1,800,000 (30 min) |
+| `ADMISSION_MAP_CONCURRENCY` | worker-sizing concurrency cap, mirrors the SFN Map's `MaxConcurrency` | 15 |
+| `ADMISSION_BRAIN_WINDOW_MS` | added to reservation TTL for Convex's script/frame/prompt phase | 180,000 (3 min) |
+| `ADMISSION_RESERVATION_BUFFER_MS` | extra slack added to reservation TTL | 300,000 (5 min) |
+| `ADMISSION_ESTIMATED_READY_MS` | reported `estimatedReadySeconds` on grant (no live pre-warm yet — see Phase 3) | 210,000 |
+| `ADMISSION_RETRY_MIN_SECONDS` / `ADMISSION_RETRY_MAX_SECONDS` | clamp on deferred `retryAfterSeconds` | 60 / 600 |
+| `RUNPOD_ACCOUNT_CAP` | shared worker cap (same var provisioner already reads) | 10 (→20) |
+| `RUNPOD_JOBS_PER_WORKER` | jobs-per-worker sizing constant (same var provisioner already reads) | 4 |
+| `BASELINE_EWMA_ALPHA` | gen-time smoothing (`executor.ts` `recordBaseline`) | 0.2 |
 
-No new infra stack — routes ride the existing API Lambda; the sweeper schedule already exists.
-SDK (`sdk/typescript/src/client.ts`) optionally gains `admit()` / `releaseAdmission()` helpers.
+**Not yet added:** `RUNPOD_PROVISION_LIVE` flip (Phase 3 — pre-warm on grant isn't wired to
+this module yet, deliberately). No new infra stack — routes ride the existing API Lambda; the
+sweeper schedule already exists. SDK (`sdk/typescript/src/client.ts`) optionally gains
+`admit()` / `releaseAdmission()` helpers (not done — StoryStudio calls the HTTP contract directly).
 
 ---
 

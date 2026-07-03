@@ -83,6 +83,16 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
     if (method === 'POST' && path === '/jobs') return handleIngest(evt);
     if (method === 'GET' && path.startsWith('/jobs/')) return handleStatus(evt);
 
+    // ── Admission gate (Gatekeeper role) ─────────────────────────────────────
+    if (method === 'POST' && path === '/admission') {
+      const { handleAdmission } = await import('./admission');
+      return handleAdmission(evt);
+    }
+    if (method === 'POST' && path.match(/^\/admission\/[^/]+\/release$/)) {
+      const { handleAdmissionRelease } = await import('./admission');
+      return handleAdmissionRelease(evt);
+    }
+
     return json(404, { error: 'Not found' });
   } catch (err) {
     console.error('[api] unhandled error', err);
@@ -144,7 +154,15 @@ async function handleSweeper(): Promise<LambdaFunctionUrlResponse> {
     return [];
   });
 
-  const result = { ...jobs, leasesReclaimed: leases.reclaimed, counter, provisioning };
+  // Expire admission reservations past their TTL (granted-but-never-started
+  // projects shouldn't pin fleet capacity forever).
+  const { expireStaleReservations } = await import('./admission');
+  const reservations = await expireStaleReservations().catch(e => {
+    console.error('[sweeper] reservation expiry error', e);
+    return { expired: 0 };
+  });
+
+  const result = { ...jobs, leasesReclaimed: leases.reclaimed, counter, provisioning, reservationsExpired: reservations.expired };
   console.info('[sweeper] result', result);
   return json(200, result);
 }

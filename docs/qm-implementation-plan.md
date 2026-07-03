@@ -54,12 +54,12 @@ every 2 min) · `QMDashboardStack` (admin SPA) · `QMPipelineStack` (`QM-broker-
 | Role | Status | What's there | What's missing |
 |---|---|---|---|
 | **1 QM-New SF** | **Built (test rig), unvalidated** | `E2E-VideoGenerationPipeline-QM-new` (`pipeline-stack.ts` `buildQmNewDefinition`/`qmFrameAssetsMap`): per-frame image(t2i/i2i)→TTS→Flux animate→Flux merge → concat → Whisper SRT → finalize | Not wired to StoryStudio's narration-basic MCP flow; no E2E validation; **premium** QM-new not built |
-| **2 Orchestrator** | **Built, working** | `QM-generate` (`POST /jobs`+poll), `executor` (ladder resolve, internal-first, circuit breaker, fallback), `catalog/background.json`, adapters (runpod/kie/replicate); modelslab decommissioned | `wan2-i2v` not repointed to RunPod; **UI-backfill** routing policy not implemented; DR-fallback path not regression-tested post-changes |
-| **3 Capacity Manager** | **Built, SHADOW mode** | `provisioner.ts` in `/sweeper`: per-endpoint demand → workers, prewarm, scale-to-zero, cap rebalance; audits decisions | `RUNPOD_PROVISION_LIVE` off (never PATCHes); only 3 endpoints (no `wan2-i2v`); not reservation-aware; no pre-warm-on-grant hook |
-| **4 Gatekeeper** | **Not built** | — | Everything: `assetLoad` module, gen-time baselines, `POST /admission`+`/release`, reservation state, wait-time estimation (see role-4 sub-plan) |
+| **2 Orchestrator** | **Built, working** | `QM-generate` (`POST /jobs`+poll), `executor` (ladder resolve, internal-first, circuit breaker, fallback), `catalog/background.json`, adapters (runpod/kie/replicate); modelslab decommissioned; `video.premium.i2v` now RunPod Wan2 primary → Replicate fallback | **UI-backfill** routing policy not implemented; DR-fallback path not regression-tested post-changes |
+| **3 Capacity Manager** | **Built, SHADOW mode** | `provisioner.ts` in `/sweeper`: per-endpoint demand → workers, prewarm, scale-to-zero, cap rebalance; audits decisions; 4th endpoint `runpod:wan2-i2v` added | `RUNPOD_PROVISION_LIVE` off (never PATCHes); **not reservation-aware** (admission's reservations aren't folded into `runProvisioner()`'s demand yet); no pre-warm-on-grant hook |
+| **4 Gatekeeper** | **Decision logic built, not live-integrated** | `src/shared/assetLoad.ts`; gen-time baselines captured in `executor.ts` (seeded from real `runpod/API.md` figures); `POST /admission` + `/admission/{id}/release` in `admission.ts`, wired into `api.ts` + the sweeper; reservation state (`RESERVATION#`/`RESERVATIONREQ#`); grant/defer/idempotency/expiry — 11 tests passing | No live pre-warm on grant (by design, deferred to align with WS-C3); StoryStudio not yet calling it; no real-traffic validation |
 
-**Cross-cutting gaps:** no per-asset gen-time baselines (executor records none); no
-consumption/balance runway signal.
+**Cross-cutting gaps:** consumption/balance runway signal not built (baselines now exist, but
+no `MeteringItem` writer or balance-runway alert yet).
 
 ---
 
@@ -78,9 +78,9 @@ TTS → **Wan2 i2v** (not Flux animate/merge) → concat → SRT → finalize; a
 `video.narrationPremium.i2v` ladder key. Validate E2E.
 
 ### WS-B — Orchestrator (role 2)
-**B1. Repoint `video.premium.i2v` → RunPod Wan2** (`background.json`): runpod primary
+**B1. ✅ DONE — Repoint `video.premium.i2v` → RunPod Wan2** (`background.json`): runpod primary
 `endpointId nd7wloyvj09xwy`, `counterKey runpod:wan2-i2v`, `lane video`, Replicate `fb:true`.
-*(Can start immediately; also needed by WS-A3 and WS-C1.)*
+Adapter gained the `i2v` mode case it needed (`src/adapters/runpod.ts`).
 **B2. Internal-first + UI-backfill policy.** Formalize: batch (reserved) runs internal; **UI
 asset requests backfill internal only when the queue is lean**, else external; batch always
 precedes UI on internal. Encode as an executor/router admission check on `jobType`/priority.
@@ -88,25 +88,34 @@ precedes UI on internal. Encode as an executor/router admission check on `jobTyp
 circuit opens (no regression from the internal-first bias). Failure-inject one endpoint.
 
 ### WS-C — Capacity Manager (role 3)
-**C1. Add `runpod:wan2-i2v`** to `provisioner.ts` `ENDPOINTS` (4 endpoints share the cap;
-`rebalanceUnderCap` already handles N).
-**C2. Reservation-aware demand.** Fold active-reservation worker commitments into
-`runProvisioner()` demand so pre-warmed pools aren't scaled down before the SFN arrives, and
-reservations count toward the cap.
+**C1. ✅ DONE — Add `runpod:wan2-i2v`** to `provisioner.ts` `ENDPOINTS` (4 endpoints share the
+cap; `rebalanceUnderCap` already handles N). Also exported `gatherQueuedByEndpoint` and a new
+`getEndpointWorkersMax(counterKey)` for WS-D's admission math to reuse.
+**C2. Reservation-aware demand.** *(Still open.)* Fold active-reservation worker commitments
+into `runProvisioner()` demand so pre-warmed pools aren't scaled down before the SFN arrives.
+Note: admission's own grant/defer decision (WS-D) already accounts for other active
+reservations independently — this task is specifically about the provisioner's organic
+scaling loop seeing the same commitment, so the two don't drift apart.
 **C3. Go LIVE + pre-warm-on-grant.** Validate the shadow log, flip `RUNPOD_PROVISION_LIVE=true`;
 on a granted admission raise `workersMin` for reserved endpoints immediately. Idle cooldown
-scales back after release.
+scales back after release. *(Admission already reports `warmedEndpoints` in its response —
+this task is the actuation that makes it real.)*
 **C4. Cap lever.** Keep `RUNPOD_ACCOUNT_CAP=10`; move to 20 once the 10-worker workflow is proven.
 
-### WS-D — Gatekeeper (role 4)  → **detailed in `qm-admission-gate-implementation-plan.md`**
-**D1.** `src/shared/assetLoad.ts` (projected load per endpoint, 90/300/600 s) + gen-time
-**baselines** captured in `executor` (`setProcessing`→`processingStartedAt`, `complete`→EWMA
-`BASELINE#{counterKey}`). *(No behavior change — ship first.)*
-**D2.** `POST /admission` + `/admission/{id}/release` in `api.ts`, `admission.ts` decision logic,
-`RESERVATION#{requestId}` (idempotent), sweeper reservation-expiry. Behind
-`ADMISSION_ENABLED` / `ADMISSION_STUB=granted`.
-**D3.** No-TAT decision: internal-first, defer-and-wait, serialize big loads under the
-fleet-protection ceiling; dynamic reservation TTL.
+### WS-D — Gatekeeper (role 4)  ✅ **decision logic built** → **detailed in `qm-admission-gate-implementation-plan.md`**
+**D1. ✅ DONE.** `src/shared/assetLoad.ts` (projected load per endpoint, duration-parameterized)
++ gen-time **baselines** captured in `executor.ts` (`recordBaseline`, EWMA into
+`BASELINE#{counterKey}`), seeded from real `runpod/API.md` warm-inference figures.
+**D2. ✅ DONE.** `POST /admission` + `/admission/{id}/release` in `api.ts` → `admission.ts`
+decision logic; `RESERVATION#{admissionId}` + `RESERVATIONREQ#{requestId}` pointer
+(idempotent); sweeper reservation-expiry. Behind `ADMISSION_STUB=granted` (no separate
+`ADMISSION_ENABLED` — real logic runs by default). **Correction made during implementation:**
+worker sizing must use peak concurrency (SFN `MaxConcurrency=15`), not lifetime job total, or
+a single basic project's 82 jobs would alone exceed the account cap — fixed and verified
+against `runpod/API.md`'s documented real worker split. 11 tests passing.
+**D3. ✅ Implemented as designed.** No-TAT decision: defer-and-wait bias, big loads serialize
+per endpoint via the fleet-protection ceiling (`ADMISSION_MAX_DRAIN_MS`, default 30 min), not
+a deadline; dynamic reservation TTL (`brainWindow + drainEstMs + buffer`).
 
 ### WS-E — Cross-cutting
 **E1. Consumption + balance runway.** Slot-seconds per endpoint → `MeteringItem`; burn vs
@@ -149,12 +158,19 @@ Exit: premium narration E2E; ramped batch traffic; runway alerting.
 
 ## 5. Immediate next actions (unblocked today)
 
-1. **WS-B1** — repoint `video.premium.i2v` to RunPod Wan2 in `background.json` (+ WS-C1 endpoint entry).
-2. **WS-D1** — `src/shared/assetLoad.ts` + baseline capture in `executor` (pure telemetry, zero risk).
+1. ✅ **WS-B1 + C1** — wan2-i2v repointed in the catalog + provisioner (done).
+2. ✅ **WS-D1 + D2** — `assetLoad`, baselines, and the full `POST /admission`/`/release`
+   decision logic are built and tested (done — see §2 above and
+   `qm-admission-gate-implementation-plan.md` for the detail, including the worker-sizing
+   correction found during implementation).
 3. **WS-A1/A2** — StoryStudio wires narration-basic to QM-new; run the first E2E (M1).
-
-These three run in parallel: A (generation path, StoryStudio-led) · D1+B1 (QM-led, no live
-impact) · nothing blocks on the still-open inputs.
+   *(Still open — StoryStudio-side.)*
+4. **WS-C2** — fold active reservations into `runProvisioner()`'s own demand, so the two
+   capacity views (admission's decision math and the provisioner's organic scaling) don't
+   silently diverge. Natural next QM-side step now that both D2 and C1 exist.
+5. **WS-C3** — go live: flip `RUNPOD_PROVISION_LIVE=true` and wire admission's grant response
+   (`warmedEndpoints`) into an actual `workersMin` raise. Depends on C2 landing first so the
+   pre-warm doesn't get clawed back by the sweeper before the SFN's jobs arrive.
 
 ---
 

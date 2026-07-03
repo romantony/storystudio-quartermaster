@@ -290,6 +290,33 @@ export interface BaselineItem {
   p95Ms?: number;     // reserved for later
 }
 
+// ─── Project admission gate (Gatekeeper role, §D2) ────────────────────────────
+
+/**
+ * A granted project-start reservation. Primary record, keyed by admissionId so
+ * `/admission/{admissionId}/release` is a direct GetItem. A small pointer item
+ * (`RESERVATIONREQ#{requestId}` → admissionId) makes `POST /admission` idempotent
+ * on retry without needing a GSI.
+ */
+export interface ReservationItem {
+  pk: string;                          // RESERVATION#{admissionId}
+  sk: 'META';
+  admissionId: string;
+  requestId: string;
+  projectType: string;
+  tier: string;
+  durationSeconds: number;
+  userId?: string;
+  neededWorkers: Record<string, number>;   // counterKey -> workers this project needs once granted
+  perEndpointJobs: Record<string, number>; // counterKey -> projected job count (drain/backlog accounting)
+  status: 'active' | 'released' | 'expired';
+  drainEstMs: number;
+  createdAt: number;
+  expiresAt: number;                   // now + brain window + drain estimate + buffer (dynamic)
+  releasedAt?: number;
+  outcome?: string;                    // "completed" | "failed", as reported by StoryStudio on release
+}
+
 // ─── RunPod endpoint provisioning state (§Pillar 2) ──────────────────────────
 
 /**

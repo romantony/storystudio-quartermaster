@@ -20,7 +20,7 @@ const db = new DynamoDBClient({});
 // The RunPod serverless endpoints QM provisions. counterKey mirrors the
 // per-endpoint semaphore in dynamo-gate; endpointId is the RunPod id from
 // /home/roman-antony/runpod/API.md.
-const ENDPOINTS: Array<{ counterKey: string; endpointId: string }> = [
+export const ENDPOINTS: Array<{ counterKey: string; endpointId: string }> = [
   { counterKey: 'runpod:flux-tts-s2t',   endpointId: 'rnqxi6c0mlq517' },
   { counterKey: 'runpod:qwen-image-gen', endpointId: 'e165se4r3eo5hp' },
   { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla' },
@@ -131,8 +131,11 @@ function rebalanceUnderCap(plans: Plan[]): void {
 
 // ─── Demand gathering ─────────────────────────────────────────────────────────
 
-/** Count QUEUED jobs per RunPod endpoint by resolving each job's internal rung. */
-async function gatherQueuedByEndpoint(): Promise<Record<string, number>> {
+/**
+ * Count QUEUED jobs per RunPod endpoint by resolving each job's internal rung.
+ * Exported for the admission gate's queue-depth/drain estimate (§D2).
+ */
+export async function gatherQueuedByEndpoint(): Promise<Record<string, number>> {
   const counts: Record<string, number> = {};
   for (const lane of ['rest', 'video']) {
     let lastKey: Record<string, unknown> | undefined;
@@ -165,6 +168,22 @@ function jobCounterKey(job: JobItem): string | undefined {
 }
 
 // ─── Endpoint state + shadow audit ───────────────────────────────────────────
+
+/**
+ * Read the currently-provisioned workersMax for one endpoint (0 if unseen).
+ * Exported for the admission gate's fleet-cap check (§D2) — organic demand-driven
+ * provisioning already reflected here is the floor the gate must respect.
+ */
+export async function getEndpointWorkersMax(counterKey: string): Promise<number> {
+  const r = await db.send(new GetItemCommand({
+    TableName: TABLE,
+    Key: marshall({ pk: 'RUNPODENDPOINT', sk: counterKey }),
+    ProjectionExpression: 'workersMax',
+  }));
+  if (!r.Item) return 0;
+  const { workersMax } = unmarshall(r.Item) as { workersMax?: number };
+  return workersMax ?? 0;
+}
 
 async function readEndpoint(counterKey: string, endpointId: string): Promise<RunPodEndpointItem> {
   const r = await db.send(new GetItemCommand({
