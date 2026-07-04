@@ -202,6 +202,44 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object 
   // The generated BGM's URL now comes from bgmResult, not a passed-in bgmUrl.
   def.States.PrepareFinalizeBasic.Parameters['bgmUrl.$'] = '$.bgmResult.cdnUrl';
 
+  // SRT via QM's self-hosted RunPod Whisper instead of the E2E-voice-srt-basic
+  // Lambda (which calls OpenAI Whisper — a 25MB upload cap that HTTP-413'd a
+  // 5-min project's 26MB concat audio and crashed the whole execution at
+  // BuildMergedVoiceResult, 2026-07-04). RunPod Whisper transcribes the audio
+  // URL on the pod, no upload limit. Catch → SkipSrt so an SRT failure degrades
+  // to "no captions" instead of failing the project (mirrors BgmGenerationFailed).
+  def.States.TranscribeAudio = {
+    Type: 'Task',
+    Resource: qmGenerateArn,
+    Comment: 'SRT via QM (srt.narration → self-hosted RunPod Whisper large-v3-turbo). Transcribes the concatenated-audio URL on the pod — no OpenAI 25MB upload limit.',
+    Parameters: {
+      assetType: 'srt',
+      tier: 'narration',        // resolves to srt.narration (no per-tier srt rung)
+      operation: 'transcribe',
+      product: 'narration',
+      queue: 'background',
+      jobType: 'batch',
+      'audioUrl.$': '$.concatenatedVideo.audioUrl',
+      'projectId.$': '$.projectId',
+    },
+    ResultPath: '$.transcribeResult',
+    TimeoutSeconds: 650,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.transcribeError', Next: 'SkipSrt' }],
+    Next: 'BuildMergedVoiceResult',
+  };
+  def.States.SkipSrt = {
+    Type: 'Pass',
+    Comment: 'SRT generation failed — proceed without captions rather than failing the whole project (graceful, mirrors BgmGenerationFailed).',
+    Parameters: { cdnUrl: '' },
+    ResultPath: '$.transcribeResult',
+    Next: 'BuildMergedVoiceResult',
+  };
+  // QM-generate returns the SRT URL as `cdnUrl` (not `srtUrl`); remap. Empty on
+  // SkipSrt → downstream finalize simply burns no captions.
+  def.States.BuildMergedVoiceResult.Parameters['srtUrl.$'] = '$.transcribeResult.cdnUrl';
+  def.States.BuildMergedVoiceResult.Parameters['captionsUrl.$'] = '$.transcribeResult.cdnUrl';
+
   return def;
 }
 
