@@ -162,7 +162,15 @@ async function handleSweeper(): Promise<LambdaFunctionUrlResponse> {
     return { expired: 0 };
   });
 
-  const result = { ...jobs, leasesReclaimed: leases.reclaimed, counter, provisioning, reservationsExpired: reservations.expired };
+  // Re-dispatch canonical jobs sitting QUEUED — either re-queued for capacity
+  // (internal endpoint was full; a slot may have freed since) or a missed inline
+  // dispatch. The executor claims each atomically, so double-dispatch is safe.
+  const redispatched = await redispatchQueuedCanonical().catch(e => {
+    console.error('[sweeper] redispatch error', e);
+    return 0;
+  });
+
+  const result = { ...jobs, leasesReclaimed: leases.reclaimed, counter, provisioning, reservationsExpired: reservations.expired, redispatched };
   console.info('[sweeper] result', result);
   return json(200, result);
 }
@@ -271,6 +279,38 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
   if (isNew) await dispatchExecutor(input.requestId, jobId);
 
   return json(202, { jobId, requestId: input.requestId, status: 'QUEUED' });
+}
+
+/**
+ * Re-dispatch canonical (assetType-bearing) jobs stuck in QUEUED to the executor.
+ * These are jobs the executor re-queued because their internal endpoint was full
+ * (approach A — wait for a worker slot rather than spill to paid external), plus
+ * any that missed their inline dispatch. Runs every sweeper tick (~2 min); the
+ * executor's atomic claim makes re-dispatching an already-running job a no-op.
+ */
+async function redispatchQueuedCanonical(): Promise<number> {
+  let dispatched = 0;
+  for (const lane of ['video', 'rest']) {
+    let lastKey: Record<string, unknown> | undefined;
+    do {
+      const res = await db.send(new QueryCommand({
+        TableName: TABLE,
+        IndexName: 'queue-index',
+        KeyConditionExpression: '#lane = :lane',
+        FilterExpression: '#status = :q AND attribute_exists(assetType)',
+        ExpressionAttributeNames: { '#lane': 'lane', '#status': 'status' },
+        ExpressionAttributeValues: marshall({ ':lane': lane, ':q': 'QUEUED' }),
+        ExclusiveStartKey: lastKey ? marshall(lastKey) : undefined,
+      }));
+      for (const raw of res.Items ?? []) {
+        const job = unmarshall(raw) as JobItem;
+        await dispatchExecutor(job.requestId, job.jobId);
+        dispatched++;
+      }
+      lastKey = res.LastEvaluatedKey ? unmarshall(res.LastEvaluatedKey) : undefined;
+    } while (lastKey);
+  }
+  return dispatched;
 }
 
 async function dispatchExecutor(requestId: string, jobId: string): Promise<void> {

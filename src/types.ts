@@ -141,6 +141,14 @@ export interface JobItem {
   manifestRef?: string;
   assetKey?: string;
   attempts: number;
+  /**
+   * Times this job was re-queued because its internal endpoint was healthy but
+   * at capacity (all workers busy). Distinct from `attempts` — a capacity wait
+   * is NOT a failure, so it must not count toward MAX_ATTEMPTS/DEAD. Bounded by
+   * MAX_CAPACITY_WAITS in the executor, after which the job falls over to the
+   * external DR rung rather than waiting forever.
+   */
+  capacityWaits?: number;
   leaseId?: string;
   leaseExpiry?: number; // epoch ms
   platform?: string;

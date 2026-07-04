@@ -7,16 +7,22 @@ import { ADAPTERS } from '../adapters';
 import { CatalogResolver } from '../catalog/resolver';
 import { acquireSimple, releaseSimple } from '../gate/dynamo-gate';
 import { isInternalRung, rungKey, selectRungOrder } from './router';
+import { endpointWorkers } from '../shared/fleet';
 import type {
   Adapter, CircuitConfig, JobItem, ProviderConfig, ProviderTaskItem, Queue, Rung,
 } from '../types';
 
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
 const WEBHOOK_BASE = process.env.WEBHOOK_BASE_URL ?? '';
-// Soft cap / in-flight counter ceiling per RunPod endpoint. High enough that
-// batches don't block on it (RunPod's own queue absorbs concurrency); it mainly
-// feeds the routing/provisioning signal.
-const RUNPOD_ENDPOINT_LIMIT = Number(process.env.RUNPOD_ENDPOINT_LIMIT ?? 25);
+// Fallback per-endpoint concurrency for any RunPod counterKey not in the FLEET
+// table (shouldn't happen — every RunPod rung's counterKey is in fleet.ts).
+const RUNPOD_ENDPOINT_LIMIT = Number(process.env.RUNPOD_ENDPOINT_LIMIT ?? 4);
+// A healthy-but-full internal endpoint re-queues the job to wait for a worker
+// slot instead of spilling routine overflow to the paid external fallback
+// (internal-first). Bounded so a genuinely stuck endpoint can't starve a job
+// forever — past this many capacity waits (~2-min sweeper ticks) the job is
+// allowed to fall over to the external DR rung.
+const MAX_CAPACITY_WAITS = Number(process.env.MAX_CAPACITY_WAITS ?? 20);
 const POLL_INTERVAL_MS = Number(process.env.EXECUTOR_POLL_INTERVAL_MS ?? 3_000);
 const POLL_BUFFER_MS = 15_000; // stop polling this long before Lambda timeout
 
@@ -48,7 +54,15 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
     return;
   }
 
-  await setProcessing(job);
+  // Claim the job atomically (QUEUED → PROCESSING). If this fails, another
+  // invocation already owns it — a real risk now that the sweeper re-dispatches
+  // QUEUED canonical jobs (step 2), which could race the original dispatch or a
+  // second sweeper tick. Without this guard two executors would each acquire a
+  // worker slot for the same job and submit it twice.
+  if (!(await claimJob(job))) {
+    console.info('[executor] job already claimed by another invocation, skipping', event.jobId);
+    return;
+  }
 
   const resolver = CatalogResolver.forQueue((job.queue ?? 'background') as Queue);
   await hydrateSecrets(resolver.getCatalog().providers);
@@ -62,6 +76,11 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
   const ordered = await selectRungOrder(ladder, job.jobType);
   const tried = new Set(job.triedRungs ?? []);
   const cfg = resolver.getCircuitConfig();
+  // Internal-first capacity model: if a healthy internal endpoint is full, we
+  // wait for a worker slot (re-queue) rather than spill to the paid external
+  // fallback — unless the job has already waited MAX_CAPACITY_WAITS times, in
+  // which case we let it fall over (DR last resort).
+  const canWaitForCapacity = (job.capacityWaits ?? 0) < MAX_CAPACITY_WAITS;
 
   for (const rung of ordered) {
     const key = rungKey(rung);
@@ -70,12 +89,22 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
     if (await isCircuitOpen(key, cfg)) continue;      // dead endpoint (§27.4)
 
     const counterKey = rung.counterKey ?? rung.provider;
+    const internal = isInternalRung(rung);
     const limit = rung.counterKey
-      ? RUNPOD_ENDPOINT_LIMIT
+      ? endpointWorkers(counterKey)                   // per-endpoint concurrency = real pod count (fleet.ts)
       : (resolver.getProviderConfig(rung.provider)?.limit ?? 10);
 
     const acq = await acquireSimple(counterKey, limit, `job:${job.jobId}`);
-    if (!acq.granted) continue;                       // pool full → try next rung (failover)
+    if (!acq.granted) {
+      // Pool full. For a healthy internal endpoint (this rung is internal and its
+      // circuit is closed — we're past the isCircuitOpen check), don't spill to
+      // external: re-queue and let the sweeper re-dispatch when a slot frees.
+      if (internal && canWaitForCapacity) {
+        await requeueForCapacity(job);
+        return;
+      }
+      continue;                                       // external full, or wait budget spent → failover
+    }
     const leaseId = acq.leaseId!;
 
     // Mark rung tried before submitting, so a re-invoke never repeats it.
@@ -83,7 +112,6 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
     await appendTried(job, key);
 
     const adapter = ADAPTERS[rung.provider];
-    const internal = isInternalRung(rung);
 
     try {
       const rungStart = Date.now();
@@ -176,14 +204,43 @@ async function loadJob(requestId: string, jobId: string): Promise<JobItem | null
   return r.Item ? (unmarshall(r.Item) as JobItem) : null;
 }
 
-async function setProcessing(job: JobItem): Promise<void> {
+/**
+ * Atomically claim a QUEUED job (→ PROCESSING). Returns false if the job is no
+ * longer QUEUED (another executor invocation already owns it) — the caller must
+ * then abort. Idempotent-safe under the sweeper's re-dispatch of QUEUED jobs.
+ */
+async function claimJob(job: JobItem): Promise<boolean> {
+  try {
+    await db.send(new UpdateItemCommand({
+      TableName: TABLE,
+      Key: marshall({ pk: job.pk, sk: job.sk }),
+      UpdateExpression: 'SET #s = :p, updatedAt = :now',
+      ConditionExpression: '#s = :q',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: marshall({ ':p': 'PROCESSING', ':q': 'QUEUED', ':now': Date.now() }),
+    }));
+    return true;
+  } catch (err: unknown) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * Re-queue a job that found its healthy internal endpoint at capacity: PROCESSING
+ * → QUEUED, bump capacityWaits (NOT attempts — a capacity wait isn't a failure),
+ * so the next sweeper tick re-dispatches it when a worker slot frees.
+ */
+async function requeueForCapacity(job: JobItem): Promise<void> {
   await db.send(new UpdateItemCommand({
     TableName: TABLE,
     Key: marshall({ pk: job.pk, sk: job.sk }),
-    UpdateExpression: 'SET #s = :p, updatedAt = :now',
+    UpdateExpression: 'SET #s = :q, updatedAt = :now, capacityWaits = if_not_exists(capacityWaits, :zero) + :one',
     ExpressionAttributeNames: { '#s': 'status' },
-    ExpressionAttributeValues: marshall({ ':p': 'PROCESSING', ':now': Date.now() }),
+    ExpressionAttributeValues: marshall({ ':q': 'QUEUED', ':now': Date.now(), ':zero': 0, ':one': 1 }),
   }));
+  console.info('[executor] re-queued for capacity (internal endpoint full)', job.jobId,
+    `capacityWaits=${(job.capacityWaits ?? 0) + 1}`);
 }
 
 async function appendTried(job: JobItem, key: string): Promise<void> {
