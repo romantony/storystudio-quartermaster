@@ -18,18 +18,24 @@
   },
   "ladders": {
     "image.basic.t2i": [
-      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest" }
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "T2I standardized on self-hosted Flux Klein 4B (Flux-TTS-S2T mode:image) across all project types." },
+      { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.explainer.t2i": [
-      { "provider": "kie", "model": "google/nano-banana", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest",
-        "note": "Explainer videos — Google nano-banana supports text rendering in images." }
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "T2I standardized on Flux Klein 4B. NOTE: nano-banana (fb) renders in-image text better — re-promote it if explainer text rendering regresses." },
+      { "provider": "kie", "model": "google/nano-banana", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true,
+        "note": "Explainer text-in-image fallback — Google nano-banana." }
     ],
     "image.basic.i2i": [
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest" }
     ],
     "image.premium.t2i": [
-      { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
-      { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fixed": { "rendering_speed": "TURBO" } }
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "T2I standardized on self-hosted Flux Klein 4B. (Also the movie-basic image t2i via alias.)" },
+      { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true },
+      { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true, "fixed": { "rendering_speed": "TURBO" } }
     ],
     "image.premium.i2i": [
       { "provider": "kie", "model": "google/nano-banana-edit", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" },
@@ -117,7 +123,9 @@
       { "provider": "replicate","model": "bytedance/seedance-1.5-pro",                                   "routingMode": "aggregated", "lane": "video", "fb": true }
     ],
     "movie.premium.image.t2i": [
-      { "provider": "kie", "model": "nano-banana-2", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest" }
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "T2I standardized on self-hosted Flux Klein 4B. Was nano-banana-2 (higher quality, now DR fallback) — re-promote if movie-premium image quality regresses." },
+      { "provider": "kie", "model": "nano-banana-2", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "movie.premium.image.i2i": { "aliasOf": "movie.premium.image.t2i" },
     "movie.premium.video.i2v": [
