@@ -91,6 +91,11 @@
       { "provider": "runpod", "model": "flux-merge", "mode": "merge", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
         "note": "Narration Basic per-frame audio merge — Flux-TTS-S2T merge (animated video + TTS voice)." }
     ],
+    "video.narrationBasic.pipeline": [
+      { "provider": "runpod", "model": "flux-pipeline", "mode": "pipeline", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "fixed": { "effect": "ken_burns" },
+        "note": "Narration Basic one-shot per frame — Flux-TTS-S2T pipeline mode (image -> Kokoro TTS -> animate -> merge in one call, models resident in VRAM). Replaces 4 separate QM jobs/frame. caption:false + no bgm (SRT + BGM are project-level). Internal-only: no external one-shot equivalent, and basic is 100% flux-dependent anyway (animate/merge are flux-only), so no DR is lost." }
+    ],
     "video.narrationPremium.merge": { "aliasOf": "video.narrationBasic.merge" },
 
     "video.basic": [

@@ -145,6 +145,26 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
         ...attribution,
       };
     }
+    case 'pipeline': {
+      // Narration-basic one-shot: image → Kokoro TTS → animate → merge in a
+      // single call (all models resident in VRAM), replacing 4 separate QM jobs.
+      // caption:false — SRT is produced project-level (Whisper on concat audio);
+      // no bgm here — BGM is one project-level call over the whole video.
+      // reference_images only when a non-empty character ref is present (else t2i).
+      const refs = (job.initImageUrls ?? []).filter((u) => typeof u === 'string' && u.length > 0);
+      return {
+        mode: 'pipeline',
+        image_prompt: job.prompt,
+        voice_text: p.voiceText ?? '',
+        tts_engine: 'kokoro',
+        tts_voice: p.voice ?? 'am_michael',
+        effect: p.effect ?? rung.fixed?.effect ?? 'ken_burns',
+        aspect_ratio: p.aspectRatio ?? '9:16',
+        caption: false,
+        ...(refs.length ? { reference_images: refs } : {}),
+        ...attribution,
+      };
+    }
     case 'i2v': {
       // Wan2.2 I2V-A14B (4-step Lightning). Aspect ratio inherits from the
       // input image; `resolution` only sets the pixel budget. duration_s is one

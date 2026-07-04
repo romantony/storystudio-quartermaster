@@ -90,6 +90,10 @@ export interface CanonicalJobParams {
   instruct?: string;
   speaker?: string;
   language?: string;
+  // Narration-basic `pipeline` mode: the frame's narration text (voice_text) —
+  // one call does image + Kokoro TTS + animate + merge on flux-tts-s2t.
+  voiceText?: string;
+  effect?: string;
 }
 
 export interface CanonicalJob {

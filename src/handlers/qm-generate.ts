@@ -44,6 +44,8 @@ interface QMGenerateEvent {
   instruct?: string;
   speaker?: string;
   language?: string;
+  voiceText?: string;                // narration-basic `pipeline` mode: voice_text
+  effect?: string;
   initImageUrls?: string[];
   audioUrl?: string;
   // BGM only: the project's frames, used to compute the generated track's
@@ -119,6 +121,8 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
       instruct: event.instruct,
       speaker: event.speaker,
       language: event.language,
+      voiceText: event.voiceText,
+      effect: event.effect,
     },
     s3Target,
     projectId: event.projectId,
