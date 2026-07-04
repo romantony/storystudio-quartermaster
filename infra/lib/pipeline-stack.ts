@@ -621,20 +621,22 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
 }
 
 /**
- * Per-frame Map for Narration-Premium-QM-New: image (Qwen t2i, or i2i when the
- * frame carries a UI `referenceImageUrl` character) → TTS (Qwen voice-design,
- * speaker/instruct/language from execution input) → Wan2 i2v (narrationText
- * doubles as the motion prompt, matching the legacy Premium-QM convention) →
- * merge (voice onto the Wan2 video — the SAME generic Flux-TTS-S2T merge rung
+ * Per-frame Map for Narration-Premium-QM-New: image (Qwen i2i when the frame
+ * carries a UI `referenceImageUrl` character, else t2i) → Wan2 i2v (narrationText
+ * doubles as the motion prompt, matching the legacy Premium-QM convention) → TTS
+ * (Qwen voice-design, speaker/instruct/language from execution input) → merge
+ * (voice onto the Wan2 video — the SAME generic Flux-TTS-S2T merge rung
  * narration-basic uses, via the video.narrationPremium.merge alias; merge is a
  * model-agnostic audio+video mux, not tied to how the silent video was made).
+ * Video is generated right after the image — before TTS — so a failing
+ * image/video step fails the frame before spending on TTS for it.
  * Emits the item shape the concat step consumes: `videoUrl` + `frameNumber`
  * (+ `duration`, `frameId`) — identical to the Basic map's output shape.
  */
 function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
   return {
     Type: 'Map',
-    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen t2i/i2i) → TTS (Qwen voice-design) → Wan2 i2v → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency.',
+    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → Wan2 i2v → TTS (Qwen voice-design) → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency.',
     ItemsPath: '$.frames',
     MaxConcurrency: 15,
     ResultPath: '$.videoResults',
@@ -658,13 +660,13 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
         },
         CheckImageCacheResult: {
           Type: 'Choice',
-          Comment: 'Cached image → skip straight to TTS; otherwise generate the image',
+          Comment: 'Cached image → skip straight to video; otherwise generate the image',
           Choices: [{ Variable: '$.imageCacheResult.cached', BooleanEquals: true, Next: 'UseImageCache' }],
           Default: 'RouteImageGen',
         },
         UseImageCache: {
           Type: 'Pass',
-          Comment: 'Image already in S3 — use cached CDN URL, still (re)generate TTS',
+          Comment: 'Image already in S3 — use cached CDN URL, still (re)generate the video',
           Parameters: {
             'cdnUrl.$': '$.imageCacheResult.cdnUrl',
             's3Key.$': '$.imageCacheResult.s3Key',
@@ -672,7 +674,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'height.$': '$.imageCacheResult.height',
           },
           ResultPath: '$.imageResult',
-          Next: 'RouteTTS',
+          Next: 'QMGenerateVideo',
         },
         RouteImageGen: {
           Type: 'Choice',
@@ -749,8 +751,8 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
           },
           ResultPath: null,
           TimeoutSeconds: 10,
-          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.metaStoreError', Next: 'RouteTTS' }],
-          Next: 'RouteTTS',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.metaStoreError', Next: 'QMGenerateVideo' }],
+          Next: 'QMGenerateVideo',
         },
         RouteTTS: {
           Type: 'Choice',
@@ -770,7 +772,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
           Comment: 'A voiceUrl was supplied upstream — reuse it, skip TTS generation',
           Parameters: { 'cdnUrl.$': '$.voiceUrl' },
           ResultPath: '$.ttsResult',
-          Next: 'QMGenerateVideo',
+          Next: 'QMMerge',
         },
         QMGenerateTTS: {
           Type: 'Task',
@@ -795,7 +797,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
           TimeoutSeconds: 300,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'QMFrameFailed' }],
-          Next: 'QMGenerateVideo',
+          Next: 'QMMerge',
         },
         QMGenerateVideo: {
           Type: 'Task',
@@ -820,7 +822,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
           TimeoutSeconds: 420,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'QMFrameFailed' }],
-          Next: 'QMMerge',
+          Next: 'RouteTTS',
         },
         QMMerge: {
           Type: 'Task',

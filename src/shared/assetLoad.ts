@@ -7,9 +7,10 @@
  * admission math and the provisioner never drift.
  *
  * Endpoint mapping (see src/catalog/background.json + docs/qm-implementation-plan.md):
- *   runpod:flux-tts-s2t  — narration-basic image/animate/merge, all TTS, SRT, BGM
- *   runpod:qwen-image-gen — narration-premium image (t2i; i2i would hit qwen-image-edit)
- *   runpod:wan2-i2v       — narration-premium video (Wan2 i2v)
+ *   runpod:flux-tts-s2t   — narration-basic image/animate/merge, all TTS, SRT, BGM
+ *   runpod:qwen-image-edit — narration-premium image (i2i — frames carry a character
+ *                            reference image, per real usage; t2i would hit qwen-image-gen)
+ *   runpod:wan2-i2v        — narration-premium video (Wan2 i2v)
  */
 
 export const FLUX_TTS_S2T = 'runpod:flux-tts-s2t';
@@ -60,15 +61,15 @@ const LOAD_SPECS: Record<string, LoadSpec> = {
     perFrame: { [FLUX_TTS_S2T]: 4 },
     perProject: { [FLUX_TTS_S2T]: 2 },
   },
-  // Premium: image (Qwen, t2i assumed) + TTS + Wan2 i2v + a per-frame merge step
-  // (silent Wan2 video + TTS voice, on flux-tts-s2t — same generic Flux-TTS-S2T
-  // merge rung narration-basic uses, via the video.narrationPremium.merge alias)
-  // per frame, plus 1 SRT + 1 BGM for the project. i2i frames would shift the
-  // image job to qwen-image-edit; projection assumes t2i (qwen-image-gen) as the
-  // dominant case.
+  // Premium: image (Qwen i2i — frames carry a character reference image) + Wan2
+  // i2v + TTS + a per-frame merge step (silent Wan2 video + TTS voice, on
+  // flux-tts-s2t — same generic Flux-TTS-S2T merge rung narration-basic uses, via
+  // the video.narrationPremium.merge alias) per frame, plus 1 SRT + 1 BGM for the
+  // project. A reference-less frame would fall back to t2i (qwen-image-gen), but
+  // real usage is i2i-dominant, so that's what capacity is projected against.
   'narration-premium': {
     tier: 'premium',
-    perFrame: { [QWEN_IMAGE_GEN]: 1, [FLUX_TTS_S2T]: 2, [WAN2_I2V]: 1 },
+    perFrame: { [QWEN_IMAGE_EDIT]: 1, [FLUX_TTS_S2T]: 2, [WAN2_I2V]: 1 },
     perProject: { [FLUX_TTS_S2T]: 2 },
   },
 };
