@@ -46,17 +46,23 @@ export class PipelineStack extends Stack {
     // Submits a canonical job to QM and polls it to completion; QM owns provider
     // selection, internal↔external failover, and concurrency. Replaces the
     // per-asset "acquire → provider Lambda → release" cluster.
+    // Timeout must exceed QM_GENERATE_DEADLINE_MS (qm-generate.ts's own poll
+    // deadline, raised to 580s alongside this) with margin, and executor.ts's
+    // timeout (600s) must in turn be >= this Lambda's polling window, or the
+    // three layers race each other into a false timeout on a genuinely
+    // slow-but-succeeding RunPod job (confirmed live 2026-07-04, Wan2 i2v).
     const qmGenerateFn = new nodejs.NodejsFunction(this, 'QMGenerateFunction', {
       functionName: 'QM-generate',
       entry: path.join(__dirname, '../../src/handlers/qm-generate.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: Duration.seconds(300),
+      timeout: Duration.seconds(610),
       memorySize: 256,
       bundling: { minify: true, sourceMap: false, externalModules: [] },
       environment: {
         QM_BASE_URL: `https://${props.qmApiDomain}`,
         GATEWAY_STATIC_KEY_ARN: props.gatewayKeySecretArn,
+        QM_GENERATE_DEADLINE_MS: '580000',
       },
     });
     qmGenerateFn.addToRolePolicy(new iam.PolicyStatement({
@@ -638,7 +644,14 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
     Type: 'Map',
     Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → Wan2 i2v → TTS (Qwen voice-design) → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency.',
     ItemsPath: '$.frames',
-    MaxConcurrency: 15,
+    // Lower than Basic-QM-New's 15 — premium touches 3 endpoints per frame, so its
+    // worker footprint is 3x a single-endpoint project's at the same concurrency.
+    // At 15, a solo premium project alone needs 12 workers (> ACCOUNT_CAP=10),
+    // deferring forever even on a fully idle fleet. Must match
+    // admission.ts's PREMIUM_MAP_CONCURRENCY exactly — capacity planning and real
+    // SFN parallelism must agree, or under-provisioned workers meet real RunPod
+    // contention this constant was supposed to prevent.
+    MaxConcurrency: 8,
     ResultPath: '$.videoResults',
     Iterator: {
       StartAt: 'CheckImageCache',
@@ -802,7 +815,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
         QMGenerateVideo: {
           Type: 'Task',
           Resource: qmGenerateArn,
-          Comment: 'Image-to-video via QM (video.narrationPremium.i2v: self-hosted Wan 2.2 I2V-A14B 4-step Lightning → Replicate fallback). Silent MP4; narrationText doubles as the motion prompt (matches the legacy Premium-QM convention). Cold start ~170-190s, so a longer timeout than the other steps.',
+          Comment: 'Image-to-video via QM (video.narrationPremium.i2v: self-hosted Wan 2.2 I2V-A14B 4-step Lightning → Replicate fallback). Silent MP4; narrationText doubles as the motion prompt (matches the legacy Premium-QM convention). Cold start ~170-190s + real RunPod-side queue wait when a Map wave (8 concurrent) exceeds the endpoint\'s ~3 real pods — 650s gives qm-generate.ts\'s 610s Lambda timeout (itself polling to a 580s deadline) room to actually observe a slow-but-real completion instead of timing out first.',
           Parameters: {
             assetType: 'video',
             tier: 'narrationPremium',
@@ -819,7 +832,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.videoResult',
-          TimeoutSeconds: 420,
+          TimeoutSeconds: 650,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'QMFrameFailed' }],
           Next: 'RouteTTS',

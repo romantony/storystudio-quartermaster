@@ -143,13 +143,43 @@ describe('handleAdmission — grant on an empty fleet', () => {
 });
 
 describe('handleAdmission — defer on cap contention', () => {
-  it('defers a solo narration-premium project when 3-endpoint concurrency exceeds the account cap', async () => {
-    // premium touches 3 endpoints at ~4 workers each (concurrency-capped) = 12 > default cap of 10.
+  it('grants a solo narration-premium project against an idle fleet (regression: premium has its own, lower Map concurrency)', async () => {
+    // Before the 2026-07-04 fix, premium shared the basic Map's concurrency (15):
+    // ceil(min(20,15)/4)=4 workers * 3 endpoints = 12 > cap(10) — a solo premium
+    // project deferred `cap_committed` forever, even on a fully idle fleet (confirmed
+    // against real StoryStudio traffic: one request retried identically for 40+ min).
+    // Premium now uses PREMIUM_MAP_CONCURRENCY (8): ceil(min(20,8)/4)=2 * 3 = 6 <= 10.
     mockScenario({ inflight: {}, workersMax: {}, baselines: {} });
     const res = await handleAdmission(evt({
       requestId: 'r-premium', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
     }));
     expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body!);
+    expect(body.decision).toBe('granted');
+    expect([...body.warmedEndpoints].sort()).toEqual([
+      'runpod:flux-tts-s2t', 'runpod:qwen-image-edit', 'runpod:wan2-i2v',
+    ]);
+
+    const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
+    const reservationWrite = putCalls
+      .map(c => unmarshall((c[0] as any).input.Item))
+      .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
+    expect(reservationWrite).toBeDefined();
+    const totalWorkers = Object.values(reservationWrite!.neededWorkers as Record<string, number>)
+      .reduce((a, b) => a + b, 0);
+    expect(totalWorkers).toBe(6); // ceil(min(20,8)/4)=2 per endpoint * 3 endpoints
+  });
+
+  it('still defers a narration-premium project when real fleet contention pushes the total over the cap', async () => {
+    // cap_committed must still be reachable for premium — just from real organic
+    // demand elsewhere, not structurally from a solo project's own footprint.
+    // 20 inflight jobs on qwen-image-gen (unrelated to this i2i-only premium
+    // project) => ceil(20/4)=5 organic workers already committed; + this
+    // project's 6 (see the grant test above) = 11 > cap(10).
+    mockScenario({ inflight: { 'runpod:qwen-image-gen': 20 }, workersMax: {}, baselines: {} });
+    const res = await handleAdmission(evt({
+      requestId: 'r-premium-contended', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
+    }));
     const body = JSON.parse(res.body!);
     expect(body.decision).toBe('deferred');
     expect(body.reason).toBe('cap_committed');

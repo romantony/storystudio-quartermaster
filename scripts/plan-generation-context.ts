@@ -28,6 +28,10 @@ const db = new DynamoDBClient({});
 const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 10);
 const JOBS_PER_WORKER = Number(process.env.RUNPOD_JOBS_PER_WORKER ?? 4);
 const SFN_MAP_MAX_CONCURRENCY = Number(process.env.ADMISSION_MAP_CONCURRENCY ?? 15);
+// narration-premium touches 3 endpoints/frame, so it gets its own (lower) ceiling
+// — see admission.ts's PREMIUM_MAP_CONCURRENCY for the full reasoning (a solo
+// premium project at the basic ceiling of 15 alone exceeds ACCOUNT_CAP).
+const PREMIUM_MAP_CONCURRENCY = Number(process.env.ADMISSION_PREMIUM_MAP_CONCURRENCY ?? 8);
 const MAX_DRAIN_MS = Number(process.env.ADMISSION_MAX_DRAIN_MS ?? 30 * 60_000);
 
 const SEED_MS: Record<string, number> = {
@@ -128,6 +132,7 @@ async function main() {
       accountCap: ACCOUNT_CAP,
       jobsPerWorker: JOBS_PER_WORKER,
       sfnMapMaxConcurrency: SFN_MAP_MAX_CONCURRENCY,
+      premiumMapConcurrency: PREMIUM_MAP_CONCURRENCY,
       maxDrainMs: MAX_DRAIN_MS,
       totalActiveWorkersNow: totalActiveWorkers,
       headroomWorkers: ACCOUNT_CAP - totalActiveWorkers,

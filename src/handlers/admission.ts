@@ -39,6 +39,16 @@ const JOBS_PER_WORKER = Number(process.env.RUNPOD_JOBS_PER_WORKER ?? 4);
 // must be driven by this — the project's *peak concurrent* load on an endpoint —
 // not its lifetime total job count, which a single worker serves over time.
 const SFN_MAP_MAX_CONCURRENCY = Number(process.env.ADMISSION_MAP_CONCURRENCY ?? 15);
+// narration-premium touches 3 endpoints per frame (image + video + tts), so its
+// worker footprint is 3x a single-endpoint project's at the same concurrency — at
+// 15 that's ceil(15/4)*3=12, which alone exceeds ACCOUNT_CAP(10) even on a fully
+// idle fleet (confirmed live 2026-07-04: a solo premium request deferred
+// `cap_committed` for 40+ min straight against zero fleet load — it can never
+// grant at 15). Lower ONLY premium's Map concurrency (pipeline-stack.ts's
+// qmPremiumFrameAssetsMap must match this value exactly, or capacity planning
+// and real SFN parallelism diverge) so a solo project fits with headroom to
+// spare: ceil(8/4)*3=6, leaving 4 workers for concurrent traffic.
+const PREMIUM_MAP_CONCURRENCY = Number(process.env.ADMISSION_PREMIUM_MAP_CONCURRENCY ?? 8);
 // Fleet-protection ceiling (not a deadline — see module comment). Defer above this.
 const MAX_DRAIN_MS = Number(process.env.ADMISSION_MAX_DRAIN_MS ?? 30 * 60_000);
 const BRAIN_WINDOW_MS = Number(process.env.ADMISSION_BRAIN_WINDOW_MS ?? 3 * 60_000);
@@ -166,7 +176,8 @@ async function decide(load: AssetLoad): Promise<Decision> {
     // stage of a given frame is active at a time, but a slow stage can
     // accumulate up to the full Map concurrency waiting on it — conservative by
     // design.
-    const concurrentJobs = Math.min(load.frameCount, SFN_MAP_MAX_CONCURRENCY);
+    const mapConcurrency = load.tier === 'premium' ? PREMIUM_MAP_CONCURRENCY : SFN_MAP_MAX_CONCURRENCY;
+    const concurrentJobs = Math.min(load.frameCount, mapConcurrency);
     const thisNeeded = Math.max(1, Math.ceil(concurrentJobs / JOBS_PER_WORKER));
     neededWorkers[ck] = thisNeeded;
 

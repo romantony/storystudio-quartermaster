@@ -53,13 +53,19 @@ export class ApiStack extends Stack {
     };
 
     // ── Executor: execute-with-failover loop. Longer timeout for RunPod cold
-    //    starts (2.5–4 min). Invoked asynchronously by the API Lambda.
+    //    starts (2.5–4 min) AND real queue wait when a burst of concurrent jobs
+    //    (e.g. a Map wave) exceeds an endpoint's actual pod count — confirmed
+    //    live 2026-07-04: Wan2 i2v genuinely completed on RunPod, but executor's
+    //    pollInline (budget = Lambda's own getRemainingTimeInMillis(), see
+    //    POLL_BUFFER_MS in executor.ts) gave up at the old 300s ceiling first,
+    //    discarding a real success and cascading to an overwhelmed external
+    //    fallback. Invoked asynchronously by the API Lambda.
     this.executorFunction = new nodejs.NodejsFunction(this, 'ExecutorFunction', {
       functionName: 'quartermaster-executor',
       entry: path.join(__dirname, '../../src/handlers/executor.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: Duration.seconds(300),
+      timeout: Duration.seconds(600),
       memorySize: 512,
       bundling: { minify: true, sourceMap: false, externalModules: [] },
       environment: {

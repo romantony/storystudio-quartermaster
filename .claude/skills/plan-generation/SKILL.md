@@ -36,7 +36,13 @@ general fleet health check.
 2. **Reason over it, don't just repeat it back.** Compute, using the same math QM's
    own admission gate uses (`src/handlers/admission.ts`'s `decide()` — read it if you
    want the exact formula):
-   - Per touched endpoint: `workersNeeded = ceil(min(frameCount, sfnMapMaxConcurrency) / jobsPerWorker)`.
+   - Per touched endpoint: `workersNeeded = ceil(min(frameCount, mapConcurrency) / jobsPerWorker)`,
+     where `mapConcurrency` is `fleet.premiumMapConcurrency` for `narration-premium`
+     (tier `premium`) and `fleet.sfnMapMaxConcurrency` otherwise — premium touches 3
+     endpoints per frame so it gets a lower ceiling on purpose (fixed 2026-07-04:
+     at the basic ceiling of 15, a solo premium project alone needed 12 workers,
+     exceeding the account cap forever, even on a fully idle fleet — see the
+     worked example below).
    - `projectedFleetTotal = fleet.totalActiveWorkersNow + sum(workersNeeded across touched endpoints)`.
    - **Grant** if `projectedFleetTotal <= fleet.accountCap` AND no endpoint's drain
      estimate (`perEndpoint[ck] * baselineGenTimeMs[ck] / workersNeeded`, roughly)
@@ -88,17 +94,26 @@ general fleet health check.
 | `runpod:qwen-image-edit` | 2 | Qwen-Image-Edit i2i — narration-premium's real usage (character reference) |
 | `runpod:wan2-i2v` | 3 | Wan 2.2 I2V-A14B — narration-premium video |
 
-Idle floors sum to exactly `RUNPOD_ACCOUNT_CAP` (10) — this is why a solo
-`narration-premium` project (needs ~4 workers × 3 endpoints = 12) always defers on
-a cold fleet; it's not a bug (see project memory `qm-admission-gate`).
+Idle floors sum to exactly `RUNPOD_ACCOUNT_CAP` (10). Before 2026-07-04, this meant a
+solo `narration-premium` project (needs ~4 workers × 3 endpoints = 12 at the basic
+Map's concurrency of 15) always deferred on a cold fleet, forever — confirmed live: one
+real request retried identically for 40+ minutes against a fully idle fleet and would
+never have granted. **Fixed** by giving premium its own, lower Map concurrency
+(`PREMIUM_MAP_CONCURRENCY`/`premiumMapConcurrency`, default 8) — see the worked example
+below. If you ever see the old symptom again (a solo request deferring `cap_committed`
+against zero fleet load), check whether `premiumMapConcurrency` drifted out of sync
+between `admission.ts` and `pipeline-stack.ts`'s `qmPremiumFrameAssetsMap` Map
+`MaxConcurrency` — they must match exactly.
 
 ## Worked examples (both tiers, verified against a live idle fleet on 2026-07-04)
 
 **`narration-premium`, 90s** — `frameCount=18`, touches 3 endpoints (`qwen-image-edit`,
-`flux-tts-s2t`, `wan2-i2v`), `workersNeeded = ceil(min(18,15)/4) = 4` on *each*, so
-`thisProjectWorkers = 12`. Against an idle fleet (`totalActiveWorkersNow=0`):
-`12 > accountCap(10)` → **defer, `cap_committed`** — structural, not congestion; a
-solo premium project always exceeds the cap by itself today. ETA driver: Wan2 i2v at
+`flux-tts-s2t`, `wan2-i2v`). Using `premiumMapConcurrency=8` (not the basic 15):
+`workersNeeded = ceil(min(18,8)/4) = 2` on *each*, so `thisProjectWorkers = 6`. Against
+an idle fleet (`totalActiveWorkersNow=0`): `6 ≤ accountCap(10)` → **grant**, with 4
+workers of headroom left for concurrent traffic. (Before the fix, at concurrency 15,
+this was `workersNeeded=4` per endpoint → `12 > 10` → permanent `cap_committed` defer —
+the exact bug a real StoryStudio request hit on 2026-07-04.) ETA driver: Wan2 i2v at
 its real baseline (~92s/frame, not a seed — `baseline.narrationPremium` samples exist
 once premium runs for real) dominates any drain estimate once granted.
 
