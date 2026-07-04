@@ -53,8 +53,8 @@
     ],
 
     "image.narrationPremium.t2i": [
-      { "provider": "runpod", "model": "qwen-image-gen", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
-        "note": "Narration Premium image T2I — self-hosted Qwen-Image (qwen-image-gen endpoint)." },
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Premium image T2I — Flux Klein 4B on flux-tts-s2t. StoryStudio always sends a character reference (→ i2i on qwen-image-edit); reference-less premium frames (scene shots) land here rather than qwen-image-gen, which is held at 0 workers (fleet.ts). Re-point to qwen-image-gen + raise its workers only if a dedicated premium t2i model is needed." },
       { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true },
       { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true, "fixed": { "rendering_speed": "TURBO" } }
     ],
