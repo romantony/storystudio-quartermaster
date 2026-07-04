@@ -23,6 +23,13 @@ const RUNPOD_ENDPOINT_LIMIT = Number(process.env.RUNPOD_ENDPOINT_LIMIT ?? 4);
 // forever — past this many capacity waits (~2-min sweeper ticks) the job is
 // allowed to fall over to the external DR rung.
 const MAX_CAPACITY_WAITS = Number(process.env.MAX_CAPACITY_WAITS ?? 20);
+// Retry the SAME rung (same provider) this many times on a generation failure
+// before failing over to the next rung — internal-first: give the primary
+// provider a couple tries (transient 5xx/429/OOM) before spilling to the paid
+// external fallback. Inline within one invocation; bounded so total stays under
+// the Lambda timeout. A capacity-full pool still re-queues (not a retry).
+const RUNG_MAX_ATTEMPTS = Number(process.env.RUNG_MAX_ATTEMPTS ?? 2);
+const RUNG_RETRY_BACKOFF_MS = Number(process.env.RUNG_RETRY_BACKOFF_MS ?? 2_000);
 const POLL_INTERVAL_MS = Number(process.env.EXECUTOR_POLL_INTERVAL_MS ?? 3_000);
 const POLL_BUFFER_MS = 15_000; // stop polling this long before Lambda timeout
 
@@ -94,74 +101,79 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
       ? endpointWorkers(counterKey)                   // per-endpoint concurrency = real pod count (fleet.ts)
       : (resolver.getProviderConfig(rung.provider)?.limit ?? 10);
 
-    const acq = await acquireSimple(counterKey, limit, `job:${job.jobId}`);
-    if (!acq.granted) {
-      // Pool full. For a healthy internal endpoint (this rung is internal and its
-      // circuit is closed — we're past the isCircuitOpen check), don't spill to
-      // external: re-queue and let the sweeper re-dispatch when a slot frees.
-      if (internal && canWaitForCapacity) {
-        await requeueForCapacity(job);
-        return;
-      }
-      continue;                                       // external full, or wait budget spent → failover
-    }
-    const leaseId = acq.leaseId!;
-
-    // Mark rung tried before submitting, so a re-invoke never repeats it.
-    tried.add(key);
-    await appendTried(job, key);
-
     const adapter = ADAPTERS[rung.provider];
-
-    try {
-      const rungStart = Date.now();
-      const callbackUrl = internal ? undefined : `${WEBHOOK_BASE}/webhooks/${rung.provider}`;
-      const raw = await submit(adapter, job, rung, callbackUrl);
-      const result = adapter.parseSubmit(raw);
-
-      // Sync completion (provider returned URLs immediately).
-      if (result.outputUrls?.length) {
-        await complete(job, result.outputUrls[0], rung.fb);
-        await recordBaseline(rung, job, Date.now() - rungStart);
-        await releaseSimple(counterKey, leaseId);
-        if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
-        await feedCircuit(key, true, cfg);
-        return;
+    // Try the SAME rung up to RUNG_MAX_ATTEMPTS before failing over to the next
+    // one (retry the provider first, spill to fallback only after). `advance`
+    // means this rung is done trying → move to the next rung.
+    let advance = false;
+    for (let attempt = 1; attempt <= RUNG_MAX_ATTEMPTS && !advance; attempt++) {
+      const acq = await acquireSimple(counterKey, limit, `job:${job.jobId}`);
+      if (!acq.granted) {
+        // Pool full. A healthy internal endpoint (circuit closed) → don't spill to
+        // external: re-queue and let re-dispatch retry when a slot frees.
+        if (internal && canWaitForCapacity) {
+          await requeueForCapacity(job);
+          return;
+        }
+        advance = true; break;                        // external full / wait budget spent → next rung
       }
+      const leaseId = acq.leaseId!;
+      // Mark rung tried on the first attempt so a re-invoke never repeats it;
+      // in-invocation retries are governed by this loop, not triedRungs.
+      if (attempt === 1) { tried.add(key); await appendTried(job, key); }
 
-      if (internal) {
-        const url = await pollInline(adapter, result.taskRef ?? '', rung, context);
-        await releaseSimple(counterKey, leaseId);
-        // Slot freed — immediately feed the pod its next queued job at worker
-        // rate, rather than waiting up to a 2-min sweeper tick (which serializes
-        // a big backlog behind few workers far too slowly — the cause of image
-        // SFN-task timeouts observed 2026-07-04). The sweeper stays the safety net.
-        await dispatchNextForEndpoint(counterKey).catch(() => {});
-        if (url) {
-          await complete(job, url, rung.fb);
+      try {
+        const rungStart = Date.now();
+        const callbackUrl = internal ? undefined : `${WEBHOOK_BASE}/webhooks/${rung.provider}`;
+        const raw = await submit(adapter, job, rung, callbackUrl);
+        const result = adapter.parseSubmit(raw);
+
+        // Sync completion (provider returned URLs immediately).
+        if (result.outputUrls?.length) {
+          await complete(job, result.outputUrls[0], rung.fb);
           await recordBaseline(rung, job, Date.now() - rungStart);
+          await releaseSimple(counterKey, leaseId);
+          if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
           await feedCircuit(key, true, cfg);
           return;
         }
-        await feedCircuit(key, false, cfg);
-        continue; // failed / timed out → failover to next rung
-      }
 
-      // Webhook-capable external rung: hand off; webhook.ts completes/releases.
-      if (!result.taskRef) {
+        if (internal) {
+          const url = await pollInline(adapter, result.taskRef ?? '', rung, context);
+          await releaseSimple(counterKey, leaseId);
+          // Slot freed — feed the pod its next queued job at worker rate (not a
+          // 2-min sweeper tick); the sweeper stays the safety net.
+          await dispatchNextForEndpoint(counterKey).catch(() => {});
+          if (url) {
+            await complete(job, url, rung.fb);
+            await recordBaseline(rung, job, Date.now() - rungStart);
+            await feedCircuit(key, true, cfg);
+            return;
+          }
+          await feedCircuit(key, false, cfg);
+          // Generation failed — retry the SAME rung before failover.
+          if (attempt < RUNG_MAX_ATTEMPTS) { await sleep(RUNG_RETRY_BACKOFF_MS * attempt); continue; }
+          advance = true; break;                      // same-provider retries exhausted → next rung
+        }
+
+        // Webhook-capable external rung: hand off; webhook.ts completes/releases.
+        if (!result.taskRef) {
+          await releaseSimple(counterKey, leaseId);
+          await feedCircuit(key, false, cfg);
+          if (attempt < RUNG_MAX_ATTEMPTS) { await sleep(RUNG_RETRY_BACKOFF_MS * attempt); continue; }
+          advance = true; break;
+        }
+        await putProviderTask(rung.provider, result.taskRef, job, leaseId, counterKey);
+        return; // await callback (slot stays held until webhook releases it)
+      } catch (err) {
+        const httpCode = (err as { httpCode?: number }).httpCode ?? 500;
         await releaseSimple(counterKey, leaseId);
+        if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
         await feedCircuit(key, false, cfg);
-        continue;
+        console.warn('[executor] rung attempt failed', key, `attempt ${attempt}/${RUNG_MAX_ATTEMPTS}`, httpCode, (err as Error).message);
+        if (attempt < RUNG_MAX_ATTEMPTS) { await sleep(RUNG_RETRY_BACKOFF_MS * attempt); continue; }
+        advance = true; break;                        // exhausted → next rung
       }
-      await putProviderTask(rung.provider, result.taskRef, job, leaseId, counterKey);
-      return; // await callback (slot stays held until webhook releases it)
-    } catch (err) {
-      const httpCode = (err as { httpCode?: number }).httpCode ?? 500;
-      await releaseSimple(counterKey, leaseId);
-      if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
-      await feedCircuit(key, false, cfg);
-      console.warn('[executor] rung failed', key, httpCode, (err as Error).message);
-      continue; // advance to next rung
     }
   }
 

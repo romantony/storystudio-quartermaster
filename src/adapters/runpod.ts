@@ -104,10 +104,18 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
       };
     }
     case 'bgm': {
+      // ACE-Step reliably generates only ~120-180s of music; a full-length track
+      // (e.g. 366s for a 5-min project) fails or hangs, then spills to the slow
+      // KIE fallback and times out (observed 2026-07-04). Generate at most
+      // BGM_MAX_DURATION_S and let the downstream mix loop it to fill the video —
+      // background music loops fine, and the legacy preset-track path always
+      // supplied short loops that finalize looped anyway.
+      const requested = p.durationS ?? 30.0;
+      const cap = Number(process.env.BGM_MAX_DURATION_S ?? 120);
       return {
         mode: 'bgm',
         prompt: job.prompt,
-        duration_s: p.durationS ?? 30.0,
+        duration_s: Math.min(requested, cap),
         steps: 20,
         guidance: 7.0,
         ...attribution,
