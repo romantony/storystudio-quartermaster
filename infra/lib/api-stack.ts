@@ -79,6 +79,15 @@ export class ApiStack extends Stack {
       actions: ['secretsmanager:GetSecretValue'],
       resources: providerSecretArns,
     }));
+    // The executor self-invokes to pull the next QUEUED job for an endpoint the
+    // moment a worker slot frees (dispatchNextForEndpoint) — feed the pod at
+    // worker rate rather than waiting for the 2-min sweeper. Grant self-invoke
+    // via the static ARN (the function name is fixed) rather than
+    // grantInvoke(self), which wires a CloudFormation circular dependency.
+    this.executorFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['lambda:InvokeFunction'],
+      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:quartermaster-executor`],
+    }));
 
     this.apiFunction = new nodejs.NodejsFunction(this, 'ApiFunction', {
       functionName: 'quartermaster-api',

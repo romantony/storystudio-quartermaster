@@ -1,5 +1,5 @@
 import {
-  DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand,
+  DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand, UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
@@ -124,6 +124,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
         await complete(job, result.outputUrls[0], rung.fb);
         await recordBaseline(rung, job, Date.now() - rungStart);
         await releaseSimple(counterKey, leaseId);
+        if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
         await feedCircuit(key, true, cfg);
         return;
       }
@@ -131,6 +132,11 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
       if (internal) {
         const url = await pollInline(adapter, result.taskRef ?? '', rung, context);
         await releaseSimple(counterKey, leaseId);
+        // Slot freed — immediately feed the pod its next queued job at worker
+        // rate, rather than waiting up to a 2-min sweeper tick (which serializes
+        // a big backlog behind few workers far too slowly — the cause of image
+        // SFN-task timeouts observed 2026-07-04). The sweeper stays the safety net.
+        await dispatchNextForEndpoint(counterKey).catch(() => {});
         if (url) {
           await complete(job, url, rung.fb);
           await recordBaseline(rung, job, Date.now() - rungStart);
@@ -152,6 +158,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
     } catch (err) {
       const httpCode = (err as { httpCode?: number }).httpCode ?? 500;
       await releaseSimple(counterKey, leaseId);
+      if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
       await feedCircuit(key, false, cfg);
       console.warn('[executor] rung failed', key, httpCode, (err as Error).message);
       continue; // advance to next rung
@@ -202,6 +209,48 @@ async function loadJob(requestId: string, jobId: string): Promise<JobItem | null
     Key: marshall({ pk: `REQ#${requestId}`, sk: `JOB#${jobId}` }),
   }));
   return r.Item ? (unmarshall(r.Item) as JobItem) : null;
+}
+
+/** Resolve the internal endpoint counterKey a QUEUED job would route to (catalog). */
+function jobCounterKey(job: JobItem): string | undefined {
+  if (!job.assetType) return undefined;
+  const resolver = CatalogResolver.forQueue((job.queue ?? 'background') as Queue);
+  const ladder = resolver.getLadder(job.assetType, job.tier, job.operation);
+  return ladder.find(isInternalRung)?.counterKey;
+}
+
+/**
+ * A worker slot on `counterKey` just freed — immediately dispatch the oldest
+ * QUEUED job that routes to it, so a backlog drains at the pod's worker rate
+ * instead of waiting for the next 2-min sweeper tick. Dispatches ONE job; that
+ * job's own completion pulls the next, chaining through the backlog. The atomic
+ * claimJob guard makes a race with the sweeper (or a sibling release) a no-op.
+ */
+async function dispatchNextForEndpoint(counterKey: string): Promise<void> {
+  const fn = process.env.AWS_LAMBDA_FUNCTION_NAME;
+  if (!fn) return;
+  for (const lane of ['video', 'rest']) {
+    const res = await db.send(new QueryCommand({
+      TableName: TABLE,
+      IndexName: 'queue-index',
+      KeyConditionExpression: '#lane = :lane',
+      FilterExpression: '#status = :q AND attribute_exists(assetType)',
+      ExpressionAttributeNames: { '#lane': 'lane', '#status': 'status' },
+      ExpressionAttributeValues: marshall({ ':lane': lane, ':q': 'QUEUED' }),
+    })); // queue-index sorts by enqueueSeq → oldest first
+    for (const raw of res.Items ?? []) {
+      const j = unmarshall(raw) as JobItem;
+      if (jobCounterKey(j) === counterKey) {
+        const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
+        await new LambdaClient({}).send(new InvokeCommand({
+          FunctionName: fn,
+          InvocationType: 'Event',
+          Payload: Buffer.from(JSON.stringify({ requestId: j.requestId, jobId: j.jobId })),
+        }));
+        return; // one dispatch; its completion pulls the next
+      }
+    }
+  }
 }
 
 /**
