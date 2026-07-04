@@ -188,12 +188,25 @@ const canonicalJobSchema = z.object({
   initImageUrls: z.array(z.string()).optional(),
   audioUrl: z.string().optional(),
   dependsOn: z.array(z.string()).optional(),
+  // Must mirror CanonicalJobParams (types.ts) — zod strips unknown keys, so any
+  // param missing here is silently dropped on ingest. That's what broke the
+  // narration-basic `pipeline` rung (voiceText → empty voice_text → pod error)
+  // and had been quietly defaulting premium TTS's speaker/instruct/language.
   params: z.object({
     aspectRatio: z.string().optional(),
     resolution: z.string().optional(),
     durationS: z.number().optional(),
     generateAudio: z.boolean().optional(),
     voice: z.string().optional(),
+    width: z.string().optional(),
+    height: z.string().optional(),
+    voiceUrl: z.string().optional(),
+    voiceTranscript: z.string().optional(),
+    instruct: z.string().optional(),
+    speaker: z.string().optional(),
+    language: z.string().optional(),
+    voiceText: z.string().optional(),
+    effect: z.string().optional(),
   }).default({}),
   s3Target: z.string(),
   manifestRef: z.string().optional(),
