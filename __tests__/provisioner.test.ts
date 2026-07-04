@@ -158,15 +158,17 @@ describe('prewarmEndpoints — immediate pre-warm on grant (WS-C3)', () => {
     const endpointWrite = putCalls
       .map(c => unmarshall((c[0] as any).input.Item))
       .find(item => item.pk === 'RUNPODENDPOINT' && item.sk === 'runpod:flux-tts-s2t');
-    expect(endpointWrite?.workersMin).toBe(1);
+    expect(endpointWrite?.workersMin).toBe(4); // all workers warmed on grant (fleet.ts cost model)
     expect(endpointWrite?.workersMax).toBe(4);
     expect(fetchMock).not.toHaveBeenCalled(); // LIVE unset -> shadow only
   });
 
   it('skips an endpoint already at or above the target — no redundant write', async () => {
-    mockScenario({ endpointState: { 'runpod:flux-tts-s2t': { workersMin: 1, workersMax: 6 } } });
+    // Already warm at min 4 (all workers) and max 6 — a prewarm of 4 asks for
+    // nothing higher, so no write.
+    mockScenario({ endpointState: { 'runpod:flux-tts-s2t': { workersMin: 4, workersMax: 6 } } });
 
-    await prewarmEndpoints({ 'runpod:flux-tts-s2t': 4 }); // 4 <= already-provisioned 6
+    await prewarmEndpoints({ 'runpod:flux-tts-s2t': 4 }); // min 4 <= 4, max 4 <= 6
 
     const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
     expect(putCalls).toHaveLength(0);
@@ -194,6 +196,6 @@ describe('prewarmEndpoints — immediate pre-warm on grant (WS-C3)', () => {
     expect(url).toContain('nd7wloyvj09xwy'); // wan2-i2v's endpointId
     expect(opts.method).toBe('PATCH');
     expect(opts.headers.Authorization).toBe('Bearer test-runpod-key');
-    expect(JSON.parse(opts.body)).toEqual({ workersMin: 1, workersMax: 2 });
+    expect(JSON.parse(opts.body)).toEqual({ workersMin: 2, workersMax: 2 }); // all requested workers warmed
   });
 });

@@ -152,7 +152,11 @@ export async function prewarmEndpoints(neededWorkers: Record<string, number>): P
     if (!ep || workers <= 0) continue;
 
     const state = await readEndpoint(counterKey, ep.endpointId);
-    const toMin = Math.max(state.workersMin, 1);
+    // Warm ALL the endpoint's workers on grant (not just 1) — the project's Map
+    // wave hits every worker at once, so a single warm worker + N cold ones would
+    // still pay N cold starts as jobs land. Scale-to-zero when the pipeline empties
+    // is what keeps this from wasting GPU (fleet.ts cost principle).
+    const toMin = Math.max(state.workersMin, workers);
     const toMax = Math.max(state.workersMax, workers);
     if (toMin === state.workersMin && toMax === state.workersMax) continue; // already sufficient
 
@@ -217,7 +221,21 @@ function rebalanceUnderCap(plans: Plan[]): void {
  * Exported for the admission gate's queue-depth/drain estimate (§D2).
  */
 export async function gatherQueuedByEndpoint(): Promise<Record<string, number>> {
-  const counts: Record<string, number> = {};
+  return (await gatherQueuedDetailed()).byEndpoint;
+}
+
+/**
+ * Scan QUEUED canonical jobs once, bucketing by resolved internal endpoint AND
+ * by `${endpoint}#${operation}`. The admission gate needs per-operation depth
+ * (basic watches merge-only backlog on flux) as well as per-endpoint depth
+ * (premium watches all of wan2). One scan feeds both.
+ */
+export async function gatherQueuedDetailed(): Promise<{
+  byEndpoint: Record<string, number>;
+  byEndpointOp: Record<string, number>;
+}> {
+  const byEndpoint: Record<string, number> = {};
+  const byEndpointOp: Record<string, number> = {};
   for (const lane of ['rest', 'video']) {
     let lastKey: Record<string, unknown> | undefined;
     do {
@@ -233,12 +251,17 @@ export async function gatherQueuedByEndpoint(): Promise<Record<string, number>> 
       for (const raw of res.Items ?? []) {
         const job = unmarshall(raw) as JobItem;
         const ck = jobCounterKey(job);
-        if (ck) counts[ck] = (counts[ck] ?? 0) + 1;
+        if (!ck) continue;
+        byEndpoint[ck] = (byEndpoint[ck] ?? 0) + 1;
+        if (job.operation) {
+          const opKey = `${ck}#${job.operation}`;
+          byEndpointOp[opKey] = (byEndpointOp[opKey] ?? 0) + 1;
+        }
       }
       lastKey = res.LastEvaluatedKey ? unmarshall(res.LastEvaluatedKey) : undefined;
     } while (lastKey);
   }
-  return counts;
+  return { byEndpoint, byEndpointOp };
 }
 
 function jobCounterKey(job: JobItem): string | undefined {

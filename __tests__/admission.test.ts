@@ -37,6 +37,7 @@ interface Scenario {
   activeReservations?: unknown[];         // pre-marshalled-friendly plain objects
   existingByRequestId?: { admissionId: string } | null;
   existingReservation?: unknown | null;
+  queuedJobs?: Array<Record<string, unknown>>; // QUEUED canonical jobs (queue-index scan)
 }
 
 function mockScenario(s: Scenario) {
@@ -72,7 +73,11 @@ function mockScenario(s: Scenario) {
     }
 
     if (name === 'QueryCommand') {
-      if (cmd.input.IndexName === 'queue-index') return { Items: [] }; // queued=0 everywhere by default
+      if (cmd.input.IndexName === 'queue-index') {
+        const lane = valuesOf(cmd)[':lane'];
+        const jobs = (s.queuedJobs ?? []).filter(j => j.lane === lane);
+        return { Items: jobs.map(j => marshall(j, { removeUndefinedValues: true })) };
+      }
       const vals = valuesOf(cmd);
       if (typeof vals[':pk'] === 'string' && vals[':pk'].startsWith('BASELINE#')) {
         const ck = vals[':pk'].slice('BASELINE#'.length);
@@ -137,18 +142,13 @@ describe('handleAdmission — grant on an empty fleet', () => {
       .map(c => unmarshall((c[0] as any).input.Item))
       .find(item => item.pk === 'RUNPODENDPOINT' && item.sk === 'runpod:flux-tts-s2t');
     expect(endpointWrite).toBeDefined();
-    expect(endpointWrite!.workersMin).toBeGreaterThanOrEqual(1); // pre-warmed, not left cold
-    expect(endpointWrite!.workersMax).toBeGreaterThanOrEqual(4); // concurrency-sized (§D2 correction)
+    expect(endpointWrite!.workersMin).toBe(4); // all workers warmed on grant (fleet.ts)
+    expect(endpointWrite!.workersMax).toBe(4); // flux static ceiling
   });
 });
 
-describe('handleAdmission — defer on cap contention', () => {
-  it('grants a solo narration-premium project against an idle fleet (regression: premium has its own, lower Map concurrency)', async () => {
-    // Before the 2026-07-04 fix, premium shared the basic Map's concurrency (15):
-    // ceil(min(20,15)/4)=4 workers * 3 endpoints = 12 > cap(10) — a solo premium
-    // project deferred `cap_committed` forever, even on a fully idle fleet (confirmed
-    // against real StoryStudio traffic: one request retried identically for 40+ min).
-    // Premium now uses PREMIUM_MAP_CONCURRENCY (8): ceil(min(20,8)/4)=2 * 3 = 6 <= 10.
+describe('handleAdmission — grant premium on an empty fleet', () => {
+  it('grants a solo narration-premium project and pre-warms all workers of its 3 endpoints', async () => {
     mockScenario({ inflight: {}, workersMax: {}, baselines: {} });
     const res = await handleAdmission(evt({
       requestId: 'r-premium', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
@@ -165,42 +165,62 @@ describe('handleAdmission — defer on cap contention', () => {
       .map(c => unmarshall((c[0] as any).input.Item))
       .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
     expect(reservationWrite).toBeDefined();
-    const totalWorkers = Object.values(reservationWrite!.neededWorkers as Record<string, number>)
-      .reduce((a, b) => a + b, 0);
-    expect(totalWorkers).toBe(6); // ceil(min(20,8)/4)=2 per endpoint * 3 endpoints
-  });
-
-  it('still defers a narration-premium project when real fleet contention pushes the total over the cap', async () => {
-    // cap_committed must still be reachable for premium — just from real organic
-    // demand elsewhere, not structurally from a solo project's own footprint.
-    // 20 inflight jobs on qwen-image-gen (unrelated to this i2i-only premium
-    // project) => ceil(20/4)=5 organic workers already committed; + this
-    // project's 6 (see the grant test above) = 11 > cap(10).
-    mockScenario({ inflight: { 'runpod:qwen-image-gen': 20 }, workersMax: {}, baselines: {} });
-    const res = await handleAdmission(evt({
-      requestId: 'r-premium-contended', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
-    }));
-    const body = JSON.parse(res.body!);
-    expect(body.decision).toBe('deferred');
-    expect(body.reason).toBe('cap_committed');
-    expect(body.retryAfterSeconds).toBeGreaterThan(0);
-    expect(body.estimatedWaitSeconds).toBeGreaterThan(0);
+    const nw = reservationWrite!.neededWorkers as Record<string, number>;
+    // Static fleet worker counts (fleet.ts): flux 4 + qwen-edit 2 + wan2 4 = 10.
+    expect(nw['runpod:wan2-i2v']).toBe(4);
+    expect(nw['runpod:qwen-image-edit']).toBe(2);
+    expect(nw['runpod:flux-tts-s2t']).toBe(4);
   });
 });
 
-describe('handleAdmission — defer on queue-depth ceiling', () => {
-  it('defers when the endpoint baseline makes drain exceed the fleet-protection ceiling, even with cap headroom', async () => {
-    // Cap is fine (basic needs ~4 workers), but an absurdly high baseline blows the 30-min drain ceiling.
-    mockScenario({
-      inflight: {}, workersMax: {},
-      baselines: { 'runpod:flux-tts-s2t': [10_000_000] }, // 10,000s per job
-    });
+describe('handleAdmission — defer on the bottleneck gate', () => {
+  it('defers narration-premium when the wan2-i2v backlog exceeds its gate (>8)', async () => {
+    // 9 queued i2v jobs on wan2 (its dedicated endpoint) > gateMax 8 → defer.
+    const wan2Jobs = Array.from({ length: 9 }, (_, i) => ({
+      lane: 'video', status: 'QUEUED', requestId: `q${i}`, jobId: `q${i}`,
+      assetType: 'video', tier: 'narrationPremium', operation: 'i2v', queue: 'background',
+    }));
+    mockScenario({ inflight: {}, workersMax: {}, baselines: {}, queuedJobs: wan2Jobs });
     const res = await handleAdmission(evt({
-      requestId: 'r-slow', projectType: 'narration-basic', tier: 'basic', durationSeconds: 100,
+      requestId: 'r-premium-busy', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
     }));
     const body = JSON.parse(res.body!);
     expect(body.decision).toBe('deferred');
-    expect(body.reason).toBe('queue_busy');
+    expect(body.reason).toBe('endpoint_busy');
+    expect(body.retryAfterSeconds).toBeGreaterThan(0);
+  });
+
+  it('defers narration-basic when the merge backlog exceeds its gate (>9)', async () => {
+    // 10 queued merge jobs on flux (per-operation gate) > gateMax 9 → defer.
+    // Other flux operations (image/tts/animate) do NOT count toward the merge gate.
+    const mergeJobs = Array.from({ length: 10 }, (_, i) => ({
+      lane: 'video', status: 'QUEUED', requestId: `m${i}`, jobId: `m${i}`,
+      assetType: 'video', tier: 'narrationBasic', operation: 'merge', queue: 'background',
+    }));
+    mockScenario({ inflight: {}, workersMax: {}, baselines: {}, queuedJobs: mergeJobs });
+    const res = await handleAdmission(evt({
+      requestId: 'r-basic-busy', projectType: 'narration-basic', tier: 'basic', durationSeconds: 100,
+    }));
+    const body = JSON.parse(res.body!);
+    expect(body.decision).toBe('deferred');
+    expect(body.reason).toBe('endpoint_busy');
+  });
+
+  it('defers when MAX_ACTIVE_PROJECTS (2) are already admitted, regardless of backlog', async () => {
+    const now = Date.now();
+    const activeReservations = [1, 2].map(i => ({
+      pk: `RESERVATION#a${i}`, sk: 'META', admissionId: `a${i}`, requestId: `a${i}`,
+      projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
+      neededWorkers: {}, perEndpointJobs: {}, status: 'active',
+      drainEstMs: 300_000, createdAt: now, expiresAt: now + 900_000,
+    }));
+    mockScenario({ inflight: {}, workersMax: {}, baselines: {}, activeReservations });
+    const res = await handleAdmission(evt({
+      requestId: 'r-third', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
+    }));
+    const body = JSON.parse(res.body!);
+    expect(body.decision).toBe('deferred');
+    expect(body.reason).toBe('max_projects');
   });
 });
 

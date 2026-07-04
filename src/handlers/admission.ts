@@ -1,13 +1,13 @@
 import { randomUUID } from 'crypto';
 import { DynamoDBClient, QueryCommand } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
-import { getInflight } from '../gate/dynamo-gate';
 import {
   getReservationByRequestId, listActiveReservations, releaseReservation, saveReservation,
 } from '../gate/reservation-gate';
 import { projectAssetLoad } from '../shared/assetLoad';
 import type { AssetLoad } from '../shared/assetLoad';
-import { ENDPOINTS, gatherQueuedByEndpoint, getEndpointWorkersMax, prewarmEndpoints } from './provisioner';
+import { MAX_ACTIVE_PROJECTS, PROJECT_FLEET, endpointWorkers } from '../shared/fleet';
+import { gatherQueuedDetailed, prewarmEndpoints } from './provisioner';
 import type { BaselineItem, LambdaFunctionUrlEvent, LambdaFunctionUrlResponse, ReservationItem } from '../types';
 
 /**
@@ -32,24 +32,8 @@ import type { BaselineItem, LambdaFunctionUrlEvent, LambdaFunctionUrlResponse, R
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
 const db = new DynamoDBClient({});
 
-const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 10);
-const JOBS_PER_WORKER = Number(process.env.RUNPOD_JOBS_PER_WORKER ?? 4);
-// Per-frame Map concurrency in the QM-new / Basic-QM SFNs (pipeline-stack.ts
-// GenerateImages / qmFrameAssetsMap both use MaxConcurrency:15). Worker sizing
-// must be driven by this — the project's *peak concurrent* load on an endpoint —
-// not its lifetime total job count, which a single worker serves over time.
-const SFN_MAP_MAX_CONCURRENCY = Number(process.env.ADMISSION_MAP_CONCURRENCY ?? 15);
-// narration-premium touches 3 endpoints per frame (image + video + tts), so its
-// worker footprint is 3x a single-endpoint project's at the same concurrency — at
-// 15 that's ceil(15/4)*3=12, which alone exceeds ACCOUNT_CAP(10) even on a fully
-// idle fleet (confirmed live 2026-07-04: a solo premium request deferred
-// `cap_committed` for 40+ min straight against zero fleet load — it can never
-// grant at 15). Lower ONLY premium's Map concurrency (pipeline-stack.ts's
-// qmPremiumFrameAssetsMap must match this value exactly, or capacity planning
-// and real SFN parallelism diverge) so a solo project fits with headroom to
-// spare: ceil(8/4)*3=6, leaving 4 workers for concurrent traffic.
-const PREMIUM_MAP_CONCURRENCY = Number(process.env.ADMISSION_PREMIUM_MAP_CONCURRENCY ?? 8);
-// Fleet-protection ceiling (not a deadline — see module comment). Defer above this.
+// Fleet-protection ceiling — used only as a fallback ETA when active reservations
+// carry no drain estimate; the gate itself (fleet.ts) is what paces admission now.
 const MAX_DRAIN_MS = Number(process.env.ADMISSION_MAX_DRAIN_MS ?? 30 * 60_000);
 const BRAIN_WINDOW_MS = Number(process.env.ADMISSION_BRAIN_WINDOW_MS ?? 3 * 60_000);
 const RESERVATION_BUFFER_MS = Number(process.env.ADMISSION_RESERVATION_BUFFER_MS ?? 5 * 60_000);
@@ -84,7 +68,7 @@ interface AdmissionRequest {
 
 type Decision =
   | { kind: 'granted'; neededWorkers: Record<string, number>; drainEstMs: number }
-  | { kind: 'deferred'; reason: 'cap_committed' | 'queue_busy' | 'fleet_saturated'; drainMs: number };
+  | { kind: 'deferred'; reason: 'max_projects' | 'endpoint_busy' | 'unsupported'; drainMs: number };
 
 // ─── POST /admission ──────────────────────────────────────────────────────────
 
@@ -142,101 +126,65 @@ export async function handleAdmissionRelease(evt: LambdaFunctionUrlEvent): Promi
 // ─── Decision ──────────────────────────────────────────────────────────────────
 
 /**
- * No-TAT admission decision (see module comment). For each endpoint this project
- * would use, estimates drain time from live inflight/queued state PLUS the
- * projected job/worker load already committed by other active reservations
- * (jobs not yet enqueued but already promised) — this is what lets big loads
- * "serialize per endpoint" instead of piling in. Separately checks whether
- * granting would push the fleet-wide worker total over the account cap.
+ * Queue-gate admission (simplified model agreed with StoryStudio 2026-07-04, see
+ * src/shared/fleet.ts). Two rules, no worker-sizing math:
+ *
+ *   1. At most MAX_ACTIVE_PROJECTS admitted at once — the shared flux-tts-s2t
+ *      endpoint means we don't run more than a couple projects concurrently.
+ *   2. Admit only when the project type's *bottleneck* endpoint backlog is at or
+ *      under its gate (premium: wan2 <= 8; basic: merge <= 9). Backlog = live
+ *      QUEUED jobs on that endpoint (per-op for basic's merge) PLUS the
+ *      not-yet-submitted load of freshly-granted reservations (younger than the
+ *      brain window — their jobs haven't hit the queue yet, so counting the live
+ *      queue alone would let a 2nd project slip in while the gate only *looks*
+ *      clear). This self-paces: admit -> the gate endpoint fills -> the next
+ *      request defers until it drains back under the gate.
+ *
+ * On grant, all workers of the touched endpoints are pre-warmed (fleet.ts).
  */
 async function decide(load: AssetLoad): Promise<Decision> {
-  const counterKeys = Object.keys(load.perEndpoint);
-  const [queuedByEndpoint, activeReservations] = await Promise.all([
-    gatherQueuedByEndpoint(),
+  const plan = PROJECT_FLEET[load.projectType.toLowerCase()];
+  if (!plan) return { kind: 'deferred', reason: 'unsupported', drainMs: 0 };
+
+  const now = Date.now();
+  const [detailed, activeReservations] = await Promise.all([
+    gatherQueuedDetailed(),
     listActiveReservations(),
   ]);
 
-  let worstDrainMs = 0;
-  const neededWorkers: Record<string, number> = {};
-
-  for (const ck of counterKeys) {
-    const [inflight, workersMax, ewmaMs] = await Promise.all([
-      getInflight(ck), getEndpointWorkersMax(ck), getBaselineMs(ck),
-    ]);
-    const queued = queuedByEndpoint[ck] ?? 0;
-    const reservedJobs = activeReservations.reduce((sum, r) => sum + (r.perEndpointJobs[ck] ?? 0), 0);
-    const reservedWorkers = activeReservations.reduce((sum, r) => sum + (r.neededWorkers[ck] ?? 0), 0);
-
-    const projectedJobs = load.perEndpoint[ck];
-    // Worker sizing uses peak concurrency (bounded by the Map's MaxConcurrency),
-    // not total job count — a worker processes many jobs sequentially over the
-    // project's lifetime, so total-jobs/JOBS_PER_WORKER would wildly overstate
-    // the workers a single project needs (e.g. 82 jobs/4 ≈ 21, which alone would
-    // blow the whole account cap). Concurrency is per-endpoint since only one
-    // stage of a given frame is active at a time, but a slow stage can
-    // accumulate up to the full Map concurrency waiting on it — conservative by
-    // design.
-    const mapConcurrency = load.tier === 'premium' ? PREMIUM_MAP_CONCURRENCY : SFN_MAP_MAX_CONCURRENCY;
-    const concurrentJobs = Math.min(load.frameCount, mapConcurrency);
-    const thisNeeded = Math.max(1, Math.ceil(concurrentJobs / JOBS_PER_WORKER));
-    neededWorkers[ck] = thisNeeded;
-
-    // Optimistic if-granted worker count (capped elsewhere by the fleet check).
-    const workersAvailable = Math.max(1, workersMax, reservedWorkers + thisNeeded);
-    const totalJobs = inflight + queued + reservedJobs + projectedJobs;
-    const drainMs = (totalJobs * ewmaMs) / workersAvailable;
-    worstDrainMs = Math.max(worstDrainMs, drainMs);
+  // Rule 1: cap concurrently-admitted projects.
+  if (activeReservations.length >= MAX_ACTIVE_PROJECTS) {
+    const soonestFreeMs = Math.min(
+      ...activeReservations.map(r => Math.max(0, r.createdAt + r.drainEstMs - now)),
+    );
+    return { kind: 'deferred', reason: 'max_projects', drainMs: Number.isFinite(soonestFreeMs) ? soonestFreeMs : MAX_DRAIN_MS };
   }
 
-  const currentActiveWorkers = await sumAllEndpointsActiveWorkers(queuedByEndpoint, activeReservations);
-  const thisProjectWorkers = Object.values(neededWorkers).reduce((a, b) => a + b, 0);
-  const projectedFleetTotal = currentActiveWorkers + thisProjectWorkers;
-
-  const capExceeded = projectedFleetTotal > ACCOUNT_CAP;
-  const drainExceeded = worstDrainMs > MAX_DRAIN_MS;
-
-  if (capExceeded || drainExceeded) {
-    const reason = capExceeded && drainExceeded ? 'fleet_saturated' : capExceeded ? 'cap_committed' : 'queue_busy';
-    return { kind: 'deferred', reason, drainMs: worstDrainMs };
-  }
-
-  return { kind: 'granted', neededWorkers, drainEstMs: Math.round(worstDrainMs) };
-}
-
-/**
- * Sum of workers *actually* committed across every endpoint (organic demand +
- * reservations), mirroring provisioner.ts's per-endpoint `effectiveWorkers`.
- *
- * Deliberately NOT a sum of each endpoint's configured `workersMax` ceiling:
- * provisioner.ts's scale-to-zero branch never drops `workersMax` below that
- * endpoint's own `baselineMax` idle floor, even at zero real demand. The four
- * endpoints' idle floors (3+2+2+3) sum to exactly `ACCOUNT_CAP` (10), so
- * comparing against the ceiling made `capExceeded` permanently true regardless
- * of actual usage — every admission call deferred forever, discovered via a
- * real StoryStudio request stuck re-deferring for 15+ minutes at zero fleet
- * load. This sums real per-endpoint commitment instead, so the cap check
- * reflects what's actually running/reserved, not each endpoint's resting cap.
- */
-async function sumAllEndpointsActiveWorkers(
-  queuedByEndpoint: Record<string, number>,
-  activeReservations: ReservationItem[],
-): Promise<number> {
-  const reservedByEndpoint: Record<string, number> = {};
+  // Rule 2: gate on the bottleneck endpoint's backlog (live queued + young reservations).
+  const liveQueued = plan.gateOperation
+    ? (detailed.byEndpointOp[`${plan.gateEndpoint}#${plan.gateOperation}`] ?? 0)
+    : (detailed.byEndpoint[plan.gateEndpoint] ?? 0);
+  let reservedYoung = 0;
   for (const r of activeReservations) {
-    for (const [ck, workers] of Object.entries(r.neededWorkers)) {
-      reservedByEndpoint[ck] = (reservedByEndpoint[ck] ?? 0) + workers;
-    }
+    if (now - r.createdAt < BRAIN_WINDOW_MS) reservedYoung += r.perEndpointJobs[plan.gateEndpoint] ?? 0;
+  }
+  const gateBacklog = liveQueued + reservedYoung;
+
+  const gateEwmaMs = await getBaselineMs(plan.gateEndpoint);
+  const gateWorkers = Math.max(1, endpointWorkers(plan.gateEndpoint));
+
+  if (gateBacklog > plan.gateMax) {
+    const drainMs = (gateBacklog * gateEwmaMs) / gateWorkers;
+    return { kind: 'deferred', reason: 'endpoint_busy', drainMs };
   }
 
-  let total = 0;
-  for (const ep of ENDPOINTS) {
-    const inflight = await getInflight(ep.counterKey);
-    const queued = queuedByEndpoint[ep.counterKey] ?? 0;
-    const reserved = reservedByEndpoint[ep.counterKey] ?? 0;
-    const organicWorkers = (inflight + queued) > 0 ? Math.max(1, Math.ceil((inflight + queued) / JOBS_PER_WORKER)) : 0;
-    total += Math.max(organicWorkers, reserved);
-  }
-  return total;
+  // Grant: pre-warm every worker of the endpoints this project touches.
+  const neededWorkers: Record<string, number> = {};
+  for (const ck of plan.endpoints) neededWorkers[ck] = endpointWorkers(ck);
+  // ETA (for reservation TTL + estimatedWaitSeconds) = this project's own load
+  // draining on its bottleneck endpoint.
+  const drainEstMs = ((load.perEndpoint[plan.gateEndpoint] ?? 0) * gateEwmaMs) / gateWorkers;
+  return { kind: 'granted', neededWorkers, drainEstMs: Math.round(drainEstMs) };
 }
 
 /** Average ewmaMs across an endpoint's known baseline ops; seed default if none yet. */
