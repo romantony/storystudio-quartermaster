@@ -146,9 +146,6 @@ async function decide(load: AssetLoad): Promise<Decision> {
     listActiveReservations(),
   ]);
 
-  const otherReservationsTotalWorkers = activeReservations.reduce(
-    (sum, r) => sum + Object.values(r.neededWorkers).reduce((a, b) => a + b, 0), 0);
-
   let worstDrainMs = 0;
   const neededWorkers: Record<string, number> = {};
 
@@ -180,9 +177,9 @@ async function decide(load: AssetLoad): Promise<Decision> {
     worstDrainMs = Math.max(worstDrainMs, drainMs);
   }
 
-  const currentTotalWorkersMax = await sumAllEndpointsWorkersMax();
+  const currentActiveWorkers = await sumAllEndpointsActiveWorkers(queuedByEndpoint, activeReservations);
   const thisProjectWorkers = Object.values(neededWorkers).reduce((a, b) => a + b, 0);
-  const projectedFleetTotal = Math.max(currentTotalWorkersMax, otherReservationsTotalWorkers) + thisProjectWorkers;
+  const projectedFleetTotal = currentActiveWorkers + thisProjectWorkers;
 
   const capExceeded = projectedFleetTotal > ACCOUNT_CAP;
   const drainExceeded = worstDrainMs > MAX_DRAIN_MS;
@@ -195,9 +192,40 @@ async function decide(load: AssetLoad): Promise<Decision> {
   return { kind: 'granted', neededWorkers, drainEstMs: Math.round(worstDrainMs) };
 }
 
-async function sumAllEndpointsWorkersMax(): Promise<number> {
-  const sums = await Promise.all(ENDPOINTS.map(e => getEndpointWorkersMax(e.counterKey)));
-  return sums.reduce((a, b) => a + b, 0);
+/**
+ * Sum of workers *actually* committed across every endpoint (organic demand +
+ * reservations), mirroring provisioner.ts's per-endpoint `effectiveWorkers`.
+ *
+ * Deliberately NOT a sum of each endpoint's configured `workersMax` ceiling:
+ * provisioner.ts's scale-to-zero branch never drops `workersMax` below that
+ * endpoint's own `baselineMax` idle floor, even at zero real demand. The four
+ * endpoints' idle floors (3+2+2+3) sum to exactly `ACCOUNT_CAP` (10), so
+ * comparing against the ceiling made `capExceeded` permanently true regardless
+ * of actual usage — every admission call deferred forever, discovered via a
+ * real StoryStudio request stuck re-deferring for 15+ minutes at zero fleet
+ * load. This sums real per-endpoint commitment instead, so the cap check
+ * reflects what's actually running/reserved, not each endpoint's resting cap.
+ */
+async function sumAllEndpointsActiveWorkers(
+  queuedByEndpoint: Record<string, number>,
+  activeReservations: ReservationItem[],
+): Promise<number> {
+  const reservedByEndpoint: Record<string, number> = {};
+  for (const r of activeReservations) {
+    for (const [ck, workers] of Object.entries(r.neededWorkers)) {
+      reservedByEndpoint[ck] = (reservedByEndpoint[ck] ?? 0) + workers;
+    }
+  }
+
+  let total = 0;
+  for (const ep of ENDPOINTS) {
+    const inflight = await getInflight(ep.counterKey);
+    const queued = queuedByEndpoint[ep.counterKey] ?? 0;
+    const reserved = reservedByEndpoint[ep.counterKey] ?? 0;
+    const organicWorkers = (inflight + queued) > 0 ? Math.max(1, Math.ceil((inflight + queued) / JOBS_PER_WORKER)) : 0;
+    total += Math.max(organicWorkers, reserved);
+  }
+  return total;
 }
 
 /** Average ewmaMs across an endpoint's known baseline ops; seed default if none yet. */

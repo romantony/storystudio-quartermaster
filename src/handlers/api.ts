@@ -291,7 +291,10 @@ async function dispatchExecutor(requestId: string, jobId: string): Promise<void>
 // ─── Job queue: GET /jobs/{requestId} ────────────────────────────────────────
 
 async function handleStatus(evt: LambdaFunctionUrlEvent): Promise<LambdaFunctionUrlResponse> {
-  const requestId = evt.rawPath.split('/').pop() ?? '';
+  // rawPath is delivered percent-encoded (colons in requestId become %3A) and
+  // is never auto-decoded by Lambda Function URLs, so this must decode
+  // explicitly or every lookup 404s despite the job existing.
+  const requestId = decodeURIComponent(evt.rawPath.split('/').pop() ?? '');
   if (!requestId) return json(400, { error: 'requestId required' });
 
   const result = await db.send(new QueryCommand({
