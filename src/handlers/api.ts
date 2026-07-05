@@ -276,13 +276,26 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
     updatedAt: now,
   };
 
+  // Overwrite is allowed when the existing record is absent OR already in a
+  // terminal failure state (FAILED/DEAD) — a retry of a previously-failed job
+  // (same requestId → same pk) must actually re-queue and re-dispatch, not
+  // silently no-op. Without the terminal-status clause, ConditionalCheckFailed
+  // on a pre-existing FAILED item swallowed the retry: isNew stayed false, the
+  // executor was never re-invoked, yet POST /jobs still returned 202 "QUEUED"
+  // — the job was permanently stuck FAILED with no visible error (confirmed
+  // 2026-07-05: a project retry re-used frameIds whose jobs had failed in an
+  // earlier aborted execution; every one of them "failed" again in ~5s with
+  // no real attempt, because the stale FAILED record was never replaced).
   let isNew = true;
   await db.send(new PutItemCommand({
     TableName: TABLE,
     Item: marshall(jobItem, { removeUndefinedValues: true }),
-    ConditionExpression: 'attribute_not_exists(pk)',
+    ConditionExpression: 'attribute_not_exists(pk) OR #s = :failed OR #s = :dead',
+    ExpressionAttributeNames: { '#s': 'status' },
+    ExpressionAttributeValues: marshall({ ':failed': 'FAILED', ':dead': 'DEAD' }),
   })).catch(e => {
-    // If item already exists (duplicate submit) that's fine — don't re-dispatch.
+    // Item already exists and is still QUEUED/PROCESSING/COMPLETE(_WITH_FALLBACKS)
+    // — a genuine in-flight duplicate submit, fine not to re-dispatch.
     if (e.name !== 'ConditionalCheckFailedException') throw e;
     isNew = false;
   });

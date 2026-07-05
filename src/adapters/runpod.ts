@@ -177,11 +177,17 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
       // Wan2.2 I2V-A14B (4-step Lightning). Aspect ratio inherits from the
       // input image; `resolution` only sets the pixel budget. duration_s is one
       // of 3–7 (→ frame_num = duration_s*16+1). Standalone Wan2 endpoint.
+      // p.durationS is a real frame duration (from narration timing) — almost
+      // never lands exactly on one of those 5 integers, and the pod rejects
+      // anything else outright ("duration_s must be one of [3, 4, 5, 6, 7]").
+      // Passed through unclamped, this silently failed random frames whose
+      // duration fell outside the set (confirmed 2026-07-05 once pollInline
+      // failures started being logged — previously invisible).
       return {
         image: job.initImageUrls?.[0],
         prompt: job.prompt ?? '',
         resolution: rung.fixed?.resolution ?? '480p',
-        duration_s: p.durationS ?? 5,
+        duration_s: Math.min(7, Math.max(3, Math.round(p.durationS ?? 5))),
         sample_steps: 4,
         ...attribution,
       };
