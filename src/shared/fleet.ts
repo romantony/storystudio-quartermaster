@@ -13,8 +13,12 @@
  *     for that endpoint — they are the same number because QM should feed a pod
  *     at its real pod rate, not oversubmit and let RunPod's queue (or an
  *     overwhelmed external fallback) absorb the overflow.
- *   - The five `workers` sum to ACCOUNT_CAP (10), so it's a *static* allocation,
- *     never dynamically reshuffled.
+ *   - The narration-serving endpoints (flux-tts-s2t, qwen-image-gen/edit,
+ *     wan2-i2v, bgm-s2t) sum to ACCOUNT_CAP (10) — a *static* allocation, never
+ *     dynamically reshuffled. ernie-image sits on its own dedicated GPU/volume
+ *     outside this pool (see its entry below), so it isn't part of that sum and
+ *     isn't in provisioner.ts's ENDPOINTS (the list that actually enforces the
+ *     shared account cap — a separate array from this file's FLEET).
  *   - Idle floor is 0 (true scale-to-zero) — we don't pay for a warm worker with
  *     no job in front of it. Pre-warm raises workers only on admission, timed to
  *     overlap the ~2-3 min cold start with Convex's brain window.
@@ -25,6 +29,7 @@ export const QWEN_IMAGE_GEN = 'runpod:qwen-image-gen';
 export const QWEN_IMAGE_EDIT = 'runpod:qwen-image-edit';
 export const WAN2_I2V = 'runpod:wan2-i2v';
 export const BGM_S2T = 'runpod:bgm-s2t';
+export const ERNIE_IMAGE = 'runpod:ernie-image';
 
 export interface FleetEndpoint {
   counterKey: string;
@@ -51,6 +56,17 @@ export const FLEET: FleetEndpoint[] = [
   // path, so low concurrency is fine. Shares the flux2-TTS-S2T-Bgm network
   // volume with flux-tts-s2t (each endpoint loads only its own models).
   { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 1 },
+  // ernie-image — baidu/ERNIE-Image-Turbo, dedicated A40 (own network volume,
+  // not shared with flux-tts-s2t/bgm-s2t). Explainer/educational t2i where
+  // in-image text must render correctly (image.explainer.t2i) — validated
+  // strongest at dense EN text; non-EN routing stays on nano-banana until
+  // language-conditional rung selection is added. Standalone: NOT in
+  // PROJECT_FLEET (no admission-gated project type calls it yet) and NOT in
+  // provisioner.ts's ENDPOINTS (that list enforces the shared narration
+  // account cap; this endpoint's own worker sits outside that pool on its own
+  // GPU, so it doesn't compete with flux/qwen/wan2 for the cap). 1 worker:
+  // low-volume, non-hot-path.
+  { counterKey: ERNIE_IMAGE,     endpointId: 'teaye48ss7oywb', workers: 1 },
 ];
 
 export const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 10);

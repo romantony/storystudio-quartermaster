@@ -23,11 +23,12 @@
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.explainer.t2i": [
-      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "T2I standardized on Flux Klein 4B. NOTE: nano-banana (fb) renders in-image text better — re-promote it if explainer text rendering regresses." },
+      { "provider": "runpod", "model": "ernie-image-turbo", "mode": "image", "endpointId": "teaye48ss7oywb", "endpoint": "v2/teaye48ss7oywb", "counterKey": "runpod:ernie-image", "routingMode": "direct", "lane": "rest",
+        "note": "Explainer/educational T2I — self-hosted baidu/ERNIE-Image-Turbo (own A40 endpoint). Validated strongest at dense, layout-sensitive EN in-image text (posters/infographics/diagrams) — beats Flux and holds up against nano-banana. English only for now: EN/中文 is its trained focus; Tamil/Hindi tested unreliable (garbled/broken conjuncts), so non-EN explainer content should stay on nano-banana until language-conditional rung selection is added to route by params.language." },
       { "provider": "kie", "model": "google/nano-banana", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true,
-        "note": "Explainer text-in-image fallback — Google nano-banana." }
+        "note": "Explainer text-in-image fallback — Google nano-banana. Also the non-EN explainer path until language-based routing lands." }
     ],
+    "image.educational.t2i": { "aliasOf": "image.explainer.t2i" },
     "image.basic.i2i": [
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest" }
     ],
