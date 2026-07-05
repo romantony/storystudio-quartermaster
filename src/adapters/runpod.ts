@@ -250,7 +250,9 @@ export const runpod: Adapter = {
       return { done: true, outputUrls: url ? [url] : undefined };
     }
     if (TERMINAL_STATUSES.has(status)) {
-      return { done: true, failed: true };
+      const out = json.output as Record<string, unknown> | undefined;
+      const error = (json.error ?? out?.error ?? JSON.stringify(json).slice(0, 300)) as string;
+      return { done: true, failed: true, error: `status=${status} ${error}` };
     }
     return { done: false };
   },

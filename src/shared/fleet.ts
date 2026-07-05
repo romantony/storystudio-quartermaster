@@ -3,10 +3,12 @@
  *
  * Consumed by the executor (per-endpoint concurrency limit), the provisioner
  * (static workersMax ceiling + scale targets), and admission (which endpoints a
- * project touches + the next-admit backlog gate). One place defines 0/4/2/4 so
- * capacity planning, real SFN parallelism, and worker provisioning can never
- * drift apart — a mismatch there is what silently dropped 12 of 21 frames in the
- * first live premium run (2026-07-04).
+ * project touches + the next-admit backlog gate). One place defines the real
+ * pod counts so capacity planning, real SFN parallelism, and worker
+ * provisioning can never drift apart — a mismatch there is what silently
+ * dropped 12 of 21 frames in the first live premium run (2026-07-04), and again
+ * silently failed 13+ of 17 Wan2 i2v frames when this file claimed 4 wan2-i2v
+ * workers against only 3 real pods (2026-07-05, see WAN2_I2V's entry below).
  *
  * Model (agreed with StoryStudio 2026-07-04):
  *   - `workers` is BOTH the static max worker count AND the QM concurrency limit
@@ -14,11 +16,13 @@
  *     at its real pod rate, not oversubmit and let RunPod's queue (or an
  *     overwhelmed external fallback) absorb the overflow.
  *   - The narration-serving endpoints (flux-tts-s2t, qwen-image-gen/edit,
- *     wan2-i2v, bgm-s2t) sum to ACCOUNT_CAP (10) — a *static* allocation, never
- *     dynamically reshuffled. ernie-image sits on its own dedicated GPU/volume
- *     outside this pool (see its entry below), so it isn't part of that sum and
- *     isn't in provisioner.ts's ENDPOINTS (the list that actually enforces the
- *     shared account cap — a separate array from this file's FLEET).
+ *     wan2-i2v, bgm-s2t) are a *static* allocation, never dynamically
+ *     reshuffled, currently summing to 9 of ACCOUNT_CAP's 10 (1 unit of
+ *     headroom, not artificially inflated to hit the cap). ernie-image sits on
+ *     its own dedicated GPU/volume outside this pool (see its entry below), so
+ *     it isn't part of that sum and isn't in provisioner.ts's ENDPOINTS (the
+ *     list that actually enforces the shared account cap — a separate array
+ *     from this file's FLEET).
  *   - Idle floor is 0 (true scale-to-zero) — we don't pay for a warm worker with
  *     no job in front of it. Pre-warm raises workers only on admission, timed to
  *     overlap the ~2-3 min cold start with Convex's brain window.
@@ -50,7 +54,16 @@ export const FLEET: FleetEndpoint[] = [
   // to 2 only if a dedicated premium t2i endpoint is ever needed.
   { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 0 },
   { counterKey: QWEN_IMAGE_EDIT, endpointId: 'oxwx8o879qwtla', workers: 2 },
-  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 4 },
+  // Corrected 4→3 (2026-07-05): only 3 real Wan2 pods exist. At 4, QM's own
+  // concurrency gate (endpointWorkers()) let a 4th job submit believing there
+  // was room, when it actually had to sit in RunPod's own internal queue
+  // behind the 3 real workers — invisible to QM's semaphore. That queuing,
+  // stacked on top of the ~90s generation time, could push total completion
+  // past pollInline's window and fail SILENTLY (no thrown error, nothing
+  // logged) — exactly what happened to 13+ of 17 frames in a live premium
+  // run. Same failure class fleet.ts's header comment already documents from
+  // 2026-07-04. Matching the gate to the real pod count removes the gap.
+  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 3 },
   // bgm-s2t (ENDPOINT_ROLE=audio) — ACE-Step BGM + Whisper SRT, ~1 call each per
   // project, shared by Basic + Premium. 1 worker: it's off the per-frame hot
   // path, so low concurrency is fine. Shares the flux2-TTS-S2T-Bgm network

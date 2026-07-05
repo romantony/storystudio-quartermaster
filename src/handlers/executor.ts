@@ -155,7 +155,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
         }
 
         if (internal) {
-          const url = await pollInline(adapter, result.taskRef ?? '', rung, context);
+          const url = await pollInline(adapter, result.taskRef ?? '', rung, context, key);
           await releaseSimple(counterKey, leaseId);
           // Slot freed — feed the pod its next queued job at worker rate (not a
           // 2-min sweeper tick); the sweeper stays the safety net.
@@ -183,10 +183,17 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
         return; // await callback (slot stays held until webhook releases it)
       } catch (err) {
         const httpCode = (err as { httpCode?: number }).httpCode ?? 500;
+        // `raw` is the provider's actual response body (attached by submit()) —
+        // e.g. Replicate's validation message on a 422. Previously discarded,
+        // logging only httpCode + a generic "submit 422" message gave no way
+        // to tell WHAT was rejected (2026-07-05: DR fallback silently failed
+        // 422 then 429 for Wan2 i2v with no visibility into either cause).
+        const raw = (err as { raw?: unknown }).raw;
+        const rawStr = raw !== undefined ? JSON.stringify(raw).slice(0, 300) : '(no body)';
         await releaseSimple(counterKey, leaseId);
         if (internal) await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
         await feedCircuit(key, false, cfg);
-        console.warn('[executor] rung attempt failed', key, `attempt ${attempt}/${RUNG_MAX_ATTEMPTS}`, httpCode, (err as Error).message);
+        console.warn('[executor] rung attempt failed', key, `attempt ${attempt}/${RUNG_MAX_ATTEMPTS}`, httpCode, (err as Error).message, rawStr);
         if (attempt < RUNG_MAX_ATTEMPTS) { await sleep(RUNG_RETRY_BACKOFF_MS * attempt); continue; }
         advance = true; break;                        // exhausted → next rung
       }
@@ -215,15 +222,24 @@ async function submit(adapter: Adapter, job: JobItem, rung: Rung, callbackUrl?: 
 }
 
 async function pollInline(
-  adapter: Adapter, taskRef: string, rung: Rung, context: LambdaContext,
+  adapter: Adapter, taskRef: string, rung: Rung, context: LambdaContext, key: string,
 ): Promise<string | undefined> {
   if (!taskRef) return undefined;
   const remaining = () => context.getRemainingTimeInMillis?.() ?? Number.MAX_SAFE_INTEGER;
   while (remaining() > POLL_BUFFER_MS) {
     const res = await adapter.poll(taskRef, rung);
-    if (res.done) return res.failed ? undefined : res.outputUrls?.[0];
+    if (res.done) {
+      if (res.failed) {
+        // Previously silent — an internal generation failure never threw, so
+        // nothing was logged (2026-07-05: 13+ of 17 Wan2 i2v frames failed
+        // with zero trace). Adapters best-effort populate `error`.
+        console.warn('[executor] internal generation failed', key, 'taskRef', taskRef, res.error ?? '(no error detail)');
+      }
+      return res.failed ? undefined : res.outputUrls?.[0];
+    }
     await sleep(POLL_INTERVAL_MS);
   }
+  console.warn('[executor] internal generation poll timed out', key, 'taskRef', taskRef, `remaining=${remaining()}ms`);
   return undefined; // timed out
 }
 

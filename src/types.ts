@@ -450,6 +450,10 @@ export interface PollResult {
   outputUrls?: string[];
   failed?: boolean;
   retryAfterMs?: number;
+  /** Best-effort reason when failed — surfaced in executor logs so an internal
+   * generation failure is diagnosable instead of silent (2026-07-05: 13+ of 17
+   * Wan2 frames failed with zero log trace because this was never populated). */
+  error?: string;
 }
 
 export interface WebhookParseResult {

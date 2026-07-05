@@ -166,8 +166,9 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
       .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
     expect(reservationWrite).toBeDefined();
     const nw = reservationWrite!.neededWorkers as Record<string, number>;
-    // Static fleet worker counts (fleet.ts): flux 3 + qwen-edit 2 + wan2 4 + bgm-s2t 1 = 10.
-    expect(nw['runpod:wan2-i2v']).toBe(4);
+    // Static fleet worker counts (fleet.ts): flux 3 + qwen-edit 2 + wan2 3 + bgm-s2t 1 = 9
+    // (wan2 corrected 4→3 2026-07-05 to match the real pod count).
+    expect(nw['runpod:wan2-i2v']).toBe(3);
     expect(nw['runpod:qwen-image-edit']).toBe(2);
     expect(nw['runpod:flux-tts-s2t']).toBe(3);
     expect(nw['runpod:bgm-s2t']).toBe(1);
