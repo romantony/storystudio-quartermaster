@@ -77,15 +77,15 @@
     ],
 
     "bgm.narration": [
-      { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "Narration BGM (both tiers) — self-hosted ACE-Step (Flux-TTS-S2T mode:bgm)." },
+      { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "6apg6j7suzuezw", "endpoint": "v2/6apg6j7suzuezw", "counterKey": "runpod:bgm-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration BGM (both tiers) — self-hosted ACE-Step on the dedicated bgm-s2t endpoint (6apg6j7suzuezw, ENDPOINT_ROLE=audio), split off flux-tts-s2t so once-per-project BGM never steals workers from the per-frame pipeline." },
       { "provider": "kie", "model": "suno", "modelId": "V4_5", "endpoint": "v1/generate", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "bgm.narrationBasic": { "aliasOf": "bgm.narration" },
     "bgm.narrationPremium": { "aliasOf": "bgm.narration" },
     "srt.narration": [
-      { "provider": "runpod", "model": "whisper-large-v3-turbo", "mode": "transcribe", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "Narration SRT (both tiers) — self-hosted Whisper large-v3-turbo (Flux-TTS-S2T mode:transcribe)." },
+      { "provider": "runpod", "model": "whisper-large-v3-turbo", "mode": "transcribe", "endpointId": "6apg6j7suzuezw", "endpoint": "v2/6apg6j7suzuezw", "counterKey": "runpod:bgm-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration SRT (both tiers) — self-hosted Whisper large-v3-turbo on the dedicated bgm-s2t endpoint (6apg6j7suzuezw, ENDPOINT_ROLE=audio), split off flux-tts-s2t." },
       { "provider": "replicate", "model": "openai/whisper", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "video.narrationBasic.animate": [

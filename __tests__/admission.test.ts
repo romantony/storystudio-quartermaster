@@ -127,7 +127,7 @@ describe('handleAdmission — grant on an empty fleet', () => {
     const body = JSON.parse(res.body!);
     expect(body.decision).toBe('granted');
     expect(body.admissionId).toMatch(/^qm_adm_/);
-    expect(body.warmedEndpoints).toEqual(['runpod:flux-tts-s2t']);
+    expect(body.warmedEndpoints).toEqual(['runpod:flux-tts-s2t', 'runpod:bgm-s2t']);
     expect(body.expiresAt).toBeGreaterThan(Date.now());
   });
 
@@ -142,13 +142,13 @@ describe('handleAdmission — grant on an empty fleet', () => {
       .map(c => unmarshall((c[0] as any).input.Item))
       .find(item => item.pk === 'RUNPODENDPOINT' && item.sk === 'runpod:flux-tts-s2t');
     expect(endpointWrite).toBeDefined();
-    expect(endpointWrite!.workersMin).toBe(4); // all workers warmed on grant (fleet.ts)
-    expect(endpointWrite!.workersMax).toBe(4); // flux static ceiling
+    expect(endpointWrite!.workersMin).toBe(3); // all workers warmed on grant (fleet.ts)
+    expect(endpointWrite!.workersMax).toBe(3); // flux static ceiling (4→3 after bgm-s2t split)
   });
 });
 
 describe('handleAdmission — grant premium on an empty fleet', () => {
-  it('grants a solo narration-premium project and pre-warms all workers of its 3 endpoints', async () => {
+  it('grants a solo narration-premium project and pre-warms all workers of its 4 endpoints', async () => {
     mockScenario({ inflight: {}, workersMax: {}, baselines: {} });
     const res = await handleAdmission(evt({
       requestId: 'r-premium', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
@@ -157,7 +157,7 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
     const body = JSON.parse(res.body!);
     expect(body.decision).toBe('granted');
     expect([...body.warmedEndpoints].sort()).toEqual([
-      'runpod:flux-tts-s2t', 'runpod:qwen-image-edit', 'runpod:wan2-i2v',
+      'runpod:bgm-s2t', 'runpod:flux-tts-s2t', 'runpod:qwen-image-edit', 'runpod:wan2-i2v',
     ]);
 
     const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
@@ -166,10 +166,11 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
       .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
     expect(reservationWrite).toBeDefined();
     const nw = reservationWrite!.neededWorkers as Record<string, number>;
-    // Static fleet worker counts (fleet.ts): flux 4 + qwen-edit 2 + wan2 4 = 10.
+    // Static fleet worker counts (fleet.ts): flux 3 + qwen-edit 2 + wan2 4 + bgm-s2t 1 = 10.
     expect(nw['runpod:wan2-i2v']).toBe(4);
     expect(nw['runpod:qwen-image-edit']).toBe(2);
-    expect(nw['runpod:flux-tts-s2t']).toBe(4);
+    expect(nw['runpod:flux-tts-s2t']).toBe(3);
+    expect(nw['runpod:bgm-s2t']).toBe(1);
   });
 });
 
