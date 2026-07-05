@@ -32,6 +32,16 @@ const RUNG_MAX_ATTEMPTS = Number(process.env.RUNG_MAX_ATTEMPTS ?? 2);
 const RUNG_RETRY_BACKOFF_MS = Number(process.env.RUNG_RETRY_BACKOFF_MS ?? 2_000);
 const POLL_INTERVAL_MS = Number(process.env.EXECUTOR_POLL_INTERVAL_MS ?? 3_000);
 const POLL_BUFFER_MS = 15_000; // stop polling this long before Lambda timeout
+// The executor self-invokes to drain a backlog at worker rate
+// (dispatchNextForEndpoint). Each self-invoke extends a Lambda→Lambda lineage
+// chain, and AWS's recursive-loop detection DROPS invocations once a chain
+// exceeds ~16 hops (RecursiveInvocationsDropped → account-level runaway
+// termination — this happened 2026-07-04). The chain is provably finite (each
+// hop consumes one QUEUED job), but AWS can't know that. So we self-terminate
+// the chain well under 16 and let the 2-min sweeper (redispatchQueuedCanonical)
+// drain the tail — each sweeper/api/webhook dispatch starts a FRESH lineage
+// (depth 0), so we never approach the kill threshold.
+const MAX_DISPATCH_CHAIN = Number(process.env.MAX_DISPATCH_CHAIN ?? 10);
 
 const db = new DynamoDBClient({});
 const sm = new SecretsManagerClient({});
@@ -39,6 +49,11 @@ const sm = new SecretsManagerClient({});
 interface ExecutorEvent {
   requestId: string;
   jobId: string;
+  // Self-invoke chain depth (dispatchNextForEndpoint). Absent/0 for the first
+  // dispatch of a lineage (api, webhook, sweeper); incremented on each
+  // executor→executor hop and capped at MAX_DISPATCH_CHAIN to stay under AWS's
+  // recursive-loop kill threshold.
+  depth?: number;
 }
 
 interface LambdaContext {
@@ -48,6 +63,7 @@ interface LambdaContext {
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 export const handler = async (event: ExecutorEvent, context: LambdaContext = {}): Promise<void> => {
+  const depth = event.depth ?? 0;
   const job = await loadJob(event.requestId, event.jobId);
   if (!job) {
     console.warn('[executor] job not found', event);
@@ -133,7 +149,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
           await complete(job, result.outputUrls[0], rung.fb);
           await recordBaseline(rung, job, Date.now() - rungStart);
           await releaseSimple(counterKey, leaseId);
-          if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
+          if (internal) await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
           await feedCircuit(key, true, cfg);
           return;
         }
@@ -143,7 +159,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
           await releaseSimple(counterKey, leaseId);
           // Slot freed — feed the pod its next queued job at worker rate (not a
           // 2-min sweeper tick); the sweeper stays the safety net.
-          await dispatchNextForEndpoint(counterKey).catch(() => {});
+          await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
           if (url) {
             await complete(job, url, rung.fb);
             await recordBaseline(rung, job, Date.now() - rungStart);
@@ -168,7 +184,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
       } catch (err) {
         const httpCode = (err as { httpCode?: number }).httpCode ?? 500;
         await releaseSimple(counterKey, leaseId);
-        if (internal) await dispatchNextForEndpoint(counterKey).catch(() => {});
+        if (internal) await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
         await feedCircuit(key, false, cfg);
         console.warn('[executor] rung attempt failed', key, `attempt ${attempt}/${RUNG_MAX_ATTEMPTS}`, httpCode, (err as Error).message);
         if (attempt < RUNG_MAX_ATTEMPTS) { await sleep(RUNG_RETRY_BACKOFF_MS * attempt); continue; }
@@ -237,10 +253,21 @@ function jobCounterKey(job: JobItem): string | undefined {
  * instead of waiting for the next 2-min sweeper tick. Dispatches ONE job; that
  * job's own completion pulls the next, chaining through the backlog. The atomic
  * claimJob guard makes a race with the sweeper (or a sibling release) a no-op.
+ *
+ * `depth` is this executor invocation's position in the self-invoke chain. Once
+ * it reaches MAX_DISPATCH_CHAIN we STOP chaining (any remaining QUEUED jobs are
+ * picked up by the next sweeper tick, starting a fresh lineage) so the chain
+ * never trips AWS's recursive-loop detection (~16-hop kill → RunawayTermination).
  */
-async function dispatchNextForEndpoint(counterKey: string): Promise<void> {
+async function dispatchNextForEndpoint(counterKey: string, depth: number): Promise<void> {
   const fn = process.env.AWS_LAMBDA_FUNCTION_NAME;
   if (!fn) return;
+  if (depth + 1 >= MAX_DISPATCH_CHAIN) {
+    // Chain length budget spent — hand the backlog tail to the 2-min sweeper
+    // rather than extend the lineage toward AWS's recursion kill threshold.
+    console.info('[executor] dispatch chain cap reached, deferring to sweeper', counterKey, `depth=${depth}`);
+    return;
+  }
   for (const lane of ['video', 'rest']) {
     const res = await db.send(new QueryCommand({
       TableName: TABLE,
@@ -257,7 +284,7 @@ async function dispatchNextForEndpoint(counterKey: string): Promise<void> {
         await new LambdaClient({}).send(new InvokeCommand({
           FunctionName: fn,
           InvocationType: 'Event',
-          Payload: Buffer.from(JSON.stringify({ requestId: j.requestId, jobId: j.jobId })),
+          Payload: Buffer.from(JSON.stringify({ requestId: j.requestId, jobId: j.jobId, depth: depth + 1 })),
         }));
         return; // one dispatch; its completion pulls the next
       }
