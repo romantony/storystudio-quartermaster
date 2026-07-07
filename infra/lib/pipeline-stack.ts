@@ -849,7 +849,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
         QMGenerateTTS: {
           Type: 'Task',
           Resource: qmGenerateArn,
-          Comment: 'TTS via QM (voice.narrationPremium.tts: self-hosted Qwen3-TTS voice-design → Google fallback). Speaker/instruct/language come from execution input (project-level, not per-frame).',
+          Comment: 'TTS via QM (voice.narrationPremium.tts: self-hosted Qwen3-TTS voice-design, no external fallback for now — Google TTS is reserved for UI). Speaker/instruct/language come from execution input (project-level, not per-frame).',
           Parameters: {
             assetType: 'voice',
             tier: 'narrationPremium',

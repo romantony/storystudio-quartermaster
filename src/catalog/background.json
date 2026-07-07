@@ -73,8 +73,7 @@
     ],
     "voice.narrationPremium.tts": [
       { "provider": "runpod", "model": "qwen-voice-design", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "Narration Premium TTS — self-hosted Qwen Voice Design (Flux-TTS-S2T mode:tts engine:qwen)." },
-      { "provider": "google", "model": "gemini-3.1-flash-tts-preview", "routingMode": "direct", "lane": "rest", "fb": true }
+        "note": "Narration Premium TTS — self-hosted Qwen Voice Design (Flux-TTS-S2T mode:tts engine:qwen). No external fallback for now — Google TTS (gemini-3.1-flash-tts-preview) is reserved for the UI-facing voice.premium.tts ladder, not wired here as DR; also wouldn't carry a cloneArtifactUrl/voiceUrl clone through anyway (see runpod.ts)." }
     ],
 
     "bgm.narration": [
