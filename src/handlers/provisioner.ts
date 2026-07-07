@@ -8,8 +8,9 @@ import { isInternalRung } from './router';
 import type { JobItem, ProvisionShadowItem, Queue, RunPodEndpointItem } from '../types';
 
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
-// Shared account-wide worker cap (10; rises to 20 once balance ≥ $200).
-const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 10);
+// Shared account-wide worker cap. Raised 10→20 (2026-07-07): balance crossed
+// $200, confirmed against the RunPod dashboard (20/20 workers deployed).
+const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 20);
 // Fallback idle floor for any endpoint that doesn't specify its own
 // `baselineMax` below. Endpoints listed in ENDPOINTS should each set a real
 // value confirmed against the account (never guess — see per-endpoint note).
@@ -26,16 +27,19 @@ const sm = new SecretsManagerClient({});
 // The RunPod serverless endpoints QM provisions. counterKey mirrors the
 // per-endpoint semaphore in dynamo-gate; endpointId is the RunPod id from
 // /home/roman-antony/runpod/API.md. `baselineMax` is each endpoint's real,
-// account-confirmed idle floor (2026-07-03) — NOT a uniform guess. Using one
-// global constant here previously caused the provisioner's shadow model to
-// silently diverge from RunPod's actual config on flux-tts-s2t and wan2-i2v
-// (both really provisioned to 3, while the old global default assumed 2),
-// which the periodic scale-to-zero tick would have kept re-asserting forever.
+// account-confirmed idle floor — NOT a uniform guess. Using one global
+// constant here previously caused the provisioner's shadow model to silently
+// diverge from RunPod's actual config, which the periodic scale-to-zero tick
+// would have kept re-asserting forever. Raised 2026-07-07 (account balance
+// crossed $200, cap doubled 10→20) to match the dashboard: Flux-TTS-ANIM=6,
+// qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=8 — see fleet.ts for the same
+// figures plus bgm-s2t/ernie-image (not in this provisioner-cap-enforcing
+// list, see fleet.ts's header for why).
 export const ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [
-  { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 3 },
+  { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 6 },
   { counterKey: 'runpod:qwen-image-gen',  endpointId: 'e165se4r3eo5hp', baselineMax: 2 },
   { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla', baselineMax: 2 },
-  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 3 },
+  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 8 },
 ];
 
 // `reserved` = worker-units committed by active admission-gate reservations for

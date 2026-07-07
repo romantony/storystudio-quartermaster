@@ -142,8 +142,8 @@ describe('handleAdmission — grant on an empty fleet', () => {
       .map(c => unmarshall((c[0] as any).input.Item))
       .find(item => item.pk === 'RUNPODENDPOINT' && item.sk === 'runpod:flux-tts-s2t');
     expect(endpointWrite).toBeDefined();
-    expect(endpointWrite!.workersMin).toBe(3); // all workers warmed on grant (fleet.ts)
-    expect(endpointWrite!.workersMax).toBe(3); // flux static ceiling (4→3 after bgm-s2t split)
+    expect(endpointWrite!.workersMin).toBe(6); // all workers warmed on grant (fleet.ts)
+    expect(endpointWrite!.workersMax).toBe(6); // flux static ceiling (3→6 2026-07-07, cap doubled 10→20)
   });
 });
 
@@ -166,12 +166,12 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
       .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
     expect(reservationWrite).toBeDefined();
     const nw = reservationWrite!.neededWorkers as Record<string, number>;
-    // Static fleet worker counts (fleet.ts): flux 3 + qwen-edit 2 + wan2 3 + bgm-s2t 1 = 9
-    // (wan2 corrected 4→3 2026-07-05 to match the real pod count).
-    expect(nw['runpod:wan2-i2v']).toBe(3);
+    // Static fleet worker counts (fleet.ts): flux 6 + qwen-edit 2 + wan2 8 + bgm-s2t 2 = 18
+    // (raised 2026-07-07: account balance crossed $200, cap doubled 10→20).
+    expect(nw['runpod:wan2-i2v']).toBe(8);
     expect(nw['runpod:qwen-image-edit']).toBe(2);
-    expect(nw['runpod:flux-tts-s2t']).toBe(3);
-    expect(nw['runpod:bgm-s2t']).toBe(1);
+    expect(nw['runpod:flux-tts-s2t']).toBe(6);
+    expect(nw['runpod:bgm-s2t']).toBe(2);
   });
 });
 

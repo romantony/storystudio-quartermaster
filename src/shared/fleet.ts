@@ -17,7 +17,10 @@
  *     overwhelmed external fallback) absorb the overflow.
  *   - The narration-serving endpoints (flux-tts-s2t, qwen-image-gen/edit,
  *     wan2-i2v, bgm-s2t) are a *static* allocation, never dynamically
- *     reshuffled, currently summing to 9 of ACCOUNT_CAP's 10 (1 unit of
+ *     reshuffled, currently summing to 18 of ACCOUNT_CAP's 20 (raised from 10
+ *     once account balance crossed $200, confirmed against the RunPod
+ *     dashboard 2026-07-07: Flux-TTS-ANIM=6, qwen-image-gen=0,
+ *     qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=8, BGM-S2T=2 — 2 units of
  *     headroom, not artificially inflated to hit the cap). ernie-image sits on
  *     its own dedicated GPU/volume outside this pool (see its entry below), so
  *     it isn't part of that sum and isn't in provisioner.ts's ENDPOINTS (the
@@ -48,27 +51,28 @@ export const FLEET: FleetEndpoint[] = [
   // calls/project). BGM (ACE-Step) + SRT (Whisper) were split off to the
   // dedicated bgm-s2t endpoint so once-per-project audio-gen/STT can't steal
   // workers/VRAM from the pipeline. Concurrency = worker count (one req/worker).
-  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 3 },
+  // Raised 3→6 (2026-07-07): account balance crossed $200, RunPod cap doubled
+  // 10→20; confirmed against the dashboard (Flux-TTS-ANIM 0/6 running, 4 idle).
+  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 6 },
   // Off: StoryStudio always sends a character reference (→ i2i on qwen-image-edit),
   // and reference-less premium frames route to Flux4b t2i on flux-tts-s2t. Raise
   // to 2 only if a dedicated premium t2i endpoint is ever needed.
   { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 0 },
   { counterKey: QWEN_IMAGE_EDIT, endpointId: 'oxwx8o879qwtla', workers: 2 },
-  // Corrected 4→3 (2026-07-05): only 3 real Wan2 pods exist. At 4, QM's own
-  // concurrency gate (endpointWorkers()) let a 4th job submit believing there
-  // was room, when it actually had to sit in RunPod's own internal queue
-  // behind the 3 real workers — invisible to QM's semaphore. That queuing,
-  // stacked on top of the ~90s generation time, could push total completion
-  // past pollInline's window and fail SILENTLY (no thrown error, nothing
-  // logged) — exactly what happened to 13+ of 17 frames in a live premium
-  // run. Same failure class fleet.ts's header comment already documents from
-  // 2026-07-04. Matching the gate to the real pod count removes the gap.
-  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 3 },
+  // Raised 3→8 (2026-07-07): account balance crossed $200, RunPod cap doubled
+  // 10→20; confirmed against the dashboard (Wan2-14b-fp8-RTX6000ADA 0/8
+  // running, 8 idle) — 8 real Wan2 pods now exist. Keep this number matched to
+  // the real pod count: a prior mismatch (4 claimed vs 3 real) silently failed
+  // 13+ of 17 frames in a live premium run (2026-07-05) because QM's own
+  // concurrency gate (endpointWorkers()) let jobs submit believing there was
+  // room, when they actually queued invisibly behind RunPod's real workers.
+  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 8 },
   // bgm-s2t (ENDPOINT_ROLE=audio) — ACE-Step BGM + Whisper SRT, ~1 call each per
-  // project, shared by Basic + Premium. 1 worker: it's off the per-frame hot
-  // path, so low concurrency is fine. Shares the flux2-TTS-S2T-Bgm network
-  // volume with flux-tts-s2t (each endpoint loads only its own models).
-  { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 1 },
+  // project, shared by Basic + Premium. Off the per-frame hot path, so low
+  // concurrency is fine. Shares the flux2-TTS-S2T-Bgm network volume with
+  // flux-tts-s2t (each endpoint loads only its own models). Raised 1→2
+  // (2026-07-07) to match the dashboard (BGM-S2T 0/2 running, 2 idle).
+  { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 2 },
   // ernie-image — baidu/ERNIE-Image-Turbo, dedicated A40 (own network volume,
   // not shared with flux-tts-s2t/bgm-s2t). Explainer/educational t2i where
   // in-image text must render correctly (image.explainer.t2i) — validated
@@ -77,12 +81,12 @@ export const FLEET: FleetEndpoint[] = [
   // PROJECT_FLEET (no admission-gated project type calls it yet) and NOT in
   // provisioner.ts's ENDPOINTS (that list enforces the shared narration
   // account cap; this endpoint's own worker sits outside that pool on its own
-  // GPU, so it doesn't compete with flux/qwen/wan2 for the cap). 1 worker:
-  // low-volume, non-hot-path.
-  { counterKey: ERNIE_IMAGE,     endpointId: 'teaye48ss7oywb', workers: 1 },
+  // GPU, so it doesn't compete with flux/qwen/wan2 for the cap). Raised 1→2
+  // (2026-07-07) to match the dashboard (story-studio-ernie 0/2 running, 2 idle).
+  { counterKey: ERNIE_IMAGE,     endpointId: 'teaye48ss7oywb', workers: 2 },
 ];
 
-export const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 10);
+export const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 20);
 
 /** Static worker count / concurrency limit for an endpoint (0 if unknown/off). */
 export function endpointWorkers(counterKey: string): number {

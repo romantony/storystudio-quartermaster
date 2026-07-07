@@ -76,13 +76,12 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(flux.demand.reserved).toBe(4);
     expect(flux.toMin).toBe(1); // pre-warm, not scaled to zero
     expect(flux.reason).toBe('reservation-prewarm');
-    // Pre-rebalance this endpoint alone wants max(reserved=4, its own baseline=3)=4,
-    // but with every endpoint's real per-endpoint baseline (flux=3, qwen-gen=2,
-    // qwen-edit=2, wan2=3) the four IDLE sums to 4+2+2+3=11 > ACCOUNT_CAP(10),
-    // so rebalanceUnderCap's demand-weighted redistribution fires and hands this
-    // endpoint's leftover cap share too (its weight of reserved*JOBS_PER_WORKER
-    // dominates the other three, which are all weight 0 while idle).
-    expect(flux.toMax).toBe(5);
+    // flux alone wants max(reserved=4, its own baseline=6)=6 — the baseline
+    // already covers this reservation, and with every endpoint's real
+    // per-endpoint baseline (flux=6, qwen-gen=2, qwen-edit=2, wan2=8) the four
+    // IDLE sums to only 6+2+2+8=18 <= ACCOUNT_CAP(20), so rebalanceUnderCap
+    // never fires.
+    expect(flux.toMax).toBe(6);
 
     // Untouched endpoints stay at the idle baseline (unaffected by the reservation).
     const wan2 = plans.find(p => p.counterKey === 'runpod:wan2-i2v')!;
@@ -90,17 +89,18 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(wan2.reason).toBe('scale-to-zero');
   });
 
-  it('idles to each endpoint\'s real per-endpoint baseline, not a uniform default (2026-07-03 account-confirmed values)', async () => {
+  it('idles to each endpoint\'s real per-endpoint baseline, not a uniform default (2026-07-07 account-confirmed values)', async () => {
     mockScenario({ inflight: {} }); // fully idle fleet, no reservations, no organic demand
     const plans = await runProvisioner();
     const byKey = Object.fromEntries(plans.map(p => [p.counterKey, p]));
-    expect(byKey['runpod:flux-tts-s2t'].toMax).toBe(3);
+    expect(byKey['runpod:flux-tts-s2t'].toMax).toBe(6);
     expect(byKey['runpod:qwen-image-gen'].toMax).toBe(2);
     expect(byKey['runpod:qwen-image-edit'].toMax).toBe(2);
-    expect(byKey['runpod:wan2-i2v'].toMax).toBe(3);
-    // Sum matches the account's real, fully-allocated cap (confirmed via RunPod's
-    // management API 2026-07-03) — no rebalancing needed at rest.
-    expect(plans.reduce((a, p) => a + p.toMax, 0)).toBe(10);
+    expect(byKey['runpod:wan2-i2v'].toMax).toBe(8);
+    // Sum is under the account's real cap (confirmed via RunPod's dashboard
+    // 2026-07-07, cap doubled 10→20 once balance crossed $200) — 2 units of
+    // headroom, no rebalancing needed at rest.
+    expect(plans.reduce((a, p) => a + p.toMax, 0)).toBe(18);
   });
 
   it('does not starve a reservation-only endpoint when heavy organic demand elsewhere exceeds the cap', async () => {
@@ -122,7 +122,7 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
 
     const plans = await runProvisioner();
     const total = plans.reduce((a, p) => a + p.toMax, 0);
-    expect(total).toBeLessThanOrEqual(10); // ACCOUNT_CAP respected
+    expect(total).toBeLessThanOrEqual(20); // ACCOUNT_CAP respected
 
     const flux = plans.find(p => p.counterKey === 'runpod:flux-tts-s2t')!;
     const qwenGen = plans.find(p => p.counterKey === 'runpod:qwen-image-gen')!;
