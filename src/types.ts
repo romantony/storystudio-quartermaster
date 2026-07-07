@@ -90,6 +90,11 @@ export interface CanonicalJobParams {
   instruct?: string;
   speaker?: string;
   language?: string;
+  // Qwen voice-clone FAST path: a precomputed .pt artifact (one per voice_id,
+  // resolved client-side by StoryStudio — see runpod/qwen-voice-clone-*.md).
+  // Takes priority over voiceUrl/voiceTranscript (the slow path that re-embeds
+  // a raw reference clip every call) when both are present.
+  cloneArtifactUrl?: string;
   // Narration-basic `pipeline` mode: the frame's narration text (voice_text) —
   // one call does image + Kokoro TTS + animate + merge on flux-tts-s2t.
   voiceText?: string;

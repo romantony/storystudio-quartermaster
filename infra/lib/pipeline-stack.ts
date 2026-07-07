@@ -631,7 +631,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
 function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
   return {
     Type: 'Map',
-    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → Wan2 i2v → TTS (Qwen voice-design) → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency.',
+    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → Wan2 i2v → TTS (Qwen voice-design) → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency. Exception: frames with imageModel=="ernie" (explainer/educational, on-screen text) get their image from image.explainer.t2i (ERNIE-Image-Turbo) instead of the normal t2i/i2i rung — everything downstream (Wan2 i2v, TTS, merge) is unchanged, since only the image source differs.',
     ItemsPath: '$.frames',
     // Lower than Basic-QM-New's 15 — premium touches 3 endpoints per frame, so its
     // worker footprint is 3x a single-endpoint project's at the same concurrency.
@@ -680,16 +680,49 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
         },
         RouteImageGen: {
           Type: 'Choice',
-          Comment: 'Character reference from the UI → image-to-image; otherwise text-to-image',
-          Choices: [{
-            And: [
-              { Variable: '$.referenceImageUrl', IsPresent: true },
-              { Variable: '$.referenceImageUrl', IsString: true },
-              { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
-            ],
-            Next: 'QMGenerateImageI2I',
-          }],
+          Comment: 'imageModel=="ernie" (explainer/educational frame needing legible on-screen text) → ERNIE-Image-Turbo, checked first since it overrides the normal i2i/t2i choice (ERNIE has no i2i mode — matches Narration-Basic-QM-New\'s documented resolution table). Otherwise: character reference from the UI → image-to-image; else text-to-image.',
+          Choices: [
+            {
+              And: [
+                { Variable: '$.imageModel', IsPresent: true },
+                { Variable: '$.imageModel', IsString: true },
+                { Variable: '$.imageModel', StringEquals: 'ernie' },
+              ],
+              Next: 'QMGenerateImageExplainer',
+            },
+            {
+              And: [
+                { Variable: '$.referenceImageUrl', IsPresent: true },
+                { Variable: '$.referenceImageUrl', IsString: true },
+                { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
+              ],
+              Next: 'QMGenerateImageI2I',
+            },
+          ],
           Default: 'QMGenerateImageT2I',
+        },
+        QMGenerateImageExplainer: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Text-to-image via QM (image.explainer.t2i: self-hosted ERNIE-Image-Turbo → nano-banana fallback). ERNIE has no i2i mode, so this always renders from imagePrompt alone even if the frame carries a referenceImageUrl.',
+          Parameters: {
+            assetType: 'image',
+            tier: 'explainer',
+            operation: 't2i',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 650,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
+          Next: 'StoreImageMeta',
         },
         QMGenerateImageT2I: {
           Type: 'Task',
@@ -767,13 +800,50 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             ],
             Next: 'UseProvidedVoice',
           }],
-          Default: 'QMGenerateTTS',
+          Default: 'RouteTTSEngine',
         },
         UseProvidedVoice: {
           Type: 'Pass',
           Comment: 'A voiceUrl was supplied upstream — reuse it, skip TTS generation',
           Parameters: { 'cdnUrl.$': '$.voiceUrl' },
           ResultPath: '$.ttsResult',
+          Next: 'QMMerge',
+        },
+        RouteTTSEngine: {
+          Type: 'Choice',
+          Comment: 'voiceCloneArtifactUrl present (StoryStudio resolved a chosen voice_id to its precomputed .pt clone artifact — see runpod/qwen-voice-clone-stepfunction-request.md) → clone path; otherwise the existing speaker/instruct design voice. Choice IsPresent is safe against older execution inputs that omit this field entirely (unlike a raw $$.Execution.Input.* Parameters reference, which would throw States.Runtime if the key is missing).',
+          Choices: [{
+            And: [
+              { Variable: '$$.Execution.Input.voiceCloneArtifactUrl', IsPresent: true },
+              { Variable: '$$.Execution.Input.voiceCloneArtifactUrl', IsString: true },
+              { Not: { Variable: '$$.Execution.Input.voiceCloneArtifactUrl', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateTTSClone',
+          }],
+          Default: 'QMGenerateTTS',
+        },
+        QMGenerateTTSClone: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'TTS via QM (voice.narrationPremium.tts, Qwen3-TTS clone_artifact_url fast path — reuses the project\'s precomputed .pt voice clone across every frame). No speaker/instruct: the artifact already encodes the cloned voice\'s identity and style.',
+          Parameters: {
+            assetType: 'voice',
+            tier: 'narrationPremium',
+            operation: 'tts',
+            product: 'narration',
+            queue: 'background',
+            jobType: 'batch',
+            'prompt.$': '$.narrationText',
+            'cloneArtifactUrl.$': '$$.Execution.Input.voiceCloneArtifactUrl',
+            'language.$': '$$.Execution.Input.voiceLanguage',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.ttsResult',
+          TimeoutSeconds: 650,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'QMFrameFailed' }],
           Next: 'QMMerge',
         },
         QMGenerateTTS: {

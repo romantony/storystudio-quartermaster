@@ -75,7 +75,22 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
     }
     case 'tts': {
       if (rung.engine === 'qwen') {
-        // Qwen3-TTS design / voice-clone.
+        // Qwen3-TTS: clone_artifact_url (fast, precomputed .pt — reused across
+        // every scene in a project) beats voice_url/voice_transcript (slow path,
+        // re-embeds the raw reference clip every call) beats speaker/instruct
+        // design mode. Per runpod/qwen-voice-clone-stepfunction-request.md: the
+        // clone_artifact_url request omits instruct/speaker entirely — the
+        // artifact already encodes the cloned voice's identity and style.
+        if (p.cloneArtifactUrl) {
+          return {
+            mode: 'tts',
+            engine: 'qwen',
+            text: job.prompt,
+            language: p.language ?? 'English',
+            clone_artifact_url: p.cloneArtifactUrl,
+            ...attribution,
+          };
+        }
         const input: Record<string, unknown> = {
           mode: 'tts',
           engine: 'qwen',
