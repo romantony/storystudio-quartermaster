@@ -149,6 +149,10 @@ export interface JobItem {
   s3Target: string;
   manifestRef?: string;
   assetKey?: string;
+  /** Real generated duration in seconds, when the completing provider response
+   * reported one (see SubmitResult.durationS) — e.g. TTS's actual spoken
+   * length, or merge's final (post-trim) output length. */
+  durationS?: number;
   attempts: number;
   /**
    * Times this job was re-queued because its internal endpoint was healthy but
@@ -448,6 +452,10 @@ export interface SubmitResult {
   outputUrls?: string[];
   taskRef?: string;
   raw: unknown;
+  /** Real generated duration in seconds, when the provider's response reports
+   * one (RunPod tts/merge/concat/animate all return duration_s) — lets the
+   * SFN branch on actual TTS length rather than the planned frame.duration. */
+  durationS?: number;
 }
 
 export interface PollResult {
@@ -459,12 +467,14 @@ export interface PollResult {
    * generation failure is diagnosable instead of silent (2026-07-05: 13+ of 17
    * Wan2 frames failed with zero log trace because this was never populated). */
   error?: string;
+  durationS?: number;
 }
 
 export interface WebhookParseResult {
   taskRef: string;
   outputUrls?: string[];
   failed?: boolean;
+  durationS?: number;
 }
 
 export interface Adapter {

@@ -239,6 +239,7 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
       requestId: input.requestId,
       status: existing.status,
       assetKey: existing.assetKey,
+      durationS: existing.durationS,
     });
   }
 
@@ -380,6 +381,7 @@ async function handleStatus(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
       requestId,
       status: complete.status,
       assetKey: complete.assetKey,
+      durationS: complete.durationS,
       degraded: complete.degraded,
     });
   }

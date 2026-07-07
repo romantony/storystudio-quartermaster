@@ -146,7 +146,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
 
         // Sync completion (provider returned URLs immediately).
         if (result.outputUrls?.length) {
-          await complete(job, result.outputUrls[0], rung.fb);
+          await complete(job, result.outputUrls[0], rung.fb, result.durationS);
           await recordBaseline(rung, job, Date.now() - rungStart);
           await releaseSimple(counterKey, leaseId);
           if (internal) await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
@@ -155,13 +155,13 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
         }
 
         if (internal) {
-          const url = await pollInline(adapter, result.taskRef ?? '', rung, context, key);
+          const polled = await pollInline(adapter, result.taskRef ?? '', rung, context, key);
           await releaseSimple(counterKey, leaseId);
           // Slot freed — feed the pod its next queued job at worker rate (not a
           // 2-min sweeper tick); the sweeper stays the safety net.
           await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
-          if (url) {
-            await complete(job, url, rung.fb);
+          if (polled) {
+            await complete(job, polled.url, rung.fb, polled.durationS);
             await recordBaseline(rung, job, Date.now() - rungStart);
             await feedCircuit(key, true, cfg);
             return;
@@ -223,7 +223,7 @@ async function submit(adapter: Adapter, job: JobItem, rung: Rung, callbackUrl?: 
 
 async function pollInline(
   adapter: Adapter, taskRef: string, rung: Rung, context: LambdaContext, key: string,
-): Promise<string | undefined> {
+): Promise<{ url: string; durationS?: number } | undefined> {
   if (!taskRef) return undefined;
   const remaining = () => context.getRemainingTimeInMillis?.() ?? Number.MAX_SAFE_INTEGER;
   while (remaining() > POLL_BUFFER_MS) {
@@ -235,7 +235,8 @@ async function pollInline(
         // with zero trace). Adapters best-effort populate `error`.
         console.warn('[executor] internal generation failed', key, 'taskRef', taskRef, res.error ?? '(no error detail)');
       }
-      return res.failed ? undefined : res.outputUrls?.[0];
+      const url = res.failed ? undefined : res.outputUrls?.[0];
+      return url ? { url, durationS: res.durationS } : undefined;
     }
     await sleep(POLL_INTERVAL_MS);
   }
@@ -356,19 +357,25 @@ async function appendTried(job: JobItem, key: string): Promise<void> {
   }));
 }
 
-async function complete(job: JobItem, assetKey: string, fallback?: boolean): Promise<void> {
+async function complete(job: JobItem, assetKey: string, fallback?: boolean, durationS?: number): Promise<void> {
+  const sets = ['#s = :s', 'assetKey = :ak', 'updatedAt = :now'];
+  const values: Record<string, unknown> = {
+    ':s': fallback ? 'COMPLETE_WITH_FALLBACKS' : 'COMPLETE',
+    ':ak': assetKey,
+    ':now': Date.now(),
+  };
+  if (durationS !== undefined) {
+    sets.push('durationS = :d');
+    values[':d'] = durationS;
+  }
   await db.send(new UpdateItemCommand({
     TableName: TABLE,
     Key: marshall({ pk: job.pk, sk: job.sk }),
-    UpdateExpression: 'SET #s = :s, assetKey = :ak, updatedAt = :now',
+    UpdateExpression: `SET ${sets.join(', ')}`,
     ExpressionAttributeNames: { '#s': 'status' },
-    ExpressionAttributeValues: marshall({
-      ':s': fallback ? 'COMPLETE_WITH_FALLBACKS' : 'COMPLETE',
-      ':ak': assetKey,
-      ':now': Date.now(),
-    }),
+    ExpressionAttributeValues: marshall(values),
   }));
-  console.info('[executor] COMPLETE', job.requestId, job.jobId, assetKey);
+  console.info('[executor] COMPLETE', job.requestId, job.jobId, assetKey, durationS !== undefined ? `duration=${durationS}s` : '');
 }
 
 /**

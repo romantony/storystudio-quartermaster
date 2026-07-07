@@ -103,6 +103,10 @@
         "note": "Narration Basic one-shot per frame — Flux-TTS-S2T pipeline mode (image -> Kokoro TTS -> animate -> merge in one call, models resident in VRAM). Replaces 4 separate QM jobs/frame. caption:false + no bgm (SRT + BGM are project-level). Internal-only: no external one-shot equivalent, and basic is 100% flux-dependent anyway (animate/merge are flux-only), so no DR is lost." }
     ],
     "video.narrationPremium.merge": { "aliasOf": "video.narrationBasic.merge" },
+    "video.narrationPremium.concat": [
+      { "provider": "runpod", "model": "flux-concat", "mode": "concat", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Premium video extension — Flux-TTS-S2T concat, duplicates a single Wan2 clip (video_urls: [url, url]) to cover TTS audio longer than Wan2's 7s max duration_s, before merge trims it to the real audio length. Internal-only: no external DR equivalent, but this only fires for the rare >7s-narration frame, not the hot path." }
+    ],
 
     "video.basic": [
       { "provider": "consumer", "model": "stock-footage",    "routingMode": "stock",  "lane": "none", "note": "Documentary Basic: free Pexels/Pixabay footage" },

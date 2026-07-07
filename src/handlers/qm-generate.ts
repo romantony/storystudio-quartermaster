@@ -72,6 +72,10 @@ interface QMGenerateResult {
   jobId: string;
   status: string;
   degraded?: unknown;
+  /** Real generated duration in seconds, when the completing rung reported one
+   * (TTS/merge/concat/animate) — e.g. drives Narration-Premium's Wan2 clip
+   * length off the TTS's ACTUAL length, not the planned frame.duration. */
+  durationS?: number;
 }
 
 const DIMS: Record<string, { width: number; height: number }> = {
@@ -140,11 +144,11 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
   if (submitRes.status >= 400) {
     throw new Error(`QM submit failed ${submitRes.status}: ${submitText}`);
   }
-  const submitted = JSON.parse(submitText) as { jobId: string; requestId: string; status: string; assetKey?: string };
+  const submitted = JSON.parse(submitText) as { jobId: string; requestId: string; status: string; assetKey?: string; durationS?: number };
 
   // Cache hit — POST /jobs can return COMPLETE directly.
   if (submitted.assetKey && submitted.status.startsWith('COMPLETE')) {
-    return finalize(submitted.assetKey, requestId, submitted.jobId, submitted.status, event.aspectRatio);
+    return finalize(submitted.assetKey, requestId, submitted.jobId, submitted.status, event.aspectRatio, undefined, submitted.durationS);
   }
 
   // 2. Poll to completion.
@@ -154,11 +158,11 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
     const r = await fetch(`${base}/jobs/${encodeURIComponent(requestId)}`, { headers });
     if (r.status === 404) continue; // not yet visible
     const data = (await r.json()) as {
-      status: string; assetKey?: string; errorReason?: string; degraded?: unknown; attempts?: number;
+      status: string; assetKey?: string; errorReason?: string; degraded?: unknown; attempts?: number; durationS?: number;
     };
     if (data.status === 'COMPLETE' || data.status === 'COMPLETE_WITH_FALLBACKS') {
       if (!data.assetKey) throw new Error(`QM job ${requestId} COMPLETE but no assetKey`);
-      return finalize(data.assetKey, requestId, submitted.jobId, data.status, event.aspectRatio, data.degraded);
+      return finalize(data.assetKey, requestId, submitted.jobId, data.status, event.aspectRatio, data.degraded, data.durationS);
     }
     if (data.status === 'FAILED' || data.status === 'DEAD') {
       throw new Error(`QM job ${requestId} ${data.status}: ${data.errorReason ?? 'all rungs exhausted'}`);
@@ -169,8 +173,8 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
 
 function finalize(
   assetKey: string, requestId: string, jobId: string, status: string,
-  aspectRatio?: string, degraded?: unknown,
+  aspectRatio?: string, degraded?: unknown, durationS?: number,
 ): QMGenerateResult {
   const { width, height } = dimsFor(aspectRatio);
-  return { cdnUrl: assetKey, s3Key: assetKey, width, height, requestId, jobId, status, degraded };
+  return { cdnUrl: assetKey, s3Key: assetKey, width, height, requestId, jobId, status, degraded, durationS };
 }

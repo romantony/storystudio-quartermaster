@@ -24,6 +24,26 @@ function runpodOutUrl(p: unknown): string | undefined {
   return dig(p);
 }
 
+// Dig the real generated duration (seconds) out of RunPod's output, when the
+// mode reports one — tts/merge/concat/animate/bgm/pipeline all return
+// duration_s (runpod/API.md). Used to drive Wan2's duration_s from the
+// TTS's ACTUAL length rather than the planned frame.duration, and to report
+// merge's final (post-trim) length downstream.
+function runpodOutDuration(p: unknown): number | undefined {
+  const dig = (x: unknown): number | undefined => {
+    if (x && typeof x === 'object') {
+      const obj = x as Record<string, unknown>;
+      if (typeof obj.duration_s === 'number') return obj.duration_s;
+      for (const v of Object.values(obj)) {
+        const found = dig(v);
+        if (found !== undefined) return found;
+      }
+    }
+    return undefined;
+  };
+  return dig(p);
+}
+
 const TERMINAL_STATUSES = new Set(['FAILED', 'ERROR', 'CANCELLED', 'TIMED_OUT']);
 
 /**
@@ -168,6 +188,20 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
         ...attribution,
       };
     }
+    case 'concat': {
+      // Concatenate multiple MP4s → one longer MP4. Used to extend a single
+      // Wan2 clip when TTS runs past its 7s max duration_s: the SFN passes the
+      // SAME clip URL twice (initImageUrls) rather than paying for a second
+      // real Wan2 generation — a fresh clip from the same source image would
+      // look near-identical anyway, so duplicating is free motion coverage.
+      // merge (downstream) trims the concatenated video down to the real TTS
+      // audio length.
+      return {
+        mode: 'concat',
+        video_urls: job.initImageUrls,
+        ...attribution,
+      };
+    }
     case 'pipeline': {
       // Narration-basic one-shot: image → Kokoro TTS → animate → merge in a
       // single call (all models resident in VRAM), replacing 4 separate QM jobs.
@@ -198,11 +232,22 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
       // Passed through unclamped, this silently failed random frames whose
       // duration fell outside the set (confirmed 2026-07-05 once pollInline
       // failures started being logged — previously invisible).
+      // Math.ceil, not Math.round (2026-07-07): Narration-Premium's
+      // ≤7s path (pipeline-stack.ts's QMGenerateVideo) sets durationS from the
+      // TTS's ACTUAL audio length, then merges with -shortest. Math.round was
+      // rounding several real durations DOWN (e.g. 3.36s→3, 4.32s→4), making
+      // the video shorter than the audio it's about to be merged with —
+      // -shortest then silently clipped the last 0.1-0.4s of narration off
+      // every one of those frames (confirmed live: frame
+      // ks79tey2jwb5tx8jzxqepxj8d18a31km's audio, 3.36s, was cut to the
+      // video's 3.06s, audibly dropping the last syllable). Rounding up always
+      // makes the video >= the audio instead — same safe "overshoot, never
+      // undershoot" direction already used for the >7s duplicate-clip case.
       return {
         image: job.initImageUrls?.[0],
         prompt: job.prompt ?? '',
         resolution: rung.fixed?.resolution ?? '480p',
-        duration_s: Math.min(7, Math.max(3, Math.round(p.durationS ?? 5))),
+        duration_s: Math.min(7, Math.max(3, Math.ceil(p.durationS ?? 5))),
         sample_steps: 4,
         ...attribution,
       };
@@ -252,10 +297,10 @@ export const runpod: Adapter = {
     const status = String(r.status ?? '').toUpperCase();
     if (status === 'COMPLETED') {
       const url = runpodOutUrl(r);
-      if (url) return { outputUrls: [url], raw };
+      if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(r) };
     }
     const url = runpodOutUrl(raw);
-    if (url) return { outputUrls: [url], raw };
+    if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(raw) };
     return { taskRef: String(r.id ?? ''), raw };
   },
 
@@ -268,7 +313,7 @@ export const runpod: Adapter = {
 
     if (status === 'COMPLETED') {
       const url = runpodOutUrl(json);
-      return { done: true, outputUrls: url ? [url] : undefined };
+      return { done: true, outputUrls: url ? [url] : undefined, durationS: runpodOutDuration(json) };
     }
     if (TERMINAL_STATUSES.has(status)) {
       const out = json.output as Record<string, unknown> | undefined;
@@ -286,6 +331,7 @@ export const runpod: Adapter = {
       taskRef: String(p.id ?? ''),
       outputUrls: url ? [url] : undefined,
       failed: TERMINAL_STATUSES.has(status),
+      durationS: runpodOutDuration(p),
     };
   },
 
