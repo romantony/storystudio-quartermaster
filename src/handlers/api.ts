@@ -240,6 +240,7 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
       status: existing.status,
       assetKey: existing.assetKey,
       durationS: existing.durationS,
+      resultText: existing.resultText,
     });
   }
 
@@ -383,6 +384,7 @@ async function handleStatus(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
       assetKey: complete.assetKey,
       durationS: complete.durationS,
       degraded: complete.degraded,
+      resultText: complete.resultText,
     });
   }
   const dead = items.find(i => i.status === 'DEAD');

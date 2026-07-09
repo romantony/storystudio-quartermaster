@@ -153,6 +153,10 @@ export interface JobItem {
    * reported one (see SubmitResult.durationS) — e.g. TTS's actual spoken
    * length, or merge's final (post-trim) output length. */
   durationS?: number;
+  /** Plain text result (see SubmitResult.text) — Whisper transcript text or
+   * an Anthropic translation's output. Not a media asset; assetKey stays the
+   * canonical result field for URL-shaped rungs. */
+  resultText?: string;
   attempts: number;
   /**
    * Times this job was re-queued because its internal endpoint was healthy but
@@ -456,6 +460,11 @@ export interface SubmitResult {
    * one (RunPod tts/merge/concat/animate all return duration_s) — lets the
    * SFN branch on actual TTS length rather than the planned frame.duration. */
   durationS?: number;
+  /** Plain text result, when the completing rung produces text rather than
+   * (or alongside) a media URL — Whisper transcribe's `text` field (source
+   * for 4lang translation) and the Anthropic adapter's translated script both
+   * ride this field through to JobItem.resultText. */
+  text?: string;
 }
 
 export interface PollResult {
@@ -468,6 +477,8 @@ export interface PollResult {
    * Wan2 frames failed with zero log trace because this was never populated). */
   error?: string;
   durationS?: number;
+  /** See SubmitResult.text. */
+  text?: string;
 }
 
 export interface WebhookParseResult {

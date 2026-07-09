@@ -146,7 +146,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
 
         // Sync completion (provider returned URLs immediately).
         if (result.outputUrls?.length) {
-          await complete(job, result.outputUrls[0], rung.fb, result.durationS);
+          await complete(job, result.outputUrls[0], rung.fb, result.durationS, result.text);
           await recordBaseline(rung, job, Date.now() - rungStart);
           await releaseSimple(counterKey, leaseId);
           if (internal) await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
@@ -161,7 +161,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
           // 2-min sweeper tick); the sweeper stays the safety net.
           await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
           if (polled) {
-            await complete(job, polled.url, rung.fb, polled.durationS);
+            await complete(job, polled.url, rung.fb, polled.durationS, polled.text);
             await recordBaseline(rung, job, Date.now() - rungStart);
             await feedCircuit(key, true, cfg);
             return;
@@ -223,7 +223,7 @@ async function submit(adapter: Adapter, job: JobItem, rung: Rung, callbackUrl?: 
 
 async function pollInline(
   adapter: Adapter, taskRef: string, rung: Rung, context: LambdaContext, key: string,
-): Promise<{ url: string; durationS?: number } | undefined> {
+): Promise<{ url: string; durationS?: number; text?: string } | undefined> {
   if (!taskRef) return undefined;
   const remaining = () => context.getRemainingTimeInMillis?.() ?? Number.MAX_SAFE_INTEGER;
   while (remaining() > POLL_BUFFER_MS) {
@@ -236,7 +236,7 @@ async function pollInline(
         console.warn('[executor] internal generation failed', key, 'taskRef', taskRef, res.error ?? '(no error detail)');
       }
       const url = res.failed ? undefined : res.outputUrls?.[0];
-      return url ? { url, durationS: res.durationS } : undefined;
+      return url ? { url, durationS: res.durationS, text: res.text } : undefined;
     }
     await sleep(POLL_INTERVAL_MS);
   }
@@ -357,7 +357,9 @@ async function appendTried(job: JobItem, key: string): Promise<void> {
   }));
 }
 
-async function complete(job: JobItem, assetKey: string, fallback?: boolean, durationS?: number): Promise<void> {
+async function complete(
+  job: JobItem, assetKey: string, fallback?: boolean, durationS?: number, text?: string,
+): Promise<void> {
   const sets = ['#s = :s', 'assetKey = :ak', 'updatedAt = :now'];
   const values: Record<string, unknown> = {
     ':s': fallback ? 'COMPLETE_WITH_FALLBACKS' : 'COMPLETE',
@@ -367,6 +369,10 @@ async function complete(job: JobItem, assetKey: string, fallback?: boolean, dura
   if (durationS !== undefined) {
     sets.push('durationS = :d');
     values[':d'] = durationS;
+  }
+  if (text !== undefined) {
+    sets.push('resultText = :rt');
+    values[':rt'] = text;
   }
   await db.send(new UpdateItemCommand({
     TableName: TABLE,

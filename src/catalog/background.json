@@ -76,6 +76,25 @@
         "note": "Narration Premium TTS — self-hosted Qwen Voice Design (Flux-TTS-S2T mode:tts engine:qwen). No external fallback for now — Google TTS (gemini-3.1-flash-tts-preview) is reserved for the UI-facing voice.premium.tts ladder, not wired here as DR; also wouldn't carry a cloneArtifactUrl/voiceUrl clone through anyway (see runpod.ts)." }
     ],
 
+    "voice.narrationBasic.ttsLocalizedQwen": [
+      { "provider": "runpod", "model": "qwen-voice-design", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "4lang localized TTS (es/pt-BR) for Narration Basic projects — same physical Qwen Voice Design rung as voice.narrationPremium.tts, split into its own key purely for billing/audit attribution (mirrors bgm.narrationBasic/bgm.narrationPremium). Qwen supports Spanish/Portuguese natively (QWEN_VALID_LANGUAGES) — verified live 2026-07-08 (near-perfect Whisper round-trip both languages)." }
+    ],
+    "voice.narrationPremium.ttsLocalizedQwen": [
+      { "provider": "runpod", "model": "qwen-voice-design", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "4lang localized TTS (es/pt-BR) for Narration Premium projects — same rung as voice.narrationBasic.ttsLocalizedQwen, split for billing/audit attribution only." }
+    ],
+    "voice.narrationBasic.ttsLocalizedKokoro": [
+      { "provider": "runpod", "model": "kokoro", "mode": "tts", "engine": "kokoro", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "fixed": { "voice": "hf_alpha", "langCode": "h" },
+        "note": "4lang localized TTS (Hindi) for Narration Basic projects — Kokoro-82M's Hindi voice pack (hf_alpha, lang_code=h) is already loaded on this pod despite the handler's voice-list comment only documenting American/British English; verified live 2026-07-08 (Whisper round-trip kept full meaning, minor phonetic drift on 2 words). Qwen (used for es/pt-BR) has no Hindi support at all (not in QWEN_VALID_LANGUAGES), hence Kokoro here instead." }
+    ],
+    "voice.narrationPremium.ttsLocalizedKokoro": [
+      { "provider": "runpod", "model": "kokoro", "mode": "tts", "engine": "kokoro", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "fixed": { "voice": "hf_alpha", "langCode": "h" },
+        "note": "4lang localized TTS (Hindi) for Narration Premium projects — same rung as voice.narrationBasic.ttsLocalizedKokoro, split for billing/audit attribution only." }
+    ],
+
     "bgm.narration": [
       { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "6apg6j7suzuezw", "endpoint": "v2/6apg6j7suzuezw", "counterKey": "runpod:bgm-s2t", "routingMode": "direct", "lane": "rest",
         "note": "Narration BGM (both tiers) — self-hosted ACE-Step on the dedicated bgm-s2t endpoint (6apg6j7suzuezw, ENDPOINT_ROLE=audio), split off flux-tts-s2t so once-per-project BGM never steals workers from the per-frame pipeline." },

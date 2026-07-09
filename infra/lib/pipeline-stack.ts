@@ -10,6 +10,8 @@ interface PipelineStackProps extends StackProps {
   gatewayKeySecretArn: string;
   /** CloudFront domain of the Quartermaster API distribution (no https://) */
   qmApiDomain: string;
+  /** Secret ARN holding the RunPod API key, used by the shorts-longform trigger */
+  runpodKeySecretArn: string;
 }
 
 export class PipelineStack extends Stack {
@@ -74,6 +76,34 @@ export class PipelineStack extends Stack {
       action: 'lambda:InvokeFunction',
     });
 
+    // ── QM-shorts-trigger Lambda (SFN → shorts-longform RunPod endpoint) ─────
+    // Fire-and-forget: POSTs the finished concat video (+ SRT + BGM) to the
+    // shorts-longform RunPod worker's async /run, then returns immediately —
+    // completion is reported by RunPod's webhook straight to Convex. Replaces
+    // the legacy TriggerShortsFromLongForm→E2E-start-shorts/10-Lambda-SFN path
+    // (see ~/longtoshort/RUNPOD-SHORTS-WORKER.md + STORYSTUDIO-INTEGRATION.md).
+    const shortsTriggerFn = new nodejs.NodejsFunction(this, 'ShortsTriggerFunction', {
+      functionName: 'QM-shorts-trigger',
+      entry: path.join(__dirname, '../../src/handlers/shorts-trigger.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(30),
+      memorySize: 256,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+      environment: {
+        RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
+        SHORTS_ENDPOINT_ID: 'u3bvq5juben8ri',
+      },
+    });
+    shortsTriggerFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [props.runpodKeySecretArn],
+    }));
+    shortsTriggerFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
     // ── State machine definition ─────────────────────────────────────────────
     const brokerArn = brokerFn.functionArn;
 
@@ -118,7 +148,7 @@ export class PipelineStack extends Stack {
     // generated through the Quartermaster gateway (QM-generate). Separate
     // machine so we can validate the gateway end-to-end without altering
     // Basic-QM/Premium-QM.
-    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn);
+    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn);
 
     const qmNewStateMachine = new sfn.CfnStateMachine(this, 'QMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
@@ -135,7 +165,7 @@ export class PipelineStack extends Stack {
     // (Qwen voice-design) → Wan2 i2v → merge, all through the Quartermaster
     // gateway. Finalize is Premium-flavored (1080p upscale), mirroring
     // buildPremiumDefinition's FinalizeVideoPremium exactly.
-    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn);
+    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn);
 
     const narrationPremiumQmNewStateMachine = new sfn.CfnStateMachine(this, 'NarrationPremiumQMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Premium-QM-New',
@@ -158,7 +188,7 @@ export class PipelineStack extends Stack {
 // that Map, replacing it removes every broker reference — the cloned brokerArn
 // never survives into the QM-new definition.
 // ---------------------------------------------------------------------------
-function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object {
+function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string): object {
   const def = JSON.parse(JSON.stringify(buildDefinition(brokerArn))) as {
     Comment: string;
     States: Record<string, any>;
@@ -193,11 +223,34 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object 
       'convexEndpoint.$': '$.convexEndpoint',
       'apiKey.$': '$.apiKey',
       'videoResults.$': '$.videoResults',
+      'fourLang.$': '$.fourLang',
     },
     Next: 'UpdateStatusConcatenating',
   };
   delete def.States.UpdateStatusGeneratingVideos;
   delete def.States.GenerateI2VBasic;
+
+  // BUGFIX (found on the first live fourLang:true run, 2026-07-08): the
+  // Parameters block above is an explicit field ALLOWLIST — it reconstructs
+  // state from scratch, so any field not named there is silently dropped.
+  // $.fourLang is optional (may be entirely absent when not requested), so
+  // it can't be referenced directly via `'fourLang.$': '$.fourLang'` above
+  // without guaranteeing it's present first — a direct `.$` reference throws
+  // at runtime if the path doesn't resolve (same gotcha voiceGender/
+  // voiceSpeaker/voiceInstruct/voiceLanguage already have — see
+  // storystudio-qm-new-sfn-trigger.md). All 3 BGM exit paths (bgmStates(),
+  // shared by both Basic and the Premium re-tier clone) route to
+  // NormalizeFourLang instead of straight to DropFrameData now, so this
+  // fix applies uniformly to both tiers rather than getting silently
+  // overwritten when Premium recreates fresh BGM state objects.
+  def.States.NormalizeFourLang = {
+    Type: 'Choice',
+    Comment: 'Guarantee $.fourLang is a real boolean before DropFrameData\'s Parameters allowlist would otherwise silently drop it if the caller omitted the key entirely.',
+    Choices: [{ Variable: '$.fourLang', BooleanEquals: true, Next: 'SetFourLangTrue' }],
+    Default: 'SetFourLangFalse',
+  };
+  def.States.SetFourLangTrue = { Type: 'Pass', Result: true, ResultPath: '$.fourLang', Next: 'DropFrameData' };
+  def.States.SetFourLangFalse = { Type: 'Pass', Result: false, ResultPath: '$.fourLang', Next: 'DropFrameData' };
 
   // The generated BGM's URL now comes from bgmResult, not a passed-in bgmUrl.
   def.States.PrepareFinalizeBasic.Parameters['bgmUrl.$'] = '$.bgmResult.cdnUrl';
@@ -240,7 +293,91 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string): object 
   def.States.BuildMergedVoiceResult.Parameters['srtUrl.$'] = '$.transcribeResult.cdnUrl';
   def.States.BuildMergedVoiceResult.Parameters['captionsUrl.$'] = '$.transcribeResult.cdnUrl';
 
+  // 4lang: optional post-concat localization (translate → localized TTS →
+  // localized SRT for es/pt-BR/hi), gated on the execution input's `fourLang`
+  // flag. Spliced between BuildMergedVoiceResult and UpdateStatusApplyingBgm
+  // — everything downstream (Finalize, Complete) is unaffected; localization
+  // only adds `$.localizedAssets` alongside the existing English artifacts.
+  def.States.BuildMergedVoiceResult.Next = 'RouteLocalization';
+  Object.assign(def.States, localizationStates(qmGenerateArn, 'narrationBasic'));
+
+  // Surface $.localizedAssets in both the Convex status callback and the
+  // execution's final output, so StoryStudio gets the 3 per-language
+  // script/audio/SRT results (or graceful failure markers) without polling
+  // anything extra. Set here (not per-tier) so both Basic and the Premium
+  // clone below inherit it identically.
+  def.States.UpdateStatusApplyingBgm.Parameters.assets['localizedAssets.$'] = '$.localizedAssets';
+  def.States.Complete.Parameters['localizedAssets.$'] = '$.localizedAssets';
+
+  // Fire-and-forget shorts trigger — mirrors legacy Premium-QM's
+  // CheckGenerateShorts/TriggerShortsFromLongForm (buildPremiumDefinition),
+  // but points at the new shorts-longform RunPod worker instead of the old
+  // E2E-start-shorts→10-Lambda-SFN path it replaces. Runs on the concat video
+  // (mergedVoiceResult), before Fargate finalize — finalize's upscale/BGM/
+  // caption burn only affects the long-form output, not the shorts.
+  def.States.PrepareFinalizeBasic.Next = 'NormalizeShortsOptions';
+  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoBasic'));
+
   return def;
+}
+
+/**
+ * Shared by both QM-new machines (Basic wires it in directly; Premium
+ * re-assigns it after cloning, retargeting the Choice's default/Next at
+ * `finalizeStateName` — mirrors bgmStates/localizationStates' clone-and-retier
+ * pattern). Spliced between PrepareFinalize{Basic,Premium} and
+ * FinalizeVideo{Basic,Premium}: only fires when the caller explicitly set
+ * `generateShorts: true`; a missing/false key skips straight to finalize.
+ * Failure is non-fatal — the shorts worker is a nice-to-have side artifact,
+ * never worth failing the main long-form project over.
+ *
+ * NormalizeShortsOptions/SetShortsOptionsDefault guarantee `$.shortsOptions`
+ * is always present before TriggerShortsFromLongForm's Parameters allowlist
+ * references it via `.$` — same gotcha as fourLang/voiceGender (see
+ * NormalizeFourLang above): a direct `'shortsOptions.$': '$.shortsOptions'`
+ * throws at runtime if the caller omitted the key entirely, which is the
+ * common case (it's optional).
+ */
+function shortsTriggerStates(shortsTriggerArn: string, finalizeStateName: string): Record<string, unknown> {
+  return {
+    NormalizeShortsOptions: {
+      Type: 'Choice',
+      Comment: 'Guarantee $.shortsOptions is a real object before TriggerShortsFromLongForm\'s Parameters allowlist would otherwise throw if the caller omitted the key entirely.',
+      Choices: [{ Variable: '$.shortsOptions', IsPresent: true, Next: 'CheckGenerateShorts' }],
+      Default: 'SetShortsOptionsDefault',
+    },
+    SetShortsOptionsDefault: { Type: 'Pass', Result: {}, ResultPath: '$.shortsOptions', Next: 'CheckGenerateShorts' },
+    CheckGenerateShorts: {
+      Type: 'Choice',
+      Comment: 'Only trigger the shorts-longform worker when the caller explicitly set generateShorts=true.',
+      Choices: [{
+        And: [
+          { Variable: '$.generateShorts', IsPresent: true },
+          { Variable: '$.generateShorts', BooleanEquals: true },
+        ],
+        Next: 'TriggerShortsFromLongForm',
+      }],
+      Default: finalizeStateName,
+    },
+    TriggerShortsFromLongForm: {
+      Type: 'Task',
+      Resource: shortsTriggerArn,
+      Comment: 'Fire-and-forget: POST the concat video + SRT + BGM (+ caller shortsOptions passthrough) to the shorts-longform RunPod endpoint (u3bvq5juben8ri) /run; completion reported via webhook straight to Convex. Failure is non-fatal.',
+      Parameters: {
+        'projectId.$': '$.projectId',
+        'jobId.$': '$.jobId',
+        'videoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
+        'srtUrl.$': '$.mergedVoiceResult.captionsUrl',
+        'bgmUrl.$': '$.bgmResult.cdnUrl',
+        'convexEndpoint.$': '$.convexEndpoint',
+        'shortsOptions.$': '$.shortsOptions',
+      },
+      ResultPath: '$.shortsExecution',
+      TimeoutSeconds: 30,
+      Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Shorts trigger failure is non-fatal — always proceed to finalize', ResultPath: '$.shortsError', Next: finalizeStateName }],
+      Next: finalizeStateName,
+    },
+  };
 }
 
 /**
@@ -275,7 +412,7 @@ function bgmStates(qmGenerateArn: string, tier: string): Record<string, unknown>
       Comment: 'No bgmPrompt supplied — proceed without background music',
       Parameters: { cdnUrl: '' },
       ResultPath: '$.bgmResult',
-      Next: 'DropFrameData',
+      Next: 'NormalizeFourLang',
     },
     QMGenerateBGM: {
       Type: 'Task',
@@ -297,14 +434,208 @@ function bgmStates(qmGenerateArn: string, tier: string): Record<string, unknown>
       TimeoutSeconds: 650,
       Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.bgmError', Next: 'BgmGenerationFailed' }],
-      Next: 'DropFrameData',
+      Next: 'NormalizeFourLang',
     },
     BgmGenerationFailed: {
       Type: 'Pass',
       Comment: 'BGM generation exhausted all rungs — proceed without music rather than failing the whole project',
       Parameters: { cdnUrl: '' },
       ResultPath: '$.bgmResult',
-      Next: 'DropFrameData',
+      Next: 'NormalizeFourLang',
+    },
+  };
+}
+
+/**
+ * 4lang: optional post-concat localization, shared by both
+ * Narration-Basic-QM-New and Narration-Premium-QM-New (the premium machine
+ * re-assigns this block with tier:'narrationPremium' after cloning the basic
+ * definition — see buildNarrationPremiumQmNewDefinition, mirrors bgmStates).
+ * Gated on the execution input's `fourLang` boolean; when true, translates
+ * the English transcript (TranscribeAudio's Whisper output, not the original
+ * per-frame narrationText — the spec's "translate the SRT" source of truth)
+ * into a FIXED set of 3 languages (es, pt-BR, hi — not a caller-supplied
+ * list), generates localized TTS per language, then re-transcribes each
+ * language's own TTS audio with Whisper to produce a properly-synced
+ * localized SRT (spec §7.4: SRT must sync to the real audio, not just
+ * translated text). Engine choice is per-language, not per-tier — es/pt-BR
+ * use Qwen Voice Design (language param), hi uses Kokoro's Hindi voice pack
+ * (hf_alpha/lang_code=h) since Qwen has no Hindi support at all — both
+ * verified live 2026-07-08 against the real flux-tts-s2t pod. A language
+ * that fails at any step emits a graceful `{failed:true}` item (mirrors
+ * QMFrameFailed) rather than failing the whole project.
+ */
+function localizationStates(qmGenerateArn: string, tier: string): Record<string, unknown> {
+  const ttsTask = (engine: 'qwen' | 'kokoro') => ({
+    Type: 'Task',
+    Resource: qmGenerateArn,
+    Comment: engine === 'qwen'
+      ? `4lang localized TTS (es/pt-BR) via QM (voice.${tier}.ttsLocalizedQwen — self-hosted Qwen Voice Design, language param drives Spanish/Portuguese).`
+      : `4lang localized TTS (Hindi) via QM (voice.${tier}.ttsLocalizedKokoro — self-hosted Kokoro Hindi voice pack, voice/lang_code fixed in the catalog rung).`,
+    Parameters: {
+      assetType: 'voice',
+      tier,
+      operation: engine === 'qwen' ? 'ttsLocalizedQwen' : 'ttsLocalizedKokoro',
+      product: 'narration',
+      queue: 'background',
+      jobType: 'batch',
+      'prompt.$': '$.translateResult.cdnUrl',
+      'language.$': '$.name',
+      'projectId.$': '$$.Execution.Input.projectId',
+      'userId.$': '$$.Execution.Input.userId',
+      // BUGFIX (found on the first successful fourLang run, 2026-07-08): with
+      // no frameId, qm-generate.ts derives requestId as
+      // `${projectId}:na:${assetType}:${operation}` — identical across all 3
+      // parallel language branches (same assetType/operation here), so QM's
+      // idempotent-by-requestId /jobs de-dup collapsed es/pt-BR onto ONE
+      // shared job (whichever won the race), silently returning that same
+      // result for both languages. Language code as frameId disambiguates
+      // both requestId and qm-generate.ts's default s3Target the same way a
+      // real frameId would for per-frame jobs.
+      'frameId.$': '$.code',
+    },
+    ResultPath: '$.ttsResult',
+    TimeoutSeconds: 650,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'LocalizationFailedForLanguage' }],
+    Next: 'QMGenerateLocalizedSRT',
+  });
+
+  return {
+    RouteLocalization: {
+      Type: 'Choice',
+      Comment: 'Only localize when the caller asked for 4lang AND the English transcript (TranscribeAudio) actually produced text — a failed/skipped SkipSrt has nothing to translate.',
+      Choices: [{
+        And: [
+          { Variable: '$.fourLang', IsPresent: true },
+          { Variable: '$.fourLang', BooleanEquals: true },
+          { Variable: '$.transcribeResult.text', IsPresent: true },
+        ],
+        Next: 'PrepareLocalization',
+      }],
+      Default: 'SkipLocalization',
+    },
+    SkipLocalization: {
+      Type: 'Pass',
+      Comment: 'fourLang not requested, or no English transcript to translate from — proceed without localized assets.',
+      Parameters: {},
+      ResultPath: '$.localizedAssets',
+      Next: 'UpdateStatusApplyingBgm',
+    },
+    PrepareLocalization: {
+      Type: 'Pass',
+      Comment: 'Fan out the 3 fixed 4lang targets (es, pt-BR, hi). Each item is self-contained (carries its own copy of the English transcript) so the Map below needs no Map-level Parameters/$$.Map.Item.Value merging.',
+      Parameters: {
+        languageConfigs: [
+          { code: 'es', name: 'Spanish', engine: 'qwen', whisperLang: 'es', 'englishText.$': '$.transcribeResult.text' },
+          { code: 'pt-BR', name: 'Portuguese', engine: 'qwen', whisperLang: 'pt', 'englishText.$': '$.transcribeResult.text' },
+          { code: 'hi', name: 'Hindi', engine: 'kokoro', whisperLang: 'hi', 'englishText.$': '$.transcribeResult.text' },
+        ],
+      },
+      ResultPath: '$.localizationPrep',
+      Next: 'LocalizeLanguages',
+    },
+    LocalizeLanguages: {
+      Type: 'Map',
+      Comment: '4lang: translate → localized TTS → localized SRT, one branch per language, fully parallel (3 fixed languages).',
+      ItemsPath: '$.localizationPrep.languageConfigs',
+      MaxConcurrency: 3,
+      ResultPath: '$.localizedAssets',
+      Iterator: {
+        StartAt: 'TranslateScript',
+        States: {
+          TranslateScript: {
+            Type: 'Task',
+            Resource: qmGenerateArn,
+            Comment: 'Translate the English transcript via QM (llm — self-hosted-less direct Anthropic Claude rung). Meaning-preserving, not word-for-word (spec §7.2): preserves scene order, factual meaning, tone, pacing, pronunciation-friendly phrasing.',
+            Parameters: {
+              assetType: 'llm',
+              tier: 'narration',
+              operation: 'translate',
+              product: 'narration',
+              queue: 'background',
+              jobType: 'batch',
+              'prompt.$': "States.Format('Translate the following English video narration script into natural, meaning-preserving {}. Preserve the original scene order, factual meaning, tone, and narration pacing. Use pronunciation-friendly phrasing suitable for text-to-speech. Return ONLY the translated text, with no preamble, labels, headers, or commentary.\n\nEnglish script:\n{}', $.name, $.englishText)",
+              'projectId.$': '$$.Execution.Input.projectId',
+              'userId.$': '$$.Execution.Input.userId',
+              // See the frameId bugfix note on ttsTask() above — without this,
+              // all 3 parallel language branches derive the identical
+              // requestId (`${projectId}:na:llm:translate`) and QM's
+              // idempotent /jobs de-dup collapses them onto one shared
+              // translation.
+              'frameId.$': '$.code',
+            },
+            ResultPath: '$.translateResult',
+            TimeoutSeconds: 120,
+            Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException', 'States.TaskFailed'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+            Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.translateError', Next: 'LocalizationFailedForLanguage' }],
+            Next: 'RouteLocalizedTTS',
+          },
+          RouteLocalizedTTS: {
+            Type: 'Choice',
+            Comment: 'Engine is per-language (set in PrepareLocalization), not per-tier — hi has no Qwen support at all, so it always routes to Kokoro regardless of project tier.',
+            Choices: [{ Variable: '$.engine', StringEquals: 'kokoro', Next: 'QMGenerateLocalizedTTSKokoro' }],
+            Default: 'QMGenerateLocalizedTTSQwen',
+          },
+          QMGenerateLocalizedTTSQwen: ttsTask('qwen'),
+          QMGenerateLocalizedTTSKokoro: ttsTask('kokoro'),
+          QMGenerateLocalizedSRT: {
+            Type: 'Task',
+            Resource: qmGenerateArn,
+            Comment: 'Localized SRT via QM (srt.narration — same self-hosted Whisper rung as the English TranscribeAudio step), re-transcribing this language\'s OWN generated TTS audio rather than reusing translated text with English timings — keeps captions synced to the real localized speech (spec §7.4).',
+            Parameters: {
+              assetType: 'srt',
+              tier: 'narration',
+              operation: 'transcribe',
+              product: 'narration',
+              queue: 'background',
+              jobType: 'batch',
+              'audioUrl.$': '$.ttsResult.cdnUrl',
+              'language.$': '$.whisperLang',
+              'projectId.$': '$$.Execution.Input.projectId',
+              // See the frameId bugfix note on ttsTask() above — without this,
+              // this collides with the ENGLISH TranscribeAudio call too (same
+              // assetType:'srt'/tier:'narration'/operation:'transcribe'
+              // triple, no frameId there either), not just across languages.
+              'frameId.$': '$.code',
+            },
+            ResultPath: '$.srtResult',
+            TimeoutSeconds: 650,
+            Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+            Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.srtError', Next: 'SkipLocalizedSrt' }],
+            Next: 'BuildLanguageAsset',
+          },
+          SkipLocalizedSrt: {
+            Type: 'Pass',
+            Comment: 'Localized SRT generation failed — keep the translated script + audio, proceed without captions for this language (mirrors SkipSrt).',
+            Parameters: { cdnUrl: '' },
+            ResultPath: '$.srtResult',
+            Next: 'BuildLanguageAsset',
+          },
+          BuildLanguageAsset: {
+            Type: 'Pass',
+            Comment: 'Success shape for one language.',
+            Parameters: {
+              'language.$': '$.code',
+              'scriptText.$': '$.translateResult.cdnUrl',
+              'voiceoverUrl.$': '$.ttsResult.cdnUrl',
+              'srtUrl.$': '$.srtResult.cdnUrl',
+            },
+            End: true,
+          },
+          LocalizationFailedForLanguage: {
+            Type: 'Pass',
+            Comment: 'This language exhausted its localization steps — emit a graceful failure item rather than aborting the whole Map (mirrors QMFrameFailed).',
+            Parameters: {
+              'language.$': '$.code',
+              failed: true,
+              error: 'LocalizationError',
+            },
+            End: true,
+          },
+        },
+      },
+      Next: 'UpdateStatusApplyingBgm',
     },
   };
 }
@@ -517,8 +848,8 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
 // the finalize section is Premium-flavored (1080p upscale), matching
 // buildPremiumDefinition's FinalizeVideoPremium exactly.
 // ---------------------------------------------------------------------------
-function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string): object {
-  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn))) as {
+function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string): object {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn))) as {
     Comment: string;
     States: Record<string, any>;
   };
@@ -535,6 +866,14 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   def.States.GenerateImages = qmPremiumFrameAssetsMap(qmGenerateArn);
   def.States.GenerateImages.Next = 'RouteBGM';
   Object.assign(def.States, bgmStates(qmGenerateArn, 'narrationPremium'));
+
+  // Same re-tier for the cloned 4lang localization states — the clone above
+  // inherited buildQmNewDefinition's tier:'narrationBasic' localized-TTS
+  // states (voice.narrationBasic.ttsLocalized{Qwen,Kokoro}); overwrite with
+  // the narrationPremium-tiered versions for correct billing/audit
+  // attribution (same physical rungs either way — mirrors the BGM re-tier
+  // immediately above).
+  Object.assign(def.States, localizationStates(qmGenerateArn, 'narrationPremium'));
 
   // Finalize becomes Premium-flavored (1080p upscale, longer Fargate timeout),
   // renaming the Basic finalize states to match buildPremiumDefinition's own
@@ -578,7 +917,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
       'convexEndpoint.$': '$.convexEndpoint',
     },
     ResultPath: '$.finalizeTaskInput',
-    Next: 'FinalizeVideoPremium',
+    Next: 'NormalizeShortsOptions',
   };
   delete def.States.PrepareFinalizeBasic;
 
@@ -611,6 +950,11 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
     Next: 'Complete',
   };
   delete def.States.FinalizeVideoBasic;
+
+  // The clone above inherited buildQmNewDefinition's CheckGenerateShorts/
+  // TriggerShortsFromLongForm pointed at FinalizeVideoBasic (now deleted) —
+  // retarget both at FinalizeVideoPremium.
+  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoPremium'));
 
   return def;
 }

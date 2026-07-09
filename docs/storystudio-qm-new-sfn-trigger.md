@@ -15,10 +15,16 @@ run a real end-to-end project yet** — that's the next step, and it's on StoryS
 (per-frame `referenceImageUrl`, no change needed). **BGM is now generated from a prompt**
 (`bgmPrompt`, project-level) instead of accepted as a pre-existing URL — `bgmUrl` is
 **removed** from both payloads; see §3.2/§9.2 and the updated flow diagrams (§4/§9.4).
+**Added 2026-07-08: optional 4lang localization** (`fourLang: true` → translated script +
+localized TTS + localized SRT for a fixed `es`/`pt-BR`/`hi` set, both tiers) — see §4a.
+**Added 2026-07-09: optional shorts trigger** (`generateShorts: true` → fire-and-forget
+POST to the standalone `shorts-longform` RunPod worker, both tiers) — see §4b. Replaces the
+legacy Premium-QM's `TriggerShortsFromLongForm → E2E-start-shorts` path for QM-New.
 **Companion docs:** `docs/storystudio-qm-admission-gate.md` (the admission contract, full
 detail), `docs/storystudio-mcp-sfn-trigger.md` (legacy Basic-QM/Premium-QM, being
 superseded by these two), `storystudio-unified/docs/quartermaster/QM_NEW_PIPELINE_DESIGN.md`
-(design rationale).
+(design rationale), `~/longtoshort/STORYSTUDIO-INTEGRATION.md` (the `shorts-longform` worker's
+own API contract).
 
 ---
 
@@ -143,6 +149,9 @@ and per-frame TTS internally and derives the SRT from the concatenated audio wit
 | `jwtToken` | string | **yes** | Short-lived Convex JWT for status callbacks |
 | `convexEndpoint` | string | **yes** | `https://<deployment>.convex.cloud` |
 | `admissionId` | string | no | From §2, if you're calling admission. Threaded through for correlation/audit; not currently read back by any state in this SFN. **You** release it (§2), not the SFN. |
+| `fourLang` | boolean | no | **Added 2026-07-08.** `true` ⇒ after concat + English SRT, also translates the transcript and generates localized TTS + SRT for a **fixed** set of 3 languages (`es`, `pt-BR`, `hi` — not configurable per-request). Omitted/false ⇒ no localization, unchanged behavior. See §4a. |
+| `generateShorts` | boolean | no | **Added 2026-07-09.** `true` ⇒ right before Fargate finalize, fire-and-forget POST the concat video + SRT + BGM to the `shorts-longform` RunPod worker (`u3bvq5juben8ri`, transcript-first AI clip selection) — see §4b. Omitted/false ⇒ skipped entirely, unchanged behavior. Failure is non-fatal; never blocks or fails the main long-form project. |
+| `shortsOptions` | object | no | **Added 2026-07-09.** Raw passthrough merged into the `shorts-longform` worker's `job.input` — see §4b for the full field surface (segments/frames, `num_clips`, `render_style`, `upscale`, `caption_config`, `hook`, `slides`, `bgm_volume`, `ass_url`, ...). Ignored if `generateShorts` isn't `true`. `project_id`/`video_url` always come from the pipeline itself and can't be overridden here. |
 
 ### 3.3 Frame object (`frames[]`, one per frame)
 
@@ -159,9 +168,13 @@ and per-frame TTS internally and derives the SRT from the concatenated audio wit
 ### 3.4 Fields you must NOT send (vs. legacy Premium-QM)
 
 This pipeline ignores or does not need: `voiceUrls`, `voiceAudioUrl`, `captionsUrl`,
-`generateShorts`, `shortsRenderStyle`, `mode`, `characterBible`, `synopsis`, `hookConfig`,
-and per-frame `voiceName` / `ttsModel` / `referenceImageUrls`. Leaving them in is harmless
-but they have no effect — voice is selected by the top-level `voiceGender`.
+`shortsRenderStyle`, `mode`, `characterBible`, `synopsis`, `hookConfig`, and per-frame
+`voiceName` / `ttsModel` / `referenceImageUrls`. Leaving them in is harmless but they have no
+effect — voice is selected by the top-level `voiceGender`.
+
+> **`generateShorts` is now supported** (added 2026-07-09, see §3.2/§4b) — this is a change
+> from earlier versions of this doc, which listed it here as ignored. `shortsRenderStyle` is
+> still ignored — the `shorts-longform` worker picks its own render style.
 
 > ⚠️ **Breaking change (2026-07-03): `bgmUrl` is gone, not just unused.** Earlier versions of
 > this doc had you pass a pre-existing `bgmUrl`. That field **no longer exists** in this
@@ -197,7 +210,11 @@ ValidateInput → CheckValidation
 → ConcatenateVideos           (E2E-video-concat-premium; reads videoUrl + frameNumber)
 → TranscribeAudio             (Whisper SRT from concat audio — no upstream SRT needed)
 → BuildMergedVoiceResult
+→ RouteLocalization → [fourLang & transcript present] PrepareLocalization → LocalizeLanguages (§4a)
+                    → [absent/no transcript]           SkipLocalization
 → UpdateStatusApplyingBgm → ValidateFinalizeInputsBasic → PrepareFinalizeBasic
+→ CheckGenerateShorts → [generateShorts=true] TriggerShortsFromLongForm (§4b, non-fatal)
+                      → [absent/false]         (skip)
 → FinalizeVideoBasic          (Fargate: audio merge + captions + BGM)
 → Complete
 ```
@@ -206,6 +223,149 @@ A frame that exhausts all QM rungs for image/TTS/animate/merge emits a graceful
 `{ failed:true, frameId, frameNumber }` item rather than aborting the Map — matching the
 legacy pipelines' per-frame resilience. Top-level unrecoverable errors route
 `HandleFailure → UpdateStatusFailed → FailState` and set the Convex job to `"failed"`.
+
+---
+
+## 4a. 4lang localization (optional, both Basic and Premium)
+
+**Added 2026-07-08.** Set `fourLang: true` (§3.2/§9.2) to also produce a
+translated script, localized TTS, and a localized SRT for a **fixed** set of
+3 languages on top of the English master: `es`, `pt-BR`, `hi`. This is not a
+caller-supplied list — the 3 languages are hardcoded in the pipeline.
+Metadata/thumbnails/YouTube publishing are **not** part of this — only
+translate + TTS + SRT.
+
+Runs once, project-level, right after `TranscribeAudio` produces the English
+transcript (the translation source — **not** the original per-frame
+`narrationText`), fully in parallel across the 3 languages
+(`MaxConcurrency: 3`):
+
+```
+LocalizeLanguages (Map, one branch per language)
+  TranslateScript        (llm → self-hosted-less direct Anthropic Claude; meaning-preserving,
+                           not word-for-word — preserves scene order/tone/pacing)
+  RouteLocalizedTTS       (es/pt-BR → Qwen Voice Design; hi → Kokoro's Hindi voice pack —
+                           Qwen has no Hindi support at all, so hi always uses Kokoro
+                           regardless of Basic/Premium tier)
+  QMGenerateLocalizedTTS{Qwen|Kokoro}  (voice.{tier}.ttsLocalized{Qwen|Kokoro})
+  QMGenerateLocalizedSRT  (srt.narration — re-transcribes THIS language's own generated TTS
+                           audio with Whisper, not the translated text + English timings, so
+                           captions stay synced to the real localized speech)
+  → { language, scriptText, voiceoverUrl, srtUrl }
+```
+
+A language that fails at any step emits `{ language, failed: true, error:
+"LocalizationError" }` rather than failing the whole project — one language
+failing doesn't block the other two or the English master video.
+
+**Result shape** — `$.localizedAssets` (an array of 3 items, success or
+failure per above) is included in the Convex status callback at
+`UpdateStatusApplyingBgm` (`assets.localizedAssets`) and in the execution's
+final `Complete` output, e.g.:
+
+```json
+{
+  "localizedAssets": [
+    { "language": "es",    "scriptText": "...", "voiceoverUrl": "https://...wav", "srtUrl": "https://...srt" },
+    { "language": "pt-BR", "scriptText": "...", "voiceoverUrl": "https://...wav", "srtUrl": "https://...srt" },
+    { "language": "hi",    "failed": true, "error": "LocalizationError" }
+  ]
+}
+```
+
+No audio-track muxing into the final video, no localized metadata/thumbnails,
+no YouTube upload — these assets are handed back as standalone URLs for
+StoryStudio to package/upload itself.
+
+---
+
+## 4b. Shorts trigger (optional, both Basic and Premium)
+
+**Added 2026-07-09.** Set `generateShorts: true` (§3.2/§9.2) to fire-and-forget trigger the
+standalone `shorts-longform` RunPod worker (endpoint `u3bvq5juben8ri`, RunPod project tag
+`QM-new`) on the finished concat video, right before Fargate finalize. This is **not** routed
+through the QM-generate gateway/catalog like every other asset in this doc — it's a direct,
+outside-the-catalog call to a dedicated RunPod endpoint, matching the pattern documented in
+`~/longtoshort/STORYSTUDIO-INTEGRATION.md`. It replaces the legacy Premium-QM's
+`TriggerShortsFromLongForm → E2E-start-shorts → E2E-ShortsFromLongForm` (10-Lambda SFN) path,
+which is being decommissioned.
+
+```
+PrepareFinalize{Basic|Premium}
+→ NormalizeShortsOptions       (defaults $.shortsOptions to {} if the caller omitted it)
+→ CheckGenerateShorts → [generateShorts=true] TriggerShortsFromLongForm
+                                                  → QM-shorts-trigger Lambda
+                                                     → POST https://api.runpod.ai/v2/u3bvq5juben8ri/run
+                                                        { ...shortsOptions,        (caller passthrough, see below)
+                                                          mode: "shorts",
+                                                          srt_url, segments_source: "ai", bgm_url,  (computed defaults,
+                                                                                                       overridable by shortsOptions)
+                                                          project_id, video_url }  (always pipeline's own — never overridable)
+                                                        webhook: {convexEndpoint}/api/e2e/runpod-webhook?jobId=...
+                                                  → FinalizeVideo{Basic|Premium}  (either way)
+                       → [absent/false]         → FinalizeVideo{Basic|Premium}
+```
+
+- `video_url` = `$.mergedVoiceResult.mergedVideoUrl` (the concat video, **before** Fargate's
+  upscale/caption-burn/BGM-mix — shorts render their own captions/BGM independently). Always
+  this execution's own value — `shortsOptions.video_url` is ignored if sent.
+- `project_id` = `$.projectId`, same non-overridable rule.
+- `srt_url` = `$.mergedVoiceResult.captionsUrl` by default (the same Whisper-generated
+  full-video SRT used for the long-form video), which also sets `segments_source: "ai"`
+  (transcript-first AI clip selection — Claude picks highlight clips, frame-accurate captions
+  sliced from this SRT). Both are plain defaults, not forced — put `srt_url` and/or
+  `segments_source` in `shortsOptions` to override (e.g. explicit `segments[]` + the pipeline's
+  SRT without AI selection).
+- `bgm_url` = `$.bgmResult.cdnUrl` by default — same generated BGM track mixed into every
+  clip. Empty if `bgmPrompt` was omitted. Overridable via `shortsOptions.bgm_url`, or use
+  `shortsOptions.bgm_prompt` instead to have the worker generate its own track.
+- **`shortsOptions`** is merged **over** the computed defaults above (so it can override
+  `srt_url`/`segments_source`/`bgm_url`) but never over `project_id`/`video_url`. It's a raw
+  passthrough into the worker's `job.input` — there's no formal schema on the RunPod side
+  (defined ad hoc in `handler.py:handler()`), so this SFN doesn't hardcode a copy of it. As of
+  2026-07-09 the accepted keys are:
+
+  | Field | Notes |
+  |---|---|
+  | `mode` | only `"shorts"` is supported (this SFN's default) |
+  | `segments[]` | explicit segments: `part_number`/`title`/`start_s`/`end_s` (many alias spellings), plus optional `hook_line`, `keywords`, `virality`, `reason`, `ass_url`. Priority: `segments` → `frames` → `num_shorts` |
+  | `frames[]` | marker objects: `frameNumber`, `duration`, `segmentStart`/`segmentEnd`, `segmentNumber`, `segmentTitle` |
+  | `num_shorts` | int; duration-based equal-split fallback; default 3 (source <300s) or 5 |
+  | `segments_source: "ai"` | Claude-based highlight selection, requires `srt_url` |
+  | `num_clips` / `num_shorts` | exact clip count for AI mode |
+  | `max_clips` | cap for AI mode when `num_clips` unset; default 3 or 5 |
+  | `min_clip_s` / `max_clip_s` | AI clip length guideline; default 30.0 / 90.0 |
+  | `project_title` | shown on title slides, given to Claude as context in AI mode |
+  | `srt_url` | pre-existing full-video SRT; skips per-short transcription |
+  | `target_width` / `target_height` | default 1080 / 1920 |
+  | `source_aspect_ratio` / `target_aspect_ratio` | default `"16:9"` / auto-computed |
+  | `render_style` | `"PAD"` \| `"BLUR_FILL"` (default) \| `"CROP_FILL"` |
+  | `fg_y_offset` | default -120 |
+  | `captions` | bool, default `true` |
+  | `srt_source` | `"endpoint"` (default) or `"local"` |
+  | `srt_endpoint_id` | default from worker env `SRT_ENDPOINT_ID` |
+  | `language` | default `"en"` |
+  | `ass_url` | custom ASS override (job-level); `segments[].ass_url` overrides per-clip |
+  | `caption_config` | object merged over defaults: `fontFamily`, `fontSize`, `fontColor`, `strokeColor`, `strokeWidth`, `highlightColor`, `keywordHighlight`, `keywordColor`, `position`, `marginBottom`, `allCaps`, `karaoke`, `wordsPerGroup` |
+  | `hook` | bool, default `true` (burn the AI-picked hook line top-center) |
+  | `slides` | bool; auto-skipped for AI-selected clips otherwise |
+  | `upscale` | `"none"` (default) \| `"realesrgan"` \| `"lanczos"` |
+  | `upscale_target` | `720` or `1080` (default) |
+  | `bgm_url` | pre-generated track (wins over `bgm_prompt`) |
+  | `bgm_prompt` | text prompt for generated BGM |
+  | `bgm_volume` | default 0.18 |
+
+  Example — force a fixed 4-clip cut with a custom look instead of the AI default:
+  ```json
+  { "generateShorts": true,
+    "shortsOptions": { "num_clips": 4, "render_style": "CROP_FILL", "upscale": "realesrgan" } }
+  ```
+
+- **Fire-and-forget, non-fatal:** `TriggerShortsFromLongForm` has a 30s timeout and a
+  `States.ALL` Catch that always proceeds to finalize — a failed or slow trigger never blocks
+  or fails the main long-form project. Completion (shorts URLs, per-clip virality scores,
+  etc.) is reported by RunPod's own webhook straight to Convex, **not** back through this SFN
+  — the SFN doesn't wait for or see the shorts job's result at all.
 
 ---
 
@@ -371,6 +531,7 @@ voice fields replace `voiceGender`, and the underlying models differ.
 | `voiceInstruct` | string | **yes (key must be present)** | Tone/style instruction for the voice-design model (e.g. `"calm authoritative documentary tone"`). Empty string is safe. |
 | `voiceLanguage` | string | **yes (key must be present)** | e.g. `"English"`. Empty string is safe (defaults server-side). |
 | `admissionId` | string | no | Same as Basic (§3.2) — pass `tier:"premium"` to admission when requesting this. |
+| `fourLang` | boolean | no | Same as Basic (§3.2/§4a) — `hi` localized TTS uses Kokoro here too (not Qwen), since Qwen has no Hindi support regardless of tier. |
 
 All other top-level fields (`projectId`, `jobId`, `userId`, `aspectRatio`, `bgmPrompt`,
 `apiKey`, `jwtToken`, `convexEndpoint`) are identical to §3.2 — including BGM: same
@@ -413,7 +574,12 @@ ValidateInput → CheckValidation
 → ConcatenateVideos           (E2E-video-concat-premium)
 → TranscribeAudio             (Whisper SRT from concat audio)
 → BuildMergedVoiceResult
+→ RouteLocalization → [fourLang & transcript present] PrepareLocalization → LocalizeLanguages (§4a,
+                       tier:"narrationPremium" — same branch, re-tiered for billing/audit attribution)
+                    → [absent/no transcript]           SkipLocalization
 → UpdateStatusApplyingBgm → ValidateFinalizeInputsPremium → PrepareFinalizePremium
+→ CheckGenerateShorts → [generateShorts=true] TriggerShortsFromLongForm (§4b, non-fatal)
+                      → [absent/false]         (skip)
 → FinalizeVideoPremium         (Fargate: 480p→1080p upscale + audio merge + captions + BGM)
 → Complete
 ```

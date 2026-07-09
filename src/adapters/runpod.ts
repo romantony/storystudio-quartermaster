@@ -24,6 +24,23 @@ function runpodOutUrl(p: unknown): string | undefined {
   return dig(p);
 }
 
+// Dig the plain-text transcript out of a `transcribe` mode response (Whisper
+// returns {mode:"transcribe", text:"...", chunks:[...], srt:"...url", ...},
+// possibly wrapped in a RunPod `output` envelope for async /status polls —
+// per runpod/API.md). Used as 4lang's translation source text; undefined for
+// every other mode (image/tts/bgm/etc never carry a `.text` field).
+function runpodOutText(p: unknown): string | undefined {
+  const dig = (x: unknown): string | undefined => {
+    if (x && typeof x === 'object') {
+      const obj = x as Record<string, unknown>;
+      if (typeof obj.text === 'string' && obj.text.length > 0) return obj.text;
+      if (obj.output !== undefined) return dig(obj.output);
+    }
+    return undefined;
+  };
+  return dig(p);
+}
+
 // Dig the real generated duration (seconds) out of RunPod's output, when the
 // mode reports one — tts/merge/concat/animate/bgm/pipeline all return
 // duration_s (runpod/API.md). Used to drive Wan2's duration_s from the
@@ -127,14 +144,18 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
         }
         return input;
       }
-      // Kokoro (default).
+      // Kokoro (default). voice/lang_code come from the catalog rung's
+      // `fixed` overrides first (e.g. the 4lang Hindi ladder pins
+      // voice:"hf_alpha", langCode:"h" — verified live 2026-07-08) so a
+      // per-language ladder doesn't depend on a job param that could be
+      // silently dropped by the zod schema (api.ts canonicalJobSchema).
       return {
         mode: 'tts',
         engine: 'kokoro',
         text: job.prompt,
-        voice: p.voice ?? 'am_michael',
+        voice: rung.fixed?.voice ?? p.voice ?? 'am_michael',
         speed: 1.0,
-        lang_code: 'a',
+        lang_code: rung.fixed?.langCode ?? 'a',
         ...attribution,
       };
     }
@@ -157,11 +178,14 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
       };
     }
     case 'transcribe': {
+      // language defaults to 'en' (the original English-only behavior) but
+      // is overridable per job — 4lang's localized SRT step re-transcribes
+      // each language's own TTS audio with its own language (es/pt/hi).
       return {
         mode: 'transcribe',
         audio_url: job.audioUrl,
         task: 'transcribe',
-        language: 'en',
+        language: p.language || 'en',
         return_timestamps: 'word',
         ...attribution,
       };
@@ -297,10 +321,10 @@ export const runpod: Adapter = {
     const status = String(r.status ?? '').toUpperCase();
     if (status === 'COMPLETED') {
       const url = runpodOutUrl(r);
-      if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(r) };
+      if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(r), text: runpodOutText(r) };
     }
     const url = runpodOutUrl(raw);
-    if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(raw) };
+    if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(raw), text: runpodOutText(raw) };
     return { taskRef: String(r.id ?? ''), raw };
   },
 
@@ -313,7 +337,7 @@ export const runpod: Adapter = {
 
     if (status === 'COMPLETED') {
       const url = runpodOutUrl(json);
-      return { done: true, outputUrls: url ? [url] : undefined, durationS: runpodOutDuration(json) };
+      return { done: true, outputUrls: url ? [url] : undefined, durationS: runpodOutDuration(json), text: runpodOutText(json) };
     }
     if (TERMINAL_STATUSES.has(status)) {
       const out = json.output as Record<string, unknown> | undefined;

@@ -60,6 +60,7 @@
     "REPLICATE_API_TOKEN_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/replicate-api-token-bFiOOH",
     "KIE_AI_API_KEY_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/kie-api-key-YSJ4Jq",
     "RUNPOD_API_KEY_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/runpod-api-key-pT4dTx",
+    "ANTHROPIC_API_KEY_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/anthropic-api-key-zr7NBL",
     "KIE_WEBHOOK_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/kie-webhook-secret-FChuIu",
     "REPLICATE_WEBHOOK_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:929075264324:secret:quartermaster/replicate-webhook-secret-T13YjM"
   }

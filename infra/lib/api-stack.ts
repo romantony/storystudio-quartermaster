@@ -19,6 +19,7 @@ interface ApiStackProps extends StackProps {
   replicateKeySecretArn: string;
   kieKeySecretArn: string;
   runpodKeySecretArn: string;
+  anthropicKeySecretArn: string;
   s3CacheBucket: string;
   webhookBaseUrl: string;
   /**
@@ -44,12 +45,14 @@ export class ApiStack extends Stack {
       props.replicateKeySecretArn,
       props.kieKeySecretArn,
       props.runpodKeySecretArn,
+      props.anthropicKeySecretArn,
     ];
     const providerSecretEnv = {
       MODELSLAB_API_KEY_ARN: props.modeslabKeySecretArn,
       REPLICATE_API_TOKEN_ARN: props.replicateKeySecretArn,
       KIE_AI_API_KEY_ARN: props.kieKeySecretArn,
       RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
+      ANTHROPIC_API_KEY_ARN: props.anthropicKeySecretArn,
     };
 
     // ── Executor: execute-with-failover loop. Longer timeout for RunPod cold
@@ -110,6 +113,7 @@ export class ApiStack extends Stack {
         REPLICATE_API_TOKEN_ARN: props.replicateKeySecretArn,
         KIE_AI_API_KEY_ARN: props.kieKeySecretArn,
         RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
+        ANTHROPIC_API_KEY_ARN: props.anthropicKeySecretArn,
         S3_CACHE_BUCKET: props.s3CacheBucket,
         SAFE_LIMIT: '15',
         VIDEO_FLOOR: '8',
@@ -134,6 +138,7 @@ export class ApiStack extends Stack {
         props.replicateKeySecretArn,
         props.kieKeySecretArn,
         props.runpodKeySecretArn,
+        props.anthropicKeySecretArn,
       ],
     }));
 
