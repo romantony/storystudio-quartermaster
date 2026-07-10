@@ -206,6 +206,7 @@ const canonicalJobSchema = z.object({
     speaker: z.string().optional(),
     language: z.string().optional(),
     cloneArtifactUrl: z.string().optional(),
+    voiceId: z.string().optional(),
     voiceText: z.string().optional(),
     effect: z.string().optional(),
   }).default({}),

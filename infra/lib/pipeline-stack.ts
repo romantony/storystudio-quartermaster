@@ -458,20 +458,28 @@ function bgmStates(qmGenerateArn: string, tier: string): Record<string, unknown>
  * list), generates localized TTS per language, then re-transcribes each
  * language's own TTS audio with Whisper to produce a properly-synced
  * localized SRT (spec §7.4: SRT must sync to the real audio, not just
- * translated text). Engine choice is per-language, not per-tier — es/pt-BR
- * use Qwen Voice Design (language param), hi uses Kokoro's Hindi voice pack
- * (hf_alpha/lang_code=h) since Qwen has no Hindi support at all — both
- * verified live 2026-07-08 against the real flux-tts-s2t pod. A language
- * that fails at any step emits a graceful `{failed:true}` item (mirrors
- * QMFrameFailed) rather than failing the whole project.
+ * translated text). Engine per language/project is DATA-DRIVEN, not
+ * hardcoded by language or tier: StoryStudio resolves each project's chosen
+ * voice to either a Qwen voice-clone .pt artifact or a Kokoro voiceId and
+ * puts it on the execution input as voiceCloneArtifactUrl{Es,PtBr,Hi} /
+ * voiceId{Es,PtBr,Hi} (mirrors the single-language voiceCloneArtifactUrl/
+ * RouteTTSEngine pattern the primary English TTS call above already uses).
+ * This SFN just passes whichever one is present straight through to QM —
+ * cloneArtifactUrl present → Qwen clone fast path, voiceId present →
+ * Kokoro. Hi will practically always take the Kokoro branch since Qwen has
+ * no Hindi support at all (see qwen-voice-clone/docs/voice-catalog.json),
+ * but that's a consequence of what gets sent, not a hardcoded rule here. A
+ * language that fails at any step (including neither identifier being
+ * sent) emits a graceful `{failed:true}` item (mirrors QMFrameFailed)
+ * rather than failing the whole project.
  */
 function localizationStates(qmGenerateArn: string, tier: string): Record<string, unknown> {
   const ttsTask = (engine: 'qwen' | 'kokoro') => ({
     Type: 'Task',
     Resource: qmGenerateArn,
     Comment: engine === 'qwen'
-      ? `4lang localized TTS (es/pt-BR) via QM (voice.${tier}.ttsLocalizedQwen — self-hosted Qwen Voice Design, language param drives Spanish/Portuguese).`
-      : `4lang localized TTS (Hindi) via QM (voice.${tier}.ttsLocalizedKokoro — self-hosted Kokoro Hindi voice pack, voice/lang_code fixed in the catalog rung).`,
+      ? `4lang localized TTS via QM (voice.${tier}.ttsLocalizedQwen — Qwen3-TTS voice-clone .pt fast path: cloneArtifactUrl + language param).`
+      : `4lang localized TTS via QM (voice.${tier}.ttsLocalizedKokoro — self-hosted Kokoro voiceId, language param drives lang_code).`,
     Parameters: {
       assetType: 'voice',
       tier,
@@ -481,6 +489,9 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
       jobType: 'batch',
       'prompt.$': '$.translateResult.cdnUrl',
       'language.$': '$.name',
+      ...(engine === 'qwen'
+        ? { 'cloneArtifactUrl.$': '$.cloneArtifactUrl' }
+        : { 'voiceId.$': '$.voiceId' }),
       'projectId.$': '$$.Execution.Input.projectId',
       'userId.$': '$$.Execution.Input.userId',
       // BUGFIX (found on the first successful fourLang run, 2026-07-08): with
@@ -501,7 +512,55 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
     Next: 'QMGenerateLocalizedSRT',
   });
 
+  // Guarantee $.<resultField> is always present (default '') before
+  // PrepareLocalization references it via '.$' — same gotcha as
+  // fourLang/shortsOptions (see NormalizeFourLang/NormalizeShortsOptions
+  // above): a raw $$.Execution.Input.<field> Parameters reference throws
+  // States.Runtime if the caller omitted that (optional, per-language)
+  // field entirely, which is the common case (a project sends either the
+  // clone-url or the voiceId for a given language, never both).
+  const cap = (s: string) => s[0].toUpperCase() + s.slice(1);
+  const normalizeVoiceField = (execField: string, resultField: string, next: string): Record<string, unknown> => {
+    const choice = `Normalize${cap(resultField)}`;
+    const present = `Set${cap(resultField)}Present`;
+    const absent = `Set${cap(resultField)}Absent`;
+    return {
+      [choice]: {
+        Type: 'Choice',
+        Choices: [{
+          And: [
+            { Variable: `$$.Execution.Input.${execField}`, IsPresent: true },
+            { Variable: `$$.Execution.Input.${execField}`, IsString: true },
+            { Not: { Variable: `$$.Execution.Input.${execField}`, StringEquals: '' } },
+          ],
+          Next: present,
+        }],
+        Default: absent,
+      },
+      [present]: { Type: 'Pass', Parameters: { 'value.$': `$$.Execution.Input.${execField}` }, ResultPath: `$.${resultField}`, Next: next },
+      [absent]: { Type: 'Pass', Result: { value: '' }, ResultPath: `$.${resultField}`, Next: next },
+    };
+  };
+
+  // Chain of 5 normalize steps run once, before PrepareLocalization fans out
+  // into the 3-way Map (hi's cloneArtifactUrl isn't normalized — Qwen has no
+  // Hindi support, so that leg is always the literal '' in PrepareLocalization
+  // below rather than a caller-suppliable field).
+  const voiceFieldChain: string[] = [
+    'voiceCloneArtifactUrlEs',
+    'voiceIdEs',
+    'voiceCloneArtifactUrlPtBr',
+    'voiceIdPtBr',
+    'voiceIdHi',
+  ];
+  const voiceNormalizeStates: Record<string, unknown> = {};
+  voiceFieldChain.forEach((field, i) => {
+    const next = i + 1 < voiceFieldChain.length ? `Normalize${cap(voiceFieldChain[i + 1])}` : 'PrepareLocalization';
+    Object.assign(voiceNormalizeStates, normalizeVoiceField(field, field, next));
+  });
+
   return {
+    ...voiceNormalizeStates,
     RouteLocalization: {
       Type: 'Choice',
       Comment: 'Only localize when the caller asked for 4lang AND the English transcript (TranscribeAudio) actually produced text — a failed/skipped SkipSrt has nothing to translate.',
@@ -511,7 +570,7 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
           { Variable: '$.fourLang', BooleanEquals: true },
           { Variable: '$.transcribeResult.text', IsPresent: true },
         ],
-        Next: 'PrepareLocalization',
+        Next: `Normalize${cap(voiceFieldChain[0])}`,
       }],
       Default: 'SkipLocalization',
     },
@@ -524,12 +583,12 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
     },
     PrepareLocalization: {
       Type: 'Pass',
-      Comment: 'Fan out the 3 fixed 4lang targets (es, pt-BR, hi). Each item is self-contained (carries its own copy of the English transcript) so the Map below needs no Map-level Parameters/$$.Map.Item.Value merging.',
+      Comment: 'Fan out the 3 fixed 4lang targets (es, pt-BR, hi). Each item carries its own copy of the English transcript plus the per-language voice identifier normalized above (cloneArtifactUrl and/or voiceId — whichever StoryStudio actually sent), so the Map below needs no Map-level Parameters/$$.Map.Item.Value merging.',
       Parameters: {
         languageConfigs: [
-          { code: 'es', name: 'Spanish', engine: 'qwen', whisperLang: 'es', 'englishText.$': '$.transcribeResult.text' },
-          { code: 'pt-BR', name: 'Portuguese', engine: 'qwen', whisperLang: 'pt', 'englishText.$': '$.transcribeResult.text' },
-          { code: 'hi', name: 'Hindi', engine: 'kokoro', whisperLang: 'hi', 'englishText.$': '$.transcribeResult.text' },
+          { code: 'es', name: 'Spanish', whisperLang: 'es', 'englishText.$': '$.transcribeResult.text', 'cloneArtifactUrl.$': '$.voiceCloneArtifactUrlEs.value', 'voiceId.$': '$.voiceIdEs.value' },
+          { code: 'pt-BR', name: 'Portuguese', whisperLang: 'pt', 'englishText.$': '$.transcribeResult.text', 'cloneArtifactUrl.$': '$.voiceCloneArtifactUrlPtBr.value', 'voiceId.$': '$.voiceIdPtBr.value' },
+          { code: 'hi', name: 'Hindi', whisperLang: 'hi', 'englishText.$': '$.transcribeResult.text', cloneArtifactUrl: '', 'voiceId.$': '$.voiceIdHi.value' },
         ],
       },
       ResultPath: '$.localizationPrep',
@@ -573,9 +632,24 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
           },
           RouteLocalizedTTS: {
             Type: 'Choice',
-            Comment: 'Engine is per-language (set in PrepareLocalization), not per-tier — hi has no Qwen support at all, so it always routes to Kokoro regardless of project tier.',
-            Choices: [{ Variable: '$.engine', StringEquals: 'kokoro', Next: 'QMGenerateLocalizedTTSKokoro' }],
-            Default: 'QMGenerateLocalizedTTSQwen',
+            Comment: 'Data-driven, not hardcoded per-language/per-tier: cloneArtifactUrl present (normalized in PrepareLocalization from voiceCloneArtifactUrl{Es,PtBr,Hi}) -> Qwen voice-clone fast path; else voiceId present (from voiceId{Es,PtBr,Hi}) -> Kokoro; neither sent for this language -> fail gracefully rather than silently generating with a wrong/default voice.',
+            Choices: [
+              {
+                And: [
+                  { Variable: '$.cloneArtifactUrl', IsPresent: true },
+                  { Not: { Variable: '$.cloneArtifactUrl', StringEquals: '' } },
+                ],
+                Next: 'QMGenerateLocalizedTTSQwen',
+              },
+              {
+                And: [
+                  { Variable: '$.voiceId', IsPresent: true },
+                  { Not: { Variable: '$.voiceId', StringEquals: '' } },
+                ],
+                Next: 'QMGenerateLocalizedTTSKokoro',
+              },
+            ],
+            Default: 'LocalizationFailedForLanguage',
           },
           QMGenerateLocalizedTTSQwen: ttsTask('qwen'),
           QMGenerateLocalizedTTSKokoro: ttsTask('kokoro'),

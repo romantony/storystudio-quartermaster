@@ -95,6 +95,10 @@ export interface CanonicalJobParams {
   // Takes priority over voiceUrl/voiceTranscript (the slow path that re-embeds
   // a raw reference clip every call) when both are present.
   cloneArtifactUrl?: string;
+  // Kokoro voice selection (4lang localized TTS + primary narrationBasic tts).
+  // Explicit request param — takes priority over a catalog rung's `fixed.voice`
+  // default now that it's zod-whitelisted (see api.ts canonicalJobSchema).
+  voiceId?: string;
   // Narration-basic `pipeline` mode: the frame's narration text (voice_text) —
   // one call does image + Kokoro TTS + animate + merge on flux-tts-s2t.
   voiceText?: string;

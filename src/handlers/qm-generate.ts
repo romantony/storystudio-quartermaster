@@ -45,6 +45,7 @@ interface QMGenerateEvent {
   speaker?: string;
   language?: string;
   cloneArtifactUrl?: string;         // Qwen voice-clone fast path (precomputed .pt)
+  voiceId?: string;                  // Kokoro voice selection (4lang + narrationBasic tts)
   voiceText?: string;                // narration-basic `pipeline` mode: voice_text
   effect?: string;
   initImageUrls?: string[];
@@ -132,6 +133,7 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
       speaker: event.speaker,
       language: event.language,
       cloneArtifactUrl: event.cloneArtifactUrl,
+      voiceId: event.voiceId,
       voiceText: event.voiceText,
       effect: event.effect,
     },

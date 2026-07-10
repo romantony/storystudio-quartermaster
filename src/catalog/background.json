@@ -78,21 +78,21 @@
 
     "voice.narrationBasic.ttsLocalizedQwen": [
       { "provider": "runpod", "model": "qwen-voice-design", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "4lang localized TTS (es/pt-BR) for Narration Basic projects — same physical Qwen Voice Design rung as voice.narrationPremium.tts, split into its own key purely for billing/audit attribution (mirrors bgm.narrationBasic/bgm.narrationPremium). Qwen supports Spanish/Portuguese natively (QWEN_VALID_LANGUAGES) — verified live 2026-07-08 (near-perfect Whisper round-trip both languages)." }
+        "note": "4lang localized TTS for Narration Basic projects — same physical Qwen Voice Design/clone rung as voice.narrationPremium.tts, split into its own key purely for billing/audit attribution (mirrors bgm.narrationBasic/bgm.narrationPremium). Since 2026-07-10 the ASL (pipeline-stack.ts localizationStates) sends a per-language cloneArtifactUrl resolved by StoryStudio (voice.narrationClone.pt per language, per qwen-voice-clone/docs/voice-catalog.json) — the clone_artifact_url fast path (runpod.ts) fires the same as the primary QMGenerateTTSClone leg. Qwen has no Hindi voices at all (voice-catalog.json: every es-es-*/pt-br-* entry is a Qwen clone; every hi-in-* entry is Kokoro), so only es/pt-BR realistically route here." }
     ],
     "voice.narrationPremium.ttsLocalizedQwen": [
       { "provider": "runpod", "model": "qwen-voice-design", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "4lang localized TTS (es/pt-BR) for Narration Premium projects — same rung as voice.narrationBasic.ttsLocalizedQwen, split for billing/audit attribution only." }
+        "note": "4lang localized TTS for Narration Premium projects — same rung as voice.narrationBasic.ttsLocalizedQwen, split for billing/audit attribution only." }
     ],
     "voice.narrationBasic.ttsLocalizedKokoro": [
       { "provider": "runpod", "model": "kokoro", "mode": "tts", "engine": "kokoro", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
         "fixed": { "voice": "hf_alpha", "langCode": "h" },
-        "note": "4lang localized TTS (Hindi) for Narration Basic projects — Kokoro-82M's Hindi voice pack (hf_alpha, lang_code=h) is already loaded on this pod despite the handler's voice-list comment only documenting American/British English; verified live 2026-07-08 (Whisper round-trip kept full meaning, minor phonetic drift on 2 words). Qwen (used for es/pt-BR) has no Hindi support at all (not in QWEN_VALID_LANGUAGES), hence Kokoro here instead." }
+        "note": "4lang localized TTS for Narration Basic projects. `fixed` is now a FALLBACK, not a hard override (changed 2026-07-10, runpod.ts) — an explicit params.voiceId + params.language (sent per-language by pipeline-stack.ts localizationStates, resolved to lang_code via runpod.ts's KOKORO_LANG_CODE map) take priority, so this one rung can serve any Kokoro-backed language, not just Hindi. hf_alpha/lang_code=h (Kokoro's Hindi pack) is loaded on this pod despite the handler's voice-list comment only documenting American/British English — verified live 2026-07-08 (Whisper round-trip kept full meaning, minor phonetic drift on 2 words). Spanish/Portuguese Kokoro voices (ef_*/pf_* per kokoro_voice_reference in qwen-voice-clone/docs/voice-catalog.json) exist upstream but are NOT yet verified on this pod or sampled into the product voice catalog (used_in_catalog:false) — if a Basic project sends a voiceId for es/pt-BR expecting Kokoro, that path is untested until someone runs the same verification Hindi got." }
     ],
     "voice.narrationPremium.ttsLocalizedKokoro": [
       { "provider": "runpod", "model": "kokoro", "mode": "tts", "engine": "kokoro", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
         "fixed": { "voice": "hf_alpha", "langCode": "h" },
-        "note": "4lang localized TTS (Hindi) for Narration Premium projects — same rung as voice.narrationBasic.ttsLocalizedKokoro, split for billing/audit attribution only." }
+        "note": "4lang localized TTS for Narration Premium projects — same rung as voice.narrationBasic.ttsLocalizedKokoro (including the fixed-as-fallback behavior), split for billing/audit attribution only." }
     ],
 
     "bgm.narration": [

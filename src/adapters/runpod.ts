@@ -6,6 +6,16 @@ import type {
 const RUNPOD = 'https://api.runpod.ai/v2';
 const env = (k: string) => process.env[k] ?? '';
 
+// Kokoro-82M lang_code per hexgrad/Kokoro-82M VOICES.md (see
+// qwen-voice-clone/docs/voice-catalog.json's kokoro_voice_reference for the
+// full voice list per language). Keyed lowercase — job.params.language comes
+// through as e.g. "Spanish"/"Portuguese"/"Hindi" (pipeline-stack.ts's
+// PrepareLocalization `name` field).
+const KOKORO_LANG_CODE: Record<string, string> = {
+  english: 'a', spanish: 'e', portuguese: 'p', hindi: 'h',
+  french: 'f', italian: 'i', japanese: 'j', chinese: 'z',
+};
+
 // Dig an asset URL out of RunPod's variable output shape. Extended beyond video
 // to cover the Flux-TTS-S2T / qwen endpoints (image, audio, srt).
 function runpodOutUrl(p: unknown): string | undefined {
@@ -144,18 +154,23 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
         }
         return input;
       }
-      // Kokoro (default). voice/lang_code come from the catalog rung's
-      // `fixed` overrides first (e.g. the 4lang Hindi ladder pins
-      // voice:"hf_alpha", langCode:"h" — verified live 2026-07-08) so a
-      // per-language ladder doesn't depend on a job param that could be
-      // silently dropped by the zod schema (api.ts canonicalJobSchema).
+      // Kokoro (default). voiceId is an explicit, zod-whitelisted request
+      // param (api.ts canonicalJobSchema) — since 2026-07-10 it takes
+      // priority over the catalog rung's `fixed.voice` (previously fixed
+      // always won, specifically because a per-language ladder couldn't yet
+      // trust a job param that might be silently dropped by the zod schema;
+      // now that voiceId/cloneArtifactUrl are both whitelisted, an explicit
+      // caller value should win). lang_code likewise now derives from
+      // p.language (the 4lang ladder's per-language TTS calls) rather than
+      // being pinned per catalog rung, so one ttsLocalizedKokoro rung can
+      // serve es/pt-BR/hi instead of being Hindi-only.
       return {
         mode: 'tts',
         engine: 'kokoro',
         text: job.prompt,
-        voice: rung.fixed?.voice ?? p.voice ?? 'am_michael',
+        voice: p.voiceId ?? rung.fixed?.voice ?? p.voice ?? 'am_michael',
         speed: 1.0,
-        lang_code: rung.fixed?.langCode ?? 'a',
+        lang_code: KOKORO_LANG_CODE[(p.language ?? '').toLowerCase()] ?? rung.fixed?.langCode ?? 'a',
         ...attribution,
       };
     }
