@@ -24,7 +24,8 @@ const LIVE = process.env.RUNPOD_PROVISION_LIVE === 'true';
 const db = new DynamoDBClient({});
 const sm = new SecretsManagerClient({});
 
-// The RunPod serverless endpoints QM provisions. counterKey mirrors the
+// The RunPod serverless endpoints QM provisions, sharing the account's single
+// worker cap (ACCOUNT_CAP) via rebalanceUnderCap below. counterKey mirrors the
 // per-endpoint semaphore in dynamo-gate; endpointId is the RunPod id from
 // /home/roman-antony/runpod/API.md. `baselineMax` is each endpoint's real,
 // account-confirmed idle floor — NOT a uniform guess. Using one global
@@ -32,14 +33,37 @@ const sm = new SecretsManagerClient({});
 // diverge from RunPod's actual config, which the periodic scale-to-zero tick
 // would have kept re-asserting forever. Raised 2026-07-07 (account balance
 // crossed $200, cap doubled 10→20) to match the dashboard: Flux-TTS-ANIM=6,
-// qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=8 — see fleet.ts for the same
-// figures plus bgm-s2t/ernie-image (not in this provisioner-cap-enforcing
-// list, see fleet.ts's header for why).
+// qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=8, BGM-S2T=2 — matches fleet.ts's
+// "18 of ACCOUNT_CAP's 20" accounting exactly (bgm-s2t is a real shared-account
+// endpoint split off flux-tts-s2t for VRAM isolation, not a separate GPU — see
+// STANDALONE_ENDPOINTS below for the one that genuinely is).
+// BUGFIX (2026-07-10): bgm-s2t was missing from this list entirely since the
+// split (commit 422969b) — fleet.ts's PROJECT_FLEET has pre-warmed it in every
+// admission grant's neededWorkers/warmedEndpoints response since then, but
+// prewarmEndpoints (below) silently no-op'd for any counterKey absent here, so
+// that pre-warm never actually reached RunPod. Added to close the gap.
 export const ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [
   { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 6 },
   { counterKey: 'runpod:qwen-image-gen',  endpointId: 'e165se4r3eo5hp', baselineMax: 2 },
   { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla', baselineMax: 2 },
   { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 8 },
+  { counterKey: 'runpod:bgm-s2t',         endpointId: '6apg6j7suzuezw', baselineMax: 2 },
+];
+
+// Endpoints that get the SAME demand-driven pre-warm/cooldown/scale-to-zero
+// lifecycle as ENDPOINTS above, but sit on their own dedicated GPU/network
+// volume OUTSIDE the shared RunPod account's worker pool — never passed
+// through rebalanceUnderCap's ACCOUNT_CAP clamp, since that cap describes a
+// resource these endpoints don't actually draw from (folding them into the
+// same clamp could incorrectly shrink their target under heavy demand
+// elsewhere in the shared pool, for no real capacity reason). Added
+// 2026-07-10 alongside PROJECT_FLEET's ernie-image pre-warm entry
+// (fleet.ts) — same bug as bgm-s2t above (prewarmEndpoints silently
+// no-op'd), plus the periodic tick never scaled it at all (not even to
+// zero), so a project's pre-warm would previously have needed a manual
+// RunPod-dashboard reset to ever come back down.
+export const STANDALONE_ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [
+  { counterKey: 'runpod:ernie-image', endpointId: 'teaye48ss7oywb', baselineMax: 2 },
 ];
 
 // `reserved` = worker-units committed by active admission-gate reservations for
@@ -56,6 +80,58 @@ interface Plan {
 }
 
 /**
+ * Compute one endpoint's desired worker counts from its current demand —
+ * shared by both the account-cap-pooled ENDPOINTS group and the standalone
+ * (own-GPU) STANDALONE_ENDPOINTS group in runProvisioner below. Does not
+ * itself apply any cap; that's rebalanceUnderCap's job, and it's only ever
+ * run over the pooled group.
+ */
+function planFor(
+  ep: { counterKey: string; endpointId: string; baselineMax: number },
+  demand: Demand,
+  state: RunPodEndpointItem,
+  now: number,
+): Plan {
+  const total = demand.inflight + demand.queued;
+
+  // Combine organic (live job) sizing with the admission gate's reservation
+  // commitment via max, not sum — a reservation's promised workers and the
+  // jobs it eventually submits describe the SAME demand, so summing them
+  // would double-count once its SFN starts running. Whichever signal is
+  // larger — real traffic or a still-unrealized reservation — wins.
+  const organicWorkers = total > 0 ? Math.max(1, Math.ceil(total / JOBS_PER_WORKER)) : 0;
+  const effectiveWorkers = Math.max(organicWorkers, demand.reserved);
+  const baselineMax = ep.baselineMax ?? DEFAULT_BASELINE_MAX;
+
+  let toMax = baselineMax;
+  let toMin = 0;
+  let reason = 'idle';
+  if (effectiveWorkers > 0) {
+    toMax = Math.max(effectiveWorkers, baselineMax);
+    toMin = 1;                       // pre-warm: keep at least one worker up while there's work
+    reason = demand.reserved > organicWorkers
+      ? (state.workersMax === 0 ? 'reservation-prewarm' : 'reservation-hold')
+      : (state.workersMax === 0 || state.workersMin === 0 ? 'prewarm' : 'scale-up');
+  } else {
+    // No organic demand AND no active reservation — only scale to zero once
+    // the cooldown has elapsed.
+    const busyRecently = state.lastBusyAt && now - state.lastBusyAt < COOLDOWN_MS;
+    if (busyRecently) {
+      toMax = Math.max(state.workersMax, baselineMax);
+      toMin = state.workersMin;      // hold warm through the cooldown
+      reason = 'cooldown';
+    } else {
+      toMax = baselineMax; toMin = 0; reason = 'scale-to-zero';
+    }
+  }
+
+  return {
+    counterKey: ep.counterKey, endpointId: ep.endpointId, demand,
+    fromMin: state.workersMin, fromMax: state.workersMax, toMin, toMax, reason,
+  };
+}
+
+/**
  * One provisioning tick (called by the sweeper). Reads per-endpoint demand,
  * computes desired worker counts under the shared account cap, and — in shadow
  * mode — records the scale decision it *would* make without touching RunPod.
@@ -67,55 +143,29 @@ export async function runProvisioner(): Promise<Plan[]> {
   ]);
   const now = Date.now();
 
-  // 1. Raw demand + a first-pass desired workersMax per endpoint.
+  // 1. Raw demand + a first-pass desired workersMax per endpoint, for the
+  //    account-cap-pooled group.
   const plans: Plan[] = [];
   for (const ep of ENDPOINTS) {
     const inflight = await getInflight(ep.counterKey);
-    const reserved = reservedWorkers[ep.counterKey] ?? 0;
-    const demand: Demand = { inflight, queued: queued[ep.counterKey] ?? 0, reserved };
+    const demand: Demand = { inflight, queued: queued[ep.counterKey] ?? 0, reserved: reservedWorkers[ep.counterKey] ?? 0 };
     const state = await readEndpoint(ep.counterKey, ep.endpointId);
-    const total = demand.inflight + demand.queued;
-
-    // Combine organic (live job) sizing with the admission gate's reservation
-    // commitment via max, not sum — a reservation's promised workers and the
-    // jobs it eventually submits describe the SAME demand, so summing them
-    // would double-count once its SFN starts running. Whichever signal is
-    // larger — real traffic or a still-unrealized reservation — wins.
-    const organicWorkers = total > 0 ? Math.max(1, Math.ceil(total / JOBS_PER_WORKER)) : 0;
-    const effectiveWorkers = Math.max(organicWorkers, reserved);
-    const baselineMax = ep.baselineMax ?? DEFAULT_BASELINE_MAX;
-
-    let toMax = baselineMax;
-    let toMin = 0;
-    let reason = 'idle';
-    if (effectiveWorkers > 0) {
-      toMax = Math.max(effectiveWorkers, baselineMax);
-      toMin = 1;                       // pre-warm: keep at least one worker up while there's work
-      reason = reserved > organicWorkers
-        ? (state.workersMax === 0 ? 'reservation-prewarm' : 'reservation-hold')
-        : (state.workersMax === 0 || state.workersMin === 0 ? 'prewarm' : 'scale-up');
-    } else {
-      // No organic demand AND no active reservation — only scale to zero once
-      // the cooldown has elapsed.
-      const busyRecently = state.lastBusyAt && now - state.lastBusyAt < COOLDOWN_MS;
-      if (busyRecently) {
-        toMax = Math.max(state.workersMax, baselineMax);
-        toMin = state.workersMin;      // hold warm through the cooldown
-        reason = 'cooldown';
-      } else {
-        toMax = baselineMax; toMin = 0; reason = 'scale-to-zero';
-      }
-    }
-
-    plans.push({
-      counterKey: ep.counterKey, endpointId: ep.endpointId, demand,
-      fromMin: state.workersMin, fromMax: state.workersMax, toMin, toMax, reason,
-    });
+    plans.push(planFor(ep, demand, state, now));
   }
 
   // 2. Rebalance to respect the shared account cap (sum of workersMax ≤ cap),
   //    proportional to each endpoint's demand share (organic + reserved).
   rebalanceUnderCap(plans);
+
+  // 2b. Standalone endpoints (own dedicated GPU, see STANDALONE_ENDPOINTS) get
+  //     the same demand/cooldown lifecycle but are never subject to the cap
+  //     clamp above — their capacity isn't drawn from the same pool.
+  for (const ep of STANDALONE_ENDPOINTS) {
+    const inflight = await getInflight(ep.counterKey);
+    const demand: Demand = { inflight, queued: queued[ep.counterKey] ?? 0, reserved: reservedWorkers[ep.counterKey] ?? 0 };
+    const state = await readEndpoint(ep.counterKey, ep.endpointId);
+    plans.push(planFor(ep, demand, state, now));
+  }
 
   // 3. Persist intended state + record the shadow decision. (Live mode would
   //    additionally PATCH rest.runpod.io here.)
@@ -152,7 +202,8 @@ export async function runProvisioner(): Promise<Plan[]> {
 export async function prewarmEndpoints(neededWorkers: Record<string, number>): Promise<void> {
   const now = Date.now();
   for (const [counterKey, workers] of Object.entries(neededWorkers)) {
-    const ep = ENDPOINTS.find(e => e.counterKey === counterKey);
+    const ep = ENDPOINTS.find(e => e.counterKey === counterKey)
+      ?? STANDALONE_ENDPOINTS.find(e => e.counterKey === counterKey);
     if (!ep || workers <= 0) continue;
 
     const state = await readEndpoint(counterKey, ep.endpointId);

@@ -97,10 +97,17 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(byKey['runpod:qwen-image-gen'].toMax).toBe(2);
     expect(byKey['runpod:qwen-image-edit'].toMax).toBe(2);
     expect(byKey['runpod:wan2-i2v'].toMax).toBe(8);
-    // Sum is under the account's real cap (confirmed via RunPod's dashboard
-    // 2026-07-07, cap doubled 10→20 once balance crossed $200) — 2 units of
-    // headroom, no rebalancing needed at rest.
-    expect(plans.reduce((a, p) => a + p.toMax, 0)).toBe(18);
+    expect(byKey['runpod:bgm-s2t'].toMax).toBe(2);
+    // Pooled sum lands exactly on the account's real cap (confirmed via
+    // RunPod's dashboard 2026-07-07, cap doubled 10→20 once balance crossed
+    // $200; bgm-s2t added to the pool 2026-07-10) — 0 units of headroom left,
+    // but still no rebalancing needed at rest since it's not over.
+    const pooled = ['runpod:flux-tts-s2t', 'runpod:qwen-image-gen', 'runpod:qwen-image-edit', 'runpod:wan2-i2v', 'runpod:bgm-s2t'];
+    expect(pooled.reduce((a, ck) => a + byKey[ck].toMax, 0)).toBe(20);
+    // Standalone (own dedicated GPU, added 2026-07-10) — same idle baseline
+    // lifecycle, deliberately excluded from the pooled cap sum above.
+    expect(byKey['runpod:ernie-image'].toMax).toBe(2);
+    expect(byKey['runpod:ernie-image'].reason).toBe('scale-to-zero');
   });
 
   it('does not starve a reservation-only endpoint when heavy organic demand elsewhere exceeds the cap', async () => {
@@ -121,8 +128,13 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     });
 
     const plans = await runProvisioner();
-    const total = plans.reduce((a, p) => a + p.toMax, 0);
-    expect(total).toBeLessThanOrEqual(20); // ACCOUNT_CAP respected
+    // ACCOUNT_CAP is only ever enforced over the pooled group — standalone
+    // endpoints (ernie-image) sit on their own dedicated GPU and are exempt
+    // from this clamp by design, so they're excluded from this sum.
+    const pooledTotal = plans
+      .filter(p => p.counterKey !== 'runpod:ernie-image')
+      .reduce((a, p) => a + p.toMax, 0);
+    expect(pooledTotal).toBeLessThanOrEqual(20); // ACCOUNT_CAP respected
 
     const flux = plans.find(p => p.counterKey === 'runpod:flux-tts-s2t')!;
     const qwenGen = plans.find(p => p.counterKey === 'runpod:qwen-image-gen')!;
