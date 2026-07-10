@@ -49,22 +49,37 @@ export class PipelineStack extends Stack {
     // selection, internal↔external failover, and concurrency. Replaces the
     // per-asset "acquire → provider Lambda → release" cluster.
     // Timeout must exceed QM_GENERATE_DEADLINE_MS (qm-generate.ts's own poll
-    // deadline, raised to 580s alongside this) with margin, and executor.ts's
-    // timeout (600s) must in turn be >= this Lambda's polling window, or the
-    // three layers race each other into a false timeout on a genuinely
-    // slow-but-succeeding RunPod job (confirmed live 2026-07-04, Wan2 i2v).
+    // deadline) with margin, and executor.ts's timeout (600s) must in turn be
+    // >= this Lambda's polling window, or the three layers race each other
+    // into a false timeout on a genuinely slow-but-succeeding RunPod job
+    // (confirmed live 2026-07-04, Wan2 i2v; again 2026-07-10, ERNIE explainer
+    // t2i — a burst of `imageModel=="ernie"` frames against fleet.ts's
+    // deliberately tiny 2-worker ERNIE_IMAGE pool pushed capacityWaits into
+    // the teens, and the job didn't fail — it took ~33min wall-clock and
+    // completed successfully long after this Lambda had already given up and
+    // routed the frame to QMFrameFailed). Raised 580s→850s (2026-07-10) to
+    // push the false-timeout point as close to AWS Lambda's hard 900s
+    // execution ceiling as safely possible — this doesn't cover every
+    // capacity-starved case (this one alone needed ~33min, which no single
+    // Lambda invocation can ever provide), but meaningfully shrinks how often
+    // QMFrameFailed fires for a job that's still legitimately queued rather
+    // than actually dead. executor.ts's own 600s timeout is unaffected by
+    // this change: it bounds a single dispatch+generation attempt, not the
+    // capacity-wait span, which is re-queued across many short executor
+    // invocations (see capacityWaits in executor.ts) rather than blocking one
+    // invocation for the whole wait.
     const qmGenerateFn = new nodejs.NodejsFunction(this, 'QMGenerateFunction', {
       functionName: 'QM-generate',
       entry: path.join(__dirname, '../../src/handlers/qm-generate.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: Duration.seconds(610),
+      timeout: Duration.seconds(890),
       memorySize: 256,
       bundling: { minify: true, sourceMap: false, externalModules: [] },
       environment: {
         QM_BASE_URL: `https://${props.qmApiDomain}`,
         GATEWAY_STATIC_KEY_ARN: props.gatewayKeySecretArn,
-        QM_GENERATE_DEADLINE_MS: '580000',
+        QM_GENERATE_DEADLINE_MS: '850000',
       },
     });
     qmGenerateFn.addToRolePolicy(new iam.PolicyStatement({
@@ -307,7 +322,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
       'projectId.$': '$.projectId',
     },
     ResultPath: '$.transcribeResult',
-    TimeoutSeconds: 650,
+    TimeoutSeconds: 920,
     Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
     Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.transcribeError', Next: 'SkipSrt' }],
     Next: 'BuildMergedVoiceResult',
@@ -462,7 +477,7 @@ function bgmStates(qmGenerateArn: string, tier: string): Record<string, unknown>
         'userId.$': '$.userId',
       },
       ResultPath: '$.bgmResult',
-      TimeoutSeconds: 650,
+      TimeoutSeconds: 920,
       Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.bgmError', Next: 'BgmGenerationFailed' }],
       Next: 'NormalizeFourLang',
@@ -537,7 +552,7 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
       'frameId.$': '$.code',
     },
     ResultPath: '$.ttsResult',
-    TimeoutSeconds: 650,
+    TimeoutSeconds: 920,
     Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
     Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'LocalizationFailedForLanguage' }],
     Next: 'QMGenerateLocalizedSRT',
@@ -706,7 +721,7 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
               'frameId.$': '$.code',
             },
             ResultPath: '$.srtResult',
-            TimeoutSeconds: 650,
+            TimeoutSeconds: 920,
             Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
             Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.srtError', Next: 'SkipLocalizedSrt' }],
             Next: 'BuildLanguageAsset',
@@ -795,7 +810,7 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.imageResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
           Next: 'RouteExplainerTTS',
@@ -838,7 +853,7 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.ttsResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'QMFrameFailed' }],
           Next: 'QMGenerateExplainerAnimate',
@@ -861,7 +876,7 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.animateResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.animateError', Next: 'QMFrameFailed' }],
           Next: 'QMGenerateExplainerMerge',
@@ -884,7 +899,7 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.pipelineResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeError', Next: 'QMFrameFailed' }],
           Next: 'BuildFrameVideo',
@@ -911,7 +926,7 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.pipelineResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.pipelineError', Next: 'QMFrameFailed' }],
           Next: 'BuildFrameVideo',
@@ -1169,7 +1184,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.imageResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
           Next: 'StoreImageMeta',
@@ -1192,7 +1207,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.imageResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
           Next: 'StoreImageMeta',
@@ -1216,7 +1231,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.imageResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailed' }],
           Next: 'StoreImageMeta',
@@ -1291,7 +1306,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.ttsResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'QMFrameFailed' }],
           Next: 'RouteVideoLength',
@@ -1316,7 +1331,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.ttsResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'QMFrameFailed' }],
           Next: 'RouteVideoLength',
@@ -1351,7 +1366,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.videoResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'QMFrameFailed' }],
           Next: 'QMConcatVideo',
@@ -1398,7 +1413,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.videoResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'QMFrameFailed' }],
           Next: 'UseSingleClipVideo',
@@ -1428,7 +1443,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
             'userId.$': '$$.Execution.Input.userId',
           },
           ResultPath: '$.mergeResult',
-          TimeoutSeconds: 650,
+          TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeError', Next: 'QMFrameFailed' }],
           Next: 'BuildFrameVideo',
