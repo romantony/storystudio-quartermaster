@@ -224,6 +224,8 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
       'apiKey.$': '$.apiKey',
       'videoResults.$': '$.videoResults',
       'fourLang.$': '$.fourLang',
+      'generateShorts.$': '$.generateShorts',
+      'shortsOptions.$': '$.shortsOptions',
     },
     Next: 'UpdateStatusConcatenating',
   };
@@ -249,8 +251,37 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
     Choices: [{ Variable: '$.fourLang', BooleanEquals: true, Next: 'SetFourLangTrue' }],
     Default: 'SetFourLangFalse',
   };
-  def.States.SetFourLangTrue = { Type: 'Pass', Result: true, ResultPath: '$.fourLang', Next: 'DropFrameData' };
-  def.States.SetFourLangFalse = { Type: 'Pass', Result: false, ResultPath: '$.fourLang', Next: 'DropFrameData' };
+  def.States.SetFourLangTrue = { Type: 'Pass', Result: true, ResultPath: '$.fourLang', Next: 'NormalizeGenerateShortsField' };
+  def.States.SetFourLangFalse = { Type: 'Pass', Result: false, ResultPath: '$.fourLang', Next: 'NormalizeGenerateShortsField' };
+
+  // BUGFIX (2026-07-10): same allowlist gotcha as fourLang above, for the two
+  // fields the later shorts-longform trigger (shortsTriggerStates below) reads
+  // via CheckGenerateShorts/TriggerShortsFromLongForm. generateShorts/
+  // shortsOptions were added to DropFrameData's Parameters allowlist without
+  // ever being guaranteed present first, so a caller that omitted either key
+  // (the common case — most projects don't request shorts) had it silently
+  // dropped here, and CheckGenerateShorts always saw $.generateShorts as
+  // absent and took the Default (skip) branch regardless of what StoryStudio
+  // actually sent at StartExecution. Named "...Field" to avoid colliding with
+  // NormalizeShortsOptions/SetShortsOptionsDefault, which are spliced in later
+  // (via shortsTriggerStates, right before PrepareFinalizeBasic) and serve a
+  // different purpose (defaulting $.shortsOptions for the Task Parameters
+  // block, not surviving the DropFrameData allowlist).
+  def.States.NormalizeGenerateShortsField = {
+    Type: 'Choice',
+    Comment: 'Guarantee $.generateShorts is a real boolean before DropFrameData\'s Parameters allowlist would otherwise silently drop it if the caller omitted the key entirely.',
+    Choices: [{ Variable: '$.generateShorts', BooleanEquals: true, Next: 'SetGenerateShortsFieldTrue' }],
+    Default: 'SetGenerateShortsFieldFalse',
+  };
+  def.States.SetGenerateShortsFieldTrue = { Type: 'Pass', Result: true, ResultPath: '$.generateShorts', Next: 'NormalizeShortsOptionsField' };
+  def.States.SetGenerateShortsFieldFalse = { Type: 'Pass', Result: false, ResultPath: '$.generateShorts', Next: 'NormalizeShortsOptionsField' };
+  def.States.NormalizeShortsOptionsField = {
+    Type: 'Choice',
+    Comment: 'Guarantee $.shortsOptions is a real object before DropFrameData\'s Parameters allowlist would otherwise silently drop it if the caller omitted the key entirely.',
+    Choices: [{ Variable: '$.shortsOptions', IsPresent: true, Next: 'DropFrameData' }],
+    Default: 'SetShortsOptionsFieldDefault',
+  };
+  def.States.SetShortsOptionsFieldDefault = { Type: 'Pass', Result: {}, ResultPath: '$.shortsOptions', Next: 'DropFrameData' };
 
   // The generated BGM's URL now comes from bgmResult, not a passed-in bgmUrl.
   def.States.PrepareFinalizeBasic.Parameters['bgmUrl.$'] = '$.bgmResult.cdnUrl';
