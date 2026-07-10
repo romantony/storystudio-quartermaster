@@ -586,9 +586,9 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
       Comment: 'Fan out the 3 fixed 4lang targets (es, pt-BR, hi). Each item carries its own copy of the English transcript plus the per-language voice identifier normalized above (cloneArtifactUrl and/or voiceId — whichever StoryStudio actually sent), so the Map below needs no Map-level Parameters/$$.Map.Item.Value merging.',
       Parameters: {
         languageConfigs: [
-          { code: 'es', name: 'Spanish', whisperLang: 'es', 'englishText.$': '$.transcribeResult.text', 'cloneArtifactUrl.$': '$.voiceCloneArtifactUrlEs.value', 'voiceId.$': '$.voiceIdEs.value' },
-          { code: 'pt-BR', name: 'Portuguese', whisperLang: 'pt', 'englishText.$': '$.transcribeResult.text', 'cloneArtifactUrl.$': '$.voiceCloneArtifactUrlPtBr.value', 'voiceId.$': '$.voiceIdPtBr.value' },
-          { code: 'hi', name: 'Hindi', whisperLang: 'hi', 'englishText.$': '$.transcribeResult.text', cloneArtifactUrl: '', 'voiceId.$': '$.voiceIdHi.value' },
+          { code: 'es', name: 'Spanish', whisperLang: 'es', defaultEngine: 'qwen', 'englishText.$': '$.transcribeResult.text', 'cloneArtifactUrl.$': '$.voiceCloneArtifactUrlEs.value', 'voiceId.$': '$.voiceIdEs.value' },
+          { code: 'pt-BR', name: 'Portuguese', whisperLang: 'pt', defaultEngine: 'qwen', 'englishText.$': '$.transcribeResult.text', 'cloneArtifactUrl.$': '$.voiceCloneArtifactUrlPtBr.value', 'voiceId.$': '$.voiceIdPtBr.value' },
+          { code: 'hi', name: 'Hindi', whisperLang: 'hi', defaultEngine: 'kokoro', 'englishText.$': '$.transcribeResult.text', cloneArtifactUrl: '', 'voiceId.$': '$.voiceIdHi.value' },
         ],
       },
       ResultPath: '$.localizationPrep',
@@ -632,7 +632,7 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
           },
           RouteLocalizedTTS: {
             Type: 'Choice',
-            Comment: 'Data-driven, not hardcoded per-language/per-tier: cloneArtifactUrl present (normalized in PrepareLocalization from voiceCloneArtifactUrl{Es,PtBr,Hi}) -> Qwen voice-clone fast path; else voiceId present (from voiceId{Es,PtBr,Hi}) -> Kokoro; neither sent for this language -> fail gracefully rather than silently generating with a wrong/default voice.',
+            Comment: 'Data-driven, not hardcoded per-language/per-tier: cloneArtifactUrl present (normalized in PrepareLocalization from voiceCloneArtifactUrl{Es,PtBr,Hi}) -> Qwen voice-clone fast path; else voiceId present (from voiceId{Es,PtBr,Hi}) -> Kokoro; else fall back to defaultEngine (es/pt-BR: qwen, hi: kokoro — the pre-2026-07-10 hardcoded mapping, preserved as the fallback so a project that sends neither field for a language keeps working exactly as before, just without an explicit voice pinned).',
             Choices: [
               {
                 And: [
@@ -648,8 +648,9 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
                 ],
                 Next: 'QMGenerateLocalizedTTSKokoro',
               },
+              { Variable: '$.defaultEngine', StringEquals: 'kokoro', Next: 'QMGenerateLocalizedTTSKokoro' },
             ],
-            Default: 'LocalizationFailedForLanguage',
+            Default: 'QMGenerateLocalizedTTSQwen',
           },
           QMGenerateLocalizedTTSQwen: ttsTask('qwen'),
           QMGenerateLocalizedTTSKokoro: ttsTask('kokoro'),

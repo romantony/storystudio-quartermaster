@@ -4,14 +4,15 @@
 **Subject:** How to opt a narration project into automatic post-concat
 localization — translated script, localized TTS, and localized SRT for a
 fixed 3-language set — on top of the existing QM-New pipelines.
-**Status (2026-07-08):** **Live and deployed.** Both
-`E2E-VideoGenerationPipeline-Narration-Basic-QM-New` and
+**Status (2026-07-08, voice fields added 2026-07-10):** **Live and
+deployed.** Both `E2E-VideoGenerationPipeline-Narration-Basic-QM-New` and
 `E2E-VideoGenerationPipeline-Narration-Premium-QM-New` support this today —
 no separate opt-in project, no new state machine, no new endpoint to call.
 **Prerequisite doc:** this assumes you're already integrated per
 `docs/storystudio-qm-new-sfn-trigger.md` (project creation, admission,
 `StartExecution`, status polling). This guide only covers the **delta**:
-one new request field and one new result field.
+one new request field to turn localization on, up to 6 optional per-language
+voice-selection fields, and one new result field.
 
 ---
 
@@ -60,9 +61,49 @@ changes:
 |---|---|---|---|
 | `fourLang` | boolean | no | `true` ⇒ run localization after concat. Omitted or `false` ⇒ unchanged behavior, no localized assets produced. Works identically on both Basic and Premium — same field name, same semantics, same fixed 3-language set. |
 
-That's the entire integration surface on the request side. Frame objects,
-`voiceGender`/`voiceSpeaker`/`voiceInstruct`/`voiceLanguage`, `bgmPrompt`,
-etc. are all unaffected and unrelated to `fourLang`.
+That's the entire integration surface for turning localization on. Frame
+objects, `voiceGender`/`voiceSpeaker`/`voiceInstruct`/`voiceLanguage`,
+`bgmPrompt`, etc. are all unaffected and unrelated to `fourLang`.
+
+### 2.1 Per-language voice selection (optional, added 2026-07-10)
+
+By default (none of the fields below sent), each of the 3 languages gets
+whatever QM's catalog defaults to for that language. If you want a specific
+voice per language — e.g. the same cloned narrator voice used for the
+English track, translated — add up to 6 optional fields to the same
+`StartExecution` input, one pair per language:
+
+| Field | Type | What it selects |
+|---|---|---|
+| `voiceCloneArtifactUrlEs` | string | Qwen voice-clone `.pt` artifact URL for Spanish (mirrors the existing single-language `voiceCloneArtifactUrl` field — same resolution: pick a `voice_id` from `qwen-voice-clone/docs/voice-catalog.json`, send its `clone_artifact_url`). |
+| `voiceCloneArtifactUrlPtBr` | string | Same, for Portuguese (Brazil). |
+| `voiceCloneArtifactUrlHi` | string | Same, for Hindi. **Don't send this** — Qwen has no Hindi voices at all (every `hi-in-*` entry in the voice catalog is Kokoro-sourced); it'll simply never match anything real. |
+| `voiceIdEs` | string | Kokoro voiceId for Spanish (e.g. `ef_dora`, `em_alex`, `em_santa`). |
+| `voiceIdPtBr` | string | Kokoro voiceId for Portuguese (e.g. `pf_dora`, `pm_alex`, `pm_santa`). |
+| `voiceIdHi` | string | Kokoro voiceId for Hindi (e.g. `hf_alpha`, `hf_beta`, `hm_omega`, `hm_psi`). |
+
+**Routing rule, per language:** if that language's `voiceCloneArtifactUrl*`
+field is present and non-empty, QM uses the Qwen voice-clone fast path. Else
+if `voiceId*` is present and non-empty, QM uses Kokoro. Send **at most one**
+of the pair per language — engine is derived from which one you send, not
+from a separate flag. If you send neither for a language, QM falls back to
+catalog defaults; you don't need to send anything for a language you're
+happy leaving at the default.
+
+**⚠️ Spanish/Portuguese Kokoro voices are unverified on the pod.** The
+`ef_*`/`pf_*` voiceIds exist in Kokoro-82M upstream and are listed in
+`voice-catalog.json`'s reference table, but nobody has confirmed they're
+actually loaded on the production pod or sampled them for quality — unlike
+Hindi's `hf_*`/`hm_*` voices, which were verified live. If you send
+`voiceIdEs`/`voiceIdPtBr`, treat the result as unverified until someone runs
+the same check Hindi got (generate + Whisper round-trip). The safer, tested
+path for Spanish/Portuguese today is `voiceCloneArtifactUrl{Es,PtBr}`
+(Qwen), same as the primary English leg.
+
+These fields are all optional and independent of `fourLang` itself — you can
+turn localization on without any of them (get catalog-default voices), or
+add them incrementally per language/project as you resolve real voice
+choices.
 
 ---
 
@@ -123,6 +164,11 @@ be absent. There's currently no automatic retry-just-this-language endpoint
 language means re-running the whole project with `fourLang: true` again, or
 waiting for that as a future addition if it's needed.
 
+Sending neither `voiceCloneArtifactUrl*` nor `voiceId*` for a language does
+**not** fail it — it falls back to the pre-2026-07-10 default (es/pt-BR →
+Qwen Voice Design, hi → Kokoro `hf_alpha`), same as before these fields
+existed. The voice-selection fields are purely additive.
+
 A partial-per-language failure can also happen within one language: if
 translation and TTS both succeed but the localized SRT re-transcription
 fails, you'll get `scriptText`/`voiceoverUrl` populated with `srtUrl: ""` —
@@ -130,23 +176,31 @@ script and audio are still usable even without captions for that language.
 
 ---
 
-## 4. The fixed language set, and why
+## 4. The fixed language set, and default engine per language
 
-| Language | Code | TTS engine | Notes |
+| Language | Code | Default TTS engine (no voice fields sent) | Overridable via §2.1 |
 |---|---|---|---|
-| Spanish | `es` | Qwen Voice Design | |
-| Portuguese (Brazil) | `pt-BR` | Qwen Voice Design | Generic Portuguese in the TTS model, not a BR-specific voice — quality verified live, near-perfect. |
-| Hindi | `hi` | Kokoro (Hindi voice pack, `hf_alpha`) | **Not Qwen** — Qwen Voice Design has no Hindi support at all in its language set, on either Basic or Premium tier. Kokoro's Hindi pack was verified live and already works on the deployed pod. |
+| Spanish | `es` | Qwen Voice Design | `voiceCloneArtifactUrlEs` (Qwen, tested) or `voiceIdEs` (Kokoro, **unverified**) |
+| Portuguese (Brazil) | `pt-BR` | Qwen Voice Design | `voiceCloneArtifactUrlPtBr` (Qwen, tested) or `voiceIdPtBr` (Kokoro, **unverified**) |
+| Hindi | `hi` | Kokoro (`hf_alpha`) | `voiceIdHi` (Kokoro, tested — other packs `hf_beta`/`hm_omega`/`hm_psi` not individually verified). **Qwen has no Hindi support at all**, on either tier — don't send `voiceCloneArtifactUrlHi`. |
 
-This engine split (Qwen for `es`/`pt-BR`, Kokoro for `hi`) is internal to QM
-and identical regardless of whether the project is `narration-basic` or
-`narration-premium` — you don't need to do anything differently per tier.
+Since 2026-07-10, engine selection is data-driven per §2.1: whichever of
+`voiceCloneArtifactUrl*`/`voiceId*` you send determines the engine for that
+language, for that project, regardless of tier. The table above is what you
+get with **no** voice fields sent — the pre-2026-07-10 behavior, preserved
+as the fallback. This is identical whether the project is
+`narration-basic` or `narration-premium`; you don't need to do anything
+differently per tier.
 
 **Quality, verified live against the production pod (2026-07-08):** all 3
-languages round-tripped cleanly through Whisper transcription with the
-generated audio matching the source meaning; Hindi had minor, non-blocking
-phonetic drift on 2 words out of a ~15-word test sentence. Translation
-quality (Claude) was near-perfect for Spanish/Portuguese in spot checks.
+languages (at their default engine above) round-tripped cleanly through
+Whisper transcription with the generated audio matching the source meaning;
+Hindi had minor, non-blocking phonetic drift on 2 words out of a ~15-word
+test sentence. Translation quality (Claude) was near-perfect for
+Spanish/Portuguese in spot checks. **This verification did not cover
+Kokoro for Spanish/Portuguese** (`voiceIdEs`/`voiceIdPtBr`) — see the
+warning in §2.1 before relying on that combination for anything
+quality-sensitive.
 
 ---
 
@@ -168,7 +222,8 @@ quality (Claude) was near-perfect for Spanish/Portuguese in spot checks.
 ## 6. Example: minimal diff to an existing integration
 
 If you're already calling `Narration-Basic-QM-New` per §3 of
-`storystudio-qm-new-sfn-trigger.md`, the only change is:
+`storystudio-qm-new-sfn-trigger.md`, the minimal change (just turning
+localization on, default voices) is:
 
 ```diff
  {
@@ -190,6 +245,18 @@ If you're already calling `Narration-Basic-QM-New` per §3 of
 
 Same diff applies verbatim to `Narration-Premium-QM-New` (§9).
 
+If you also want to pin specific voices per language (§2.1) — e.g. a
+Premium project whose English track already uses a cloned narrator voice
+via `voiceCloneArtifactUrl`, extended to es/pt-BR, with a tested Kokoro
+voice for Hindi:
+
+```diff
+   "fourLang": true,
++  "voiceCloneArtifactUrlEs": "https://pub-.../clones/es-es-doc-f.pt",
++  "voiceCloneArtifactUrlPtBr": "https://pub-.../clones/pt-br-doc-f.pt",
++  "voiceIdHi": "hf_alpha",
+```
+
 ---
 
 ## 7. Companion docs
@@ -198,6 +265,12 @@ Same diff applies verbatim to `Narration-Premium-QM-New` (§9).
   (full technical detail: state names, ASL flow, retry/failure semantics) —
   read this if you need to debug a specific execution rather than just
   integrate the happy path.
+- `qwen-voice-clone/docs/voice-catalog.json` — the source of truth for
+  `voice_id` → `clone_artifact_url` resolution (the `voices` array) and for
+  which raw Kokoro voiceIds exist per language (the
+  `kokoro_voice_reference` table, including which ones are actually
+  `used_in_catalog`). Resolve your chosen voice here before populating
+  `voiceCloneArtifactUrl*`/`voiceId*` (§2.1).
 - `StoryStudio Multilingual Video Generation Specification.pdf` — the
   original, broader spec (adds metadata/thumbnails/YouTube publishing on
   top of this). This guide covers a scoped first slice of it: translate +
