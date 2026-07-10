@@ -115,18 +115,32 @@ export interface ProjectFleetPlan {
 export const PROJECT_FLEET: Record<string, ProjectFleetPlan> = {
   // Basic runs the per-frame pipeline on flux-tts-s2t, plus one BGM + one SRT on
   // bgm-s2t (project-level). Merge is the terminal per-frame step, so its backlog
-  // is the cleanest "frames still unfinished" signal → still the gate.
+  // is the cleanest "frames still unfinished" signal → still the gate. ernie-image
+  // added 2026-07-10: explainer/infographic frames (imageModel=="ernie", routed
+  // per-frame in pipeline-stack.ts's RouteImageModel, invisible to admission
+  // otherwise) were hitting a cold, un-pre-warmed 2-worker pool — confirmed live,
+  // one frame needed 16 capacity-wait retries and ~33min to get a slot (see
+  // pipeline-stack.ts:47-70). Pre-warming its (small, fixed) 2 workers on every
+  // grant at least removes the cold-start tax; it does NOT fix a project sending
+  // a large burst of ernie frames at once, since admission has no visibility into
+  // per-frame imageModel — that would need a new StoryStudio→QM request field
+  // (e.g. explainerFrameCount) threaded through assetLoad.ts, which doesn't
+  // exist yet. ernie-image is deliberately NOT the gate here: it's a rare,
+  // low-volume path, not this project type's bottleneck.
   'narration-basic': {
-    endpoints: [FLUX_TTS_S2T, BGM_S2T],
+    endpoints: [FLUX_TTS_S2T, BGM_S2T, ERNIE_IMAGE],
     gateEndpoint: FLUX_TTS_S2T,
     gateOperation: 'merge',
     gateMax: 9, // "< 10"
   },
   // Premium touches image (qwen-edit), video (wan2), per-frame audio/merge
   // (flux), and project-level SRT+BGM (bgm-s2t). Wan2 is the bottleneck
-  // (90s/job), so it's the gate.
+  // (90s/job), so it's the gate. ernie-image added 2026-07-10 — same
+  // explainer-frame pre-warm rationale as narration-basic above; Premium's
+  // RouteImageGen Choice (pipeline-stack.ts:1131-1157) hits the same
+  // image.explainer.t2i rung.
   'narration-premium': {
-    endpoints: [QWEN_IMAGE_EDIT, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T],
+    endpoints: [QWEN_IMAGE_EDIT, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T, ERNIE_IMAGE],
     gateEndpoint: WAN2_I2V,
     gateMax: 8, // "<= 8"
   },

@@ -127,7 +127,7 @@ describe('handleAdmission — grant on an empty fleet', () => {
     const body = JSON.parse(res.body!);
     expect(body.decision).toBe('granted');
     expect(body.admissionId).toMatch(/^qm_adm_/);
-    expect(body.warmedEndpoints).toEqual(['runpod:flux-tts-s2t', 'runpod:bgm-s2t']);
+    expect(body.warmedEndpoints).toEqual(['runpod:flux-tts-s2t', 'runpod:bgm-s2t', 'runpod:ernie-image']);
     expect(body.expiresAt).toBeGreaterThan(Date.now());
   });
 
@@ -148,7 +148,7 @@ describe('handleAdmission — grant on an empty fleet', () => {
 });
 
 describe('handleAdmission — grant premium on an empty fleet', () => {
-  it('grants a solo narration-premium project and pre-warms all workers of its 4 endpoints', async () => {
+  it('grants a solo narration-premium project and pre-warms all workers of its 5 endpoints', async () => {
     mockScenario({ inflight: {}, workersMax: {}, baselines: {} });
     const res = await handleAdmission(evt({
       requestId: 'r-premium', projectType: 'narration-premium', tier: 'premium', durationSeconds: 100,
@@ -157,7 +157,7 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
     const body = JSON.parse(res.body!);
     expect(body.decision).toBe('granted');
     expect([...body.warmedEndpoints].sort()).toEqual([
-      'runpod:bgm-s2t', 'runpod:flux-tts-s2t', 'runpod:qwen-image-edit', 'runpod:wan2-i2v',
+      'runpod:bgm-s2t', 'runpod:ernie-image', 'runpod:flux-tts-s2t', 'runpod:qwen-image-edit', 'runpod:wan2-i2v',
     ]);
 
     const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
@@ -166,12 +166,15 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
       .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
     expect(reservationWrite).toBeDefined();
     const nw = reservationWrite!.neededWorkers as Record<string, number>;
-    // Static fleet worker counts (fleet.ts): flux 6 + qwen-edit 2 + wan2 8 + bgm-s2t 2 = 18
-    // (raised 2026-07-07: account balance crossed $200, cap doubled 10→20).
+    // Static fleet worker counts (fleet.ts): flux 6 + qwen-edit 2 + wan2 8 + bgm-s2t 2
+    // + ernie-image 2 = 20 (raised 2026-07-07: account balance crossed $200, cap
+    // doubled 10→20; ernie-image added to the plan 2026-07-10 — it sits on its own
+    // dedicated GPU outside the shared account cap, see fleet.ts).
     expect(nw['runpod:wan2-i2v']).toBe(8);
     expect(nw['runpod:qwen-image-edit']).toBe(2);
     expect(nw['runpod:flux-tts-s2t']).toBe(6);
     expect(nw['runpod:bgm-s2t']).toBe(2);
+    expect(nw['runpod:ernie-image']).toBe(2);
   });
 });
 
