@@ -168,7 +168,16 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
         mode: 'tts',
         engine: 'kokoro',
         text: job.prompt,
-        voice: p.voiceId ?? rung.fixed?.voice ?? p.voice ?? 'am_michael',
+        // BUGFIX (2026-07-10, found on the first live 4lang run with no
+        // fourLangVoiceIds sent): pipeline-stack.ts's NormalizeVoiceIdHi/Es/
+        // PtBr always sends voiceId as a real string, defaulting to '' (not
+        // absent) when the caller supplied no per-language voice — so `??`
+        // treated that explicit '' as "caller set voiceId" and never fell
+        // through to rung.fixed?.voice (hf_alpha), sending an empty voice
+        // name to the pod instead and exhausting every rung. `||` correctly
+        // treats '' the same as absent, same fix class as the SFN allowlist
+        // bugs above.
+        voice: p.voiceId || rung.fixed?.voice || p.voice || 'am_michael',
         speed: 1.0,
         lang_code: KOKORO_LANG_CODE[(p.language ?? '').toLowerCase()] ?? rung.fixed?.langCode ?? 'a',
         ...attribution,
