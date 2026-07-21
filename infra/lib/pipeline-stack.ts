@@ -1240,11 +1240,13 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: stri
     // Lower than Basic-QM-New's 15 — premium touches 3 endpoints per frame, so its
     // worker footprint is 3x a single-endpoint project's at the same concurrency.
     // At 15, a solo premium project alone needs 12 workers (> ACCOUNT_CAP=10),
-    // deferring forever even on a fully idle fleet. Must match
-    // admission.ts's PREMIUM_MAP_CONCURRENCY exactly — capacity planning and real
-    // SFN parallelism must agree, or under-provisioned workers meet real RunPod
-    // contention this constant was supposed to prevent.
-    MaxConcurrency: 8,
+    // deferring forever even on a fully idle fleet. Must match Wan2's real pod
+    // count (fleet.ts's WAN2_I2V entry / PROJECT_FLEET's narration-premium
+    // gateMax) exactly — capacity planning and real SFN parallelism must agree,
+    // or under-provisioned workers meet real RunPod contention this constant
+    // was supposed to prevent. Lowered 8→6 (2026-07-21): re-confirmed against
+    // the dashboard that only 6 real Wan2 pods exist today, not 8.
+    MaxConcurrency: 6,
     ResultPath: '$.videoResults',
     Iterator: {
       StartAt: 'NormalizeTextManifest',

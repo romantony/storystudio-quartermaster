@@ -166,12 +166,13 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
       .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
     expect(reservationWrite).toBeDefined();
     const nw = reservationWrite!.neededWorkers as Record<string, number>;
-    // Static fleet worker counts (fleet.ts): flux 6 + qwen-edit 2 + wan2 8 + bgm-s2t 2
-    // + qwen-image-gen 2 = 20 (raised 2026-07-07: account balance crossed $200, cap
-    // doubled 10→20; qwen-image-gen's pre-warm slot moved here 2026-07-21 from the
-    // retired ernie-image endpoint when image.explainer.t2i's primary rung swapped
-    // to qwen-image-gen — it's a pooled endpoint now, not its own dedicated GPU).
-    expect(nw['runpod:wan2-i2v']).toBe(8);
+    // Static fleet worker counts (fleet.ts): flux 6 + qwen-edit 2 + wan2 6 + bgm-s2t 2
+    // + qwen-image-gen 2 = 18 (wan2 corrected 8→6 2026-07-21, re-confirmed against
+    // the real RunPod dashboard; qwen-image-gen's pre-warm slot moved here the same
+    // day from the retired ernie-image endpoint when image.explainer.t2i's primary
+    // rung swapped to qwen-image-gen — it's a pooled endpoint now, not its own
+    // dedicated GPU).
+    expect(nw['runpod:wan2-i2v']).toBe(6);
     expect(nw['runpod:qwen-image-edit']).toBe(2);
     expect(nw['runpod:flux-tts-s2t']).toBe(6);
     expect(nw['runpod:bgm-s2t']).toBe(2);
@@ -180,9 +181,9 @@ describe('handleAdmission — grant premium on an empty fleet', () => {
 });
 
 describe('handleAdmission — defer on the bottleneck gate', () => {
-  it('defers narration-premium when the wan2-i2v backlog exceeds its gate (>8)', async () => {
-    // 9 queued i2v jobs on wan2 (its dedicated endpoint) > gateMax 8 → defer.
-    const wan2Jobs = Array.from({ length: 9 }, (_, i) => ({
+  it('defers narration-premium when the wan2-i2v backlog exceeds its gate (>6)', async () => {
+    // 7 queued i2v jobs on wan2 (its dedicated endpoint) > gateMax 6 → defer.
+    const wan2Jobs = Array.from({ length: 7 }, (_, i) => ({
       lane: 'video', status: 'QUEUED', requestId: `q${i}`, jobId: `q${i}`,
       assetType: 'video', tier: 'narrationPremium', operation: 'i2v', queue: 'background',
     }));

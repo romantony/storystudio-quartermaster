@@ -132,7 +132,7 @@ export async function handleAdmissionRelease(evt: LambdaFunctionUrlEvent): Promi
  *   1. At most MAX_ACTIVE_PROJECTS admitted at once — the shared flux-tts-s2t
  *      endpoint means we don't run more than a couple projects concurrently.
  *   2. Admit only when the project type's *bottleneck* endpoint backlog is at or
- *      under its gate (premium: wan2 <= 8; basic: merge <= 9). Backlog = live
+ *      under its gate (premium: wan2 <= 6; basic: merge <= 9). Backlog = live
  *      QUEUED jobs on that endpoint (per-op for basic's merge) PLUS the
  *      not-yet-submitted load of freshly-granted reservations (younger than the
  *      brain window — their jobs haven't hit the queue yet, so counting the live

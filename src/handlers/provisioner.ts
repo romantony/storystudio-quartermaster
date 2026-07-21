@@ -33,7 +33,8 @@ const sm = new SecretsManagerClient({});
 // diverge from RunPod's actual config, which the periodic scale-to-zero tick
 // would have kept re-asserting forever. Raised 2026-07-07 (account balance
 // crossed $200, cap doubled 10→20) to match the dashboard: Flux-TTS-ANIM=6,
-// qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=8, BGM-S2T=2 — matches fleet.ts's
+// qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=6 (corrected from a stale 8 on
+// 2026-07-21 — see fleet.ts's WAN2_I2V entry), BGM-S2T=2 — matches fleet.ts's
 // "18 of ACCOUNT_CAP's 20" accounting exactly (bgm-s2t is a real shared-account
 // endpoint split off flux-tts-s2t for VRAM isolation, not a separate GPU — see
 // STANDALONE_ENDPOINTS below for the one that genuinely is).
@@ -46,7 +47,7 @@ export const ENDPOINTS: Array<{ counterKey: string; endpointId: string; baseline
   { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 6 },
   { counterKey: 'runpod:qwen-image-gen',  endpointId: 'e165se4r3eo5hp', baselineMax: 2 },
   { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla', baselineMax: 2 },
-  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 8 },
+  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 6 },
   { counterKey: 'runpod:bgm-s2t',         endpointId: '6apg6j7suzuezw', baselineMax: 2 },
 ];
 

@@ -78,8 +78,8 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(flux.reason).toBe('reservation-prewarm');
     // flux alone wants max(reserved=4, its own baseline=6)=6 — the baseline
     // already covers this reservation, and with every endpoint's real
-    // per-endpoint baseline (flux=6, qwen-gen=2, qwen-edit=2, wan2=8) the four
-    // IDLE sums to only 6+2+2+8=18 <= ACCOUNT_CAP(20), so rebalanceUnderCap
+    // per-endpoint baseline (flux=6, qwen-gen=2, qwen-edit=2, wan2=6) the four
+    // IDLE sums to only 6+2+2+6=16 <= ACCOUNT_CAP(20), so rebalanceUnderCap
     // never fires.
     expect(flux.toMax).toBe(6);
 
@@ -96,14 +96,16 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(byKey['runpod:flux-tts-s2t'].toMax).toBe(6);
     expect(byKey['runpod:qwen-image-gen'].toMax).toBe(2);
     expect(byKey['runpod:qwen-image-edit'].toMax).toBe(2);
-    expect(byKey['runpod:wan2-i2v'].toMax).toBe(8);
+    expect(byKey['runpod:wan2-i2v'].toMax).toBe(6);
     expect(byKey['runpod:bgm-s2t'].toMax).toBe(2);
-    // Pooled sum lands exactly on the account's real cap (confirmed via
-    // RunPod's dashboard 2026-07-07, cap doubled 10→20 once balance crossed
-    // $200; bgm-s2t added to the pool 2026-07-10) — 0 units of headroom left,
-    // but still no rebalancing needed at rest since it's not over.
+    // Pooled sum is 18 of the account's 20-worker cap (re-confirmed via the
+    // RunPod dashboard 2026-07-21 — wan2 corrected 8→6, a stale count from
+    // 2026-07-07 that was never re-checked). The remaining 2 units are
+    // deployed outside this pool entirely (long2shorts, a direct RunPod call
+    // not routed through QM's catalog/provisioner — see fleet.ts's top
+    // comment), not idle headroom in this pool.
     const pooled = ['runpod:flux-tts-s2t', 'runpod:qwen-image-gen', 'runpod:qwen-image-edit', 'runpod:wan2-i2v', 'runpod:bgm-s2t'];
-    expect(pooled.reduce((a, ck) => a + byKey[ck].toMax, 0)).toBe(20);
+    expect(pooled.reduce((a, ck) => a + byKey[ck].toMax, 0)).toBe(18);
     // STANDALONE_ENDPOINTS is empty since 2026-07-21 (ernie-image, its one
     // entry, was retired when image.explainer.t2i's primary rung moved to
     // qwen-image-gen — a pooled endpoint, already asserted above).
