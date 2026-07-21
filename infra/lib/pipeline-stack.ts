@@ -902,7 +902,7 @@ function textOverlayStates(remotionOverlayArn: string, nextAfterNormalize: strin
 function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): object {
   return {
     Type: 'Map',
-    Comment: 'Per-frame video via Quartermaster gateway (Narration-Basic): ONE flux-tts-s2t `pipeline` call per frame does image (t2i/i2i) → Kokoro TTS → animate → merge (models resident in VRAM). Replaces 4 QM jobs/frame with 1. QM owns internal-first routing + per-endpoint concurrency. Exception: frames with imageModel=="ernie" (explainer/educational, on-screen text) branch to a decomposed 4-step flow instead — ERNIE-Image-Turbo is t2i-only (no pipeline/animate/merge mode of its own), so those frames pay 4 QM jobs to get correct in-image text, while every other frame keeps the 1-job optimization. Frames carrying a non-empty textManifest (the same 5 genres) additionally get a Remotion text-overlay render spliced in after BuildFrameVideo — see textOverlayStates below.',
+    Comment: 'Per-frame video via Quartermaster gateway (Narration-Basic): ONE flux-tts-s2t `pipeline` call per frame does image (t2i/i2i) → Kokoro TTS → animate → merge (models resident in VRAM). Replaces 4 QM jobs/frame with 1. QM owns internal-first routing + per-endpoint concurrency. Exception: frames with imageModel=="ernie" or "qwen-image-gen" (explainer/educational/advertisement/documentary/product-promotion, on-screen text overlay) branch to a decomposed 4-step flow instead — this rung is t2i-only (no pipeline/animate/merge mode of its own), so those frames pay 4 QM jobs to get a clean text-free image, while every other frame keeps the 1-job optimization. Frames carrying a non-empty textManifest (the same 5 genres) additionally get a Remotion text-overlay render spliced in after BuildFrameVideo — see textOverlayStates below.',
     ItemsPath: '$.frames',
     MaxConcurrency: 15,
     ResultPath: '$.videoResults',
@@ -912,12 +912,19 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
         ...textOverlayStates(remotionOverlayArn, 'RouteImageModel'),
         RouteImageModel: {
           Type: 'Choice',
-          Comment: 'imageModel=="ernie" (StoryStudio-resolved — explainer/educational frames needing legible on-screen text) → decomposed image/TTS/animate/merge via image.explainer.t2i (ERNIE-Image-Turbo). Any other value, or the field missing entirely (older callers pre-dating the 2026-07-05 imageModel field), keeps the efficient one-shot Flux pipeline.',
+          Comment: 'imageModel=="ernie" OR "qwen-image-gen" (StoryStudio-resolved — explainer/educational/advertisement/documentary/product-promotion frames needing an on-screen text overlay) → decomposed image/TTS/animate/merge via image.explainer.t2i (Qwen-Image-Gen). Two accepted values because pipeline.ts sends "ernie" only via its (currently dead) hasTextTag path, and "qwen-image-gen" for narration-premium\'s real text-free-genre frames — narration-basic still always sends "flux-klein-4b" today (StoryStudio\'s own documented choice), so this branch only fires for Basic via the "ernie" tag path until/unless that changes. Any other value, or the field missing entirely (older callers pre-dating the 2026-07-05 imageModel field), keeps the efficient one-shot Flux pipeline.',
           Choices: [{
-            And: [
-              { Variable: '$.imageModel', IsPresent: true },
-              { Variable: '$.imageModel', IsString: true },
-              { Variable: '$.imageModel', StringEquals: 'ernie' },
+            Or: [
+              { And: [
+                { Variable: '$.imageModel', IsPresent: true },
+                { Variable: '$.imageModel', IsString: true },
+                { Variable: '$.imageModel', StringEquals: 'ernie' },
+              ] },
+              { And: [
+                { Variable: '$.imageModel', IsPresent: true },
+                { Variable: '$.imageModel', IsString: true },
+                { Variable: '$.imageModel', StringEquals: 'qwen-image-gen' },
+              ] },
             ],
             Next: 'QMGenerateExplainerImage',
           }],
@@ -926,7 +933,7 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
         QMGenerateExplainerImage: {
           Type: 'Task',
           Resource: qmGenerateArn,
-          Comment: 'Text-to-image via QM (image.explainer.t2i: self-hosted ERNIE-Image-Turbo → nano-banana fallback). ERNIE has no i2i mode, so this always renders from imagePrompt alone even if the frame carries a referenceImageUrl (matches StoryStudio\'s documented override: explainer/text frames use ernie regardless of the i2i/t2i row).',
+          Comment: 'Text-to-image via QM (image.explainer.t2i: self-hosted Qwen-Image-Gen → nano-banana fallback). No i2i mode on this rung, so this always renders from imagePrompt alone even if the frame carries a referenceImageUrl (matches StoryStudio\'s documented override: explainer/text-overlay frames use this branch regardless of the i2i/t2i row).',
           Parameters: {
             assetType: 'image',
             tier: 'explainer',
@@ -992,7 +999,7 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
         QMGenerateExplainerAnimate: {
           Type: 'Task',
           Resource: qmGenerateArn,
-          Comment: 'Ken Burns animation of the ERNIE image via QM (video.narrationBasic.animate: self-hosted Flux-TTS-S2T animate mode) — same animation rung the one-shot path uses internally. durationS comes from $.ttsResult.durationS (the real spoken/measured length QMGenerateExplainerTTS just reported, guaranteed present regardless of branch via UseProvidedExplainerVoice\'s fallback) rather than the originally-planned $.duration estimate, so the Ken Burns clip QMGenerateExplainerMerge glues the voice onto is never shorter than the actual narration audio (mirrors Narration-Premium-QM-New\'s QMGenerateVideoNormal — a stale $.duration here previously let real speech run past the clip length and cut off the last syllable(s) of narration).',
+          Comment: 'Ken Burns animation of the Qwen-Image-Gen image via QM (video.narrationBasic.animate: self-hosted Flux-TTS-S2T animate mode) — same animation rung the one-shot path uses internally. durationS comes from $.ttsResult.durationS (the real spoken/measured length QMGenerateExplainerTTS just reported, guaranteed present regardless of branch via UseProvidedExplainerVoice\'s fallback) rather than the originally-planned $.duration estimate, so the Ken Burns clip QMGenerateExplainerMerge glues the voice onto is never shorter than the actual narration audio (mirrors Narration-Premium-QM-New\'s QMGenerateVideoNormal — a stale $.duration here previously let real speech run past the clip length and cut off the last syllable(s) of narration).',
           Parameters: {
             assetType: 'video',
             tier: 'narrationBasic',
@@ -1228,7 +1235,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
 function qmPremiumFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): object {
   return {
     Type: 'Map',
-    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → TTS (Qwen voice-design) → Wan2 i2v → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency. TTS runs BEFORE video (reordered) so RouteVideoLength can branch on the TTS\'s real spoken length: ≤7s (Wan2\'s max duration_s) → one clip at that length, used as-is; >7s → one fixed 5s clip, duplicated via concat to 10s (video_urls: [url, url] — cheaper than a second unique Wan2 generation, near-identical motion anyway), then merge trims the result down to the real audio length. Exception: frames with imageModel=="ernie" (explainer/educational, on-screen text) get their image from image.explainer.t2i (Qwen-Image-Gen) instead of the normal t2i/i2i rung — everything downstream is unchanged, since only the image source differs. Frames carrying a non-empty textManifest (the same 5 genres) additionally get a Remotion text-overlay render spliced in after BuildFrameVideo — see textOverlayStates below.',
+    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → TTS (Qwen voice-design) → Wan2 i2v → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency. TTS runs BEFORE video (reordered) so RouteVideoLength can branch on the TTS\'s real spoken length: ≤7s (Wan2\'s max duration_s) → one clip at that length, used as-is; >7s → one fixed 5s clip, duplicated via concat to 10s (video_urls: [url, url] — cheaper than a second unique Wan2 generation, near-identical motion anyway), then merge trims the result down to the real audio length. Exception: frames with imageModel=="ernie" or "qwen-image-gen" (explainer/educational/advertisement/documentary/product-promotion, on-screen text overlay) get their image from image.explainer.t2i (Qwen-Image-Gen) instead of the normal t2i/i2i rung — everything downstream is unchanged, since only the image source differs. Frames carrying a non-empty textManifest (the same 5 genres) additionally get a Remotion text-overlay render spliced in after BuildFrameVideo — see textOverlayStates below.',
     ItemsPath: '$.frames',
     // Lower than Basic-QM-New's 15 — premium touches 3 endpoints per frame, so its
     // worker footprint is 3x a single-endpoint project's at the same concurrency.
@@ -1278,13 +1285,20 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: stri
         },
         RouteImageGen: {
           Type: 'Choice',
-          Comment: 'imageModel=="ernie" (explainer/educational frame needing legible on-screen text) → ERNIE-Image-Turbo, checked first since it overrides the normal i2i/t2i choice (ERNIE has no i2i mode — matches Narration-Basic-QM-New\'s documented resolution table). Otherwise: character reference from the UI → image-to-image; else text-to-image.',
+          Comment: 'imageModel=="ernie" OR "qwen-image-gen" (explainer/educational/advertisement/documentary/product-promotion frame needing an on-screen text overlay) → Qwen-Image-Gen via image.explainer.t2i, checked first since it overrides the normal i2i/t2i choice (this rung has no i2i mode). Two accepted values: pipeline.ts sends "qwen-image-gen" literally for narration-premium\'s real text-free-genre, reference-less frames (confirmed live 2026-07-12) — "ernie" is kept too for its (currently dead) hasTextTag path. Otherwise: character reference from the UI → image-to-image; else text-to-image.',
           Choices: [
             {
-              And: [
-                { Variable: '$.imageModel', IsPresent: true },
-                { Variable: '$.imageModel', IsString: true },
-                { Variable: '$.imageModel', StringEquals: 'ernie' },
+              Or: [
+                { And: [
+                  { Variable: '$.imageModel', IsPresent: true },
+                  { Variable: '$.imageModel', IsString: true },
+                  { Variable: '$.imageModel', StringEquals: 'ernie' },
+                ] },
+                { And: [
+                  { Variable: '$.imageModel', IsPresent: true },
+                  { Variable: '$.imageModel', IsString: true },
+                  { Variable: '$.imageModel', StringEquals: 'qwen-image-gen' },
+                ] },
               ],
               Next: 'QMGenerateImageExplainer',
             },
@@ -1302,7 +1316,7 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: stri
         QMGenerateImageExplainer: {
           Type: 'Task',
           Resource: qmGenerateArn,
-          Comment: 'Text-to-image via QM (image.explainer.t2i: self-hosted ERNIE-Image-Turbo → nano-banana fallback). ERNIE has no i2i mode, so this always renders from imagePrompt alone even if the frame carries a referenceImageUrl.',
+          Comment: 'Text-to-image via QM (image.explainer.t2i: self-hosted Qwen-Image-Gen → nano-banana fallback). No i2i mode on this rung, so this always renders from imagePrompt alone even if the frame carries a referenceImageUrl.',
           Parameters: {
             assetType: 'image',
             tier: 'explainer',
