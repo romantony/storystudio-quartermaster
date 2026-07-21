@@ -870,11 +870,12 @@ function textOverlayStates(remotionOverlayArn: string, nextAfterNormalize: strin
     RenderTextOverlay: {
       Type: 'Task',
       Resource: remotionOverlayArn,
-      Comment: 'Per-frame Remotion text-overlay render (QM-remotion-overlay Lambda, direct invoke — see remotion-overlay-lambda-integration-handoff.md §6 Option B). Composites $.textManifest\'s textElements onto the already-animated, already-audio-merged clip BuildFrameVideo just produced.',
+      Comment: 'Per-frame Remotion text-overlay render (QM-remotion-overlay Lambda, direct invoke — see remotion-overlay-lambda-integration-handoff.md §6 Option B). Composites $.textManifest\'s textElements onto the already-animated, already-audio-merged clip BuildFrameVideo just produced. duration is the clip\'s real length (BuildFrameVideo\'s $.duration — see NormalizeRealDuration for Basic, $.ttsResult.durationS for Premium, both already the real reported length) — the Lambda force-overrides Remotion\'s rendered duration to this, since textManifest.durationInFrames was computed by StoryStudio before real TTS ran and otherwise silently truncates the clip\'s tail (confirmed live 2026-07-21: cut-off narration audio).',
       Parameters: {
         'clipUrl.$': '$.videoUrl',
         'textManifest.$': '$.textManifest',
         'frameId.$': '$.frameId',
+        'duration.$': '$.duration',
       },
       ResultPath: '$.overlayResult',
       TimeoutSeconds: 180,
@@ -1056,7 +1057,7 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
           TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeError', Next: 'QMFrameFailed' }],
-          Next: 'BuildFrameVideo',
+          Next: 'NormalizeRealDuration',
         },
         QMGeneratePipeline: {
           Type: 'Task',
@@ -1083,7 +1084,7 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
           TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.pipelineError', Next: 'QMFrameFailed' }],
-          Next: 'BuildFrameVideo',
+          Next: 'NormalizeRealDuration',
         },
         QMFrameFailed: {
           Type: 'Pass',
@@ -1096,14 +1097,35 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
           },
           End: true,
         },
+        // The pod's real merged output length ($.pipelineResult.durationS —
+        // reported by both the one-shot `pipeline` mode and the explainer
+        // branch's `merge` mode, per runpod/API.md; both share ResultPath
+        // $.pipelineResult) is often longer than the originally-planned
+        // $.duration StoryStudio sent before TTS ever ran (the real spoken
+        // length of narrationText varies). Confirmed live 2026-07-21: frames
+        // carrying a textManifest were audibly cut off mid-narration, because
+        // RenderTextOverlay's Remotion composition renders exactly
+        // textManifest.durationInFrames frames — a value StoryStudio computed
+        // from the SAME stale planned duration — truncating the real clip's
+        // tail. Falls back to $.duration only if the pod genuinely didn't
+        // report one (shouldn't happen per the API, but Choice's IsPresent
+        // check keeps this safe against that regardless).
+        NormalizeRealDuration: {
+          Type: 'Choice',
+          Comment: 'Prefer the pod\'s real reported merged-clip duration over the originally-planned $.duration, so BuildFrameVideo\'s duration (and RenderTextOverlay\'s forced Remotion duration) reflect the actual clip, not a pre-TTS estimate.',
+          Choices: [{ Variable: '$.pipelineResult.durationS', IsPresent: true, Next: 'SetRealDurationFromPipeline' }],
+          Default: 'SetRealDurationFromPlanned',
+        },
+        SetRealDurationFromPipeline: { Type: 'Pass', Parameters: { 'value.$': '$.pipelineResult.durationS' }, ResultPath: '$.realDuration', Next: 'BuildFrameVideo' },
+        SetRealDurationFromPlanned: { Type: 'Pass', Parameters: { 'value.$': '$.duration' }, ResultPath: '$.realDuration', Next: 'BuildFrameVideo' },
         BuildFrameVideo: {
           Type: 'Pass',
-          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = pipeline output: merged animation + voice). textManifest carried through (normalized to \'\' by NormalizeTextManifest above when absent) so RouteTextOverlay/RenderTextOverlay below can read it — this Pass\'s Parameters block replaces $ entirely, so anything not named here would otherwise be lost before the overlay step could see it.',
+          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = pipeline output: merged animation + voice). duration comes from $.realDuration (the pod\'s actual reported length, see NormalizeRealDuration above), not the originally-planned $.duration, so downstream concat/SRT timing and RenderTextOverlay\'s forced clip length both match the real artifact. textManifest carried through (normalized to \'\' by NormalizeTextManifest above when absent) so RouteTextOverlay/RenderTextOverlay below can read it — this Pass\'s Parameters block replaces $ entirely, so anything not named here would otherwise be lost before the overlay step could see it.',
           Parameters: {
             'frameId.$': '$.frameId',
             'frameNumber.$': '$.frameNumber',
             'videoUrl.$': '$.pipelineResult.cdnUrl',
-            'duration.$': '$.duration',
+            'duration.$': '$.realDuration.value',
             'textManifest.$': '$.textManifest',
           },
           Next: 'RouteTextOverlay',

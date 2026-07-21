@@ -22,6 +22,15 @@ import type { AwsRegion } from '@remotion/lambda-client';
  * correct the merged clip's real fps against `textManifest.fps` — a
  * Premium/Wan2 fps mismatch would silently judder rather than fail. Not
  * solved here; flagged as a follow-up.
+ *
+ * `duration` (the clip's real length in seconds, reported by the pod that
+ * produced it — see pipeline-stack.ts's NormalizeRealDuration for Basic)
+ * force-overrides Remotion's rendered duration via `forceDurationInFrames`.
+ * Without this, the composition renders exactly `textManifest.durationInFrames`
+ * frames — a value StoryStudio computed from the frame's originally-planned
+ * duration *before* real TTS ever ran — silently truncating the tail of any
+ * clip whose real narration ran longer than planned (confirmed live
+ * 2026-07-21: audibly cut-off narration on every frame carrying a manifest).
  */
 
 interface RemotionOverlayEvent {
@@ -29,6 +38,8 @@ interface RemotionOverlayEvent {
   /** JSON-stringified FrameRenderManifest: {fps, durationInFrames, textElements[], ...}. */
   textManifest: string;
   frameId?: string;
+  /** The clip's real length in seconds — overrides textManifest's pre-TTS-estimated durationInFrames. */
+  duration?: number;
 }
 
 interface RemotionOverlayResult {
@@ -47,6 +58,9 @@ export const handler = async (event: RemotionOverlayEvent): Promise<RemotionOver
   const manifest = JSON.parse(event.textManifest) as Record<string, unknown>;
   manifest.background = { type: 'video', src: event.clipUrl };
 
+  const fps = typeof manifest.fps === 'number' ? manifest.fps : 30;
+  const forceDurationInFrames = event.duration != null ? Math.round(event.duration * fps) : undefined;
+
   const { renderId, bucketName } = await renderMediaOnLambda({
     region: REGION,
     functionName: FUNCTION_NAME,
@@ -54,6 +68,7 @@ export const handler = async (event: RemotionOverlayEvent): Promise<RemotionOver
     composition: COMPOSITION_ID,
     inputProps: manifest,
     codec: 'h264',
+    forceDurationInFrames,
   });
 
   const deadline = Date.now() + DEADLINE_MS;
