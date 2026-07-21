@@ -23,10 +23,10 @@
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.explainer.t2i": [
-      { "provider": "runpod", "model": "ernie-image-turbo", "mode": "image", "endpointId": "teaye48ss7oywb", "endpoint": "v2/teaye48ss7oywb", "counterKey": "runpod:ernie-image", "routingMode": "direct", "lane": "rest",
-        "note": "Explainer/educational T2I — self-hosted baidu/ERNIE-Image-Turbo (own A40 endpoint). Validated strongest at dense, layout-sensitive EN in-image text (posters/infographics/diagrams) — beats Flux and holds up against nano-banana. English only for now: EN/中文 is its trained focus; Tamil/Hindi tested unreliable (garbled/broken conjuncts), so non-EN explainer content should stay on nano-banana until language-conditional rung selection is added to route by params.language." },
+      { "provider": "runpod", "model": "qwen-image-gen", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
+        "note": "Explainer/educational/advertisement/documentary/product-promotion T2I — self-hosted Qwen-Image-Gen. Replaces ERNIE-Image-Turbo (2026-07-21): these 5 genres generate text-free images now (StoryStudio, since 2026-07-11) — on-screen text is composited afterward as an animated Remotion overlay onto the frame's rendered clip (docs/quartermaster/remotion-overlay-lambda-integration-handoff.md), because diffusion-rendered text smudges once the still frame is animated into video. ERNIE's dense-EN-text strength is no longer the deciding factor for a model that never renders text at all, so this tier now uses the same plain t2i model already used elsewhere rather than keeping a dedicated text-rendering endpoint alive." },
       { "provider": "kie", "model": "google/nano-banana", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true,
-        "note": "Explainer text-in-image fallback — Google nano-banana. Also the non-EN explainer path until language-based routing lands." }
+        "note": "Explainer T2I fallback — Google nano-banana. Plain t2i fallback (no longer needs any special text-rendering strength — see the primary rung's note)." }
     ],
     "image.educational.t2i": { "aliasOf": "image.explainer.t2i" },
     "image.basic.i2i": [

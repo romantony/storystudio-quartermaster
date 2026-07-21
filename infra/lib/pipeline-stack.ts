@@ -49,8 +49,8 @@ export class PipelineStack extends Stack {
     // selection, internal↔external failover, and concurrency. Replaces the
     // per-asset "acquire → provider Lambda → release" cluster.
     // Timeout must exceed QM_GENERATE_DEADLINE_MS (qm-generate.ts's own poll
-    // deadline) with margin, and executor.ts's timeout (600s) must in turn be
-    // >= this Lambda's polling window, or the three layers race each other
+    // deadline) with margin, and executor.ts's timeout must in turn be >=
+    // this Lambda's polling window, or the three layers race each other
     // into a false timeout on a genuinely slow-but-succeeding RunPod job
     // (confirmed live 2026-07-04, Wan2 i2v; again 2026-07-10, ERNIE explainer
     // t2i — a burst of `imageModel=="ernie"` frames against fleet.ts's
@@ -63,11 +63,13 @@ export class PipelineStack extends Stack {
     // capacity-starved case (this one alone needed ~33min, which no single
     // Lambda invocation can ever provide), but meaningfully shrinks how often
     // QMFrameFailed fires for a job that's still legitimately queued rather
-    // than actually dead. executor.ts's own 600s timeout is unaffected by
-    // this change: it bounds a single dispatch+generation attempt, not the
-    // capacity-wait span, which is re-queued across many short executor
-    // invocations (see capacityWaits in executor.ts) rather than blocking one
-    // invocation for the whole wait.
+    // than actually dead. executor.ts's own timeout (raised 600s→890s,
+    // 2026-07-11, api-stack.ts — a pt-BR ttsLocalizedQwen job against the
+    // shared 6-worker rnqxi6c0mlq517 endpoint hit the old 600s ceiling
+    // mid-poll and was falsely marked FAILED) bounds a single dispatch+
+    // generation attempt, not the capacity-wait span, which is re-queued
+    // across many short executor invocations (see capacityWaits in
+    // executor.ts) rather than blocking one invocation for the whole wait.
     const qmGenerateFn = new nodejs.NodejsFunction(this, 'QMGenerateFunction', {
       functionName: 'QM-generate',
       entry: path.join(__dirname, '../../src/handlers/qm-generate.ts'),
@@ -119,6 +121,49 @@ export class PipelineStack extends Stack {
       action: 'lambda:InvokeFunction',
     });
 
+    // ── QM-remotion-overlay Lambda (SFN → per-frame Remotion text-overlay render) ─
+    // Direct Lambda invoke inside the GenerateImages Map (Option B of
+    // docs/quartermaster/remotion-overlay-lambda-integration-handoff.md), not
+    // routed through the QM-generate catalog/ladder — Remotion rendering isn't
+    // GPU-scarce and doesn't need QM's semaphore, AWS Lambda scales it on its
+    // own. Calls the already-deployed Remotion Lambda function/site/composition
+    // (owned by StoryStudio, same AWS account — not built or redeployed by this
+    // stack) via @remotion/lambda-client's renderMediaOnLambda/getRenderProgress,
+    // pinned to the function's exact deployed version (4.0.443) — a caret range
+    // resolves to the newest published client version and hard-fails with a
+    // version-mismatch error against an older deployed function (confirmed live
+    // in the handoff doc's own benchmark).
+    const remotionOverlayFn = new nodejs.NodejsFunction(this, 'RemotionOverlayFunction', {
+      functionName: 'QM-remotion-overlay',
+      entry: path.join(__dirname, '../../src/handlers/remotion-overlay.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(150),
+      memorySize: 256,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+      environment: {
+        REMOTION_FUNCTION_NAME: 'remotion-render-4-0-443-mem2048mb-disk2048mb-120sec',
+        REMOTION_SERVE_URL: 'https://remotionlambda-useast1-55dp29f3ln.s3.us-east-1.amazonaws.com/sites/storystudio-frame-render/index.html',
+        REMOTION_COMPOSITION_ID: 'FrameOverlay',
+        REMOTION_REGION: 'us-east-1',
+      },
+    });
+    remotionOverlayFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['lambda:InvokeFunction', 'lambda:GetFunction', 'lambda:GetFunctionConfiguration'],
+      resources: ['arn:aws:lambda:us-east-1:929075264324:function:remotion-render-4-0-443-mem2048mb-disk2048mb-120sec'],
+    }));
+    remotionOverlayFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['s3:GetObject', 's3:ListBucket'],
+      resources: [
+        'arn:aws:s3:::remotionlambda-useast1-55dp29f3ln',
+        'arn:aws:s3:::remotionlambda-useast1-55dp29f3ln/*',
+      ],
+    }));
+    remotionOverlayFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
     // ── State machine definition ─────────────────────────────────────────────
     const brokerArn = brokerFn.functionArn;
 
@@ -163,7 +208,7 @@ export class PipelineStack extends Stack {
     // generated through the Quartermaster gateway (QM-generate). Separate
     // machine so we can validate the gateway end-to-end without altering
     // Basic-QM/Premium-QM.
-    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn);
+    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn);
 
     const qmNewStateMachine = new sfn.CfnStateMachine(this, 'QMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
@@ -180,7 +225,7 @@ export class PipelineStack extends Stack {
     // (Qwen voice-design) → Wan2 i2v → merge, all through the Quartermaster
     // gateway. Finalize is Premium-flavored (1080p upscale), mirroring
     // buildPremiumDefinition's FinalizeVideoPremium exactly.
-    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn);
+    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn);
 
     const narrationPremiumQmNewStateMachine = new sfn.CfnStateMachine(this, 'NarrationPremiumQMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Premium-QM-New',
@@ -203,7 +248,7 @@ export class PipelineStack extends Stack {
 // that Map, replacing it removes every broker reference — the cloned brokerArn
 // never survives into the QM-new definition.
 // ---------------------------------------------------------------------------
-function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string): object {
+function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string): object {
   const def = JSON.parse(JSON.stringify(buildDefinition(brokerArn))) as {
     Comment: string;
     States: Record<string, any>;
@@ -213,7 +258,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
   // The QM frame Map now produces the finished per-frame video (image → TTS →
   // Flux animate → Flux merge), so it emits $.videoResults directly and the
   // local Ken Burns Map (GenerateI2VBasic) is no longer needed.
-  def.States.GenerateImages = qmFrameAssetsMap(qmGenerateArn);
+  def.States.GenerateImages = qmFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
 
   // BGM is now generated from a prompt (bgmPrompt), not passed in as a
   // pre-existing URL. Route through it right after the frame Map — $.frames
@@ -762,6 +807,91 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
 }
 
 /**
+ * Per-frame Remotion text-overlay states, shared by both qmFrameAssetsMap
+ * (Basic) and qmPremiumFrameAssetsMap (Premium) iterators — direct Lambda
+ * invoke (Option B of docs/quartermaster/remotion-overlay-lambda-integration-handoff.md),
+ * not routed through the QM-generate catalog/ladder, spliced in right after
+ * each iterator's shared BuildFrameVideo state produces `videoUrl`.
+ *
+ * `NormalizeTextManifest`/`SetTextManifestDefault` must run as the iterator's
+ * very first state (StartAt), before anything else, guaranteeing `$.textManifest`
+ * is always a real string (empty when the frame doesn't carry one — only the 5
+ * genres needing an on-screen overlay do) — same "Pass + ResultPath, never
+ * Parameters" safe-default pattern as NormalizeFourLang/the 4lang voice-field
+ * chain above: a direct `.$` reference to an absent key throws `States.Runtime`,
+ * and BuildFrameVideo's own Parameters block (a full `$` reshape, no ResultPath)
+ * needs to reference `$.textManifest` safely to carry it through to
+ * RouteTextOverlay below.
+ *
+ * RouteTextOverlay/RenderTextOverlay/ApplyTextOverlay/SkipTextOverlay run once
+ * BuildFrameVideo has already produced the frame's videoUrl. Because this all
+ * happens *inside* the Map (before it closes), textManifest never needs to
+ * survive DropFrameData's allowlist — consumed and discarded within the same
+ * iteration, unlike the older Fargate-batch proposal's design.
+ */
+function textOverlayStates(remotionOverlayArn: string, nextAfterNormalize: string): Record<string, unknown> {
+  const nonEmptyTextManifest = {
+    And: [
+      { Variable: '$.textManifest', IsPresent: true },
+      { Variable: '$.textManifest', IsString: true },
+      { Not: { Variable: '$.textManifest', StringEquals: '' } },
+    ],
+  };
+  return {
+    NormalizeTextManifest: {
+      Type: 'Choice',
+      Comment: 'Guarantee $.textManifest is a real string before BuildFrameVideo\'s Parameters allowlist would otherwise throw if the frame omitted it entirely (the common case — only explainer/educational/advertisement/documentary/product-promotion frames carry one).',
+      Choices: [{ ...nonEmptyTextManifest, Next: nextAfterNormalize }],
+      Default: 'SetTextManifestDefault',
+    },
+    SetTextManifestDefault: { Type: 'Pass', Result: '', ResultPath: '$.textManifest', Next: nextAfterNormalize },
+    RouteTextOverlay: {
+      Type: 'Choice',
+      Comment: 'Gate purely on a non-empty textManifest — StoryStudio only populates this for the 5 genres needing an on-screen text overlay, so its presence alone already encodes the genre gate; no separate top-level textOverlayEnabled flag needed (same data-driven-not-flag-driven style RouteImageModel/RouteImageGen already use for imageModel).',
+      Choices: [{ ...nonEmptyTextManifest, Next: 'RenderTextOverlay' }],
+      Default: 'SkipTextOverlay',
+    },
+    RenderTextOverlay: {
+      Type: 'Task',
+      Resource: remotionOverlayArn,
+      Comment: 'Per-frame Remotion text-overlay render (QM-remotion-overlay Lambda, direct invoke — see remotion-overlay-lambda-integration-handoff.md §6 Option B). Composites $.textManifest\'s textElements onto the already-animated, already-audio-merged clip BuildFrameVideo just produced.',
+      Parameters: {
+        'clipUrl.$': '$.videoUrl',
+        'textManifest.$': '$.textManifest',
+        'frameId.$': '$.frameId',
+      },
+      ResultPath: '$.overlayResult',
+      TimeoutSeconds: 180,
+      Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Passthrough failure policy (handoff doc §8\'s recommendation): one frame\'s overlay failing degrades to its un-overlaid clip rather than failing the whole video.', ResultPath: '$.overlayError', Next: 'SkipTextOverlay' }],
+      Next: 'ApplyTextOverlay',
+    },
+    ApplyTextOverlay: {
+      Type: 'Pass',
+      Comment: 'Overlay succeeded — use the overlaid clip in place of the original.',
+      Parameters: {
+        'frameId.$': '$.frameId',
+        'frameNumber.$': '$.frameNumber',
+        'videoUrl.$': '$.overlayResult.overlayRenderedUrl',
+        'duration.$': '$.duration',
+      },
+      End: true,
+    },
+    SkipTextOverlay: {
+      Type: 'Pass',
+      Comment: 'No text overlay needed (empty textManifest), or the overlay render failed — keep the original un-overlaid clip. Reshapes to the same videoResults[] item shape as ApplyTextOverlay so nothing downstream of the Map needs to branch on which path ran.',
+      Parameters: {
+        'frameId.$': '$.frameId',
+        'frameNumber.$': '$.frameNumber',
+        'videoUrl.$': '$.videoUrl',
+        'duration.$': '$.duration',
+      },
+      End: true,
+    },
+  };
+}
+
+/**
  * Per-frame Map that builds the finished frame video entirely through the QM
  * gateway: image (t2i, or i2i when the frame carries a UI `referenceImageUrl`
  * character) → TTS (`narrationText`, voice by `voiceGender`) → Flux `animate`
@@ -769,16 +899,17 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
  * onto the animation). Emits the item shape the concat step consumes:
  * `videoUrl` + `frameNumber` (+ `duration`, `frameId`).
  */
-function qmFrameAssetsMap(qmGenerateArn: string): object {
+function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): object {
   return {
     Type: 'Map',
-    Comment: 'Per-frame video via Quartermaster gateway (Narration-Basic): ONE flux-tts-s2t `pipeline` call per frame does image (t2i/i2i) → Kokoro TTS → animate → merge (models resident in VRAM). Replaces 4 QM jobs/frame with 1. QM owns internal-first routing + per-endpoint concurrency. Exception: frames with imageModel=="ernie" (explainer/educational, on-screen text) branch to a decomposed 4-step flow instead — ERNIE-Image-Turbo is t2i-only (no pipeline/animate/merge mode of its own), so those frames pay 4 QM jobs to get correct in-image text, while every other frame keeps the 1-job optimization.',
+    Comment: 'Per-frame video via Quartermaster gateway (Narration-Basic): ONE flux-tts-s2t `pipeline` call per frame does image (t2i/i2i) → Kokoro TTS → animate → merge (models resident in VRAM). Replaces 4 QM jobs/frame with 1. QM owns internal-first routing + per-endpoint concurrency. Exception: frames with imageModel=="ernie" (explainer/educational, on-screen text) branch to a decomposed 4-step flow instead — ERNIE-Image-Turbo is t2i-only (no pipeline/animate/merge mode of its own), so those frames pay 4 QM jobs to get correct in-image text, while every other frame keeps the 1-job optimization. Frames carrying a non-empty textManifest (the same 5 genres) additionally get a Remotion text-overlay render spliced in after BuildFrameVideo — see textOverlayStates below.',
     ItemsPath: '$.frames',
     MaxConcurrency: 15,
     ResultPath: '$.videoResults',
     Iterator: {
-      StartAt: 'RouteImageModel',
+      StartAt: 'NormalizeTextManifest',
       States: {
+        ...textOverlayStates(remotionOverlayArn, 'RouteImageModel'),
         RouteImageModel: {
           Type: 'Choice',
           Comment: 'imageModel=="ernie" (StoryStudio-resolved — explainer/educational frames needing legible on-screen text) → decomposed image/TTS/animate/merge via image.explainer.t2i (ERNIE-Image-Turbo). Any other value, or the field missing entirely (older callers pre-dating the 2026-07-05 imageModel field), keeps the efficient one-shot Flux pipeline.',
@@ -830,8 +961,8 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
         },
         UseProvidedExplainerVoice: {
           Type: 'Pass',
-          Comment: 'A voiceUrl was supplied upstream — reuse it, skip TTS generation.',
-          Parameters: { 'cdnUrl.$': '$.voiceUrl' },
+          Comment: 'A voiceUrl was supplied upstream — reuse it, skip TTS generation. durationS falls back to the frame\'s planned $.duration since no TTS call ran to report a real one (QMGenerateExplainerAnimate reads $.ttsResult.durationS uniformly regardless of which branch ran — mirrors Narration-Premium-QM-New\'s UseProvidedVoice; see its comment for the 2026-07-07 States.Runtime incident a field-name mismatch here caused).',
+          Parameters: { 'cdnUrl.$': '$.voiceUrl', 'durationS.$': '$.duration' },
           ResultPath: '$.ttsResult',
           Next: 'QMGenerateExplainerAnimate',
         },
@@ -861,7 +992,7 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
         QMGenerateExplainerAnimate: {
           Type: 'Task',
           Resource: qmGenerateArn,
-          Comment: 'Ken Burns animation of the ERNIE image via QM (video.narrationBasic.animate: self-hosted Flux-TTS-S2T animate mode) — same animation rung the one-shot path uses internally.',
+          Comment: 'Ken Burns animation of the ERNIE image via QM (video.narrationBasic.animate: self-hosted Flux-TTS-S2T animate mode) — same animation rung the one-shot path uses internally. durationS comes from $.ttsResult.durationS (the real spoken/measured length QMGenerateExplainerTTS just reported, guaranteed present regardless of branch via UseProvidedExplainerVoice\'s fallback) rather than the originally-planned $.duration estimate, so the Ken Burns clip QMGenerateExplainerMerge glues the voice onto is never shorter than the actual narration audio (mirrors Narration-Premium-QM-New\'s QMGenerateVideoNormal — a stale $.duration here previously let real speech run past the clip length and cut off the last syllable(s) of narration).',
           Parameters: {
             assetType: 'video',
             tier: 'narrationBasic',
@@ -870,7 +1001,7 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
             queue: 'background',
             jobType: 'batch',
             'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
-            'durationS.$': '$.duration',
+            'durationS.$': '$.ttsResult.durationS',
             'projectId.$': '$$.Execution.Input.projectId',
             'frameId.$': '$.frameId',
             'userId.$': '$$.Execution.Input.userId',
@@ -944,14 +1075,15 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
         },
         BuildFrameVideo: {
           Type: 'Pass',
-          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = pipeline output: merged animation + voice).',
+          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = pipeline output: merged animation + voice). textManifest carried through (normalized to \'\' by NormalizeTextManifest above when absent) so RouteTextOverlay/RenderTextOverlay below can read it — this Pass\'s Parameters block replaces $ entirely, so anything not named here would otherwise be lost before the overlay step could see it.',
           Parameters: {
             'frameId.$': '$.frameId',
             'frameNumber.$': '$.frameNumber',
             'videoUrl.$': '$.pipelineResult.cdnUrl',
             'duration.$': '$.duration',
+            'textManifest.$': '$.textManifest',
           },
-          End: true,
+          Next: 'RouteTextOverlay',
         },
       },
     },
@@ -969,8 +1101,8 @@ function qmFrameAssetsMap(qmGenerateArn: string): object {
 // the finalize section is Premium-flavored (1080p upscale), matching
 // buildPremiumDefinition's FinalizeVideoPremium exactly.
 // ---------------------------------------------------------------------------
-function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string): object {
-  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn))) as {
+function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string): object {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn))) as {
     Comment: string;
     States: Record<string, any>;
   };
@@ -984,7 +1116,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   // block, which must not silently persist into a premium project's job
   // records (wrong billing/audit attribution even though it's the same
   // physical ACE-Step rung).
-  def.States.GenerateImages = qmPremiumFrameAssetsMap(qmGenerateArn);
+  def.States.GenerateImages = qmPremiumFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
   def.States.GenerateImages.Next = 'RouteBGM';
   Object.assign(def.States, bgmStates(qmGenerateArn, 'narrationPremium'));
 
@@ -1093,10 +1225,10 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
  * Emits the item shape the concat step consumes: `videoUrl` + `frameNumber`
  * (+ `duration`, `frameId`) — identical to the Basic map's output shape.
  */
-function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
+function qmPremiumFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): object {
   return {
     Type: 'Map',
-    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → TTS (Qwen voice-design) → Wan2 i2v → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency. TTS runs BEFORE video (reordered) so RouteVideoLength can branch on the TTS\'s real spoken length: ≤7s (Wan2\'s max duration_s) → one clip at that length, used as-is; >7s → one fixed 5s clip, duplicated via concat to 10s (video_urls: [url, url] — cheaper than a second unique Wan2 generation, near-identical motion anyway), then merge trims the result down to the real audio length. Exception: frames with imageModel=="ernie" (explainer/educational, on-screen text) get their image from image.explainer.t2i (ERNIE-Image-Turbo) instead of the normal t2i/i2i rung — everything downstream is unchanged, since only the image source differs.',
+    Comment: 'Per-frame video via Quartermaster gateway (Narration-Premium): image (Qwen i2i/t2i) → TTS (Qwen voice-design) → Wan2 i2v → merge. QM owns provider selection, internal→external failover, and per-endpoint concurrency. TTS runs BEFORE video (reordered) so RouteVideoLength can branch on the TTS\'s real spoken length: ≤7s (Wan2\'s max duration_s) → one clip at that length, used as-is; >7s → one fixed 5s clip, duplicated via concat to 10s (video_urls: [url, url] — cheaper than a second unique Wan2 generation, near-identical motion anyway), then merge trims the result down to the real audio length. Exception: frames with imageModel=="ernie" (explainer/educational, on-screen text) get their image from image.explainer.t2i (Qwen-Image-Gen) instead of the normal t2i/i2i rung — everything downstream is unchanged, since only the image source differs. Frames carrying a non-empty textManifest (the same 5 genres) additionally get a Remotion text-overlay render spliced in after BuildFrameVideo — see textOverlayStates below.',
     ItemsPath: '$.frames',
     // Lower than Basic-QM-New's 15 — premium touches 3 endpoints per frame, so its
     // worker footprint is 3x a single-endpoint project's at the same concurrency.
@@ -1108,8 +1240,9 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
     MaxConcurrency: 8,
     ResultPath: '$.videoResults',
     Iterator: {
-      StartAt: 'CheckImageCache',
+      StartAt: 'NormalizeTextManifest',
       States: {
+        ...textOverlayStates(remotionOverlayArn, 'CheckImageCache'),
         CheckImageCache: {
           Type: 'Task',
           Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-asset-cache-check',
@@ -1461,14 +1594,15 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string): object {
         },
         BuildFrameVideo: {
           Type: 'Pass',
-          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = merged Wan2 video + voice). duration comes from $.ttsResult.durationS (the real spoken/target length that drove Wan2 + merge\'s trim) rather than the originally-planned $.duration, so downstream concat/SRT timing matches the actual final artifact — guaranteed present regardless of which TTS branch ran (see UseProvidedVoice/QMGenerateTTS/QMGenerateTTSClone).',
+          Comment: 'Emit the per-frame video item the concat step consumes (videoUrl = merged Wan2 video + voice). duration comes from $.ttsResult.durationS (the real spoken/target length that drove Wan2 + merge\'s trim) rather than the originally-planned $.duration, so downstream concat/SRT timing matches the actual final artifact — guaranteed present regardless of which TTS branch ran (see UseProvidedVoice/QMGenerateTTS/QMGenerateTTSClone). textManifest carried through (normalized to \'\' by NormalizeTextManifest above when absent) so RouteTextOverlay/RenderTextOverlay below can read it — this Pass\'s Parameters block replaces $ entirely, so anything not named here would otherwise be lost before the overlay step could see it.',
           Parameters: {
             'frameId.$': '$.frameId',
             'frameNumber.$': '$.frameNumber',
             'videoUrl.$': '$.mergeResult.cdnUrl',
             'duration.$': '$.ttsResult.durationS',
+            'textManifest.$': '$.textManifest',
           },
-          End: true,
+          Next: 'RouteTextOverlay',
         },
       },
     },

@@ -17,15 +17,14 @@
  *     overwhelmed external fallback) absorb the overflow.
  *   - The narration-serving endpoints (flux-tts-s2t, qwen-image-gen/edit,
  *     wan2-i2v, bgm-s2t) are a *static* allocation, never dynamically
- *     reshuffled, currently summing to 18 of ACCOUNT_CAP's 20 (raised from 10
- *     once account balance crossed $200, confirmed against the RunPod
- *     dashboard 2026-07-07: Flux-TTS-ANIM=6, qwen-image-gen=0,
- *     qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=8, BGM-S2T=2 — 2 units of
- *     headroom, not artificially inflated to hit the cap). ernie-image sits on
- *     its own dedicated GPU/volume outside this pool (see its entry below), so
- *     it isn't part of that sum and isn't in provisioner.ts's ENDPOINTS (the
- *     list that actually enforces the shared account cap — a separate array
- *     from this file's FLEET).
+ *     reshuffled, summing to exactly ACCOUNT_CAP's 20 (raised from 10 once
+ *     account balance crossed $200; qwen-image-gen raised 0→2 on 2026-07-21
+ *     when the explainer/educational/advertisement/documentary/
+ *     product-promotion T2I rung moved onto it from the now-retired
+ *     ernie-image endpoint — see image.explainer.t2i in background.json —
+ *     using the 2 units of headroom the 2026-07-07 dashboard confirmation
+ *     left unused: Flux-TTS-ANIM=6, qwen-image-edit=2,
+ *     Wan2-14b-fp8-RTX6000ADA=8, BGM-S2T=2, qwen-image-gen=2).
  *   - Idle floor is 0 (true scale-to-zero) — we don't pay for a warm worker with
  *     no job in front of it. Pre-warm raises workers only on admission, timed to
  *     overlap the ~2-3 min cold start with Convex's brain window.
@@ -36,7 +35,6 @@ export const QWEN_IMAGE_GEN = 'runpod:qwen-image-gen';
 export const QWEN_IMAGE_EDIT = 'runpod:qwen-image-edit';
 export const WAN2_I2V = 'runpod:wan2-i2v';
 export const BGM_S2T = 'runpod:bgm-s2t';
-export const ERNIE_IMAGE = 'runpod:ernie-image';
 
 export interface FleetEndpoint {
   counterKey: string;
@@ -54,10 +52,12 @@ export const FLEET: FleetEndpoint[] = [
   // Raised 3→6 (2026-07-07): account balance crossed $200, RunPod cap doubled
   // 10→20; confirmed against the dashboard (Flux-TTS-ANIM 0/6 running, 4 idle).
   { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 6 },
-  // Off: StoryStudio always sends a character reference (→ i2i on qwen-image-edit),
-  // and reference-less premium frames route to Flux4b t2i on flux-tts-s2t. Raise
-  // to 2 only if a dedicated premium t2i endpoint is ever needed.
-  { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 0 },
+  // Raised 0→2 (2026-07-21): now the primary rung for image.explainer.t2i
+  // (explainer/educational/advertisement/documentary/product-promotion T2I —
+  // see background.json), replacing the retired ernie-image endpoint. Premium
+  // frames without a character reference still route to Flux4b t2i on
+  // flux-tts-s2t, not here — this endpoint is explainer-tier only for now.
+  { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 2 },
   { counterKey: QWEN_IMAGE_EDIT, endpointId: 'oxwx8o879qwtla', workers: 2 },
   // Raised 3→8 (2026-07-07): account balance crossed $200, RunPod cap doubled
   // 10→20; confirmed against the dashboard (Wan2-14b-fp8-RTX6000ADA 0/8
@@ -73,17 +73,6 @@ export const FLEET: FleetEndpoint[] = [
   // flux-tts-s2t (each endpoint loads only its own models). Raised 1→2
   // (2026-07-07) to match the dashboard (BGM-S2T 0/2 running, 2 idle).
   { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 2 },
-  // ernie-image — baidu/ERNIE-Image-Turbo, dedicated A40 (own network volume,
-  // not shared with flux-tts-s2t/bgm-s2t). Explainer/educational t2i where
-  // in-image text must render correctly (image.explainer.t2i) — validated
-  // strongest at dense EN text; non-EN routing stays on nano-banana until
-  // language-conditional rung selection is added. Standalone: NOT in
-  // PROJECT_FLEET (no admission-gated project type calls it yet) and NOT in
-  // provisioner.ts's ENDPOINTS (that list enforces the shared narration
-  // account cap; this endpoint's own worker sits outside that pool on its own
-  // GPU, so it doesn't compete with flux/qwen/wan2 for the cap). Raised 1→2
-  // (2026-07-07) to match the dashboard (story-studio-ernie 0/2 running, 2 idle).
-  { counterKey: ERNIE_IMAGE,     endpointId: 'teaye48ss7oywb', workers: 2 },
 ];
 
 export const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 20);
@@ -115,32 +104,36 @@ export interface ProjectFleetPlan {
 export const PROJECT_FLEET: Record<string, ProjectFleetPlan> = {
   // Basic runs the per-frame pipeline on flux-tts-s2t, plus one BGM + one SRT on
   // bgm-s2t (project-level). Merge is the terminal per-frame step, so its backlog
-  // is the cleanest "frames still unfinished" signal → still the gate. ernie-image
-  // added 2026-07-10: explainer/infographic frames (imageModel=="ernie", routed
-  // per-frame in pipeline-stack.ts's RouteImageModel, invisible to admission
-  // otherwise) were hitting a cold, un-pre-warmed 2-worker pool — confirmed live,
-  // one frame needed 16 capacity-wait retries and ~33min to get a slot (see
-  // pipeline-stack.ts:47-70). Pre-warming its (small, fixed) 2 workers on every
-  // grant at least removes the cold-start tax; it does NOT fix a project sending
-  // a large burst of ernie frames at once, since admission has no visibility into
-  // per-frame imageModel — that would need a new StoryStudio→QM request field
-  // (e.g. explainerFrameCount) threaded through assetLoad.ts, which doesn't
-  // exist yet. ernie-image is deliberately NOT the gate here: it's a rare,
-  // low-volume path, not this project type's bottleneck.
+  // is the cleanest "frames still unfinished" signal → still the gate.
+  // qwen-image-gen pre-warm (originally added for ernie-image 2026-07-10, moved
+  // here 2026-07-21 when image.explainer.t2i's primary rung retired ernie-image
+  // in favor of qwen-image-gen — see fleet.ts's FLEET comment): explainer/
+  // educational/etc. frames (imageModel=="ernie", routed per-frame in
+  // pipeline-stack.ts's RouteImageModel, invisible to admission otherwise) were
+  // hitting a cold, un-pre-warmed pool — confirmed live, one frame needed 16
+  // capacity-wait retries and ~33min to get a slot on the old ernie-image
+  // endpoint (see pipeline-stack.ts:47-70). Pre-warming qwen-image-gen's workers
+  // on every grant at least removes the same cold-start tax; it does NOT fix a
+  // project sending a large burst of these frames at once, since admission has
+  // no visibility into per-frame imageModel — that would need a new
+  // StoryStudio→QM request field (e.g. explainerFrameCount) threaded through
+  // assetLoad.ts, which doesn't exist yet. qwen-image-gen is deliberately NOT
+  // the gate here: it's a rare, low-volume path, not this project type's
+  // bottleneck.
   'narration-basic': {
-    endpoints: [FLUX_TTS_S2T, BGM_S2T, ERNIE_IMAGE],
+    endpoints: [FLUX_TTS_S2T, BGM_S2T, QWEN_IMAGE_GEN],
     gateEndpoint: FLUX_TTS_S2T,
     gateOperation: 'merge',
     gateMax: 9, // "< 10"
   },
   // Premium touches image (qwen-edit), video (wan2), per-frame audio/merge
   // (flux), and project-level SRT+BGM (bgm-s2t). Wan2 is the bottleneck
-  // (90s/job), so it's the gate. ernie-image added 2026-07-10 — same
-  // explainer-frame pre-warm rationale as narration-basic above; Premium's
-  // RouteImageGen Choice (pipeline-stack.ts:1131-1157) hits the same
+  // (90s/job), so it's the gate. qwen-image-gen pre-warm — same explainer-frame
+  // rationale as narration-basic above (moved from ernie-image 2026-07-21);
+  // Premium's RouteImageGen Choice (pipeline-stack.ts:1131-1157) hits the same
   // image.explainer.t2i rung.
   'narration-premium': {
-    endpoints: [QWEN_IMAGE_EDIT, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T, ERNIE_IMAGE],
+    endpoints: [QWEN_IMAGE_EDIT, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T, QWEN_IMAGE_GEN],
     gateEndpoint: WAN2_I2V,
     gateMax: 8, // "<= 8"
   },

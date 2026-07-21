@@ -56,15 +56,11 @@ export const ENDPOINTS: Array<{ counterKey: string; endpointId: string; baseline
 // through rebalanceUnderCap's ACCOUNT_CAP clamp, since that cap describes a
 // resource these endpoints don't actually draw from (folding them into the
 // same clamp could incorrectly shrink their target under heavy demand
-// elsewhere in the shared pool, for no real capacity reason). Added
-// 2026-07-10 alongside PROJECT_FLEET's ernie-image pre-warm entry
-// (fleet.ts) — same bug as bgm-s2t above (prewarmEndpoints silently
-// no-op'd), plus the periodic tick never scaled it at all (not even to
-// zero), so a project's pre-warm would previously have needed a manual
-// RunPod-dashboard reset to ever come back down.
-export const STANDALONE_ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [
-  { counterKey: 'runpod:ernie-image', endpointId: 'teaye48ss7oywb', baselineMax: 2 },
-];
+// elsewhere in the shared pool, for no real capacity reason). Empty since
+// 2026-07-21: the one entry this held (ernie-image) was retired when
+// image.explainer.t2i's primary rung moved to qwen-image-gen (a pooled
+// ENDPOINTS-group endpoint, see above) — see background.json/fleet.ts.
+export const STANDALONE_ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [];
 
 // `reserved` = worker-units committed by active admission-gate reservations for
 // this endpoint (§WS-C2) — a project the gatekeeper has granted but that hasn't

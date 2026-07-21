@@ -104,10 +104,10 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     // but still no rebalancing needed at rest since it's not over.
     const pooled = ['runpod:flux-tts-s2t', 'runpod:qwen-image-gen', 'runpod:qwen-image-edit', 'runpod:wan2-i2v', 'runpod:bgm-s2t'];
     expect(pooled.reduce((a, ck) => a + byKey[ck].toMax, 0)).toBe(20);
-    // Standalone (own dedicated GPU, added 2026-07-10) — same idle baseline
-    // lifecycle, deliberately excluded from the pooled cap sum above.
-    expect(byKey['runpod:ernie-image'].toMax).toBe(2);
-    expect(byKey['runpod:ernie-image'].reason).toBe('scale-to-zero');
+    // STANDALONE_ENDPOINTS is empty since 2026-07-21 (ernie-image, its one
+    // entry, was retired when image.explainer.t2i's primary rung moved to
+    // qwen-image-gen — a pooled endpoint, already asserted above).
+    expect(plans.some(p => p.counterKey === 'runpod:ernie-image')).toBe(false);
   });
 
   it('does not starve a reservation-only endpoint when heavy organic demand elsewhere exceeds the cap', async () => {
@@ -128,12 +128,10 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     });
 
     const plans = await runProvisioner();
-    // ACCOUNT_CAP is only ever enforced over the pooled group — standalone
-    // endpoints (ernie-image) sit on their own dedicated GPU and are exempt
-    // from this clamp by design, so they're excluded from this sum.
-    const pooledTotal = plans
-      .filter(p => p.counterKey !== 'runpod:ernie-image')
-      .reduce((a, p) => a + p.toMax, 0);
+    // ACCOUNT_CAP is only ever enforced over the pooled group — STANDALONE_ENDPOINTS
+    // is empty since 2026-07-21 (see the idle-baseline test above), so every plan
+    // here is already in the pooled group; no exclusion needed.
+    const pooledTotal = plans.reduce((a, p) => a + p.toMax, 0);
     expect(pooledTotal).toBeLessThanOrEqual(20); // ACCOUNT_CAP respected
 
     const flux = plans.find(p => p.counterKey === 'runpod:flux-tts-s2t')!;
