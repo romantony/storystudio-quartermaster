@@ -298,10 +298,21 @@ export interface AuditItem {
   timestamp: number;
 }
 
-export interface MeteringItem {
-  pk: string;         // USAGE:{projectId}:{yyyymmdd}
-  sk: string;         // {model}:count | {model}:slot_ms
-  value: number;
+/**
+ * Cumulative GPU-hour cost for one project, bucketed by day + GPU type.
+ * Written by the executor on every internal RunPod completion (see
+ * gpuPricing.ts); read by /api/projects/{id}/cost to answer "what did this
+ * project actually cost" from RunPod's own billed executionTime, not an
+ * estimate.
+ */
+export interface ProjectCostItem {
+  pk: string;          // PROJECTCOST#{projectId}
+  sk: string;          // {yyyymmdd}#{gpuType}   e.g. 20260711#A40
+  gpuType: string;      // 'A40' | 'RTX6000ADA'
+  costUsd: number;      // cumulative for this project+day+gpuType bucket
+  executionMs: number;  // cumulative RunPod-billed executionTime
+  requestCount: number;
+  updatedAt: number;
 }
 
 /**
@@ -469,6 +480,12 @@ export interface SubmitResult {
    * for 4lang translation) and the Anthropic adapter's translated script both
    * ride this field through to JobItem.resultText. */
   text?: string;
+  /** RunPod's own top-level `executionTime` (ms) — the actual billed worker
+   * duration, INCLUDING cold-start model load time. Confirmed live 2026-07-11:
+   * a cold Flux-TTS-S2T call reported executionTime=94497ms vs the pod's own
+   * self-reported output.gen_time_s=2.1s (56.8s of that was just loading the
+   * flux model) — gen_time_s is not a usable cost signal, executionTime is. */
+  executionTimeMs?: number;
 }
 
 export interface PollResult {
@@ -483,6 +500,8 @@ export interface PollResult {
   durationS?: number;
   /** See SubmitResult.text. */
   text?: string;
+  /** See SubmitResult.executionTimeMs. */
+  executionTimeMs?: number;
 }
 
 export interface WebhookParseResult {

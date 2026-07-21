@@ -71,6 +71,18 @@ function runpodOutDuration(p: unknown): number | undefined {
   return dig(p);
 }
 
+// RunPod's own top-level `executionTime` (ms) on /run and /status responses —
+// the actual billed worker duration (queue wait via `delayTime` is separate
+// and NOT billed). This is distinct from output.gen_time_s (the pod's own
+// self-reported inference time, which EXCLUDES cold-start model loading —
+// confirmed live 2026-07-11: a cold call reported executionTime=94497ms vs
+// gen_time_s=2.1s, a 45x gap from ~57s of model load time alone). Cost
+// tracking must key off this field, not gen_time_s.
+function runpodExecutionTimeMs(p: unknown): number | undefined {
+  const obj = p as Record<string, unknown>;
+  return typeof obj?.executionTime === 'number' ? obj.executionTime : undefined;
+}
+
 const TERMINAL_STATUSES = new Set(['FAILED', 'ERROR', 'CANCELLED', 'TIMED_OUT']);
 
 /**
@@ -345,10 +357,10 @@ export const runpod: Adapter = {
     const status = String(r.status ?? '').toUpperCase();
     if (status === 'COMPLETED') {
       const url = runpodOutUrl(r);
-      if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(r), text: runpodOutText(r) };
+      if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(r), text: runpodOutText(r), executionTimeMs: runpodExecutionTimeMs(r) };
     }
     const url = runpodOutUrl(raw);
-    if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(raw), text: runpodOutText(raw) };
+    if (url) return { outputUrls: [url], raw, durationS: runpodOutDuration(raw), text: runpodOutText(raw), executionTimeMs: runpodExecutionTimeMs(raw) };
     return { taskRef: String(r.id ?? ''), raw };
   },
 
@@ -361,7 +373,7 @@ export const runpod: Adapter = {
 
     if (status === 'COMPLETED') {
       const url = runpodOutUrl(json);
-      return { done: true, outputUrls: url ? [url] : undefined, durationS: runpodOutDuration(json), text: runpodOutText(json) };
+      return { done: true, outputUrls: url ? [url] : undefined, durationS: runpodOutDuration(json), text: runpodOutText(json), executionTimeMs: runpodExecutionTimeMs(json) };
     }
     if (TERMINAL_STATUSES.has(status)) {
       const out = json.output as Record<string, unknown> | undefined;

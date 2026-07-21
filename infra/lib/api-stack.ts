@@ -68,7 +68,15 @@ export class ApiStack extends Stack {
       entry: path.join(__dirname, '../../src/handlers/executor.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: Duration.seconds(600),
+      // Raised 600s→890s (2026-07-11) to match QM-generate's own ceiling
+      // (pipeline-stack.ts) — confirmed live same day: a pt-BR ttsLocalizedQwen
+      // job against the shared 6-worker rnqxi6c0mlq517 endpoint burned the full
+      // 600s window mid-poll (588.8s billed) and was declared FAILED while
+      // RunPod itself never reported an error, just hadn't finished. 890s (10s
+      // under Lambda's hard 900s ceiling, same margin QM-generate uses) gives
+      // pollInline's remaining()>POLL_BUFFER_MS loop (executor.ts) much more
+      // runway before giving up on a slow-but-still-working generation.
+      timeout: Duration.seconds(890),
       memorySize: 512,
       bundling: { minify: true, sourceMap: false, externalModules: [] },
       environment: {

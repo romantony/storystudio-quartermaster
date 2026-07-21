@@ -58,6 +58,14 @@ export const api = {
     ).toString();
     return request<unknown>(`/api/cost${qs ? `?${qs}` : ''}`);
   },
+  getProjectCost: (projectId: string) =>
+    request<{
+      projectId: string;
+      totalCostUsd: number;
+      totalExecutionMs: number;
+      totalRequests: number;
+      breakdown: Array<{ gpuType: string; costUsd: number; executionMs: number; requestCount: number }>;
+    }>(`/api/projects/${encodeURIComponent(projectId)}/cost`),
 
   // Balances
   getBalances: () =>

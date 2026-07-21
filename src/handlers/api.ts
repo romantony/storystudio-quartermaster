@@ -60,6 +60,7 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
       if (method === 'PUT' && path.match(/^\/api\/providers\/[^/]+$/)) return handlePutProvider(evt, actor);
       if (method === 'POST' && path.match(/^\/api\/providers\/[^/]+\/rotate-key$/)) return handleRotateKey(evt, actor);
       if (method === 'GET' && path === '/api/cost') return handleGetCost(evt);
+      if (method === 'GET' && path.match(/^\/api\/projects\/[^/]+\/cost$/)) return handleGetProjectCost(evt);
       if (method === 'GET' && path === '/api/balances') return handleGetBalances();
       if (method === 'PUT' && path.match(/^\/api\/balances\/[^/]+$/)) return handlePutBalance(evt, actor);
       if (method === 'GET' && path === '/api/audit') return handleGetAudit(evt);
@@ -589,6 +590,57 @@ async function handleGetCost(evt: LambdaFunctionUrlEvent): Promise<LambdaFunctio
 
   const items = (result.Items ?? []).map(i => unmarshall(i));
   return json(200, { date, platform, entries: items });
+}
+
+/**
+ * Real per-project GPU cost — sums the ProjectCostItem buckets the executor
+ * writes on every internal RunPod completion (executor.ts's recordGpuCost),
+ * keyed off RunPod's own billed executionTime, not an estimate. Distinct from
+ * (and more accurate than) handleGetCost above, which was never wired to a
+ * real write path.
+ */
+async function handleGetProjectCost(evt: LambdaFunctionUrlEvent): Promise<LambdaFunctionUrlResponse> {
+  const match = evt.rawPath.match(/^\/api\/projects\/([^/]+)\/cost$/);
+  const projectId = match ? decodeURIComponent(match[1]) : '';
+  if (!projectId) return json(400, { error: 'Missing projectId' });
+
+  const items: Array<{ sk: string; gpuType: string; costUsd: number; executionMs: number; requestCount: number }> = [];
+  let lastKey: Record<string, unknown> | undefined;
+  do {
+    const result = await db.send(new QueryCommand({
+      TableName: TABLE,
+      KeyConditionExpression: 'pk = :pk',
+      ExpressionAttributeValues: marshall({ ':pk': `PROJECTCOST#${projectId}` }),
+      ExclusiveStartKey: lastKey ? marshall(lastKey) : undefined,
+    }));
+    for (const raw of result.Items ?? []) {
+      items.push(unmarshall(raw) as typeof items[number]);
+    }
+    lastKey = result.LastEvaluatedKey ? unmarshall(result.LastEvaluatedKey) : undefined;
+  } while (lastKey);
+
+  const byGpuType = new Map<string, { costUsd: number; executionMs: number; requestCount: number }>();
+  let totalCostUsd = 0;
+  let totalExecutionMs = 0;
+  let totalRequests = 0;
+  for (const it of items) {
+    const cur = byGpuType.get(it.gpuType) ?? { costUsd: 0, executionMs: 0, requestCount: 0 };
+    cur.costUsd += it.costUsd;
+    cur.executionMs += it.executionMs;
+    cur.requestCount += it.requestCount;
+    byGpuType.set(it.gpuType, cur);
+    totalCostUsd += it.costUsd;
+    totalExecutionMs += it.executionMs;
+    totalRequests += it.requestCount;
+  }
+
+  return json(200, {
+    projectId,
+    totalCostUsd,
+    totalExecutionMs,
+    totalRequests,
+    breakdown: Array.from(byGpuType.entries()).map(([gpuType, v]) => ({ gpuType, ...v })),
+  });
 }
 
 // ─── Admin: Balances ──────────────────────────────────────────────────────────

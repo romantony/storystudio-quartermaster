@@ -48,6 +48,70 @@ function groupRows(rows: CostRow[], by: GroupBy): { key: string; calls: number; 
     .sort((a, b) => b.costUsd - a.costUsd);
 }
 
+function ProjectCostLookup() {
+  const [input, setInput] = useState('');
+  const [projectId, setProjectId] = useState('');
+
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['project-cost', projectId],
+    queryFn: () => api.getProjectCost(projectId),
+    enabled: projectId.length > 0,
+  });
+
+  return (
+    <div className="bg-white border rounded-xl p-4 mb-6">
+      <p className="text-xs text-gray-500 mb-2">Project cost (real RunPod GPU-second billing, not an estimate)</p>
+      <form
+        className="flex gap-2 mb-3"
+        onSubmit={(e) => { e.preventDefault(); setProjectId(input.trim()); }}
+      >
+        <input
+          className="flex-1 border rounded-lg px-3 py-1.5 text-sm font-mono"
+          placeholder="Project ID (e.g. js75gpvt4jpa7xjvjyq97ga1z18a96yg)"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+        />
+        <button type="submit" className="px-3 py-1.5 rounded-lg bg-indigo-700 text-white text-sm">
+          Look up
+        </button>
+      </form>
+
+      {isLoading && <p className="text-gray-500 text-sm">Loading…</p>}
+      {error && <p className="text-red-600 text-sm">Error loading project cost</p>}
+
+      {data && (
+        <div>
+          <p className="text-2xl font-bold text-gray-900 mb-3">${fmt(data.totalCostUsd)}</p>
+          {data.breakdown.length > 0 ? (
+            <table className="w-full text-sm">
+              <thead className="border-b">
+                <tr>
+                  <th className="text-left py-1.5 font-medium text-gray-600">GPU type</th>
+                  <th className="text-right py-1.5 font-medium text-gray-600">Requests</th>
+                  <th className="text-right py-1.5 font-medium text-gray-600">GPU time</th>
+                  <th className="text-right py-1.5 font-medium text-gray-600">Cost (USD)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {data.breakdown.map((row) => (
+                  <tr key={row.gpuType}>
+                    <td className="py-1.5 font-mono text-gray-800">{row.gpuType}</td>
+                    <td className="py-1.5 text-right text-gray-700">{row.requestCount.toLocaleString()}</td>
+                    <td className="py-1.5 text-right text-gray-700">{(row.executionMs / 1000).toFixed(1)}s</td>
+                    <td className="py-1.5 text-right font-mono text-gray-800">${fmt(row.costUsd)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="text-gray-500 text-sm">No recorded GPU usage for this project.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Cost() {
   const [groupBy, setGroupBy] = useState<GroupBy>('provider');
   const [days, setDays] = useState(7);
@@ -89,6 +153,8 @@ export default function Cost() {
           </div>
         </div>
       </div>
+
+      <ProjectCostLookup />
 
       {summary && (
         <div className="grid grid-cols-3 gap-4 mb-6">

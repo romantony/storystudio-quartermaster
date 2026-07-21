@@ -8,6 +8,7 @@ import { CatalogResolver } from '../catalog/resolver';
 import { acquireSimple, releaseSimple } from '../gate/dynamo-gate';
 import { isInternalRung, rungKey, selectRungOrder } from './router';
 import { endpointWorkers } from '../shared/fleet';
+import { gpuCostUsd, gpuTypeForRung } from '../shared/gpuPricing';
 import type {
   Adapter, CircuitConfig, JobItem, ProviderConfig, ProviderTaskItem, Queue, Rung,
 } from '../types';
@@ -146,7 +147,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
 
         // Sync completion (provider returned URLs immediately).
         if (result.outputUrls?.length) {
-          await complete(job, result.outputUrls[0], rung.fb, result.durationS, result.text);
+          await complete(job, result.outputUrls[0], rung.fb, result.durationS, result.text, rung, result.executionTimeMs);
           await recordBaseline(rung, job, Date.now() - rungStart);
           await releaseSimple(counterKey, leaseId);
           if (internal) await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
@@ -161,7 +162,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
           // 2-min sweeper tick); the sweeper stays the safety net.
           await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
           if (polled) {
-            await complete(job, polled.url, rung.fb, polled.durationS, polled.text);
+            await complete(job, polled.url, rung.fb, polled.durationS, polled.text, rung, polled.executionTimeMs);
             await recordBaseline(rung, job, Date.now() - rungStart);
             await feedCircuit(key, true, cfg);
             return;
@@ -223,7 +224,7 @@ async function submit(adapter: Adapter, job: JobItem, rung: Rung, callbackUrl?: 
 
 async function pollInline(
   adapter: Adapter, taskRef: string, rung: Rung, context: LambdaContext, key: string,
-): Promise<{ url: string; durationS?: number; text?: string } | undefined> {
+): Promise<{ url: string; durationS?: number; text?: string; executionTimeMs?: number } | undefined> {
   if (!taskRef) return undefined;
   const remaining = () => context.getRemainingTimeInMillis?.() ?? Number.MAX_SAFE_INTEGER;
   while (remaining() > POLL_BUFFER_MS) {
@@ -236,7 +237,7 @@ async function pollInline(
         console.warn('[executor] internal generation failed', key, 'taskRef', taskRef, res.error ?? '(no error detail)');
       }
       const url = res.failed ? undefined : res.outputUrls?.[0];
-      return url ? { url, durationS: res.durationS, text: res.text } : undefined;
+      return url ? { url, durationS: res.durationS, text: res.text, executionTimeMs: res.executionTimeMs } : undefined;
     }
     await sleep(POLL_INTERVAL_MS);
   }
@@ -359,6 +360,7 @@ async function appendTried(job: JobItem, key: string): Promise<void> {
 
 async function complete(
   job: JobItem, assetKey: string, fallback?: boolean, durationS?: number, text?: string,
+  rung?: Rung, executionTimeMs?: number,
 ): Promise<void> {
   const sets = ['#s = :s', 'assetKey = :ak', 'updatedAt = :now'];
   const values: Record<string, unknown> = {
@@ -382,6 +384,42 @@ async function complete(
     ExpressionAttributeValues: marshall(values),
   }));
   console.info('[executor] COMPLETE', job.requestId, job.jobId, assetKey, durationS !== undefined ? `duration=${durationS}s` : '');
+
+  if (rung && executionTimeMs !== undefined) {
+    await recordGpuCost(job, rung, executionTimeMs).catch(e =>
+      console.warn('[executor] recordGpuCost failed', job.requestId, e));
+  }
+}
+
+/**
+ * Attribute this completion's RunPod-billed GPU time to its project. Only
+ * meaningful for internal (self-hosted RunPod) rungs — external/fallback
+ * providers bill per-call, not per GPU-second, so they're out of scope here.
+ * One cumulative item per project+day+GPU-type (ADD, not overwrite) so
+ * concurrent frame completions never race-clobber each other's totals.
+ */
+async function recordGpuCost(job: JobItem, rung: Rung, executionTimeMs: number): Promise<void> {
+  if (!job.projectId || !isInternalRung(rung)) return;
+  if (!rung.counterKey) {
+    // isInternalRung only checks provider+endpointId, not counterKey — every
+    // runpod ladder entry carries both today (background.json/foreground.json
+    // convention), but if that ever slips, fail closed (skip + warn) rather
+    // than gpuTypeForRung silently defaulting to 'A40' and misattributing cost
+    // to the wrong GPU type.
+    console.warn('[executor] recordGpuCost skipped — internal rung missing counterKey', job.requestId, rung.provider, rung.endpointId);
+    return;
+  }
+  const gpuType = gpuTypeForRung(rung.counterKey);
+  const costUsd = gpuCostUsd(executionTimeMs, rung.counterKey);
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  await db.send(new UpdateItemCommand({
+    TableName: TABLE,
+    Key: marshall({ pk: `PROJECTCOST#${job.projectId}`, sk: `${day}#${gpuType}` }),
+    UpdateExpression: 'SET gpuType = :g, updatedAt = :now ADD costUsd :c, executionMs :e, requestCount :n',
+    ExpressionAttributeValues: marshall({
+      ':g': gpuType, ':now': Date.now(), ':c': costUsd, ':e': executionTimeMs, ':n': 1,
+    }),
+  }));
 }
 
 /**
