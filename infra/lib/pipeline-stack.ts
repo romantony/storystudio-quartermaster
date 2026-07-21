@@ -140,7 +140,23 @@ export class PipelineStack extends Stack {
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: Duration.seconds(150),
       memorySize: 256,
-      bundling: { minify: true, sourceMap: false, externalModules: [] },
+      bundling: {
+        minify: true, sourceMap: false, externalModules: [],
+        // @remotion/lambda-client's package.json "exports" map offers both a
+        // working CJS build (dist/cjs/index.js) and a broken ESM one
+        // (dist/esm/index.mjs, which calls createRequire(import.meta.url) —
+        // esbuild's CJS output doesn't populate import.meta.url, so that
+        // resolves to undefined and crashes at require-time on cold start:
+        // "TypeError [ERR_INVALID_ARG_VALUE]: The argument 'filename' must be
+        // ... Received undefined"). esbuild honors the package's conditional
+        // exports over its own default platform:'node' mainFields, so without
+        // this it picks the ESM entry (confirmed live 2026-07-21 — 29/29 real
+        // RenderTextOverlay invocations failed with this exact error, caught
+        // gracefully by the passthrough failure policy but rendering zero
+        // overlays). Forcing the "require" condition makes it resolve the
+        // working CJS build instead.
+        esbuildArgs: { '--conditions': 'require' },
+      },
       environment: {
         REMOTION_FUNCTION_NAME: 'remotion-render-4-0-443-mem2048mb-disk2048mb-120sec',
         REMOTION_SERVE_URL: 'https://remotionlambda-useast1-55dp29f3ln.s3.us-east-1.amazonaws.com/sites/storystudio-frame-render/index.html',
