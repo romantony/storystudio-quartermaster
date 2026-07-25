@@ -88,6 +88,13 @@ export class PipelineStack extends Stack {
       actions: ['secretsmanager:GetSecretValue'],
       resources: [props.gatewayKeySecretArn],
     }));
+    // waitForTaskToken cache-hit path (see localizationStates' ttsTask()):
+    // qm-generate.ts resolves the SFN task directly when POST /jobs returns
+    // an already-COMPLETE job, instead of leaving it to webhook.ts.
+    qmGenerateFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['states:SendTaskSuccess', 'states:SendTaskFailure'],
+      resources: ['*'],
+    }));
     qmGenerateFn.addPermission('E2ESfnInvoke', {
       principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
       action: 'lambda:InvokeFunction',
@@ -581,39 +588,55 @@ function bgmStates(qmGenerateArn: string, tier: string): Record<string, unknown>
  * rather than failing the whole project.
  */
 function localizationStates(qmGenerateArn: string, tier: string): Record<string, unknown> {
+  // waitForTaskToken (2026-07-25): this call synthesizes the WHOLE translated
+  // script in one shot (not per-frame), whose real generation time can
+  // exceed any single Lambda invocation's window — confirmed live when both
+  // es/pt timed out at the old 850s QM_GENERATE_DEADLINE_MS ceiling
+  // (qm-generate.ts), itself already pushed close to Lambda's 900s hard
+  // execution limit. Plain lambda:invoke can't be pushed further; instead
+  // qm-generate.ts (passed $$.Task.Token below) submits the job and returns
+  // immediately, and webhook.ts resumes this task via SendTaskSuccess/
+  // Failure once RunPod's async webhook actually reports completion — see
+  // executor.ts's webhookCompletion rung handling and background.json's
+  // voice.*.ttsLocalizedQwen/Kokoro catalog entries. TimeoutSeconds is now
+  // bounded only by "did the webhook ever arrive," not Lambda's ceiling.
   const ttsTask = (engine: 'qwen' | 'kokoro') => ({
     Type: 'Task',
-    Resource: qmGenerateArn,
+    Resource: 'arn:aws:states:::lambda:invoke.waitForTaskToken',
     Comment: engine === 'qwen'
       ? `4lang localized TTS via QM (voice.${tier}.ttsLocalizedQwen — Qwen3-TTS voice-clone .pt fast path: cloneArtifactUrl + language param).`
       : `4lang localized TTS via QM (voice.${tier}.ttsLocalizedKokoro — self-hosted Kokoro voiceId, language param drives lang_code).`,
     Parameters: {
-      assetType: 'voice',
-      tier,
-      operation: engine === 'qwen' ? 'ttsLocalizedQwen' : 'ttsLocalizedKokoro',
-      product: 'narration',
-      queue: 'background',
-      jobType: 'batch',
-      'prompt.$': '$.translateResult.cdnUrl',
-      'language.$': '$.name',
-      ...(engine === 'qwen'
-        ? { 'cloneArtifactUrl.$': '$.cloneArtifactUrl' }
-        : { 'voiceId.$': '$.voiceId' }),
-      'projectId.$': '$$.Execution.Input.projectId',
-      'userId.$': '$$.Execution.Input.userId',
-      // BUGFIX (found on the first successful fourLang run, 2026-07-08): with
-      // no frameId, qm-generate.ts derives requestId as
-      // `${projectId}:na:${assetType}:${operation}` — identical across all 3
-      // parallel language branches (same assetType/operation here), so QM's
-      // idempotent-by-requestId /jobs de-dup collapsed es/pt-BR onto ONE
-      // shared job (whichever won the race), silently returning that same
-      // result for both languages. Language code as frameId disambiguates
-      // both requestId and qm-generate.ts's default s3Target the same way a
-      // real frameId would for per-frame jobs.
-      'frameId.$': '$.code',
+      FunctionName: qmGenerateArn,
+      Payload: {
+        assetType: 'voice',
+        tier,
+        operation: engine === 'qwen' ? 'ttsLocalizedQwen' : 'ttsLocalizedKokoro',
+        product: 'narration',
+        queue: 'background',
+        jobType: 'batch',
+        'prompt.$': '$.translateResult.cdnUrl',
+        'language.$': '$.name',
+        ...(engine === 'qwen'
+          ? { 'cloneArtifactUrl.$': '$.cloneArtifactUrl' }
+          : { 'voiceId.$': '$.voiceId' }),
+        'projectId.$': '$$.Execution.Input.projectId',
+        'userId.$': '$$.Execution.Input.userId',
+        // BUGFIX (found on the first successful fourLang run, 2026-07-08): with
+        // no frameId, qm-generate.ts derives requestId as
+        // `${projectId}:na:${assetType}:${operation}` — identical across all 3
+        // parallel language branches (same assetType/operation here), so QM's
+        // idempotent-by-requestId /jobs de-dup collapsed es/pt-BR onto ONE
+        // shared job (whichever won the race), silently returning that same
+        // result for both languages. Language code as frameId disambiguates
+        // both requestId and qm-generate.ts's default s3Target the same way a
+        // real frameId would for per-frame jobs.
+        'frameId.$': '$.code',
+        'taskToken.$': '$$.Task.Token',
+      },
     },
     ResultPath: '$.ttsResult',
-    TimeoutSeconds: 920,
+    TimeoutSeconds: 1800,
     Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
     Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'LocalizationFailedForLanguage' }],
     Next: 'QMGenerateLocalizedSRT',

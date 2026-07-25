@@ -45,6 +45,11 @@ export interface Rung {
   counterKey?: string;
   // RunPod-internal rungs only: engine selector for tts (kokoro|qwen).
   engine?: string;
+  // Opt-in: an internal RunPod rung whose real generation time can exceed a
+  // single Lambda invocation's window (e.g. whole-script localized TTS) uses
+  // RunPod's async webhook mode (like external rungs) instead of executor.ts's
+  // inline pollInline() — see executor.ts's dispatch loop.
+  webhookCompletion?: boolean;
 }
 
 export interface CatalogLadder {
@@ -131,6 +136,8 @@ export interface CanonicalJob {
   jobType?: JobType;
   // rung keys already attempted (so retries/failover don't repeat a dead rung).
   triedRungs?: string[];
+  // See JobItem.taskToken.
+  taskToken?: string;
 }
 
 // ─── DynamoDB Job Item ────────────────────────────────────────────────────────
@@ -188,6 +195,12 @@ export interface JobItem {
   updatedAt: number;    // epoch ms
   degraded?: Array<{ jobId: string; reason: string }>;
   errorReason?: string;
+  // SFN Task Token (waitForTaskToken integration) — present when the caller
+  // (qm-generate.ts) submitted this job on behalf of a paused Step Functions
+  // task. Threaded onto ProviderTaskItem so webhook.ts (or executor.ts's own
+  // completion) can resume the SFN via SendTaskSuccess/Failure once the job
+  // actually finishes, instead of the SFN Lambda blocking-polling for it.
+  taskToken?: string;
 }
 
 // ─── Semaphore Item ───────────────────────────────────────────────────────────
@@ -231,6 +244,11 @@ export interface ProviderTaskItem {
   provider?: string;
   leaseId?: string;
   leaseCounterKey?: string;   // COUNTER#{key} the slot was taken from
+  // RunPod-internal webhookCompletion rungs only: the rung's endpointId, so
+  // webhook.ts can reconstruct a minimal Rung for isInternalRung/cost
+  // attribution (recordGpuCost/recordBaseline need provider+endpointId+
+  // counterKey, not the full catalog Rung).
+  endpointId?: string;
 }
 
 // ─── Circuit Breaker Item ─────────────────────────────────────────────────────
@@ -509,6 +527,10 @@ export interface WebhookParseResult {
   outputUrls?: string[];
   failed?: boolean;
   durationS?: number;
+  /** See SubmitResult.text. */
+  text?: string;
+  /** See SubmitResult.executionTimeMs. */
+  executionTimeMs?: number;
 }
 
 export interface Adapter {

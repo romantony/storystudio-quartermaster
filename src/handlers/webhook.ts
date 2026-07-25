@@ -4,10 +4,16 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import { ADAPTERS } from '../adapters';
 import { releaseSimple } from '../gate/dynamo-gate';
+// complete/recordBaseline/loadJob are DB-only (no Lambda-specific state), so
+// reusing them here — rather than duplicating — keeps a webhookCompletion
+// internal rung's completion/cost/baseline accounting identical to the
+// inline-poll path in executor.ts.
+import { complete, loadJob, recordBaseline } from './executor';
 import type {
   LambdaFunctionUrlEvent,
   LambdaFunctionUrlResponse,
   ProviderTaskItem,
+  Rung,
 } from '../types';
 
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
@@ -56,7 +62,7 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
     const adapter = ADAPTERS[provider];
     if (!adapter.parseWebhook) return ok;
 
-    const { taskRef, outputUrls, failed } = adapter.parseWebhook(raw);
+    const { taskRef, outputUrls, failed, durationS, text, executionTimeMs } = adapter.parseWebhook(raw);
     if (!taskRef) return ok;
 
     // 5. Lookup PROVIDERTASK# item
@@ -95,25 +101,49 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
       console.info('[webhook] provider failed → failover', provider, taskRef);
     } else {
       const assetKey = outputUrls?.[0];
-      await db.send(new UpdateItemCommand({
-        TableName: TABLE,
-        Key: marshall({ pk: `REQ#${map.requestId}`, sk: `JOB#${map.jobId}` }),
-        UpdateExpression: 'SET #status = :s, updatedAt = :now' + (assetKey ? ', assetKey = :ak' : ''),
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: marshall({
-          ':s': 'COMPLETE',
-          ':now': now,
-          ...(assetKey ? { ':ak': assetKey } : {}),
-        }),
-      }));
+      // A webhookCompletion internal rung (RunPod, endpointId set) reuses
+      // executor.ts's own complete()/recordBaseline() so cost/baseline
+      // accounting matches the inline-poll path exactly — the plain
+      // UpdateItemCommand below (unchanged) still covers external providers
+      // (replicate/kie), which were already completing this way and don't
+      // carry GPU cost/baseline data.
+      const isInternalWebhookJob = map.provider === 'runpod' && !!map.endpointId;
+      if (isInternalWebhookJob && assetKey) {
+        const job = await loadJob(map.requestId, map.jobId);
+        if (job) {
+          const rung: Rung = {
+            provider: map.provider ?? provider,
+            endpointId: map.endpointId,
+            counterKey: map.leaseCounterKey,
+            model: '', lane: 'rest', routingMode: 'direct',
+          };
+          await complete(job, assetKey, undefined, durationS, text, rung, executionTimeMs);
+          await recordBaseline(rung, job, now - map.createdAt);
+        } else {
+          console.warn('[webhook] job record missing for internal webhookCompletion task', map.requestId, map.jobId);
+        }
+      } else {
+        await db.send(new UpdateItemCommand({
+          TableName: TABLE,
+          Key: marshall({ pk: `REQ#${map.requestId}`, sk: `JOB#${map.jobId}` }),
+          UpdateExpression: 'SET #status = :s, updatedAt = :now' + (assetKey ? ', assetKey = :ak' : ''),
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: marshall({
+            ':s': 'COMPLETE',
+            ':now': now,
+            ...(assetKey ? { ':ak': assetKey } : {}),
+          }),
+        }));
+      }
       console.info('[webhook] resolved', provider, taskRef, 'COMPLETE');
     }
 
-    // Phase 2 stub: if a taskToken is present, resume the Step Function
+    // If a taskToken is present, resume the paused Step Functions task
+    // (waitForTaskToken integration — see pipeline-stack.ts's ttsTask()).
     if (map.taskToken) {
-      await resumeStepFunction(map.taskToken, { outputUrls, failed }).catch(e =>
-        console.warn('[webhook] sendTaskSuccess/Failure failed (SFN not wired yet)', e),
-      );
+      await resumeStepFunction(map.taskToken, {
+        failed, requestId: map.requestId, jobId: map.jobId, assetKey: outputUrls?.[0], durationS, text,
+      }).catch(e => console.warn('[webhook] sendTaskSuccess/Failure failed', e));
     }
 
     return ok;
@@ -199,21 +229,45 @@ async function dispatchExecutor(requestId: string, jobId: string): Promise<void>
   }));
 }
 
-// ─── Step Functions stub (Phase 2) ───────────────────────────────────────────
+// ─── Step Functions task-token resume (waitForTaskToken integration) ────────
 
-async function resumeStepFunction(taskToken: string, result: { outputUrls?: string[]; failed?: boolean }) {
+interface TaskTokenResult {
+  failed?: boolean;
+  requestId: string;
+  jobId: string;
+  assetKey?: string;
+  durationS?: number;
+  text?: string;
+}
+
+// Resumes an SFN task paused on `lambda:invoke.waitForTaskToken`
+// (pipeline-stack.ts's ttsTask()). Success output must match the shape
+// qm-generate.ts's finalize() produces — downstream states (e.g.
+// QMGenerateLocalizedSRT) read $.ttsResult.cdnUrl the same way regardless of
+// whether the task resolved via a normal Lambda return or this callback.
+async function resumeStepFunction(taskToken: string, result: TaskTokenResult) {
   const { SFNClient, SendTaskSuccessCommand, SendTaskFailureCommand } = await import('@aws-sdk/client-sfn');
   const sfn = new SFNClient({});
-  if (result.failed) {
+  if (result.failed || !result.assetKey) {
     await sfn.send(new SendTaskFailureCommand({
       taskToken,
       error: 'ProviderFailed',
-      cause: 'Provider reported failure',
+      cause: result.failed ? 'Provider reported failure' : 'Provider reported success with no output URL',
     }));
   } else {
     await sfn.send(new SendTaskSuccessCommand({
       taskToken,
-      output: JSON.stringify({ outputUrls: result.outputUrls }),
+      output: JSON.stringify({
+        cdnUrl: result.assetKey,
+        s3Key: result.assetKey,
+        width: 1024,
+        height: 1024,
+        requestId: result.requestId,
+        jobId: result.jobId,
+        status: 'COMPLETE',
+        durationS: result.durationS,
+        text: result.text,
+      }),
     }));
   }
 }

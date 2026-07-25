@@ -220,6 +220,11 @@ const canonicalJobSchema = z.object({
   priority: z.enum(['P0', 'P1', 'P2']).optional(),
   lane: z.enum(['video', 'rest', 'none']).optional(),
   jobType: z.enum(['batch', 'realtime']).optional(),
+  // SFN Task Token, present when qm-generate.ts was invoked via the SFN's
+  // waitForTaskToken integration (pipeline-stack.ts's ttsTask()) — persisted
+  // onto the JobItem so executor.ts's putProviderTask can thread it onto
+  // ProviderTaskItem for webhook.ts to resolve later.
+  taskToken: z.string().optional(),
 });
 
 async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunctionUrlResponse> {
@@ -279,6 +284,7 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
     queue: input.queue,
     createdAt: now,
     updatedAt: now,
+    taskToken: input.taskToken,
   };
 
   // Overwrite is allowed when the existing record is absent OR already in a

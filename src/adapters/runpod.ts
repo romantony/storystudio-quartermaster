@@ -392,6 +392,8 @@ export const runpod: Adapter = {
       outputUrls: url ? [url] : undefined,
       failed: TERMINAL_STATUSES.has(status),
       durationS: runpodOutDuration(p),
+      text: runpodOutText(p),
+      executionTimeMs: runpodExecutionTimeMs(p),
     };
   },
 

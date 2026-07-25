@@ -141,7 +141,13 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
 
       try {
         const rungStart = Date.now();
-        const callbackUrl = internal ? undefined : `${WEBHOOK_BASE}/webhooks/${rung.provider}`;
+        // Internal rungs normally poll inline (below); an opt-in
+        // webhookCompletion rung (e.g. whole-script localized TTS, whose real
+        // generation time can exceed a single Lambda's window) instead gets a
+        // callbackUrl like an external rung and is handed off to webhook.ts —
+        // see the "Webhook-capable rung" branch below.
+        const useWebhook = !internal || rung.webhookCompletion;
+        const callbackUrl = useWebhook ? `${WEBHOOK_BASE}/webhooks/${rung.provider}` : undefined;
         const raw = await submit(adapter, job, rung, callbackUrl);
         const result = adapter.parseSubmit(raw);
 
@@ -155,7 +161,7 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
           return;
         }
 
-        if (internal) {
+        if (internal && !rung.webhookCompletion) {
           const polled = await pollInline(adapter, result.taskRef ?? '', rung, context, key);
           await releaseSimple(counterKey, leaseId);
           // Slot freed — feed the pod its next queued job at worker rate (not a
@@ -173,14 +179,20 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
           advance = true; break;                      // same-provider retries exhausted → next rung
         }
 
-        // Webhook-capable external rung: hand off; webhook.ts completes/releases.
+        // Webhook-capable rung (external, or an internal opt-in
+        // webhookCompletion rung): hand off; webhook.ts completes/releases.
+        // For internal rungs the slot stays held (endpointWorkers concurrency)
+        // until webhook.ts releases it — the sweeper (not
+        // dispatchNextForEndpoint) drains any backlog after that, since this
+        // path is low-volume/long-duration and doesn't need at-worker-rate
+        // immediate re-dispatch the way per-frame internal rungs do.
         if (!result.taskRef) {
           await releaseSimple(counterKey, leaseId);
           await feedCircuit(key, false, cfg);
           if (attempt < RUNG_MAX_ATTEMPTS) { await sleep(RUNG_RETRY_BACKOFF_MS * attempt); continue; }
           advance = true; break;
         }
-        await putProviderTask(rung.provider, result.taskRef, job, leaseId, counterKey);
+        await putProviderTask(rung.provider, result.taskRef, job, leaseId, counterKey, rung.endpointId);
         return; // await callback (slot stays held until webhook releases it)
       } catch (err) {
         const httpCode = (err as { httpCode?: number }).httpCode ?? 500;
@@ -249,7 +261,10 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 // ─── Job status writes ──────────────────────────────────────────────────────
 
-async function loadJob(requestId: string, jobId: string): Promise<JobItem | null> {
+// Exported for webhook.ts — needs the full JobItem (projectId/assetType/
+// tier/operation) to attribute GPU cost/baseline for a webhookCompletion
+// internal rung, which ProviderTaskItem alone doesn't carry.
+export async function loadJob(requestId: string, jobId: string): Promise<JobItem | null> {
   const r = await db.send(new GetItemCommand({
     TableName: TABLE,
     Key: marshall({ pk: `REQ#${requestId}`, sk: `JOB#${jobId}` }),
@@ -358,7 +373,10 @@ async function appendTried(job: JobItem, key: string): Promise<void> {
   }));
 }
 
-async function complete(
+// Exported for webhook.ts — completing a webhookCompletion internal rung (or
+// resuming its GPU cost/baseline accounting) reuses this same logic instead
+// of duplicating it; both are DB-only, no Lambda-specific state.
+export async function complete(
   job: JobItem, assetKey: string, fallback?: boolean, durationS?: number, text?: string,
   rung?: Rung, executionTimeMs?: number,
 ): Promise<void> {
@@ -398,7 +416,7 @@ async function complete(
  * One cumulative item per project+day+GPU-type (ADD, not overwrite) so
  * concurrent frame completions never race-clobber each other's totals.
  */
-async function recordGpuCost(job: JobItem, rung: Rung, executionTimeMs: number): Promise<void> {
+export async function recordGpuCost(job: JobItem, rung: Rung, executionTimeMs: number): Promise<void> {
   if (!job.projectId || !isInternalRung(rung)) return;
   if (!rung.counterKey) {
     // isInternalRung only checks provider+endpointId, not counterKey — every
@@ -428,7 +446,7 @@ async function recordGpuCost(job: JobItem, rung: Rung, executionTimeMs: number):
  * Internal RunPod rungs only (guarded by counterKey — external rungs have none).
  * Best-effort: baselines are advisory (drive admission ETAs), never fail the job.
  */
-async function recordBaseline(rung: Rung, job: JobItem, genMs: number): Promise<void> {
+export async function recordBaseline(rung: Rung, job: JobItem, genMs: number): Promise<void> {
   if (!rung.counterKey || genMs <= 0) return;
   const asset = `${job.assetType}.${job.tier ?? 'na'}.${job.operation ?? 'na'}`;
   const alpha = Number(process.env.BASELINE_EWMA_ALPHA ?? 0.2);
@@ -466,6 +484,7 @@ async function markFailed(job: JobItem, reason: string): Promise<void> {
 
 async function putProviderTask(
   provider: string, taskRef: string, job: JobItem, leaseId: string, leaseCounterKey: string,
+  endpointId?: string,
 ): Promise<void> {
   const now = Date.now();
   const item: ProviderTaskItem = {
@@ -473,12 +492,14 @@ async function putProviderTask(
     sk: 'TOKEN',
     jobId: job.jobId,
     requestId: job.requestId,
+    taskToken: job.taskToken,
     s3Target: job.s3Target,
     createdAt: now,
     ttl: Math.floor(now / 1000) + 24 * 3600,
     provider,
     leaseId,
     leaseCounterKey,
+    endpointId,
   };
   await db.send(new PutItemCommand({ TableName: TABLE, Item: marshall(item, { removeUndefinedValues: true }) }));
 }

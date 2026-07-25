@@ -62,6 +62,14 @@ interface QMGenerateEvent {
   userId?: string;
   requestId?: string;
   s3Target?: string;
+  /** SFN Task Token ($$.Task.Token), present when the calling state uses the
+   * `lambda:invoke.waitForTaskToken` integration (pipeline-stack.ts's
+   * ttsTask()) instead of a plain synchronous invoke — see the branch in the
+   * handler below. Lets a job whose real generation time can exceed a single
+   * Lambda's window (e.g. whole-script localized TTS) resolve later via
+   * webhook.ts's SendTaskSuccess/Failure instead of this Lambda blocking-
+   * polling for it. */
+  taskToken?: string;
 }
 
 interface QMGenerateResult {
@@ -141,6 +149,7 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
     projectId: event.projectId,
     frameId: event.frameId,
     userId: event.userId,
+    taskToken: event.taskToken,
   };
 
   // 1. Submit (idempotent: a duplicate requestId returns the existing job).
@@ -157,7 +166,23 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
 
   // Cache hit — POST /jobs can return COMPLETE directly.
   if (submitted.assetKey && submitted.status.startsWith('COMPLETE')) {
-    return finalize(submitted.assetKey, requestId, submitted.jobId, submitted.status, event.aspectRatio, undefined, submitted.durationS, submitted.resultText);
+    const result = finalize(submitted.assetKey, requestId, submitted.jobId, submitted.status, event.aspectRatio, undefined, submitted.durationS, submitted.resultText);
+    // A waitForTaskToken caller's SFN task only resumes via SendTaskSuccess/
+    // Failure — a plain Lambda return does NOT resume it (unlike a normal
+    // synchronous lambda:invoke). Resolve it inline here since there's
+    // nothing left to wait for.
+    if (event.taskToken) await sendTaskSuccess(event.taskToken, result);
+    return result;
+  }
+
+  // When called with a taskToken, submit and return immediately — the SFN
+  // task stays paused (waitForTaskToken) until webhook.ts resolves it via
+  // ProviderTaskItem.taskToken once the job actually finishes, however long
+  // that takes. This is what lets a genuinely long-running job (e.g.
+  // whole-script localized TTS) outlive a single Lambda invocation instead
+  // of hitting DEADLINE_MS/Lambda's own 900s ceiling below.
+  if (event.taskToken) {
+    return finalize(submitted.assetKey ?? '', requestId, submitted.jobId, submitted.status, event.aspectRatio);
   }
 
   // 2. Poll to completion.
@@ -186,4 +211,10 @@ function finalize(
 ): QMGenerateResult {
   const { width, height } = dimsFor(aspectRatio);
   return { cdnUrl: assetKey, s3Key: assetKey, width, height, requestId, jobId, status, degraded, durationS, text };
+}
+
+async function sendTaskSuccess(taskToken: string, result: QMGenerateResult): Promise<void> {
+  const { SFNClient, SendTaskSuccessCommand } = await import('@aws-sdk/client-sfn');
+  const sfn = new SFNClient({});
+  await sfn.send(new SendTaskSuccessCommand({ taskToken, output: JSON.stringify(result) }));
 }
