@@ -95,6 +95,16 @@
         "note": "4lang localized TTS for Narration Premium projects — same rung as voice.narrationBasic.ttsLocalizedKokoro (including the fixed-as-fallback behavior), split for billing/audit attribution only." }
     ],
 
+    "voice.narrationBasic.ttsFrameLocalizedQwen": [
+      { "provider": "runpod", "model": "qwen-voice-design", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "fourLang per-frame full-video pipeline (2026-07-25, storystudio-4lang-video-pipeline-handoff.md) — localized TTS for ONE frame's narrationTextEs/PtBr (a single sentence StoryStudio already translated, not a whole script), so this is a plain per-frame rung like voice.narrationBasic.tts — no webhookCompletion (unlike voice.narrationBasic.ttsLocalizedQwen's whole-script variant, this never risks exceeding a single Lambda invocation). Same physical Qwen Voice Design/clone rung, split into its own key purely for billing/audit attribution." }
+    ],
+    "voice.narrationBasic.ttsFrameLocalizedKokoro": [
+      { "provider": "runpod", "model": "kokoro", "mode": "tts", "engine": "kokoro", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "fixed": { "voice": "hf_alpha", "langCode": "h" },
+        "note": "fourLang per-frame full-video pipeline (2026-07-25) — localized TTS for ONE frame's narrationTextHi (or Es/PtBr when an explicit voiceId is sent, per RouteLocalizedTTS's data-driven engine choice). `fixed` is a fallback, not a hard override — see voice.narrationBasic.ttsLocalizedKokoro's note. No webhookCompletion — per-frame text is a single sentence, same duration class as voice.narrationBasic.tts." }
+    ],
+
     "bgm.narration": [
       { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "6apg6j7suzuezw", "endpoint": "v2/6apg6j7suzuezw", "counterKey": "runpod:bgm-s2t", "routingMode": "direct", "lane": "rest",
         "note": "Narration BGM (both tiers) — self-hosted ACE-Step on the dedicated bgm-s2t endpoint (6apg6j7suzuezw, ENDPOINT_ROLE=audio), split off flux-tts-s2t so once-per-project BGM never steals workers from the per-frame pipeline." },

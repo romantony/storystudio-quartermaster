@@ -241,10 +241,21 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
     case 'merge': {
       // Combine a (silent) video with an audio track → MP4 with audio.
       // initImageUrls[0] carries the video URL; audioUrl carries the voice.
+      // Default (no duration_s): the pod trims to the SHORTER of video/audio
+      // via ffmpeg -shortest (Flux-klien-4b/handler.py). fourLang per-frame
+      // merge (pipeline-stack.ts's fourLangMergeBranch) sends an explicit
+      // duration_s — the frame's max-across-4-languages video length — since
+      // a shorter language's audio there needs padding with trailing silence
+      // to fill the shared video, the OPPOSITE of -shortest's default
+      // trim-to-shorter behavior. NOT YET EMPIRICALLY VERIFIED that the pod
+      // actually pads to duration_s rather than still trimming/erroring —
+      // flagged as a pre-production check in the fourLang implementation plan,
+      // same posture as the 2026-07-08 Qwen/Kokoro language verification.
       return {
         mode: 'merge',
         video_url: job.initImageUrls?.[0],
         audio_url: job.audioUrl,
+        ...(p.durationS !== undefined ? { duration_s: p.durationS } : {}),
         ...attribution,
       };
     }

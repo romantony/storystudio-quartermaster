@@ -282,12 +282,38 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
   // Flux animate → Flux merge), so it emits $.videoResults directly and the
   // local Ken Burns Map (GenerateI2VBasic) is no longer needed.
   def.States.GenerateImages = qmFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
+  def.States.GenerateImages.Next = 'RouteBGM';
+
+  // fourLang per-frame full-video pipeline (2026-07-25,
+  // storystudio-4lang-video-pipeline-handoff.md): route into
+  // qmFourLangFrameAssetsMap instead of the single-language qmFrameAssetsMap
+  // above — supersedes the old whole-script post-concat localization for
+  // Basic (see the RouteConcatFourLang/fourLangConcatFinalizeStates wiring
+  // below). IsPresent-guarded like RouteBGM's $.bgmPrompt check, since
+  // $.fourLang hasn't been normalized to a real boolean yet at this point in
+  // the graph (NormalizeFourLang below runs after BGM, right before
+  // DropFrameData) — a bare BooleanEquals on a possibly-absent key throws
+  // States.Runtime.
+  def.States.UpdateStatusGeneratingImages.Next = 'RouteFrameGeneration';
+  def.States.UpdateStatusGeneratingImages.Catch[0].Next = 'RouteFrameGeneration';
+  def.States.RouteFrameGeneration = {
+    Type: 'Choice',
+    Choices: [{
+      And: [
+        { Variable: '$.fourLang', IsPresent: true },
+        { Variable: '$.fourLang', BooleanEquals: true },
+      ],
+      Next: 'GenerateImagesFourLang',
+    }],
+    Default: 'GenerateImages',
+  };
+  def.States.GenerateImagesFourLang = qmFourLangFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
+  def.States.GenerateImagesFourLang.Next = 'RouteBGM';
 
   // BGM is now generated from a prompt (bgmPrompt), not passed in as a
   // pre-existing URL. Route through it right after the frame Map — $.frames
   // is still present at this point (DropFrameData is what discards it below),
   // and QM-generate needs the full frames array to sum durations (§bgmStates).
-  def.States.GenerateImages.Next = 'RouteBGM';
   Object.assign(def.States, bgmStates(qmGenerateArn, 'narrationBasic'));
 
   // Repurpose DropFrameData to carry videoResults (not imageResults) and the
@@ -407,13 +433,40 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
   def.States.BuildMergedVoiceResult.Parameters['srtUrl.$'] = '$.transcribeResult.cdnUrl';
   def.States.BuildMergedVoiceResult.Parameters['captionsUrl.$'] = '$.transcribeResult.cdnUrl';
 
-  // 4lang: optional post-concat localization (translate → localized TTS →
-  // localized SRT for es/pt-BR/hi), gated on the execution input's `fourLang`
-  // flag. Spliced between BuildMergedVoiceResult and UpdateStatusApplyingBgm
-  // — everything downstream (Finalize, Complete) is unaffected; localization
-  // only adds `$.localizedAssets` alongside the existing English artifacts.
-  def.States.BuildMergedVoiceResult.Next = 'RouteLocalization';
-  Object.assign(def.States, localizationStates(qmGenerateArn, 'narrationBasic'));
+  // fourLang per-frame full-video pipeline (2026-07-25): the fourLang branch
+  // needs its own per-language concat (RouteFrameGeneration above already
+  // produced per-frame videoUrls{en,es,ptBr,hi}, not a single videoUrl the
+  // existing ConcatenateVideos' $.videoResults shape expects), so this Choice
+  // has to fire BEFORE ConcatenateVideos even runs, not after concat like the
+  // old whole-script localizationStates() did. $.fourLang was already
+  // normalized to a real boolean by NormalizeFourLang above (runs before
+  // DropFrameData), so a plain BooleanEquals is safe here — the IsPresent
+  // guard is kept anyway for defensive consistency with the rest of this file.
+  // localizationStates()/RouteLocalization/LocalizeLanguages stay defined
+  // below (Premium still calls localizationStates() unchanged, and neutralizes
+  // this whole fourLang-per-frame block — see buildNarrationPremiumQmNewDefinition)
+  // but Basic no longer wires them in.
+  def.States.UpdateStatusConcatenating.Next = 'RouteConcatFourLang';
+  def.States.RouteConcatFourLang = {
+    Type: 'Choice',
+    Choices: [{
+      And: [
+        { Variable: '$.fourLang', IsPresent: true },
+        { Variable: '$.fourLang', BooleanEquals: true },
+      ],
+      Next: 'BuildLangVideoArrays',
+    }],
+    Default: 'ConcatenateVideos',
+  };
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn));
+  def.States.BuildMergedVoiceResult.Next = 'SetNoLocalizedAssets';
+  def.States.SetNoLocalizedAssets = {
+    Type: 'Pass',
+    Comment: 'Non-fourLang path — no localized assets to report. Matches the old SkipLocalization convention ({} not []) so StoryStudio\'s existing consumer sees the same shape it always has for a non-fourLang project.',
+    Parameters: {},
+    ResultPath: '$.localizedAssets',
+    Next: 'UpdateStatusApplyingBgm',
+  };
 
   // Surface $.localizedAssets in both the Convex status callback and the
   // execution's final output, so StoryStudio gets the 3 per-language
@@ -1160,6 +1213,890 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
   };
 }
 
+const STD_RETRY = [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }];
+
+/**
+ * One Parallel branch (self-contained mini state machine) generating es/pt-BR's
+ * localized per-frame TTS — `narrationTextEs`/`narrationTextPtBr`, the raw text
+ * StoryStudio already translated (no QM-side translation step, unlike the
+ * whole-script `localizationStates()` flow). Mirrors Narration-Premium-QM-New's
+ * `RouteTTSEngine`/`QMGenerateTTSClone` pattern (Choice directly on
+ * `$$.Execution.Input.*`, IsPresent-guarded — a bare BooleanEquals/StringEquals
+ * on an absent key throws `States.Runtime`) rather than pre-normalizing via a
+ * hoisted Pass chain, since Parallel branches (unlike Map iterations) already
+ * see the full frame item as `$`, so there's nothing to merge in.
+ *
+ * `frameId` is composited with the language code (`${frameId}:es`) — without
+ * this, qm-generate.ts derives an identical requestId across the 4 parallel
+ * per-language branches for the same frame (same assetType/operation), and
+ * QM's idempotent-by-requestId /jobs de-dup would collapse them onto one
+ * shared job, exactly like the whole-script bug already fixed once (see
+ * ttsTask()'s comment in localizationStates below).
+ */
+function localizedFrameTtsCloneBranch(
+  qmGenerateArn: string, langCode: string, langKey: string, narrationField: string,
+  cloneField: string, idField: string,
+): { StartAt: string; States: Record<string, unknown> } {
+  const frameIdExpr = `States.Format('{}:${langCode}', $.frameId)`;
+  return {
+    StartAt: `RouteTTSFourLang${langKey}`,
+    States: {
+      [`RouteTTSFourLang${langKey}`]: {
+        Type: 'Choice',
+        Comment: `Empty ${narrationField} (StoryStudio always sends this key on a fourLang project — "" means ${langCode} generation failed for this frame, per storystudio-4lang-video-pipeline-handoff.md §1) -> skip ${langCode} for this frame rather than sending an empty TTS prompt.`,
+        Choices: [{
+          And: [
+            { Variable: `$.${narrationField}`, IsPresent: true },
+            { Variable: `$.${narrationField}`, IsString: true },
+            { Not: { Variable: `$.${narrationField}`, StringEquals: '' } },
+          ],
+          Next: `RouteLocalizedTTSEngineFourLang${langKey}`,
+        }],
+        Default: `SkipTTSFourLang${langKey}`,
+      },
+      [`SkipTTSFourLang${langKey}`]: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, skipped: true }, End: true },
+      [`RouteLocalizedTTSEngineFourLang${langKey}`]: {
+        Type: 'Choice',
+        Comment: `Data-driven engine choice, same rule as localizationStates()'s RouteLocalizedTTS: ${cloneField} present -> Qwen voice-clone fast path; else ${idField} present -> Kokoro; else default to Qwen (this language's defaultEngine).`,
+        Choices: [
+          {
+            And: [
+              { Variable: `$$.Execution.Input.${cloneField}`, IsPresent: true },
+              { Variable: `$$.Execution.Input.${cloneField}`, IsString: true },
+              { Not: { Variable: `$$.Execution.Input.${cloneField}`, StringEquals: '' } },
+            ],
+            Next: `QMGenerateTTSFourLang${langKey}Qwen`,
+          },
+          {
+            And: [
+              { Variable: `$$.Execution.Input.${idField}`, IsPresent: true },
+              { Variable: `$$.Execution.Input.${idField}`, IsString: true },
+              { Not: { Variable: `$$.Execution.Input.${idField}`, StringEquals: '' } },
+            ],
+            Next: `QMGenerateTTSFourLang${langKey}Kokoro`,
+          },
+        ],
+        Default: `QMGenerateTTSFourLang${langKey}Qwen`,
+      },
+      [`QMGenerateTTSFourLang${langKey}Qwen`]: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedQwen — Qwen3-TTS voice-clone .pt fast path). Prompt is the raw ${narrationField} text StoryStudio already translated — no QM-side translation for this flow.`,
+        Parameters: {
+          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedQwen', product: 'narration', queue: 'background', jobType: 'batch',
+          [`prompt.$`]: `$.${narrationField}`,
+          language: langCode,
+          [`cloneArtifactUrl.$`]: `$$.Execution.Input.${cloneField}`,
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': frameIdExpr,
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.ttsError${langKey}`, Next: `TtsFailedFourLang${langKey}` }],
+        End: true,
+      },
+      [`QMGenerateTTSFourLang${langKey}Kokoro`]: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro — self-hosted Kokoro voiceId). Prompt is the raw ${narrationField} text StoryStudio already translated.`,
+        Parameters: {
+          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
+          [`prompt.$`]: `$.${narrationField}`,
+          language: langCode,
+          [`voiceId.$`]: `$$.Execution.Input.${idField}`,
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': frameIdExpr,
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.ttsError${langKey}`, Next: `TtsFailedFourLang${langKey}` }],
+        End: true,
+      },
+      [`TtsFailedFourLang${langKey}`]: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, failed: true }, End: true },
+    },
+  };
+}
+
+/**
+ * Hindi's branch — Kokoro-only (Qwen has no Hindi support at all, see
+ * localizationStates()'s PrepareLocalization comment), so no engine Choice is
+ * needed, just an optional voiceIdHi (IsPresent-guarded the same way).
+ */
+function localizedFrameTtsHiBranch(qmGenerateArn: string): { StartAt: string; States: Record<string, unknown> } {
+  const frameIdExpr = "States.Format('{}:hi', $.frameId)";
+  return {
+    StartAt: 'RouteTTSFourLangHi',
+    States: {
+      RouteTTSFourLangHi: {
+        Type: 'Choice',
+        Comment: 'Empty narrationTextHi -> skip Hindi for this frame (see the es/pt-BR branch comment for why StoryStudio always sends the key).',
+        Choices: [{
+          And: [
+            { Variable: '$.narrationTextHi', IsPresent: true },
+            { Variable: '$.narrationTextHi', IsString: true },
+            { Not: { Variable: '$.narrationTextHi', StringEquals: '' } },
+          ],
+          Next: 'RouteVoiceIdFourLangHi',
+        }],
+        Default: 'SkipTTSFourLangHi',
+      },
+      SkipTTSFourLangHi: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, skipped: true }, End: true },
+      RouteVoiceIdFourLangHi: {
+        Type: 'Choice',
+        Comment: 'voiceIdHi is optional — IsPresent-guarded before the .$ reference below (a bare Parameters .$ reference to an absent key throws States.Runtime). Absent -> rely on the catalog rung\'s fixed hf_alpha/langCode:h fallback.',
+        Choices: [{
+          And: [
+            { Variable: '$$.Execution.Input.voiceIdHi', IsPresent: true },
+            { Variable: '$$.Execution.Input.voiceIdHi', IsString: true },
+            { Not: { Variable: '$$.Execution.Input.voiceIdHi', StringEquals: '' } },
+          ],
+          Next: 'QMGenerateTTSFourLangHiWithVoice',
+        }],
+        Default: 'QMGenerateTTSFourLangHiDefault',
+      },
+      QMGenerateTTSFourLangHiWithVoice: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: 'Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), explicit voiceIdHi.',
+        Parameters: {
+          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
+          'prompt.$': '$.narrationTextHi',
+          language: 'hi',
+          'voiceId.$': '$$.Execution.Input.voiceIdHi',
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': frameIdExpr,
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsErrorHi', Next: 'TtsFailedFourLangHi' }],
+        End: true,
+      },
+      QMGenerateTTSFourLangHiDefault: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: 'Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), no explicit voiceIdHi — rely on the catalog rung\'s fixed hf_alpha/langCode:h.',
+        Parameters: {
+          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
+          'prompt.$': '$.narrationTextHi',
+          language: 'hi',
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': frameIdExpr,
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsErrorHi', Next: 'TtsFailedFourLangHi' }],
+        End: true,
+      },
+      TtsFailedFourLangHi: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, failed: true }, End: true },
+    },
+  };
+}
+
+/**
+ * English's TTS branch — identical logic to qmFrameAssetsMap's
+ * RouteExplainerTTS/UseProvidedExplainerVoice/QMGenerateExplainerTTS, just
+ * reshaped as a standalone Parallel branch (End:true, no ResultPath on the
+ * Task so its raw {cdnUrl,durationS,...} result becomes the branch's own $).
+ * English's narrationText is never empty (required unless voiceUrl is set —
+ * see the frame contract), so no skip branch is needed here.
+ */
+function localizedFrameTtsEnBranch(qmGenerateArn: string): { StartAt: string; States: Record<string, unknown> } {
+  return {
+    StartAt: 'RouteTTSFourLangEn',
+    States: {
+      RouteTTSFourLangEn: {
+        Type: 'Choice',
+        Choices: [{
+          And: [
+            { Variable: '$.voiceUrl', IsPresent: true },
+            { Variable: '$.voiceUrl', IsString: true },
+            { Not: { Variable: '$.voiceUrl', StringEquals: '' } },
+          ],
+          Next: 'UseProvidedVoiceFourLangEn',
+        }],
+        Default: 'QMGenerateTTSFourLangEn',
+      },
+      UseProvidedVoiceFourLangEn: { Type: 'Pass', Parameters: { 'cdnUrl.$': '$.voiceUrl', 'durationS.$': '$.duration' }, End: true },
+      QMGenerateTTSFourLangEn: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: 'English TTS via QM (voice.narrationBasic.tts: self-hosted Kokoro-82M -> Replicate fallback) — same rung the single-language frame Map uses.',
+        Parameters: {
+          assetType: 'voice', tier: 'narrationBasic', operation: 'tts', product: 'narration', queue: 'background', jobType: 'batch',
+          'prompt.$': '$.narrationText',
+          'voiceGender.$': '$$.Execution.Input.voiceGender',
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': '$.frameId',
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsErrorEn', Next: 'TtsFailedFourLangEn' }],
+        End: true,
+      },
+      TtsFailedFourLangEn: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, failed: true }, End: true },
+    },
+  };
+}
+
+/**
+ * Merge branch for one language — same video.narrationBasic.merge rung the
+ * single-language flow uses, plus a new `durationS` param (the frame's shared
+ * max-across-4-languages duration) so a language whose TTS came in shorter
+ * than the animated clip gets its audio padded with trailing silence rather
+ * than left short (storystudio-4lang-video-pipeline-handoff.md §3/§6). NOT
+ * YET EMPIRICALLY VERIFIED that the RunPod merge worker actually pads to this
+ * — same verification posture as the 2026-07-08 Qwen/Kokoro language check;
+ * flagged in the implementation plan as a pre-production check, not a
+ * blocker to building this plumbing.
+ *
+ * Starts with its own skip-check (this language's TTS cdnUrl empty — skipped
+ * or failed upstream) rather than a static skip flag, so the Parallel this
+ * branch lives in (MergeFourLangAudio) can decide per-frame at runtime. Every
+ * exit path (skip / merge success / merge failure) explicitly sets a
+ * `failed` boolean — BuildFrameVideoFourLang reads it directly via a plain
+ * `.$` reference (there's no States.Or/boolean-OR intrinsic in ASL, so the
+ * failure flag has to be computed once, here, not derived downstream from
+ * multiple upstream fields).
+ */
+function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey: string): { StartAt: string; States: Record<string, unknown> } {
+  const route = `RouteMergeFourLang${langKey}`;
+  const skip = `MergeSkip${langKey}`;
+  const task = `QMMergeFourLang${langKey}`;
+  const success = `MergeSuccess${langKey}`;
+  const failed = `MergeFailed${langKey}`;
+  return {
+    StartAt: route,
+    States: {
+      [route]: {
+        Type: 'Choice',
+        Comment: `${langKey}'s TTS was skipped or failed for this frame (empty cdnUrl) — skip merge too rather than merging an empty audio URL.`,
+        Choices: [{
+          And: [
+            { Variable: `$.ttsResults.${ttsFieldKey}.cdnUrl`, IsPresent: true },
+            { Variable: `$.ttsResults.${ttsFieldKey}.cdnUrl`, IsString: true },
+            { Not: { Variable: `$.ttsResults.${ttsFieldKey}.cdnUrl`, StringEquals: '' } },
+          ],
+          Next: task,
+        }],
+        Default: skip,
+      },
+      [skip]: { Type: 'Pass', Parameters: { cdnUrl: '', failed: true }, End: true },
+      [task]: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: `Merge this frame's ${langKey} TTS audio onto the SHARED animated clip (video.narrationBasic.merge) — same rung, same clip, every language merges onto it independently. durationS = the frame's max-across-4-languages duration (target for silence-padding a shorter track, see this function's header comment).`,
+        Parameters: {
+          assetType: 'video', tier: 'narrationBasic', operation: 'merge', product: 'narration', queue: 'background', jobType: 'batch',
+          'initImageUrls.$': 'States.Array($.animateResult.cdnUrl)',
+          'audioUrl.$': `$.ttsResults.${ttsFieldKey}.cdnUrl`,
+          'durationS.$': '$.maxDuration.value',
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': '$.frameId',
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        ResultPath: '$.mergeTaskResult',
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.mergeError${langKey}`, Next: failed }],
+        Next: success,
+      },
+      [success]: { Type: 'Pass', Parameters: { 'cdnUrl.$': '$.mergeTaskResult.cdnUrl', failed: false }, End: true },
+      [failed]: { Type: 'Pass', Parameters: { cdnUrl: '', failed: true }, End: true },
+    },
+  };
+}
+
+/**
+ * fourLang per-frame Map (storystudio-4lang-video-pipeline-handoff.md, built
+ * 2026-07-25): supersedes localizationStates()'s whole-script post-concat
+ * flow for Narration-Basic-QM-New. Per frame: image ONCE (standalone t2i/i2i
+ * — never the one-shot `pipeline` rung, which bundles TTS+animate+merge for
+ * a single language) -> TTS x4 in parallel (en/es/pt-BR/hi; a language whose
+ * narrationText{Es,PtBr,Hi} is empty for this frame is skipped, not an error)
+ * -> the frame's video duration is the MAX of whichever languages succeeded
+ * (no ASL max() intrinsic, so a 3-step pairwise Choice/Pass chain) -> animate
+ * ONCE at that max duration (the video is shared/common across languages,
+ * only the audio differs) -> merge x4 (each language's TTS audio onto the
+ * SAME shared animated clip, padded to the max duration for the languages
+ * that came in shorter) -> emit videoUrls{en,es,ptBr,hi} + per-language
+ * failure flags (esFailed/ptBrFailed/hiFailed), consumed downstream by
+ * fourLangConcatFinalizeStates()'s all-or-nothing per-language omission.
+ *
+ * Text overlay (Remotion burn-in) only applies to the English clip for v1 —
+ * the handoff doc doesn't address per-language on-screen text at all; a
+ * localized overlay would need its own per-language Remotion pass, out of
+ * scope here (flagged to StoryStudio as an open gap, not silently guessed).
+ *
+ * MaxConcurrency is deliberately far below qmFrameAssetsMap's 15: this Map
+ * adds up to 3 more parallel TTS calls and 3 more parallel merge calls PER
+ * FRAME against the same runpod:flux-tts-s2t 6-worker pool the image/animate
+ * calls already share (fleet.ts FLUX_TTS_S2T). Starting conservative (4) —
+ * executor.ts's requeueForCapacity backpressure queues gracefully either way,
+ * so this is a latency knob to tune from real dev-stack timing, not a
+ * correctness one (see the implementation plan's Concurrency risk note).
+ */
+function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): object {
+  return {
+    Type: 'Map',
+    Comment: 'fourLang per-frame video via Quartermaster gateway: image once, TTS x4 (en/es/pt-BR/hi), video animated once at the max TTS duration across languages, merge x4 onto the shared clip. Supersedes the old whole-script post-concat localization for fourLang:true Narration-Basic projects.',
+    ItemsPath: '$.frames',
+    MaxConcurrency: 4,
+    ResultPath: '$.videoResults',
+    Iterator: {
+      StartAt: 'NormalizeTextManifestFourLang',
+      States: {
+        NormalizeTextManifestFourLang: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifest is a real string before BuildFrameVideoFourLang references it — same gotcha textOverlayStates()\'s NormalizeTextManifest guards against.',
+          Choices: [{
+            And: [
+              { Variable: '$.textManifest', IsPresent: true },
+              { Variable: '$.textManifest', IsString: true },
+              { Not: { Variable: '$.textManifest', StringEquals: '' } },
+            ],
+            Next: 'RouteImageModelFourLang',
+          }],
+          Default: 'SetTextManifestDefaultFourLang',
+        },
+        SetTextManifestDefaultFourLang: { Type: 'Pass', Result: '', ResultPath: '$.textManifest', Next: 'RouteImageModelFourLang' },
+        RouteImageModelFourLang: {
+          Type: 'Choice',
+          Comment: 'Image generation must always be a standalone call for fourLang frames (never the one-shot pipeline rung, which bundles a single language\'s TTS+animate+merge) — same imageModel routing rule as qmFrameAssetsMap\'s RouteImageModel/RouteImageGen, decomposed.',
+          Choices: [{
+            Or: [
+              { And: [{ Variable: '$.imageModel', IsPresent: true }, { Variable: '$.imageModel', IsString: true }, { Variable: '$.imageModel', StringEquals: 'ernie' }] },
+              { And: [{ Variable: '$.imageModel', IsPresent: true }, { Variable: '$.imageModel', IsString: true }, { Variable: '$.imageModel', StringEquals: 'qwen-image-gen' }] },
+            ],
+            Next: 'QMGenerateImageExplainerFourLang',
+          }],
+          Default: 'RouteImageI2IFourLang',
+        },
+        RouteImageI2IFourLang: {
+          Type: 'Choice',
+          Choices: [{
+            And: [
+              { Variable: '$.referenceImageUrl', IsPresent: true },
+              { Variable: '$.referenceImageUrl', IsString: true },
+              { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateImageI2IFourLang',
+          }],
+          Default: 'QMGenerateImageT2IFourLang',
+        },
+        QMGenerateImageExplainerFourLang: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Text-to-image via QM (image.explainer.t2i) — same rung/rule as qmFrameAssetsMap\'s QMGenerateExplainerImage.',
+          Parameters: {
+            assetType: 'image', tier: 'explainer', operation: 't2i', product: 'narration', queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt', 'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailedFourLang' }],
+          Next: 'GenerateFourLangTts',
+        },
+        QMGenerateImageT2IFourLang: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Text-to-image via QM (image.narrationBasic.t2i), standalone (not the one-shot pipeline).',
+          Parameters: {
+            assetType: 'image', tier: 'narrationBasic', operation: 't2i', product: 'narration', queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt', 'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailedFourLang' }],
+          Next: 'GenerateFourLangTts',
+        },
+        QMGenerateImageI2IFourLang: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Image-to-image via QM (image.narrationBasic.i2i), standalone.',
+          Parameters: {
+            assetType: 'image', tier: 'narrationBasic', operation: 'i2i', product: 'narration', queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt', 'initImageUrls.$': 'States.Array($.referenceImageUrl)', 'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailedFourLang' }],
+          Next: 'GenerateFourLangTts',
+        },
+        QMFrameFailedFourLang: {
+          Type: 'Pass',
+          Comment: 'Image generation failed — this frame can\'t produce ANY language\'s video (image is shared), so fail the whole frame (mirrors QMFrameFailed).',
+          Parameters: { failed: true, error: 'QMFrameFailed', 'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber' },
+          End: true,
+        },
+        GenerateFourLangTts: {
+          Type: 'Parallel',
+          Comment: 'TTS x4, one branch per language. Each branch outputs {cdnUrl, durationS} (skipped/failed languages get durationS:0, cdnUrl:\'\').',
+          Branches: [
+            localizedFrameTtsEnBranch(qmGenerateArn),
+            localizedFrameTtsCloneBranch(qmGenerateArn, 'es', 'Es', 'narrationTextEs', 'voiceCloneArtifactUrlEs', 'voiceIdEs'),
+            localizedFrameTtsCloneBranch(qmGenerateArn, 'pt-BR', 'PtBr', 'narrationTextPtBr', 'voiceCloneArtifactUrlPtBr', 'voiceIdPtBr'),
+            localizedFrameTtsHiBranch(qmGenerateArn),
+          ],
+          ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
+          ResultPath: '$.ttsResults',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsResultsError', Next: 'QMFrameFailedFourLang' }],
+          Next: 'ComputeMaxDurationStep1',
+        },
+        // No max() intrinsic in ASL — pairwise Choice/Pass chain across the 4
+        // languages' durationS (0 for a skipped/failed language, so it never
+        // wins the max).
+        ComputeMaxDurationStep1: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.ttsResults.en.durationS', NumericGreaterThanPath: '$.ttsResults.es.durationS', Next: 'SetMaxDurationStep1En' }],
+          Default: 'SetMaxDurationStep1Es',
+        },
+        SetMaxDurationStep1En: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.en.durationS' }, ResultPath: '$.maxDurationStep1', Next: 'ComputeMaxDurationStep2' },
+        SetMaxDurationStep1Es: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.es.durationS' }, ResultPath: '$.maxDurationStep1', Next: 'ComputeMaxDurationStep2' },
+        ComputeMaxDurationStep2: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.maxDurationStep1.value', NumericGreaterThanPath: '$.ttsResults.ptBr.durationS', Next: 'SetMaxDurationStep2Prev' }],
+          Default: 'SetMaxDurationStep2PtBr',
+        },
+        SetMaxDurationStep2Prev: { Type: 'Pass', Parameters: { 'value.$': '$.maxDurationStep1.value' }, ResultPath: '$.maxDurationStep2', Next: 'ComputeMaxDurationStep3' },
+        SetMaxDurationStep2PtBr: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.ptBr.durationS' }, ResultPath: '$.maxDurationStep2', Next: 'ComputeMaxDurationStep3' },
+        ComputeMaxDurationStep3: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.maxDurationStep2.value', NumericGreaterThanPath: '$.ttsResults.hi.durationS', Next: 'SetMaxDurationFinalPrev' }],
+          Default: 'SetMaxDurationFinalHi',
+        },
+        SetMaxDurationFinalPrev: { Type: 'Pass', Parameters: { 'value.$': '$.maxDurationStep2.value' }, ResultPath: '$.maxDuration', Next: 'QMGenerateAnimateFourLang' },
+        SetMaxDurationFinalHi: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.hi.durationS' }, ResultPath: '$.maxDuration', Next: 'QMGenerateAnimateFourLang' },
+        QMGenerateAnimateFourLang: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Ken Burns animation via QM (video.narrationBasic.animate), ONCE per frame, sized to the max TTS duration across all 4 languages — this clip is shared/common across every language\'s merge below.',
+          Parameters: {
+            assetType: 'video', tier: 'narrationBasic', operation: 'animate', product: 'narration', queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'durationS.$': '$.maxDuration.value',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.animateResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.animateError', Next: 'QMFrameFailedFourLang' }],
+          Next: 'MergeFourLangAudio',
+        },
+        MergeFourLangAudio: {
+          Type: 'Parallel',
+          Comment: 'Merge x4 — each language\'s TTS audio onto the SAME shared animated clip. A language whose TTS was skipped/failed for this frame skips merge too.',
+          Branches: [
+            fourLangMergeBranch(qmGenerateArn, 'En', 'en'),
+            fourLangMergeBranch(qmGenerateArn, 'Es', 'es'),
+            fourLangMergeBranch(qmGenerateArn, 'PtBr', 'ptBr'),
+            fourLangMergeBranch(qmGenerateArn, 'Hi', 'hi'),
+          ],
+          ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
+          ResultPath: '$.mergeResults',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeResultsError', Next: 'QMFrameFailedFourLang' }],
+          Next: 'BuildFrameVideoFourLang',
+        },
+        BuildFrameVideoFourLang: {
+          Type: 'Pass',
+          Comment: 'Emit the per-frame multi-language item fourLangConcatFinalizeStates() consumes. A skipped/failed merge lands as cdnUrl:\'\' — esFailed/ptBrFailed/hiFailed drive the all-or-nothing per-language omission downstream (English never fails independently of the whole frame — see QMFrameFailedFourLang).',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'duration.$': '$.maxDuration.value',
+            'textManifest.$': '$.textManifest',
+            videoUrls: {
+              'en.$': '$.mergeResults.en.cdnUrl',
+              'es.$': '$.mergeResults.es.cdnUrl',
+              'ptBr.$': '$.mergeResults.ptBr.cdnUrl',
+              'hi.$': '$.mergeResults.hi.cdnUrl',
+            },
+            'esFailed.$': '$.mergeResults.es.failed',
+            'ptBrFailed.$': '$.mergeResults.ptBr.failed',
+            'hiFailed.$': '$.mergeResults.hi.failed',
+          },
+          Next: 'RouteTextOverlayFourLang',
+        },
+        RouteTextOverlayFourLang: {
+          Type: 'Choice',
+          Comment: 'Text overlay (Remotion burn-in) only applies to the English clip for v1 — the handoff doc doesn\'t address per-language on-screen text; a localized overlay is out of scope here (flag to StoryStudio).',
+          Choices: [{
+            And: [
+              { Variable: '$.textManifest', IsPresent: true },
+              { Variable: '$.textManifest', IsString: true },
+              { Not: { Variable: '$.textManifest', StringEquals: '' } },
+            ],
+            Next: 'RenderTextOverlayFourLang',
+          }],
+          Default: 'SkipTextOverlayFourLang',
+        },
+        RenderTextOverlayFourLang: {
+          Type: 'Task',
+          Resource: remotionOverlayArn,
+          Comment: 'Per-frame Remotion text-overlay render, English clip only (see RouteTextOverlayFourLang comment).',
+          Parameters: {
+            'clipUrl.$': '$.videoUrls.en',
+            'textManifest.$': '$.textManifest',
+            'frameId.$': '$.frameId',
+            'duration.$': '$.duration',
+          },
+          ResultPath: '$.overlayResult', TimeoutSeconds: 180, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Passthrough failure policy, same as textOverlayStates() — an overlay failure degrades to the un-overlaid English clip rather than failing the frame.', ResultPath: '$.overlayError', Next: 'SkipTextOverlayFourLang' }],
+          Next: 'ApplyTextOverlayFourLang',
+        },
+        ApplyTextOverlayFourLang: {
+          Type: 'Pass',
+          Parameters: {
+            'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber', 'duration.$': '$.duration',
+            videoUrls: {
+              'en.$': '$.overlayResult.overlayRenderedUrl',
+              'es.$': '$.videoUrls.es', 'ptBr.$': '$.videoUrls.ptBr', 'hi.$': '$.videoUrls.hi',
+            },
+            'esFailed.$': '$.esFailed', 'ptBrFailed.$': '$.ptBrFailed', 'hiFailed.$': '$.hiFailed',
+          },
+          End: true,
+        },
+        SkipTextOverlayFourLang: {
+          Type: 'Pass',
+          Parameters: {
+            'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber', 'duration.$': '$.duration',
+            'videoUrls.$': '$.videoUrls',
+            'esFailed.$': '$.esFailed', 'ptBrFailed.$': '$.ptBrFailed', 'hiFailed.$': '$.hiFailed',
+          },
+          End: true,
+        },
+      },
+    },
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'DropFrameData',
+  };
+}
+
+/** One Parallel branch reshaping $.videoResults into a flat {videoUrl,frameNumber}[]
+ * array for one language, via Map ItemSelector + a no-op Identity iterator —
+ * the standard JSONPath-mode idiom for projecting one field across an array
+ * (ASL has no map/project intrinsic). fieldKey matches videoUrls' property
+ * names (en/es/ptBr/hi). */
+function langVideoArrayBranch(fieldKey: string): { StartAt: string; States: Record<string, unknown> } {
+  // State names (including the nested Iterator's) must be unique across ALL
+  // branches of the containing Parallel (BuildLangVideoArrays below), not
+  // just within this one branch — confirmed via
+  // `aws stepfunctions validate-state-machine-definition` (DUPLICATE_STATE_NAME),
+  // so every name here is suffixed with fieldKey.
+  const reshape = `Reshape${fieldKey}`;
+  const identity = `Identity${fieldKey}`;
+  return {
+    StartAt: reshape,
+    States: {
+      [reshape]: {
+        Type: 'Map',
+        ItemsPath: '$.videoResults',
+        MaxConcurrency: 20,
+        ItemSelector: { 'videoUrl.$': `$$.Map.Item.Value.videoUrls.${fieldKey}`, 'frameNumber.$': '$$.Map.Item.Value.frameNumber' },
+        Iterator: { StartAt: identity, States: { [identity]: { Type: 'Pass', End: true } } },
+        End: true,
+      },
+    },
+  };
+}
+
+/** Same idiom as langVideoArrayBranch, but extracts a flat boolean[] (via
+ * OutputPath, unwrapping the ItemSelector's {flag} object down to the bare
+ * value) for States.ArrayContains to check against below. field matches the
+ * frame item's own failure-flag property (esFailed/ptBrFailed/hiFailed). */
+function langFailureFlagBranch(field: string): { StartAt: string; States: Record<string, unknown> } {
+  const reshape = `Reshape${field}`;
+  const identity = `Identity${field}`;
+  return {
+    StartAt: reshape,
+    States: {
+      [reshape]: {
+        Type: 'Map',
+        ItemsPath: '$.videoResults',
+        MaxConcurrency: 20,
+        ItemSelector: { 'flag.$': `$$.Map.Item.Value.${field}` },
+        Iterator: { StartAt: identity, States: { [identity]: { Type: 'Pass', OutputPath: '$.flag', End: true } } },
+        End: true,
+      },
+    },
+  };
+}
+
+/** One branch of ConcatenateVideosFourLang — same E2E-video-concat-premium
+ * contract the single-language ConcatenateVideos already uses, unchanged,
+ * just pointed at this language's reshaped video array and a language-suffixed
+ * outputKey (own S3 subfolder for all 4 languages, including en, so this new
+ * fourLang concat path never collides with the legacy single-language key). */
+function concatFourLangBranch(fieldKey: string, langCode: string): { StartAt: string; States: Record<string, unknown> } {
+  const state = `Concat${fieldKey}`;
+  const failed = `${state}Failed`;
+  return {
+    StartAt: state,
+    States: {
+      [state]: {
+        Type: 'Task',
+        Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-video-concat-premium',
+        Comment: `Concatenate all frame videos for ${langCode} (external Lambda, storystudio-unified-owned — unchanged {videoUrl,frameNumber}[] contract).`,
+        Parameters: {
+          'videos.$': `$.fourLangConcatPrep.${fieldKey}`,
+          'aspectRatio.$': '$.aspectRatio',
+          'projectId.$': '$.projectId',
+          'outputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated.mp4', $.projectId)`,
+          'jwtToken.$': '$.jwtToken',
+          'apiKey.$': '$.apiKey',
+        },
+        TimeoutSeconds: 900,
+        Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 1.5 }],
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.concatError${fieldKey}`, Next: failed }],
+        End: true,
+      },
+      [failed]: { Type: 'Pass', Comment: 'Isolate this language\'s concat failure from the other 3 — mirrors ConcatenateVideos\' own Catch->HandleFailure, but scoped per-language here.', Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true },
+    },
+  };
+}
+
+/** One branch of FinalizeLocalizedVideos — es/pt-BR/hi only (English reuses
+ * the EXISTING ValidateFinalizeInputsBasic/PrepareFinalizeBasic/FinalizeVideoBasic
+ * chain unchanged, via BuildMergedVoiceResultFourLangEn below, so its Fargate
+ * finalize call is written once, not duplicated here).
+ *
+ * CROSS-REPO DEPENDENCY, not verified from this repo: `outputKey`/`language`
+ * are NEW fields e2e-finalize (storystudio-unified) doesn't read today — the
+ * existing FinalizeVideoBasic payload has no outputKey at all, meaning
+ * e2e-finalize currently determines its own output location internally and
+ * reports completion straight to Convex, never back through this ASL. For
+ * the 3 new localized finalize calls to land at distinct, known locations
+ * (rather than 3 languages racing to overwrite English's single default
+ * output), e2e-finalize needs a corresponding change to honor a caller-
+ * supplied outputKey. `finalVideoUrl` below is therefore a DETERMINISTIC
+ * construction from that same outputKey (mirroring how qm-generate.ts's own
+ * finalize() treats `cdnUrl` as literally the storage key, no separate CDN
+ * base concatenation happening in this codebase) — not a value read back
+ * from the Fargate task, which today never reports anything into SFN state.
+ */
+function finalizeLocalizedBranch(
+  qmGenerateArn: string, fieldKey: string, langCode: string, omissionField: string, transcribeIndex: number,
+): { StartAt: string; States: Record<string, unknown> } {
+  const check = `CheckOmitted${fieldKey}`;
+  const omitted = `Omitted${fieldKey}`;
+  const prepare = `PrepareFinalize${fieldKey}`;
+  const finalize = `FinalizeVideo${fieldKey}`;
+  const finalizeFailed = `FinalizeFailed${fieldKey}`;
+  const buildAsset = `BuildLocalizedAsset${fieldKey}`;
+  const taskInputPath = `$.finalizeTaskInput${fieldKey}`;
+  const outputKeyExpr = `States.Format('projects/{}/videos/${langCode}/final.mp4', $.projectId)`;
+  return {
+    StartAt: check,
+    States: {
+      [check]: {
+        Type: 'Choice',
+        Comment: `All-or-nothing per language (locked-in product decision): if ANY frame failed ${langCode}'s TTS/merge, skip finalize entirely and omit finalVideoUrl rather than shipping a video with silent gaps.`,
+        Choices: [{ Variable: `$.languageOmissions.${omissionField}`, BooleanEquals: true, Next: omitted }],
+        Default: prepare,
+      },
+      [omitted]: { Type: 'Pass', Parameters: { language: langCode, failed: true, error: 'PartialFailure' }, End: true },
+      [prepare]: {
+        Type: 'Pass',
+        Comment: `Same finalizeTaskInput shape PrepareFinalizeBasic builds for English, for ${langCode}.`,
+        Parameters: {
+          mode: 'basic',
+          'jobId.$': '$.jobId',
+          'projectId.$': '$.projectId',
+          'projectType.$': '$.projectType',
+          'aspectRatio.$': '$.aspectRatio',
+          'videoUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`,
+          'voiceAudioUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.audioUrl`,
+          'captionsUrl.$': `$.transcribeResultsFourLang[${transcribeIndex}].srtUrl`,
+          'bgmUrl.$': '$.bgmResult.cdnUrl',
+          language: langCode,
+          'outputKey.$': outputKeyExpr,
+          'jwtToken.$': '$.jwtToken',
+          'convexEndpoint.$': '$.convexEndpoint',
+        },
+        ResultPath: taskInputPath,
+        Next: finalize,
+      },
+      [finalize]: {
+        Type: 'Task',
+        Resource: 'arn:aws:states:::ecs:runTask.sync',
+        Comment: `Finalize on Fargate for ${langCode} — same cluster/task-def as FinalizeVideoBasic. See this function's header comment for the cross-repo outputKey dependency.`,
+        Parameters: {
+          Cluster: 'arn:aws:ecs:us-east-1:929075264324:cluster/storystudio-e2e',
+          LaunchType: 'FARGATE',
+          TaskDefinition: 'e2e-finalize',
+          NetworkConfiguration: {
+            AwsvpcConfiguration: {
+              Subnets: ['subnet-02557f42e07118380', 'subnet-0389bf7ebb5a497ac'],
+              SecurityGroups: ['sg-0c2549fa2cb194dc6'],
+              AssignPublicIp: 'ENABLED',
+            },
+          },
+          Overrides: {
+            ContainerOverrides: [{
+              Name: 'finalize',
+              Environment: [{ Name: 'PAYLOAD_JSON', 'Value.$': `States.JsonToString(${taskInputPath})` }],
+            }],
+          },
+        },
+        ResultPath: `$.finalizeEcs${fieldKey}`,
+        TimeoutSeconds: 3600,
+        Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.finalizeError${fieldKey}`, Next: finalizeFailed }],
+        Next: buildAsset,
+      },
+      [finalizeFailed]: { Type: 'Pass', Parameters: { language: langCode, failed: true, error: 'FinalizeFailed' }, End: true },
+      [buildAsset]: {
+        Type: 'Pass',
+        Parameters: {
+          language: langCode,
+          'voiceoverUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.audioUrl`,
+          'srtUrl.$': `$.transcribeResultsFourLang[${transcribeIndex}].srtUrl`,
+          'finalVideoUrl.$': outputKeyExpr,
+        },
+        End: true,
+      },
+    },
+  };
+}
+
+/**
+ * Downstream of the fourLang frame Map: reshape per-language video arrays,
+ * decide per-language omission (all-or-nothing on any frame failure),
+ * concat x4, transcribe x4, then let English fall through the EXISTING
+ * ValidateFinalizeInputsBasic/PrepareFinalizeBasic/FinalizeVideoBasic/Complete
+ * chain unchanged while es/pt-BR/hi get their own finalize fan-out
+ * (FinalizeLocalizedVideos), landing in $.localizedAssets per
+ * storystudio-4lang-video-pipeline-handoff.md §4. Spliced in between
+ * RouteConcatFourLang (see buildQmNewDefinition) and UpdateStatusApplyingBgm
+ * — the non-fourLang path (ConcatenateVideos/TranscribeAudio/
+ * BuildMergedVoiceResult, all unchanged) reaches the same UpdateStatusApplyingBgm
+ * via SetNoLocalizedAssets instead.
+ */
+function fourLangConcatFinalizeStates(qmGenerateArn: string): Record<string, unknown> {
+  return {
+    BuildLangVideoArrays: {
+      Type: 'Parallel',
+      Comment: 'Reshape $.videoResults (per-frame items carrying 4 videoUrls + failure flags) into 4 flat {videoUrl,frameNumber}[] arrays (for ConcatenateVideosFourLang) and 3 flat boolean[] arrays (per-frame es/ptBr/hi failure flags, for the omission check below).',
+      Branches: [
+        langVideoArrayBranch('en'), langVideoArrayBranch('es'), langVideoArrayBranch('ptBr'), langVideoArrayBranch('hi'),
+        langFailureFlagBranch('esFailed'), langFailureFlagBranch('ptBrFailed'), langFailureFlagBranch('hiFailed'),
+      ],
+      ResultSelector: {
+        'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]',
+        'esFailedFlags.$': '$[4]', 'ptBrFailedFlags.$': '$[5]', 'hiFailedFlags.$': '$[6]',
+      },
+      ResultPath: '$.fourLangConcatPrep',
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: 'ComputeLanguageOmissions',
+    },
+    ComputeLanguageOmissions: {
+      Type: 'Pass',
+      Comment: 'All-or-nothing per language: any frame with esFailed/ptBrFailed/hiFailed:true omits that language\'s finalVideoUrl for the whole project. States.ArrayContains is a real ASL intrinsic; Choice states can\'t call intrinsics directly in a Variable comparison, so this Pass materializes the boolean first.',
+      Parameters: {
+        'esOmitted.$': 'States.ArrayContains($.fourLangConcatPrep.esFailedFlags, true)',
+        'ptBrOmitted.$': 'States.ArrayContains($.fourLangConcatPrep.ptBrFailedFlags, true)',
+        'hiOmitted.$': 'States.ArrayContains($.fourLangConcatPrep.hiFailedFlags, true)',
+      },
+      ResultPath: '$.languageOmissions',
+      Next: 'ConcatenateVideosFourLang',
+    },
+    ConcatenateVideosFourLang: {
+      Type: 'Parallel',
+      Branches: [
+        concatFourLangBranch('en', 'en'), concatFourLangBranch('es', 'es'), concatFourLangBranch('ptBr', 'pt-BR'), concatFourLangBranch('hi', 'hi'),
+      ],
+      ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
+      ResultPath: '$.concatenatedVideosFourLang',
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: 'PrepareTranscribeFourLang',
+    },
+    PrepareTranscribeFourLang: {
+      Type: 'Pass',
+      Comment: 'Fan-out config for TranscribeAudioFourLang below — mirrors localizationStates()\'s PrepareLocalization idiom. en has no whisperLang hint (\'\'), matching today\'s single-language TranscribeAudio, which sends no language field at all.',
+      Parameters: {
+        transcribeConfigs: [
+          { code: 'en', whisperLang: '', 'audioUrl.$': '$.concatenatedVideosFourLang.en.audioUrl' },
+          { code: 'es', whisperLang: 'es', 'audioUrl.$': '$.concatenatedVideosFourLang.es.audioUrl' },
+          { code: 'pt-BR', whisperLang: 'pt', 'audioUrl.$': '$.concatenatedVideosFourLang.ptBr.audioUrl' },
+          { code: 'hi', whisperLang: 'hi', 'audioUrl.$': '$.concatenatedVideosFourLang.hi.audioUrl' },
+        ],
+      },
+      ResultPath: '$.transcribePrep',
+      Next: 'TranscribeAudioFourLang',
+    },
+    TranscribeAudioFourLang: {
+      Type: 'Map',
+      Comment: 'SRT x4 via QM (srt.narration — same self-hosted Whisper rung TranscribeAudio uses today), one per language\'s concatenated audio. Array order is fixed (matches transcribeConfigs: en=[0], es=[1], pt-BR=[2], hi=[3]) — downstream states index into it directly rather than re-keying by language.',
+      ItemsPath: '$.transcribePrep.transcribeConfigs',
+      MaxConcurrency: 4,
+      ResultPath: '$.transcribeResultsFourLang',
+      Iterator: {
+        StartAt: 'RouteTranscribeLanguageHint',
+        States: {
+          RouteTranscribeLanguageHint: {
+            Type: 'Choice',
+            Comment: 'Only forward a language hint when non-empty (en\'s whisperLang is \'\') — matches this codebase\'s existing "empty string == not sent" convention (frame narrationText{Es,PtBr,Hi}, bgmPrompt).',
+            Choices: [{ Variable: '$.whisperLang', StringEquals: '', Next: 'TranscribeOneLanguageNoHint' }],
+            Default: 'TranscribeOneLanguageWithHint',
+          },
+          TranscribeOneLanguageWithHint: {
+            Type: 'Task',
+            Resource: qmGenerateArn,
+            Parameters: {
+              assetType: 'srt', tier: 'narration', operation: 'transcribe', product: 'narration', queue: 'background', jobType: 'batch',
+              'audioUrl.$': '$.audioUrl',
+              'language.$': '$.whisperLang',
+              'projectId.$': '$$.Execution.Input.projectId',
+              'frameId.$': '$.code',
+            },
+            ResultPath: '$.srtResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+            Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.srtError', Next: 'SkipTranscribeOneLanguage' }],
+            Next: 'BuildTranscribeItem',
+          },
+          TranscribeOneLanguageNoHint: {
+            Type: 'Task',
+            Resource: qmGenerateArn,
+            Parameters: {
+              assetType: 'srt', tier: 'narration', operation: 'transcribe', product: 'narration', queue: 'background', jobType: 'batch',
+              'audioUrl.$': '$.audioUrl',
+              'projectId.$': '$$.Execution.Input.projectId',
+              'frameId.$': '$.code',
+            },
+            ResultPath: '$.srtResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+            Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.srtError', Next: 'SkipTranscribeOneLanguage' }],
+            Next: 'BuildTranscribeItem',
+          },
+          SkipTranscribeOneLanguage: { Type: 'Pass', Parameters: { cdnUrl: '' }, ResultPath: '$.srtResult', Next: 'BuildTranscribeItem' },
+          BuildTranscribeItem: { Type: 'Pass', Parameters: { 'code.$': '$.code', 'srtUrl.$': '$.srtResult.cdnUrl' }, End: true },
+        },
+      },
+      Next: 'BuildMergedVoiceResultFourLangEn',
+    },
+    BuildMergedVoiceResultFourLangEn: {
+      Type: 'Pass',
+      Comment: 'Same shape as the non-fourLang BuildMergedVoiceResult, sourced from the "en" entries above — lets English fall through the EXISTING ValidateFinalizeInputsBasic -> PrepareFinalizeBasic -> FinalizeVideoBasic -> Complete chain completely unchanged (English\'s Fargate finalize call is written once, reused by both paths, not duplicated in FinalizeLocalizedVideos below).',
+      Parameters: {
+        'mergedVideoUrl.$': '$.concatenatedVideosFourLang.en.videoUrl',
+        'audioUrl.$': '$.concatenatedVideosFourLang.en.audioUrl',
+        'srtUrl.$': '$.transcribeResultsFourLang[0].srtUrl',
+        'captionsUrl.$': '$.transcribeResultsFourLang[0].srtUrl',
+      },
+      ResultPath: '$.mergedVoiceResult',
+      Next: 'FinalizeLocalizedVideos',
+    },
+    FinalizeLocalizedVideos: {
+      Type: 'Parallel',
+      Comment: 'es/pt-BR/hi finalize fan-out — English is deliberately NOT a branch here (see BuildMergedVoiceResultFourLangEn). Output array (order: es, pt-BR, hi) becomes $.localizedAssets directly, matching the doc\'s array-of-{language,...} shape.',
+      Branches: [
+        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 'esOmitted', 1),
+        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 'ptBrOmitted', 2),
+        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 'hiOmitted', 3),
+      ],
+      ResultPath: '$.localizedAssets',
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: 'UpdateStatusApplyingBgm',
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Narration-Premium-QM-New SFN definition
 // ---------------------------------------------------------------------------
@@ -1188,6 +2125,34 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   def.States.GenerateImages.Next = 'RouteBGM';
   Object.assign(def.States, bgmStates(qmGenerateArn, 'narrationPremium'));
 
+  // Neutralize the fourLang PER-FRAME full-video pipeline inherited from the
+  // Basic clone (2026-07-25, storystudio-4lang-video-pipeline-handoff.md) —
+  // that flow is Basic-only for now (Premium is an explicit followup once
+  // Basic is proven), and its per-frame Map/catalog rungs are Basic-tiered
+  // (image.narrationBasic.*, voice.narrationBasic.*, video.narrationBasic.*),
+  // wrong for a Premium project. Without this, a Premium execution with
+  // fourLang:true would silently route through Basic's rungs via the
+  // inherited RouteFrameGeneration/RouteConcatFourLang Choices. Delete the
+  // inherited states outright (rather than leaving them unreferenced dead
+  // weight — every added sibling here compounds this file's overall ASL
+  // definition size) and repoint straight back to the pre-fourLang-per-frame
+  // wiring, restoring Premium's existing whole-script localizationStates()
+  // flow exactly as it was before this feature existed.
+  delete def.States.RouteFrameGeneration;
+  delete def.States.GenerateImagesFourLang;
+  delete def.States.RouteConcatFourLang;
+  delete def.States.BuildLangVideoArrays;
+  delete def.States.ComputeLanguageOmissions;
+  delete def.States.ConcatenateVideosFourLang;
+  delete def.States.PrepareTranscribeFourLang;
+  delete def.States.TranscribeAudioFourLang;
+  delete def.States.BuildMergedVoiceResultFourLangEn;
+  delete def.States.FinalizeLocalizedVideos;
+  delete def.States.SetNoLocalizedAssets;
+  def.States.UpdateStatusGeneratingImages.Next = 'GenerateImages';
+  def.States.UpdateStatusGeneratingImages.Catch[0].Next = 'GenerateImages';
+  def.States.UpdateStatusConcatenating.Next = 'ConcatenateVideos';
+
   // Same re-tier for the cloned 4lang localization states — the clone above
   // inherited buildQmNewDefinition's tier:'narrationBasic' localized-TTS
   // states (voice.narrationBasic.ttsLocalized{Qwen,Kokoro}); overwrite with
@@ -1195,6 +2160,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   // attribution (same physical rungs either way — mirrors the BGM re-tier
   // immediately above).
   Object.assign(def.States, localizationStates(qmGenerateArn, 'narrationPremium'));
+  def.States.BuildMergedVoiceResult.Next = 'RouteLocalization';
 
   // Finalize becomes Premium-flavored (1080p upscale, longer Fargate timeout),
   // renaming the Basic finalize states to match buildPremiumDefinition's own
