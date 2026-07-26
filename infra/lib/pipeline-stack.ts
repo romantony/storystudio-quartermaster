@@ -1216,15 +1216,25 @@ function qmFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): ob
 const STD_RETRY = [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }];
 
 /**
- * One Parallel branch (self-contained mini state machine) generating es/pt-BR's
- * localized per-frame TTS — `narrationTextEs`/`narrationTextPtBr`, the raw text
- * StoryStudio already translated (no QM-side translation step, unlike the
- * whole-script `localizationStates()` flow). Mirrors Narration-Premium-QM-New's
- * `RouteTTSEngine`/`QMGenerateTTSClone` pattern (Choice directly on
- * `$$.Execution.Input.*`, IsPresent-guarded — a bare BooleanEquals/StringEquals
- * on an absent key throws `States.Runtime`) rather than pre-normalizing via a
- * hoisted Pass chain, since Parallel branches (unlike Map iterations) already
- * see the full frame item as `$`, so there's nothing to merge in.
+ * One Parallel branch (self-contained mini state machine) generating one
+ * localized language's per-frame TTS via self-hosted Kokoro
+ * (voice.narrationBasic.ttsFrameLocalizedKokoro) — Narration Basic uses
+ * Kokoro for all four languages (en/es/pt-BR/hi), never Qwen voice clone;
+ * Qwen is Premium-only (see localizationStates()'s ttsTask() for that tier's
+ * whole-script flow, not yet ported to per-frame). Originally es/pt-BR had
+ * their own Qwen-capable branch (data-driven Qwen-vs-Kokoro choice) separate
+ * from Hindi's Kokoro-only one — collapsed into this single function
+ * 2026-07-26 once the product call above ruled Qwen out for Basic entirely.
+ *
+ * `langName` is the full English language name ('Spanish'/'Portuguese'/
+ * 'Hindi') — RunPod's Kokoro handler resolves it via KOKORO_LANG_CODE
+ * (runpod.ts), which is keyed by full lowercase names, not locale codes; a
+ * bare code like 'es' isn't recognized and silently falls back to the
+ * catalog rung's fixed hf_alpha/langCode:h. That fallback happens to be
+ * correct for Hindi (masking the bug there) but would be wrong for Spanish/
+ * Portuguese. Found live 2026-07-26 when the old Qwen leg sent the same bare
+ * code as its `language` param and RunPod's Qwen engine rejected it outright
+ * ("Invalid language 'es'/'pt-BR'. Valid: [...English names...]").
  *
  * `frameId` is composited with the language code (`${frameId}:es`) — without
  * this, qm-generate.ts derives an identical requestId across the 4 parallel
@@ -1232,10 +1242,20 @@ const STD_RETRY = [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyReq
  * QM's idempotent-by-requestId /jobs de-dup would collapse them onto one
  * shared job, exactly like the whole-script bug already fixed once (see
  * ttsTask()'s comment in localizationStates below).
+ *
+ * When StoryStudio sends no explicit voiceId for this language (Default
+ * leg), `voiceGender.$` is forwarded so qm-generate.ts's
+ * defaultLocalizedKokoroVoiceId can resolve a language+gender-appropriate
+ * Kokoro voice_id itself (spanish/portuguese/hindi × male/female) — added
+ * 2026-07-26 so the fallback isn't just the catalog rung's single fixed
+ * hf_alpha (Hindi female, wrong language entirely for es/pt-BR). Spanish/
+ * Portuguese pairs are unverified live (used_in_catalog:false in
+ * qwen-voice-clone/docs/voice-catalog.json) — same posture as the 2026-07-08
+ * Hindi check; confirm on the pod before trusting in production.
  */
-function localizedFrameTtsCloneBranch(
-  qmGenerateArn: string, langCode: string, langKey: string, narrationField: string,
-  cloneField: string, idField: string,
+function localizedFrameTtsKokoroBranch(
+  qmGenerateArn: string, langCode: string, langKey: string, langName: string,
+  narrationField: string, idField: string,
 ): { StartAt: string; States: Record<string, unknown> } {
   const frameIdExpr = `States.Format('{}:${langCode}', $.frameId)`;
   return {
@@ -1250,60 +1270,32 @@ function localizedFrameTtsCloneBranch(
             { Variable: `$.${narrationField}`, IsString: true },
             { Not: { Variable: `$.${narrationField}`, StringEquals: '' } },
           ],
-          Next: `RouteLocalizedTTSEngineFourLang${langKey}`,
+          Next: `RouteVoiceIdFourLang${langKey}`,
         }],
         Default: `SkipTTSFourLang${langKey}`,
       },
       [`SkipTTSFourLang${langKey}`]: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, skipped: true }, End: true },
-      [`RouteLocalizedTTSEngineFourLang${langKey}`]: {
+      [`RouteVoiceIdFourLang${langKey}`]: {
         Type: 'Choice',
-        Comment: `Data-driven engine choice, same rule as localizationStates()'s RouteLocalizedTTS: ${cloneField} present -> Qwen voice-clone fast path; else ${idField} present -> Kokoro; else default to Qwen (this language's defaultEngine).`,
-        Choices: [
-          {
-            And: [
-              { Variable: `$$.Execution.Input.${cloneField}`, IsPresent: true },
-              { Variable: `$$.Execution.Input.${cloneField}`, IsString: true },
-              { Not: { Variable: `$$.Execution.Input.${cloneField}`, StringEquals: '' } },
-            ],
-            Next: `QMGenerateTTSFourLang${langKey}Qwen`,
-          },
-          {
-            And: [
-              { Variable: `$$.Execution.Input.${idField}`, IsPresent: true },
-              { Variable: `$$.Execution.Input.${idField}`, IsString: true },
-              { Not: { Variable: `$$.Execution.Input.${idField}`, StringEquals: '' } },
-            ],
-            Next: `QMGenerateTTSFourLang${langKey}Kokoro`,
-          },
-        ],
-        Default: `QMGenerateTTSFourLang${langKey}Qwen`,
+        Comment: `${idField} is optional — IsPresent-guarded before the .$ reference below (a bare Parameters .$ reference to an absent key throws States.Runtime). Absent -> QM-generate.ts's defaultLocalizedKokoroVoiceId resolves a language+gender-appropriate Kokoro voice_id server-side (falling back to the catalog rung's fixed hf_alpha/langCode:h only if that lookup also misses).`,
+        Choices: [{
+          And: [
+            { Variable: `$$.Execution.Input.${idField}`, IsPresent: true },
+            { Variable: `$$.Execution.Input.${idField}`, IsString: true },
+            { Not: { Variable: `$$.Execution.Input.${idField}`, StringEquals: '' } },
+          ],
+          Next: `QMGenerateTTSFourLang${langKey}WithVoice`,
+        }],
+        Default: `QMGenerateTTSFourLang${langKey}Default`,
       },
-      [`QMGenerateTTSFourLang${langKey}Qwen`]: {
+      [`QMGenerateTTSFourLang${langKey}WithVoice`]: {
         Type: 'Task',
         Resource: qmGenerateArn,
-        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedQwen — Qwen3-TTS voice-clone .pt fast path). Prompt is the raw ${narrationField} text StoryStudio already translated — no QM-side translation for this flow.`,
-        Parameters: {
-          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedQwen', product: 'narration', queue: 'background', jobType: 'batch',
-          [`prompt.$`]: `$.${narrationField}`,
-          language: langCode,
-          [`cloneArtifactUrl.$`]: `$$.Execution.Input.${cloneField}`,
-          'projectId.$': '$$.Execution.Input.projectId',
-          'frameId.$': frameIdExpr,
-          'userId.$': '$$.Execution.Input.userId',
-        },
-        TimeoutSeconds: 920,
-        Retry: STD_RETRY,
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.ttsError${langKey}`, Next: `TtsFailedFourLang${langKey}` }],
-        End: true,
-      },
-      [`QMGenerateTTSFourLang${langKey}Kokoro`]: {
-        Type: 'Task',
-        Resource: qmGenerateArn,
-        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro — self-hosted Kokoro voiceId). Prompt is the raw ${narrationField} text StoryStudio already translated.`,
+        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), explicit ${idField}.`,
         Parameters: {
           assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
           [`prompt.$`]: `$.${narrationField}`,
-          language: langCode,
+          language: langName,
           [`voiceId.$`]: `$$.Execution.Input.${idField}`,
           'projectId.$': '$$.Execution.Input.projectId',
           'frameId.$': frameIdExpr,
@@ -1314,84 +1306,25 @@ function localizedFrameTtsCloneBranch(
         Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.ttsError${langKey}`, Next: `TtsFailedFourLang${langKey}` }],
         End: true,
       },
+      [`QMGenerateTTSFourLang${langKey}Default`]: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), no explicit ${idField} — voiceGender.$ lets QM-generate.ts pick a language+gender-appropriate default voice_id (defaultLocalizedKokoroVoiceId).`,
+        Parameters: {
+          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
+          [`prompt.$`]: `$.${narrationField}`,
+          language: langName,
+          'voiceGender.$': '$$.Execution.Input.voiceGender',
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': frameIdExpr,
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.ttsError${langKey}`, Next: `TtsFailedFourLang${langKey}` }],
+        End: true,
+      },
       [`TtsFailedFourLang${langKey}`]: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, failed: true }, End: true },
-    },
-  };
-}
-
-/**
- * Hindi's branch — Kokoro-only (Qwen has no Hindi support at all, see
- * localizationStates()'s PrepareLocalization comment), so no engine Choice is
- * needed, just an optional voiceIdHi (IsPresent-guarded the same way).
- */
-function localizedFrameTtsHiBranch(qmGenerateArn: string): { StartAt: string; States: Record<string, unknown> } {
-  const frameIdExpr = "States.Format('{}:hi', $.frameId)";
-  return {
-    StartAt: 'RouteTTSFourLangHi',
-    States: {
-      RouteTTSFourLangHi: {
-        Type: 'Choice',
-        Comment: 'Empty narrationTextHi -> skip Hindi for this frame (see the es/pt-BR branch comment for why StoryStudio always sends the key).',
-        Choices: [{
-          And: [
-            { Variable: '$.narrationTextHi', IsPresent: true },
-            { Variable: '$.narrationTextHi', IsString: true },
-            { Not: { Variable: '$.narrationTextHi', StringEquals: '' } },
-          ],
-          Next: 'RouteVoiceIdFourLangHi',
-        }],
-        Default: 'SkipTTSFourLangHi',
-      },
-      SkipTTSFourLangHi: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, skipped: true }, End: true },
-      RouteVoiceIdFourLangHi: {
-        Type: 'Choice',
-        Comment: 'voiceIdHi is optional — IsPresent-guarded before the .$ reference below (a bare Parameters .$ reference to an absent key throws States.Runtime). Absent -> rely on the catalog rung\'s fixed hf_alpha/langCode:h fallback.',
-        Choices: [{
-          And: [
-            { Variable: '$$.Execution.Input.voiceIdHi', IsPresent: true },
-            { Variable: '$$.Execution.Input.voiceIdHi', IsString: true },
-            { Not: { Variable: '$$.Execution.Input.voiceIdHi', StringEquals: '' } },
-          ],
-          Next: 'QMGenerateTTSFourLangHiWithVoice',
-        }],
-        Default: 'QMGenerateTTSFourLangHiDefault',
-      },
-      QMGenerateTTSFourLangHiWithVoice: {
-        Type: 'Task',
-        Resource: qmGenerateArn,
-        Comment: 'Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), explicit voiceIdHi.',
-        Parameters: {
-          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
-          'prompt.$': '$.narrationTextHi',
-          language: 'hi',
-          'voiceId.$': '$$.Execution.Input.voiceIdHi',
-          'projectId.$': '$$.Execution.Input.projectId',
-          'frameId.$': frameIdExpr,
-          'userId.$': '$$.Execution.Input.userId',
-        },
-        TimeoutSeconds: 920,
-        Retry: STD_RETRY,
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsErrorHi', Next: 'TtsFailedFourLangHi' }],
-        End: true,
-      },
-      QMGenerateTTSFourLangHiDefault: {
-        Type: 'Task',
-        Resource: qmGenerateArn,
-        Comment: 'Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), no explicit voiceIdHi — rely on the catalog rung\'s fixed hf_alpha/langCode:h.',
-        Parameters: {
-          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
-          'prompt.$': '$.narrationTextHi',
-          language: 'hi',
-          'projectId.$': '$$.Execution.Input.projectId',
-          'frameId.$': frameIdExpr,
-          'userId.$': '$$.Execution.Input.userId',
-        },
-        TimeoutSeconds: 920,
-        Retry: STD_RETRY,
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsErrorHi', Next: 'TtsFailedFourLangHi' }],
-        End: true,
-      },
-      TtsFailedFourLangHi: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, failed: true }, End: true },
     },
   };
 }
@@ -1635,9 +1568,9 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
           Comment: 'TTS x4, one branch per language. Each branch outputs {cdnUrl, durationS} (skipped/failed languages get durationS:0, cdnUrl:\'\').',
           Branches: [
             localizedFrameTtsEnBranch(qmGenerateArn),
-            localizedFrameTtsCloneBranch(qmGenerateArn, 'es', 'Es', 'narrationTextEs', 'voiceCloneArtifactUrlEs', 'voiceIdEs'),
-            localizedFrameTtsCloneBranch(qmGenerateArn, 'pt-BR', 'PtBr', 'narrationTextPtBr', 'voiceCloneArtifactUrlPtBr', 'voiceIdPtBr'),
-            localizedFrameTtsHiBranch(qmGenerateArn),
+            localizedFrameTtsKokoroBranch(qmGenerateArn, 'es', 'Es', 'Spanish', 'narrationTextEs', 'voiceIdEs'),
+            localizedFrameTtsKokoroBranch(qmGenerateArn, 'pt-BR', 'PtBr', 'Portuguese', 'narrationTextPtBr', 'voiceIdPtBr'),
+            localizedFrameTtsKokoroBranch(qmGenerateArn, 'hi', 'Hi', 'Hindi', 'narrationTextHi', 'voiceIdHi'),
           ],
           ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
           ResultPath: '$.ttsResults',

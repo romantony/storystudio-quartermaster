@@ -106,6 +106,30 @@ function genderToVoice(gender?: string): string {
   return (gender ?? '').trim().toLowerCase() === 'female' ? 'af_bella' : 'am_adam';
 }
 
+// Per-frame localized Kokoro default (voice.narrationBasic.ttsFrameLocalizedKokoro,
+// pipeline-stack.ts's localizedFrameTtsKokoroBranch) — used only when the SFN
+// sent no explicit voiceId for that language. One catalog rung serves
+// es/pt-BR/hi, so a single `fixed.voice` fallback (background.json) can't be
+// language-aware; this resolves language+gender to the right Kokoro voice_id
+// instead, mirroring genderToVoice's role for English. Pairs from
+// qwen-voice-clone/docs/voice-catalog.json's kokoro_voice_reference. Hindi's
+// pair (hf_alpha/hm_omega) is verified live (2026-07-08, Whisper round-trip).
+// Spanish/Portuguese (ef_dora/em_alex, pf_dora/pm_alex) are NOT yet verified
+// live — used_in_catalog:false in that doc — same unverified posture as the
+// silence-padding assumption in the fourLang redesign; confirm on the pod
+// before trusting in production.
+const KOKORO_LANG_GENDER_VOICE: Record<string, { male: string; female: string }> = {
+  spanish: { male: 'em_alex', female: 'ef_dora' },
+  portuguese: { male: 'pm_alex', female: 'pf_dora' },
+  hindi: { male: 'hm_omega', female: 'hf_alpha' },
+};
+
+function defaultLocalizedKokoroVoiceId(language?: string, gender?: string): string | undefined {
+  const pair = KOKORO_LANG_GENDER_VOICE[(language ?? '').trim().toLowerCase()];
+  if (!pair) return undefined;
+  return (gender ?? '').trim().toLowerCase() === 'female' ? pair.female : pair.male;
+}
+
 export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult> => {
   const base = process.env.QM_BASE_URL!;
   const key = await getKey();
@@ -141,7 +165,8 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
       speaker: event.speaker,
       language: event.language,
       cloneArtifactUrl: event.cloneArtifactUrl,
-      voiceId: event.voiceId,
+      voiceId: event.voiceId
+        ?? (operation === 'ttsFrameLocalizedKokoro' ? defaultLocalizedKokoroVoiceId(event.language, event.voiceGender) : undefined),
       voiceText: event.voiceText,
       effect: event.effect,
     },
