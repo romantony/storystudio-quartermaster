@@ -1395,13 +1395,31 @@ function localizedFrameTtsEnBranch(qmGenerateArn: string): { StartAt: string; St
  * `.$` reference (there's no States.Or/boolean-OR intrinsic in ASL, so the
  * failure flag has to be computed once, here, not derived downstream from
  * multiple upstream fields).
+ *
+ * `frameId` is composited with `langCode` (`${frameId}:es`) — all 4 branches
+ * share the same assetType/operation (`video`/`merge`, no per-language
+ * operation name the way TTS has `tts` vs `ttsFrameLocalized{Kokoro,Qwen}`),
+ * so without this every language's merge call for a frame produced the
+ * IDENTICAL requestId (`{projectId}:{frameId}:video:merge`) *and* the
+ * identical jobId (a hash of assetType/tier/operation/prompt/params —
+ * `audioUrl` isn't part of that hash, so 4 calls with different audio but
+ * otherwise-identical params hash the same). QM's `/jobs` is idempotent by
+ * requestId, so all 4 collapsed onto ONE shared job — whichever language's
+ * call reached QM first "won", and the other 3 silently got back that same
+ * merged clip instead of their own audio. Found live 2026-07-26 tracing a
+ * garbled Hindi Whisper re-transcription (a repeating-stutter artifact) back
+ * to only ONE `video:merge` completion ever logged per frame instead of 4.
+ * Exactly the collision class `localizedFrameTtsKokoroBranch`/
+ * `localizedFrameTtsEnBranch` already guard against for TTS — merge never
+ * got the same treatment when this Parallel was built.
  */
-function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey: string): { StartAt: string; States: Record<string, unknown> } {
+function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey: string, langCode: string): { StartAt: string; States: Record<string, unknown> } {
   const route = `RouteMergeFourLang${langKey}`;
   const skip = `MergeSkip${langKey}`;
   const task = `QMMergeFourLang${langKey}`;
   const success = `MergeSuccess${langKey}`;
   const failed = `MergeFailed${langKey}`;
+  const frameIdExpr = `States.Format('{}:${langCode}', $.frameId)`;
   return {
     StartAt: route,
     States: {
@@ -1429,7 +1447,7 @@ function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey
           'audioUrl.$': `$.ttsResults.${ttsFieldKey}.cdnUrl`,
           'durationS.$': '$.maxDuration.value',
           'projectId.$': '$$.Execution.Input.projectId',
-          'frameId.$': '$.frameId',
+          'frameId.$': frameIdExpr,
           'userId.$': '$$.Execution.Input.userId',
         },
         ResultPath: '$.mergeTaskResult',
@@ -1618,10 +1636,10 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
           Type: 'Parallel',
           Comment: 'Merge x4 — each language\'s TTS audio onto the SAME shared animated clip. A language whose TTS was skipped/failed for this frame skips merge too.',
           Branches: [
-            fourLangMergeBranch(qmGenerateArn, 'En', 'en'),
-            fourLangMergeBranch(qmGenerateArn, 'Es', 'es'),
-            fourLangMergeBranch(qmGenerateArn, 'PtBr', 'ptBr'),
-            fourLangMergeBranch(qmGenerateArn, 'Hi', 'hi'),
+            fourLangMergeBranch(qmGenerateArn, 'En', 'en', 'en'),
+            fourLangMergeBranch(qmGenerateArn, 'Es', 'es', 'es'),
+            fourLangMergeBranch(qmGenerateArn, 'PtBr', 'ptBr', 'pt-BR'),
+            fourLangMergeBranch(qmGenerateArn, 'Hi', 'hi', 'hi'),
           ],
           ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
           ResultPath: '$.mergeResults',
