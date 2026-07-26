@@ -1463,6 +1463,67 @@ function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey
 }
 
 /**
+ * One Parallel branch (self-contained mini state machine) applying the
+ * per-frame Remotion text overlay for one language — generalizes the
+ * original English-only Route/Render/Apply/Skip chain to run once per
+ * language (storystudio-4lang-text-overlay-handoff.md, 2026-07-26).
+ * StoryStudio now sends `textManifestEs`/`textManifestPtBr`/`textManifestHi`
+ * (same shape as the existing `textManifest`, only `textElements[].content`
+ * translated) alongside the English field, for frame 1's title card and
+ * text-free-genre on-screen captions in every language, not just English.
+ *
+ * Empty `textManifest{X}` (StoryStudio always sends the key — "" means no
+ * on-screen text for this language/frame) -> skip overlay, pass the merged
+ * clip through unchanged. An overlay failure is NOT a language failure —
+ * same passthrough policy the original English branch used: fall back to
+ * the un-overlaid clip rather than failing the frame or this language (TTS/
+ * merge upstream already own the real per-language all-or-nothing failure
+ * semantics — esFailed/ptBrFailed/hiFailed are untouched by this branch).
+ */
+function fourLangTextOverlayBranch(
+  remotionOverlayArn: string, langKey: string, videoUrlField: string, manifestField: string,
+): { StartAt: string; States: Record<string, unknown> } {
+  const route = `RouteTextOverlayFourLang${langKey}`;
+  const render = `RenderTextOverlayFourLang${langKey}`;
+  const apply = `ApplyTextOverlayFourLang${langKey}`;
+  const skip = `SkipTextOverlayFourLang${langKey}`;
+  return {
+    StartAt: route,
+    States: {
+      [route]: {
+        Type: 'Choice',
+        Comment: `Empty ${manifestField} -> this frame has no on-screen text for ${langKey} (or isn't a fourLang project) -> skip overlay, keep the merged clip as-is.`,
+        Choices: [{
+          And: [
+            { Variable: `$.${manifestField}`, IsPresent: true },
+            { Variable: `$.${manifestField}`, IsString: true },
+            { Not: { Variable: `$.${manifestField}`, StringEquals: '' } },
+          ],
+          Next: render,
+        }],
+        Default: skip,
+      },
+      [render]: {
+        Type: 'Task',
+        Resource: remotionOverlayArn,
+        Comment: `Per-frame Remotion text-overlay render for ${langKey} (storystudio-4lang-text-overlay-handoff.md) — clipUrl is this language's already-audio-merged clip, not English's.`,
+        Parameters: {
+          'clipUrl.$': `$.videoUrls.${videoUrlField}`,
+          'textManifest.$': `$.${manifestField}`,
+          'frameId.$': '$.frameId',
+          'duration.$': '$.duration',
+        },
+        ResultPath: '$.overlayResult', TimeoutSeconds: 180, Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Passthrough failure policy — an overlay failure degrades to the un-overlaid clip rather than failing the frame or this language.', ResultPath: '$.overlayError', Next: skip }],
+        Next: apply,
+      },
+      [apply]: { Type: 'Pass', Parameters: { 'cdnUrl.$': '$.overlayResult.overlayRenderedUrl' }, End: true },
+      [skip]: { Type: 'Pass', Parameters: { 'cdnUrl.$': `$.videoUrls.${videoUrlField}` }, End: true },
+    },
+  };
+}
+
+/**
  * fourLang per-frame Map (storystudio-4lang-video-pipeline-handoff.md, built
  * 2026-07-25): supersedes localizationStates()'s whole-script post-concat
  * flow for Narration-Basic-QM-New. Per frame: image ONCE (standalone t2i/i2i
@@ -1474,14 +1535,12 @@ function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey
  * ONCE at that max duration (the video is shared/common across languages,
  * only the audio differs) -> merge x4 (each language's TTS audio onto the
  * SAME shared animated clip, padded to the max duration for the languages
- * that came in shorter) -> emit videoUrls{en,es,ptBr,hi} + per-language
+ * that came in shorter) -> text overlay x4 (per-language Remotion burn-in,
+ * storystudio-4lang-text-overlay-handoff.md 2026-07-26 — each language
+ * overlays its own translated textManifest{Es,PtBr,Hi} onto its own merged
+ * clip, not just English) -> emit videoUrls{en,es,ptBr,hi} + per-language
  * failure flags (esFailed/ptBrFailed/hiFailed), consumed downstream by
  * fourLangConcatFinalizeStates()'s all-or-nothing per-language omission.
- *
- * Text overlay (Remotion burn-in) only applies to the English clip for v1 —
- * the handoff doc doesn't address per-language on-screen text at all; a
- * localized overlay would need its own per-language Remotion pass, out of
- * scope here (flagged to StoryStudio as an open gap, not silently guessed).
  *
  * MaxConcurrency is deliberately far below qmFrameAssetsMap's 15: this Map
  * adds up to 3 more parallel TTS calls and 3 more parallel merge calls PER
@@ -1510,11 +1569,45 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
               { Variable: '$.textManifest', IsString: true },
               { Not: { Variable: '$.textManifest', StringEquals: '' } },
             ],
-            Next: 'RouteImageModelFourLang',
+            Next: 'NormalizeTextManifestEsFourLang',
           }],
           Default: 'SetTextManifestDefaultFourLang',
         },
-        SetTextManifestDefaultFourLang: { Type: 'Pass', Result: '', ResultPath: '$.textManifest', Next: 'RouteImageModelFourLang' },
+        SetTextManifestDefaultFourLang: { Type: 'Pass', Result: '', ResultPath: '$.textManifest', Next: 'NormalizeTextManifestEsFourLang' },
+        // Es/PtBr/Hi guards (storystudio-4lang-text-overlay-handoff.md, 2026-07-26)
+        // — same "absent key throws States.Runtime on a bare .$ reference" gotcha
+        // as English's guard above, for the 3 new per-language manifest fields
+        // fourLangTextOverlayBranch's Render step references.
+        NormalizeTextManifestEsFourLang: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifestEs is a real string before TextOverlayFourLang references it.',
+          Choices: [{
+            And: [{ Variable: '$.textManifestEs', IsPresent: true }, { Variable: '$.textManifestEs', IsString: true }],
+            Next: 'NormalizeTextManifestPtBrFourLang',
+          }],
+          Default: 'SetTextManifestEsDefaultFourLang',
+        },
+        SetTextManifestEsDefaultFourLang: { Type: 'Pass', Result: '', ResultPath: '$.textManifestEs', Next: 'NormalizeTextManifestPtBrFourLang' },
+        NormalizeTextManifestPtBrFourLang: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifestPtBr is a real string before TextOverlayFourLang references it.',
+          Choices: [{
+            And: [{ Variable: '$.textManifestPtBr', IsPresent: true }, { Variable: '$.textManifestPtBr', IsString: true }],
+            Next: 'NormalizeTextManifestHiFourLang',
+          }],
+          Default: 'SetTextManifestPtBrDefaultFourLang',
+        },
+        SetTextManifestPtBrDefaultFourLang: { Type: 'Pass', Result: '', ResultPath: '$.textManifestPtBr', Next: 'NormalizeTextManifestHiFourLang' },
+        NormalizeTextManifestHiFourLang: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifestHi is a real string before TextOverlayFourLang references it.',
+          Choices: [{
+            And: [{ Variable: '$.textManifestHi', IsPresent: true }, { Variable: '$.textManifestHi', IsString: true }],
+            Next: 'RouteImageModelFourLang',
+          }],
+          Default: 'SetTextManifestHiDefaultFourLang',
+        },
+        SetTextManifestHiDefaultFourLang: { Type: 'Pass', Result: '', ResultPath: '$.textManifestHi', Next: 'RouteImageModelFourLang' },
         RouteImageModelFourLang: {
           Type: 'Choice',
           Comment: 'Image generation must always be a standalone call for fourLang frames (never the one-shot pipeline rung, which bundles a single language\'s TTS+animate+merge) — same imageModel routing rule as qmFrameAssetsMap\'s RouteImageModel/RouteImageGen, decomposed.',
@@ -1654,6 +1747,9 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
             'frameNumber.$': '$.frameNumber',
             'duration.$': '$.maxDuration.value',
             'textManifest.$': '$.textManifest',
+            'textManifestEs.$': '$.textManifestEs',
+            'textManifestPtBr.$': '$.textManifestPtBr',
+            'textManifestHi.$': '$.textManifestHi',
             videoUrls: {
               'en.$': '$.mergeResults.en.cdnUrl',
               'es.$': '$.mergeResults.es.cdnUrl',
@@ -1664,52 +1760,28 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
             'ptBrFailed.$': '$.mergeResults.ptBr.failed',
             'hiFailed.$': '$.mergeResults.hi.failed',
           },
-          Next: 'RouteTextOverlayFourLang',
+          Next: 'TextOverlayFourLang',
         },
-        RouteTextOverlayFourLang: {
-          Type: 'Choice',
-          Comment: 'Text overlay (Remotion burn-in) only applies to the English clip for v1 — the handoff doc doesn\'t address per-language on-screen text; a localized overlay is out of scope here (flag to StoryStudio).',
-          Choices: [{
-            And: [
-              { Variable: '$.textManifest', IsPresent: true },
-              { Variable: '$.textManifest', IsString: true },
-              { Not: { Variable: '$.textManifest', StringEquals: '' } },
-            ],
-            Next: 'RenderTextOverlayFourLang',
-          }],
-          Default: 'SkipTextOverlayFourLang',
+        TextOverlayFourLang: {
+          Type: 'Parallel',
+          Comment: 'Text overlay x4 — one per-language Remotion burn-in branch (storystudio-4lang-text-overlay-handoff.md, 2026-07-26), each overlaying its own translated textManifest{Es,PtBr,Hi} onto its own merged clip. A language with no on-screen text for this frame (or an overlay failure) passes its merged clip through unchanged — never fails the frame.',
+          Branches: [
+            fourLangTextOverlayBranch(remotionOverlayArn, 'En', 'en', 'textManifest'),
+            fourLangTextOverlayBranch(remotionOverlayArn, 'Es', 'es', 'textManifestEs'),
+            fourLangTextOverlayBranch(remotionOverlayArn, 'PtBr', 'ptBr', 'textManifestPtBr'),
+            fourLangTextOverlayBranch(remotionOverlayArn, 'Hi', 'hi', 'textManifestHi'),
+          ],
+          ResultSelector: { 'en.$': '$[0].cdnUrl', 'es.$': '$[1].cdnUrl', 'ptBr.$': '$[2].cdnUrl', 'hi.$': '$[3].cdnUrl' },
+          ResultPath: '$.overlaidVideoUrls',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.overlayResultsError', Next: 'QMFrameFailedFourLang' }],
+          Next: 'FinalizeFrameVideoFourLang',
         },
-        RenderTextOverlayFourLang: {
-          Type: 'Task',
-          Resource: remotionOverlayArn,
-          Comment: 'Per-frame Remotion text-overlay render, English clip only (see RouteTextOverlayFourLang comment).',
-          Parameters: {
-            'clipUrl.$': '$.videoUrls.en',
-            'textManifest.$': '$.textManifest',
-            'frameId.$': '$.frameId',
-            'duration.$': '$.duration',
-          },
-          ResultPath: '$.overlayResult', TimeoutSeconds: 180, Retry: STD_RETRY,
-          Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Passthrough failure policy, same as textOverlayStates() — an overlay failure degrades to the un-overlaid English clip rather than failing the frame.', ResultPath: '$.overlayError', Next: 'SkipTextOverlayFourLang' }],
-          Next: 'ApplyTextOverlayFourLang',
-        },
-        ApplyTextOverlayFourLang: {
+        FinalizeFrameVideoFourLang: {
           Type: 'Pass',
+          Comment: 'Reshape TextOverlayFourLang\'s Parallel result back into the per-frame item fourLangConcatFinalizeStates() consumes — same shape BuildFrameVideoFourLang emitted before overlay, videoUrls now overlaid where applicable.',
           Parameters: {
             'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber', 'duration.$': '$.duration',
-            videoUrls: {
-              'en.$': '$.overlayResult.overlayRenderedUrl',
-              'es.$': '$.videoUrls.es', 'ptBr.$': '$.videoUrls.ptBr', 'hi.$': '$.videoUrls.hi',
-            },
-            'esFailed.$': '$.esFailed', 'ptBrFailed.$': '$.ptBrFailed', 'hiFailed.$': '$.hiFailed',
-          },
-          End: true,
-        },
-        SkipTextOverlayFourLang: {
-          Type: 'Pass',
-          Parameters: {
-            'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber', 'duration.$': '$.duration',
-            'videoUrls.$': '$.videoUrls',
+            'videoUrls.$': '$.overlaidVideoUrls',
             'esFailed.$': '$.esFailed', 'ptBrFailed.$': '$.ptBrFailed', 'hiFailed.$': '$.hiFailed',
           },
           End: true,
