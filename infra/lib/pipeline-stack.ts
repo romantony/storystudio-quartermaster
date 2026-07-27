@@ -1,8 +1,9 @@
-import { Stack, StackProps, CfnOutput, Duration } from 'aws-cdk-lib';
+import { Stack, StackProps, CfnOutput, Duration, RemovalPolicy, Size } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as path from 'path';
 
@@ -187,6 +188,55 @@ export class PipelineStack extends Stack {
       action: 'lambda:InvokeFunction',
     });
 
+    // ── QM-remove-silence Lambda + output bucket (post-concat per-language
+    // silence removal) ───────────────────────────────────────────────────────
+    // 2026-07-27 product decision: a fourLang project's concatenated
+    // narration video carries visible dead air at every frame boundary (each
+    // frame's TTS clip bakes in leading/trailing silence — confirmed live on
+    // a real project: 20.3% of a 130.9s Hindi concat was silence, ffmpeg
+    // silencedetect). The real fix (trimming silence at TTS-generation time)
+    // is drafted but stuck in flux4B-Wan2/handler.py, an untracked repo with
+    // no established deploy process — so this runs post-concat instead, in
+    // infrastructure QM fully owns. Publicly readable output bucket (no
+    // CloudFront) mirrors how Remotion's own render bucket
+    // (remotionlambda-useast1-55dp29f3ln) is already read directly via plain
+    // S3 URLs elsewhere in this pipeline — same posture, not a new pattern.
+    const removeSilenceBucket = new s3.Bucket(this, 'RemoveSilenceOutputBucket', {
+      bucketName: 'qm-remove-silence-output',
+      publicReadAccess: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ACLS,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    // Algorithm validated locally against a real project's hi/concatenated.mp4
+    // before deploying (see qm-4lang-fullvideo-perframe memory): ffmpeg
+    // silencedetect -> invert into keep-segments (130ms pad each edge, not a
+    // hard jump-cut) -> cut each segment via -ss/-to (a single filter_complex
+    // graph with ~30 trim branches OOM-killed at this memory size) -> rejoin
+    // via the concat DEMUXER (-c copy, fast, no re-encode). @ffmpeg-installer/
+    // ffmpeg ships a static linux-x64 binary; bundling.nodeModules (not
+    // esbuild bundling) tells CDK to npm-install it straight into the
+    // deployment package so the native binary survives, matching the
+    // standard recipe for native deps under NodejsFunction/esbuild.
+    const removeSilenceFn = new nodejs.NodejsFunction(this, 'RemoveSilenceFunction', {
+      functionName: 'QM-remove-silence',
+      entry: path.join(__dirname, '../../src/handlers/remove-silence.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(300),
+      memorySize: 2048,
+      ephemeralStorageSize: Size.mebibytes(2048),
+      bundling: { minify: true, sourceMap: false, externalModules: [], nodeModules: ['@ffmpeg-installer/ffmpeg'] },
+      environment: {
+        OUTPUT_BUCKET: removeSilenceBucket.bucketName,
+      },
+    });
+    removeSilenceBucket.grantPut(removeSilenceFn);
+    removeSilenceFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
     // ── State machine definition ─────────────────────────────────────────────
     const brokerArn = brokerFn.functionArn;
 
@@ -231,7 +281,7 @@ export class PipelineStack extends Stack {
     // generated through the Quartermaster gateway (QM-generate). Separate
     // machine so we can validate the gateway end-to-end without altering
     // Basic-QM/Premium-QM.
-    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn);
+    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn);
 
     const qmNewStateMachine = new sfn.CfnStateMachine(this, 'QMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
@@ -248,7 +298,7 @@ export class PipelineStack extends Stack {
     // (Qwen voice-design) → Wan2 i2v → merge, all through the Quartermaster
     // gateway. Finalize is Premium-flavored (1080p upscale), mirroring
     // buildPremiumDefinition's FinalizeVideoPremium exactly.
-    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn);
+    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn);
 
     const narrationPremiumQmNewStateMachine = new sfn.CfnStateMachine(this, 'NarrationPremiumQMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Premium-QM-New',
@@ -271,7 +321,7 @@ export class PipelineStack extends Stack {
 // that Map, replacing it removes every broker reference — the cloned brokerArn
 // never survives into the QM-new definition.
 // ---------------------------------------------------------------------------
-function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string): object {
+function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string): object {
   const def = JSON.parse(JSON.stringify(buildDefinition(brokerArn))) as {
     Comment: string;
     States: Record<string, any>;
@@ -458,7 +508,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
     }],
     Default: 'ConcatenateVideos',
   };
-  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn));
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn));
   def.States.BuildMergedVoiceResult.Next = 'SetNoLocalizedAssets';
   def.States.SetNoLocalizedAssets = {
     Type: 'Pass',
@@ -640,7 +690,7 @@ function bgmStates(qmGenerateArn: string, tier: string): Record<string, unknown>
  * sent) emits a graceful `{failed:true}` item (mirrors QMFrameFailed)
  * rather than failing the whole project.
  */
-function localizationStates(qmGenerateArn: string, tier: string): Record<string, unknown> {
+function localizationStates(qmGenerateArn: string, tier: string, removeSilenceArn: string): Record<string, unknown> {
   // waitForTaskToken (2026-07-25): this call synthesizes the WHOLE translated
   // script in one shot (not per-frame), whose real generation time can
   // exceed any single Lambda invocation's window — confirmed live when both
@@ -692,7 +742,7 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
     TimeoutSeconds: 1800,
     Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
     Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'LocalizationFailedForLanguage' }],
-    Next: 'QMGenerateLocalizedSRT',
+    Next: 'RemoveSilenceLocalized',
   });
 
   // Guarantee $.<resultField> is always present (default '') before
@@ -837,6 +887,38 @@ function localizationStates(qmGenerateArn: string, tier: string): Record<string,
           },
           QMGenerateLocalizedTTSQwen: ttsTask('qwen'),
           QMGenerateLocalizedTTSKokoro: ttsTask('kokoro'),
+          // 2026-07-27: cut dead-air silence out of this language's whole-script
+          // translated TTS audio before transcribing captions from it — same
+          // product decision/algorithm as Basic's RemoveSilenceFourLang (see
+          // QM-remove-silence's header comment), applied here to the ONE
+          // audio-only artifact Premium's fourLang flow produces per language
+          // (no separate concatenated video to trim — Premium pairs this
+          // audio with English's existing single video, per localizationStates()'s
+          // own header comment on the outputKey cross-repo gap). By construction
+          // this state is only reached after TTS actually succeeded (a TTS
+          // failure already diverted to LocalizationFailedForLanguage above),
+          // so no empty-URL gate is needed the way Basic's per-frame case needs
+          // one. ResultSelector unwraps the Lambda's {trimmedAudioUrl,...} down
+          // to the bare {cdnUrl} shape QMGenerateLocalizedSRT/BuildLanguageAsset
+          // already expect at $.ttsResult, so this REPLACES $.ttsResult in place
+          // — safe because neither downstream state reads any other $.ttsResult
+          // field (confirmed: both only ever reference $.ttsResult.cdnUrl).
+          RemoveSilenceLocalized: {
+            Type: 'Task',
+            Resource: removeSilenceArn,
+            Comment: 'Cut dead-air silence out of this language\'s translated voiceover audio (QM-remove-silence) before transcribing/finalizing it.',
+            Parameters: {
+              'mediaUrl.$': '$.ttsResult.cdnUrl',
+              hasVideo: false,
+              'outputKey.$': "States.Format('projects/{}/localized/{}/voiceover-trimmed.m4a', $$.Execution.Input.projectId, $.code)",
+            },
+            ResultSelector: { 'cdnUrl.$': '$.trimmedAudioUrl' },
+            ResultPath: '$.ttsResult',
+            TimeoutSeconds: 300,
+            Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 1.5 }],
+            Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.removeSilenceError', Next: 'QMGenerateLocalizedSRT' }],
+            Next: 'QMGenerateLocalizedSRT',
+          },
           QMGenerateLocalizedSRT: {
             Type: 'Task',
             Resource: qmGenerateArn,
@@ -1927,6 +2009,79 @@ function concatFourLangBranch(
  * base concatenation happening in this codebase) — not a value read back
  * from the Fargate task, which today never reports anything into SFN state.
  */
+/** One branch of RemoveSilenceFourLang — post-concat dead-air removal for one
+ * language's finished narration video (2026-07-27 product decision: cut
+ * silence out entirely with a small ~130ms pad, not just cap long pauses —
+ * see QM-remove-silence's own header comment for the validated algorithm and
+ * why it lives here rather than in the still-unfixed flux4B-Wan2 TTS-level
+ * fix). Gated on this language actually HAVING a concatenated video
+ * (`concatFourLangBranch`'s omission/failure short-circuit already produces
+ * `videoUrl:''` for an omitted/failed language) — nothing to trim there,
+ * pass it through unchanged rather than sending the Lambda an empty URL.
+ * Passthrough-on-failure if the RemoveSilence call itself errors, same
+ * policy `fourLangTextOverlayBranch` already uses: degrade to the
+ * pre-trim clip rather than failing the whole language. Output shape is
+ * identical to `concatFourLangBranch`'s own `{videoUrl,audioUrl}` — this
+ * REPLACES `$.concatenatedVideosFourLang` in place, so PrepareTranscribeFourLang
+ * and finalizeLocalizedBranch downstream need zero changes. */
+function removeSilenceFourLangBranch(removeSilenceArn: string, fieldKey: string, langCode: string): { StartAt: string; States: Record<string, unknown> } {
+  const route = `RouteRemoveSilence${fieldKey}`;
+  const task = `RemoveSilence${fieldKey}`;
+  const applied = `RemoveSilenceApplied${fieldKey}`;
+  const skip = `RemoveSilenceSkip${fieldKey}`;
+  return {
+    StartAt: route,
+    States: {
+      [route]: {
+        Type: 'Choice',
+        Comment: `${langCode} has no concatenated video (omitted upstream, or ConcatenateVideosFourLang failed for it) — nothing to trim.`,
+        Choices: [{
+          And: [
+            { Variable: `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`, IsPresent: true },
+            { Not: { Variable: `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`, StringEquals: '' } },
+          ],
+          Next: task,
+        }],
+        Default: skip,
+      },
+      [task]: {
+        Type: 'Task',
+        Resource: removeSilenceArn,
+        Comment: `Cut dead-air silence out of ${langCode}'s finished concatenated narration video/audio (QM-remove-silence).`,
+        Parameters: {
+          'mediaUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`,
+          hasVideo: true,
+          'outputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated-trimmed.mp4', $.projectId)`,
+          'audioOutputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated-trimmed.m4a', $.projectId)`,
+        },
+        ResultPath: `$.removeSilenceResult${fieldKey}`,
+        TimeoutSeconds: 300,
+        Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 1.5 }],
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.removeSilenceError${fieldKey}`, Next: skip }],
+        Next: applied,
+      },
+      [applied]: {
+        Type: 'Pass',
+        Comment: 'Swap in the trimmed video+audio URLs — same {videoUrl,audioUrl} shape ConcatenateVideosFourLang itself produces.',
+        Parameters: {
+          'videoUrl.$': `$.removeSilenceResult${fieldKey}.trimmedVideoUrl`,
+          'audioUrl.$': `$.removeSilenceResult${fieldKey}.trimmedAudioUrl`,
+        },
+        End: true,
+      },
+      [skip]: {
+        Type: 'Pass',
+        Comment: 'No trimming applied (omitted/failed concat, or the RemoveSilence call itself failed) — pass the original concat output through unchanged.',
+        Parameters: {
+          'videoUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`,
+          'audioUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.audioUrl`,
+        },
+        End: true,
+      },
+    },
+  };
+}
+
 function finalizeLocalizedBranch(
   qmGenerateArn: string, fieldKey: string, langCode: string, omissionField: string, transcribeIndex: number,
 ): { StartAt: string; States: Record<string, unknown> } {
@@ -2025,7 +2180,7 @@ function finalizeLocalizedBranch(
  * BuildMergedVoiceResult, all unchanged) reaches the same UpdateStatusApplyingBgm
  * via SetNoLocalizedAssets instead.
  */
-function fourLangConcatFinalizeStates(qmGenerateArn: string): Record<string, unknown> {
+function fourLangConcatFinalizeStates(qmGenerateArn: string, removeSilenceArn: string): Record<string, unknown> {
   return {
     BuildLangVideoArrays: {
       Type: 'Parallel',
@@ -2060,6 +2215,20 @@ function fourLangConcatFinalizeStates(qmGenerateArn: string): Record<string, unk
         concatFourLangBranch('es', 'es', 'esOmitted'),
         concatFourLangBranch('ptBr', 'pt-BR', 'ptBrOmitted'),
         concatFourLangBranch('hi', 'hi', 'hiOmitted'),
+      ],
+      ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
+      ResultPath: '$.concatenatedVideosFourLang',
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: 'RemoveSilenceFourLang',
+    },
+    RemoveSilenceFourLang: {
+      Type: 'Parallel',
+      Comment: '2026-07-27: cut dead-air silence out of each language\'s finished concatenated narration video before transcribe/finalize (see QM-remove-silence\'s header comment) — replaces $.concatenatedVideosFourLang with the SAME {en,es,ptBr,hi}:{videoUrl,audioUrl} shape ConcatenateVideosFourLang itself produces, so PrepareTranscribeFourLang/FinalizeLocalizedVideos below need no changes.',
+      Branches: [
+        removeSilenceFourLangBranch(removeSilenceArn, 'en', 'en'),
+        removeSilenceFourLangBranch(removeSilenceArn, 'es', 'es'),
+        removeSilenceFourLangBranch(removeSilenceArn, 'ptBr', 'pt-BR'),
+        removeSilenceFourLangBranch(removeSilenceArn, 'hi', 'hi'),
       ],
       ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
       ResultPath: '$.concatenatedVideosFourLang',
@@ -2170,8 +2339,8 @@ function fourLangConcatFinalizeStates(qmGenerateArn: string): Record<string, unk
 // the finalize section is Premium-flavored (1080p upscale), matching
 // buildPremiumDefinition's FinalizeVideoPremium exactly.
 // ---------------------------------------------------------------------------
-function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string): object {
-  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn))) as {
+function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string): object {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, removeSilenceArn))) as {
     Comment: string;
     States: Record<string, any>;
   };
@@ -2208,6 +2377,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   delete def.States.BuildLangVideoArrays;
   delete def.States.ComputeLanguageOmissions;
   delete def.States.ConcatenateVideosFourLang;
+  delete def.States.RemoveSilenceFourLang;
   delete def.States.PrepareTranscribeFourLang;
   delete def.States.TranscribeAudioFourLang;
   delete def.States.BuildMergedVoiceResultFourLangEn;
@@ -2223,7 +2393,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   // the narrationPremium-tiered versions for correct billing/audit
   // attribution (same physical rungs either way — mirrors the BGM re-tier
   // immediately above).
-  Object.assign(def.States, localizationStates(qmGenerateArn, 'narrationPremium'));
+  Object.assign(def.States, localizationStates(qmGenerateArn, 'narrationPremium', removeSilenceArn));
   def.States.BuildMergedVoiceResult.Next = 'RouteLocalization';
 
   // Finalize becomes Premium-flavored (1080p upscale, longer Fargate timeout),
