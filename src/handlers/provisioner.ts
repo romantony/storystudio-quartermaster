@@ -8,9 +8,11 @@ import { isInternalRung } from './router';
 import type { JobItem, ProvisionShadowItem, Queue, RunPodEndpointItem } from '../types';
 
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
-// Shared account-wide worker cap. Raised 10→20 (2026-07-07): balance crossed
-// $200, confirmed against the RunPod dashboard (20/20 workers deployed).
-const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 20);
+// Shared account-wide worker cap. Raised 20→30 (2026-07-27): confirmed
+// against the RunPod dashboard ("30/30 Workers deployed") — see fleet.ts's
+// ACCOUNT_CAP (this is a separate constant, not imported from there; keep
+// both in sync manually, same as the ENDPOINTS baselineMax values below).
+const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 30);
 // Fallback idle floor for any endpoint that doesn't specify its own
 // `baselineMax` below. Endpoints listed in ENDPOINTS should each set a real
 // value confirmed against the account (never guess — see per-endpoint note).
@@ -31,11 +33,11 @@ const sm = new SecretsManagerClient({});
 // account-confirmed idle floor — NOT a uniform guess. Using one global
 // constant here previously caused the provisioner's shadow model to silently
 // diverge from RunPod's actual config, which the periodic scale-to-zero tick
-// would have kept re-asserting forever. Raised 2026-07-07 (account balance
-// crossed $200, cap doubled 10→20) to match the dashboard: Flux-TTS-ANIM=6,
-// qwen-image-edit=2, Wan2-14b-fp8-RTX6000ADA=6 (corrected from a stale 8 on
-// 2026-07-21 — see fleet.ts's WAN2_I2V entry), BGM-S2T=2 — matches fleet.ts's
-// "18 of ACCOUNT_CAP's 20" accounting exactly (bgm-s2t is a real shared-account
+// would have kept re-asserting forever. Raised 2026-07-27 (RunPod account cap
+// doubled 20→30) to match the dashboard ("30/30 Workers deployed"):
+// Flux-TTS-ANIM=10 (was 6), qwen-image-gen=2, qwen-image-edit=2,
+// Wan2-14b-fp8-RTX6000ADA=8 (was 6), BGM-S2T=4 (was 2) — matches fleet.ts's
+// "26 of ACCOUNT_CAP's 30" accounting exactly (bgm-s2t is a real shared-account
 // endpoint split off flux-tts-s2t for VRAM isolation, not a separate GPU — see
 // STANDALONE_ENDPOINTS below for the one that genuinely is).
 // BUGFIX (2026-07-10): bgm-s2t was missing from this list entirely since the
@@ -44,11 +46,11 @@ const sm = new SecretsManagerClient({});
 // prewarmEndpoints (below) silently no-op'd for any counterKey absent here, so
 // that pre-warm never actually reached RunPod. Added to close the gap.
 export const ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [
-  { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 6 },
+  { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 10 },
   { counterKey: 'runpod:qwen-image-gen',  endpointId: 'e165se4r3eo5hp', baselineMax: 2 },
   { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla', baselineMax: 2 },
-  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 6 },
-  { counterKey: 'runpod:bgm-s2t',         endpointId: '6apg6j7suzuezw', baselineMax: 2 },
+  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 8 },
+  { counterKey: 'runpod:bgm-s2t',         endpointId: '6apg6j7suzuezw', baselineMax: 4 },
 ];
 
 // Endpoints that get the SAME demand-driven pre-warm/cooldown/scale-to-zero
