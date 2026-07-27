@@ -130,23 +130,20 @@ export const PROJECT_FLEET: Record<string, ProjectFleetPlan> = {
   // flux-tts-s2t-hosted per-frame step (image → TTS x4 → animate →
   // [merge x4, now Lambda] → overlay x4), so it's the new cleanest
   // "frames still unfinished on this pool" signal.
-  // qwen-image-gen pre-warm (originally added for ernie-image 2026-07-10, moved
-  // here 2026-07-21 when image.explainer.t2i's primary rung retired ernie-image
-  // in favor of qwen-image-gen — see fleet.ts's FLEET comment): explainer/
-  // educational/etc. frames (imageModel=="ernie", routed per-frame in
-  // pipeline-stack.ts's RouteImageModel, invisible to admission otherwise) were
-  // hitting a cold, un-pre-warmed pool — confirmed live, one frame needed 16
-  // capacity-wait retries and ~33min to get a slot on the old ernie-image
-  // endpoint (see pipeline-stack.ts:47-70). Pre-warming qwen-image-gen's workers
-  // on every grant at least removes the same cold-start tax; it does NOT fix a
-  // project sending a large burst of these frames at once, since admission has
-  // no visibility into per-frame imageModel — that would need a new
-  // StoryStudio→QM request field (e.g. explainerFrameCount) threaded through
-  // assetLoad.ts, which doesn't exist yet. qwen-image-gen is deliberately NOT
-  // the gate here: it's a rare, low-volume path, not this project type's
-  // bottleneck.
+  // qwen-image-gen removed from this tier's pre-warm 2026-07-27 (was added
+  // 2026-07-10 for the imageModel=="ernie"/"qwen-image-gen" explainer-genre
+  // text-free-image path): user confirmed narration-basic never actually
+  // exercises that path at all — on-screen text is rendered via Remotion
+  // overlay, not by asking the image model for a clean text-free frame, so
+  // narration-basic always sends imageModel:"flux-klein-4b" and
+  // RouteImageModelFourLang's ernie/qwen-image-gen branch is dead code for
+  // this tier. Pre-warming qwen-image-gen here was real wasted RunPod spend
+  // on every single narration-basic admission for a path that never fires.
+  // (Premium's PROJECT_FLEET entry below keeps its own qwen-image-gen
+  // pre-warm — Premium's text-free-genre frames are confirmed live traffic,
+  // per that entry's own comment.)
   'narration-basic': {
-    endpoints: [FLUX_TTS_S2T, BGM_S2T, QWEN_IMAGE_GEN],
+    endpoints: [FLUX_TTS_S2T, BGM_S2T],
     gateEndpoint: FLUX_TTS_S2T,
     gateOperation: 'animate',
     gateMax: 9, // "< 10"
