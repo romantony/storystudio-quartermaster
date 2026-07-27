@@ -1847,31 +1847,63 @@ function langFailureFlagBranch(field: string): { StartAt: string; States: Record
  * contract the single-language ConcatenateVideos already uses, unchanged,
  * just pointed at this language's reshaped video array and a language-suffixed
  * outputKey (own S3 subfolder for all 4 languages, including en, so this new
- * fourLang concat path never collides with the legacy single-language key). */
-function concatFourLangBranch(fieldKey: string, langCode: string): { StartAt: string; States: Record<string, unknown> } {
+ * fourLang concat path never collides with the legacy single-language key).
+ *
+ * `omissionField` (unset for English, which is never omitted) gates the
+ * concat call on `$.languageOmissions.<field>`, computed one state earlier by
+ * ComputeLanguageOmissions. Without this gate, a language omitted on every
+ * frame (all-empty videoUrls) still got sent to E2E-video-concat-premium,
+ * which — found live 2026-07-26 debugging a full execution failure —
+ * returns a 200 with an error-shaped body (`{statusCode:500,...}`, no
+ * `audioUrl`) instead of throwing, so Step Functions treated it as success
+ * and PrepareTranscribeFourLang's unconditional `.audioUrl` reference blew up
+ * with States.Runtime, failing the ENTIRE execution over one omitted
+ * language. Short-circuiting here to the same `{videoUrl:'',audioUrl:'',
+ * failed:true}` shape the Catch-path already produces guarantees
+ * `$.concatenatedVideosFourLang.<lang>.audioUrl` always resolves (to '' when
+ * omitted), and skips a pointless external call besides. */
+function concatFourLangBranch(
+  fieldKey: string, langCode: string, omissionField?: string,
+): { StartAt: string; States: Record<string, unknown> } {
   const state = `Concat${fieldKey}`;
   const failed = `${state}Failed`;
+  const concatTask = {
+    Type: 'Task',
+    Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-video-concat-premium',
+    Comment: `Concatenate all frame videos for ${langCode} (external Lambda, storystudio-unified-owned — unchanged {videoUrl,frameNumber}[] contract).`,
+    Parameters: {
+      'videos.$': `$.fourLangConcatPrep.${fieldKey}`,
+      'aspectRatio.$': '$.aspectRatio',
+      'projectId.$': '$.projectId',
+      'outputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated.mp4', $.projectId)`,
+      'jwtToken.$': '$.jwtToken',
+      'apiKey.$': '$.apiKey',
+    },
+    TimeoutSeconds: 900,
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 1.5 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.concatError${fieldKey}`, Next: failed }],
+    End: true,
+  };
+  const failedState = { Type: 'Pass', Comment: 'Isolate this language\'s concat failure from the other 3 — mirrors ConcatenateVideos\' own Catch->HandleFailure, but scoped per-language here.', Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true };
+
+  if (!omissionField) {
+    return { StartAt: state, States: { [state]: concatTask, [failed]: failedState } };
+  }
+
+  const route = `RouteConcat${fieldKey}`;
+  const omitted = `${state}Omitted`;
   return {
-    StartAt: state,
+    StartAt: route,
     States: {
-      [state]: {
-        Type: 'Task',
-        Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-video-concat-premium',
-        Comment: `Concatenate all frame videos for ${langCode} (external Lambda, storystudio-unified-owned — unchanged {videoUrl,frameNumber}[] contract).`,
-        Parameters: {
-          'videos.$': `$.fourLangConcatPrep.${fieldKey}`,
-          'aspectRatio.$': '$.aspectRatio',
-          'projectId.$': '$.projectId',
-          'outputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated.mp4', $.projectId)`,
-          'jwtToken.$': '$.jwtToken',
-          'apiKey.$': '$.apiKey',
-        },
-        TimeoutSeconds: 900,
-        Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 1.5 }],
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.concatError${fieldKey}`, Next: failed }],
-        End: true,
+      [route]: {
+        Type: 'Choice',
+        Comment: `${langCode} already known omitted (every frame failed/skipped it upstream, per ComputeLanguageOmissions) — skip the concat Lambda call entirely rather than sending it an all-empty video array.`,
+        Choices: [{ Variable: `$.languageOmissions.${omissionField}`, BooleanEquals: true, Next: omitted }],
+        Default: state,
       },
-      [failed]: { Type: 'Pass', Comment: 'Isolate this language\'s concat failure from the other 3 — mirrors ConcatenateVideos\' own Catch->HandleFailure, but scoped per-language here.', Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true },
+      [state]: concatTask,
+      [omitted]: { Type: 'Pass', Comment: `${langCode} omitted before concat was ever attempted — same shape as ${failed} so downstream (PrepareTranscribeFourLang, FinalizeLocalizedVideos) can't tell the two apart.`, Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true },
+      [failed]: failedState,
     },
   };
 }
@@ -2024,7 +2056,10 @@ function fourLangConcatFinalizeStates(qmGenerateArn: string): Record<string, unk
     ConcatenateVideosFourLang: {
       Type: 'Parallel',
       Branches: [
-        concatFourLangBranch('en', 'en'), concatFourLangBranch('es', 'es'), concatFourLangBranch('ptBr', 'pt-BR'), concatFourLangBranch('hi', 'hi'),
+        concatFourLangBranch('en', 'en'),
+        concatFourLangBranch('es', 'es', 'esOmitted'),
+        concatFourLangBranch('ptBr', 'pt-BR', 'ptBrOmitted'),
+        concatFourLangBranch('hi', 'hi', 'hiOmitted'),
       ],
       ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
       ResultPath: '$.concatenatedVideosFourLang',
@@ -2033,13 +2068,13 @@ function fourLangConcatFinalizeStates(qmGenerateArn: string): Record<string, unk
     },
     PrepareTranscribeFourLang: {
       Type: 'Pass',
-      Comment: 'Fan-out config for TranscribeAudioFourLang below — mirrors localizationStates()\'s PrepareLocalization idiom. en has no whisperLang hint (\'\'), matching today\'s single-language TranscribeAudio, which sends no language field at all.',
+      Comment: 'Fan-out config for TranscribeAudioFourLang below — mirrors localizationStates()\'s PrepareLocalization idiom. en has no whisperLang hint (\'\'), matching today\'s single-language TranscribeAudio, which sends no language field at all. `omitted` (always false for en, which is never omitted) carries $.languageOmissions through per-item so the Map iterator below can skip the Whisper call entirely for a language already known omitted, rather than transcribing a known-empty audioUrl.',
       Parameters: {
         transcribeConfigs: [
-          { code: 'en', whisperLang: '', 'audioUrl.$': '$.concatenatedVideosFourLang.en.audioUrl' },
-          { code: 'es', whisperLang: 'es', 'audioUrl.$': '$.concatenatedVideosFourLang.es.audioUrl' },
-          { code: 'pt-BR', whisperLang: 'pt', 'audioUrl.$': '$.concatenatedVideosFourLang.ptBr.audioUrl' },
-          { code: 'hi', whisperLang: 'hi', 'audioUrl.$': '$.concatenatedVideosFourLang.hi.audioUrl' },
+          { code: 'en', whisperLang: '', omitted: false, 'audioUrl.$': '$.concatenatedVideosFourLang.en.audioUrl' },
+          { code: 'es', whisperLang: 'es', 'omitted.$': '$.languageOmissions.esOmitted', 'audioUrl.$': '$.concatenatedVideosFourLang.es.audioUrl' },
+          { code: 'pt-BR', whisperLang: 'pt', 'omitted.$': '$.languageOmissions.ptBrOmitted', 'audioUrl.$': '$.concatenatedVideosFourLang.ptBr.audioUrl' },
+          { code: 'hi', whisperLang: 'hi', 'omitted.$': '$.languageOmissions.hiOmitted', 'audioUrl.$': '$.concatenatedVideosFourLang.hi.audioUrl' },
         ],
       },
       ResultPath: '$.transcribePrep',
@@ -2052,8 +2087,14 @@ function fourLangConcatFinalizeStates(qmGenerateArn: string): Record<string, unk
       MaxConcurrency: 4,
       ResultPath: '$.transcribeResultsFourLang',
       Iterator: {
-        StartAt: 'RouteTranscribeLanguageHint',
+        StartAt: 'RouteTranscribeOmission',
         States: {
+          RouteTranscribeOmission: {
+            Type: 'Choice',
+            Comment: 'Skip the Whisper call entirely for a language already known omitted (every frame failed/skipped it upstream, per ComputeLanguageOmissions) — its audioUrl is \'\' anyway, so there\'s nothing useful to transcribe.',
+            Choices: [{ Variable: '$.omitted', BooleanEquals: true, Next: 'SkipTranscribeOneLanguage' }],
+            Default: 'RouteTranscribeLanguageHint',
+          },
           RouteTranscribeLanguageHint: {
             Type: 'Choice',
             Comment: 'Only forward a language hint when non-empty (en\'s whisperLang is \'\') — matches this codebase\'s existing "empty string == not sent" convention (frame narrationText{Es,PtBr,Hi}, bgmPrompt).',
