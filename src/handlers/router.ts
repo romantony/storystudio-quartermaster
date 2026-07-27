@@ -7,9 +7,22 @@ import { getInflight } from '../gate/dynamo-gate';
 // to the external (KIE/Replicate) rungs so the user never waits on a queue.
 const REALTIME_INTERNAL_MAX = Number(process.env.REALTIME_INTERNAL_MAX ?? 5);
 
-/** A rung is "internal" (self-hosted RunPod) iff it carries an endpointId. */
+/** A rung is "internal" (QM-owned/self-hosted, as opposed to a paid external
+ * API) iff it's a RunPod endpoint (carries an endpointId) OR a same-account
+ * Lambda (adapters/lambdamerge.ts's `lambda` provider — currently just
+ * QM-merge). Broadened 2026-07-27: `orderRungs`' batch-job path
+ * (`[...internal, ...external]`) originally treated anything non-RunPod as
+ * "external" and pushed it to the END regardless of catalog order — found
+ * live wiring QM-merge into video.narrationBasic.merge's ladder ahead of the
+ * RunPod fallback: a real batch job still tried RunPod FIRST despite the
+ * catalog listing lambda first, because isInternalRung() only recognized
+ * RunPod. `lambda` rungs have no counterKey/warm-capacity concept the way
+ * RunPod endpoints do, so they're always treated as "cold" by the realtime
+ * lead/tail split below — fine today (every lambda-provider rung is
+ * batch-only in practice), but would need its own warm-tracking if a
+ * realtime one is ever added. */
 export function isInternalRung(rung: Rung): boolean {
-  return rung.provider === 'runpod' && !!rung.endpointId;
+  return (rung.provider === 'runpod' && !!rung.endpointId) || rung.provider === 'lambda';
 }
 
 /** Stable identity for a rung — used for triedRungs + circuit-breaker keys. */

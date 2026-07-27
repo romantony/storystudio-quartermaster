@@ -7,7 +7,9 @@
     "anthropic": { "limit": 8,  "secretEnv": "ANTHROPIC_API_KEY" },
     "openai":    { "limit": 8,  "secretEnv": "OPENAI_API_KEY" },
     "runpod":    { "limit": 10, "secretEnv": "RUNPOD_API_KEY",
-                   "note": "Self-hosted RunPod-serverless models (Flux-TTS-S2T, qwen-image-gen/edit). Concurrency is gated per-endpoint (COUNTER#runpod:*), not by this global limit; account-wide worker cap is 10 (20 post-$200)." }
+                   "note": "Self-hosted RunPod-serverless models (Flux-TTS-S2T, qwen-image-gen/edit). Concurrency is gated per-endpoint (COUNTER#runpod:*), not by this global limit; account-wide worker cap is 10 (20 post-$200)." },
+    "lambda":    { "limit": 30, "secretEnv": "",
+                   "note": "QM-owned Lambda rungs (currently just QM-merge — see adapters/lambdamerge.ts). IAM-authenticated same-account invoke, no API secret. Not a fleet.ts entry — Lambda concurrency isn't a fixed pod count the way RunPod worker counts are, so this global limit (not a per-endpoint counterKey) is the concurrency gate." }
   },
   "circuit": {
     "errorThreshold": 0.5,
@@ -123,8 +125,10 @@
         "note": "Narration Basic animation — Flux-TTS-S2T animate (smooth Ken Burns), replaces the jittery local i2v render." }
     ],
     "video.narrationBasic.merge": [
-      { "provider": "runpod", "model": "flux-merge", "mode": "merge", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "Narration Basic per-frame audio merge — Flux-TTS-S2T merge (animated video + TTS voice)." }
+      { "provider": "lambda", "model": "qm-merge", "routingMode": "direct", "lane": "rest",
+        "note": "2026-07-27: moved off the GPU pod — merge is pure ffmpeg muxing, no model inference, and was competing with image/TTS/animate for flux-tts-s2t's 6 workers (a real contributor to real execution timeouts). Also the first merge path to correctly PAD a shorter language's audio to the frame's shared duration (via durationS) instead of only ever trimming — see handlers/merge.ts." },
+      { "provider": "runpod", "model": "flux-merge", "mode": "merge", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest", "fb": true,
+        "note": "Fallback only (kept for resilience during rollout) — Flux-TTS-S2T merge (animated video + TTS voice), -shortest trim-only, no padding." }
     ],
     "video.narrationBasic.pipeline": [
       { "provider": "runpod", "model": "flux-pipeline", "mode": "pipeline", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",

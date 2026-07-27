@@ -220,6 +220,29 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
 
 async function submit(adapter: Adapter, job: JobItem, rung: Rung, callbackUrl?: string): Promise<unknown> {
   const req = adapter.buildRequest(job as unknown as import('../types').CanonicalJob, rung, callbackUrl);
+  // A same-account Lambda-to-Lambda call (currently just QM-merge, see
+  // adapters/lambdamerge.ts) has no HTTP endpoint of its own to fetch() — the
+  // adapter instead encodes it as a `lambda:<functionName>` pseudo-URL here,
+  // which this branch recognizes and direct-invokes via the SDK
+  // (RequestResponse, synchronous) instead of going through the generic HTTP
+  // path every other (real API) adapter uses.
+  if (req.url.startsWith('lambda:')) {
+    const fn = req.url.slice('lambda:'.length);
+    const { LambdaClient, InvokeCommand } = await import('@aws-sdk/client-lambda');
+    const lambda = new LambdaClient({});
+    const resp = await lambda.send(new InvokeCommand({
+      FunctionName: fn,
+      InvocationType: 'RequestResponse',
+      Payload: Buffer.from(JSON.stringify(req.body ?? {})),
+    }));
+    const text = Buffer.from(resp.Payload ?? []).toString('utf-8');
+    let raw: unknown;
+    try { raw = JSON.parse(text); } catch { raw = text; }
+    if (resp.FunctionError) {
+      throw Object.assign(new Error(`lambda invoke error: ${resp.FunctionError}`), { httpCode: 500, raw });
+    }
+    return raw;
+  }
   const resp = await fetch(req.url, {
     method: req.method,
     headers: req.headers,

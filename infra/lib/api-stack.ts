@@ -1,8 +1,9 @@
-import { Stack, StackProps, Duration, CfnOutput } from 'aws-cdk-lib';
+import { Stack, StackProps, Duration, CfnOutput, RemovalPolicy, Size } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 
@@ -99,6 +100,45 @@ export class ApiStack extends Stack {
       actions: ['lambda:InvokeFunction'],
       resources: [`arn:aws:lambda:${this.region}:${this.account}:function:quartermaster-executor`],
     }));
+
+    // ── QM-merge: audio+video mux, moved off the RunPod GPU pod (2026-07-27)
+    // ──────────────────────────────────────────────────────────────────────
+    // video.narrationBasic.merge (background.json) is pure ffmpeg muxing, no
+    // model inference — it only ever ran on flux-tts-s2t's 6 workers for
+    // convenience, competing there with image/TTS/animate (merge x4-per-frame
+    // in the fourLang per-frame flow was one of the two biggest concurrent
+    // fan-outs against that pool, a real contributor to real execution
+    // timeouts, see qm-4lang-fullvideo-perframe memory). Invoked directly by
+    // executorFunction (adapters/lambdamerge.ts's `lambda:<fn>` pseudo-URL,
+    // recognized by executor.ts's submit()) rather than through the
+    // catalog's usual HTTP-fetch path — a same-account Lambda has no HTTP
+    // endpoint of its own to hit. Also finally fixes the long-flagged
+    // silence-padding gap (Bug #6): RunPod's merge hardcoded ffmpeg's
+    // `-shortest` (always trims to the shorter of video/audio); this pads a
+    // shorter language's audio to the frame's shared max-duration instead,
+    // via ffmpeg's `apad=whole_dur` — see handlers/merge.ts's header comment.
+    const mergeOutputBucket = new s3.Bucket(this, 'MergeOutputBucket', {
+      bucketName: 'qm-merge-output',
+      publicReadAccess: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ACLS,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    const mergeFunction = new nodejs.NodejsFunction(this, 'MergeFunction', {
+      functionName: 'QM-merge',
+      entry: path.join(__dirname, '../../src/handlers/merge.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(120),
+      memorySize: 1024,
+      ephemeralStorageSize: Size.mebibytes(1024),
+      bundling: { minify: true, sourceMap: false, externalModules: [], nodeModules: ['@ffmpeg-installer/ffmpeg'] },
+      environment: {
+        OUTPUT_BUCKET: mergeOutputBucket.bucketName,
+      },
+    });
+    mergeOutputBucket.grantPut(mergeFunction);
+    mergeFunction.grantInvoke(this.executorFunction);
 
     this.apiFunction = new nodejs.NodejsFunction(this, 'ApiFunction', {
       functionName: 'quartermaster-api',
