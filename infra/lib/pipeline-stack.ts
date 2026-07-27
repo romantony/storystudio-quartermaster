@@ -1752,8 +1752,17 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
         },
         QMFrameFailedFourLang: {
           Type: 'Pass',
-          Comment: 'Image generation failed — this frame can\'t produce ANY language\'s video (image is shared), so fail the whole frame (mirrors QMFrameFailed).',
-          Parameters: { failed: true, error: 'QMFrameFailed', 'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber' },
+          Comment: 'Reached from image gen AND from the TTS/animate/merge/overlay Catches above — whichever stage failed, this frame can\'t produce a video for at least one language (mirrors QMFrameFailed). Must emit the SAME videoUrls/esFailed/ptBrFailed/hiFailed shape FinalizeFrameVideoFourLang emits on success: found live 2026-07-27 — a single frame\'s hi:video:merge timeout reached here with the old {failed,error,frameId,frameNumber}-only shape (no videoUrls key), which crashed the downstream Reshape{en,es,ptBr,hi} Maps\' unconditional `$$.Map.Item.Value.videoUrls.<lang>` lookup with States.Runtime, failing the ENTIRE execution over one frame. Emitting empty videoUrls for all 4 languages here (English included — a whole-frame failure has no video for English either, unlike a per-language merge failure) lets the existing per-language all-or-nothing omission machinery treat this frame like any other failed frame instead of crashing.',
+          Parameters: {
+            failed: true,
+            error: 'QMFrameFailed',
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            videoUrls: { en: '', es: '', ptBr: '', hi: '' },
+            esFailed: true,
+            ptBrFailed: true,
+            hiFailed: true,
+          },
           End: true,
         },
         GenerateFourLangTts: {
