@@ -140,12 +140,22 @@ function computeKeepSegments(duration: number, silences: [number, number][]): [n
  * per-segment files, not the original whole clip (that whole-clip-in-one-
  * filter-graph approach was tried first and OOM-killed the container). */
 function cutAndConcat(input: string, keep: [number, number][], hasVideo: boolean, workDir: string, outPath: string): void {
+  // Audio-only output (hasVideo:false, and the standalone track extracted
+  // separately when hasVideo:true) is always PCM WAV, never AAC — found live
+  // 2026-07-27: RunPod's Whisper worker loads audio via soundfile/libsndfile,
+  // which doesn't support M4A/AAC at all ("Soundfile is either not in the
+  // correct format or is malformed"). Every one of a real project's 4
+  // TranscribeAudioFourLang languages failed this way once transcribe started
+  // reading this Lambda's trimmed output instead of the original
+  // (WAV-format) concat audio. WAV is universally readable, at the cost of a
+  // larger file — fine at these durations (whole-project narration audio,
+  // not raw video).
   const segFiles: string[] = [];
   keep.forEach(([s, e], i) => {
-    const segPath = path.join(workDir, `seg${String(i).padStart(3, '0')}.${hasVideo ? 'mp4' : 'm4a'}`);
+    const segPath = path.join(workDir, `seg${String(i).padStart(3, '0')}.${hasVideo ? 'mp4' : 'wav'}`);
     const args = ['-y', '-ss', s.toFixed(3), '-to', e.toFixed(3), '-i', input];
     if (hasVideo) args.push('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '160k');
-    else args.push('-vn', '-c:a', 'aac', '-b:a', '160k');
+    else args.push('-vn', '-c:a', 'pcm_s16le');
     args.push(segPath);
     const { status, stderr } = run(args);
     if (status !== 0) throw new Error(`ffmpeg segment ${i} (${s}-${e}) failed: ${stderr.slice(-1500)}`);
@@ -160,7 +170,7 @@ function cutAndConcat(input: string, keep: [number, number][], hasVideo: boolean
     : `${segFiles.map((_, i) => `[${i}:a]`).join('')}concat=n=${n}:v=0:a=1[outa]`;
   args.push('-filter_complex', filter);
   if (hasVideo) args.push('-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '160k');
-  else args.push('-map', '[outa]', '-c:a', 'aac', '-b:a', '160k');
+  else args.push('-map', '[outa]', '-c:a', 'pcm_s16le');
   args.push(outPath);
 
   const { status, stderr } = run(args);
@@ -179,7 +189,11 @@ async function upload(localPath: string, key: string, contentType: string): Prom
 
 export const handler = async (event: RemoveSilenceEvent): Promise<RemoveSilenceResult> => {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'silence-'));
-  const inputExt = event.hasVideo ? 'mp4' : 'm4a';
+  // Input extension is just a local temp filename — ffmpeg sniffs real
+  // content regardless, so a mismatch here (e.g. actual input being WAV)
+  // never breaks reading it. Only the OUTPUT audio format matters (see
+  // cutAndConcat's header comment on why it's always WAV, never AAC).
+  const inputExt = event.hasVideo ? 'mp4' : 'wav';
   const inputPath = path.join(workDir, `input.${inputExt}`);
   const outputPath = path.join(workDir, `output.${inputExt}`);
 
@@ -188,9 +202,17 @@ export const handler = async (event: RemoveSilenceEvent): Promise<RemoveSilenceR
 
     const { duration, silences } = detectSilence(inputPath);
     if (silences.length === 0 || duration === 0) {
-      // Nothing to trim (or duration unreadable) — upload the input as-is
-      // rather than failing the whole language over a no-op.
-      fs.copyFileSync(inputPath, outputPath);
+      if (event.hasVideo) {
+        // Nothing to trim (or duration unreadable) — upload the input as-is
+        // rather than failing the whole language over a no-op.
+        fs.copyFileSync(inputPath, outputPath);
+      } else {
+        // Audio-only passthrough must still GUARANTEE WAV output (not just
+        // copy whatever format the input happened to be) — re-encode rather
+        // than raw-copy, same reasoning as cutAndConcat's WAV-only policy.
+        const { status, stderr } = run(['-y', '-i', inputPath, '-c:a', 'pcm_s16le', outputPath]);
+        if (status !== 0) throw new Error(`ffmpeg passthrough re-encode failed: ${stderr.slice(-1500)}`);
+      }
     } else {
       const keep = computeKeepSegments(duration, silences);
       cutAndConcat(inputPath, keep, event.hasVideo, workDir, outputPath);
@@ -202,12 +224,12 @@ export const handler = async (event: RemoveSilenceEvent): Promise<RemoveSilenceR
     let trimmedAudioUrl = '';
     if (event.hasVideo) {
       trimmedVideoUrl = await upload(outputPath, event.outputKey, 'video/mp4');
-      const audioPath = path.join(workDir, 'audio.m4a');
-      const { status, stderr } = run(['-y', '-i', outputPath, '-vn', '-c:a', 'copy', audioPath]);
+      const audioPath = path.join(workDir, 'audio.wav');
+      const { status, stderr } = run(['-y', '-i', outputPath, '-vn', '-c:a', 'pcm_s16le', audioPath]);
       if (status !== 0) throw new Error(`audio extraction failed: ${stderr.slice(-1500)}`);
-      trimmedAudioUrl = await upload(audioPath, event.audioOutputKey ?? event.outputKey.replace(/\.mp4$/, '.m4a'), 'audio/mp4');
+      trimmedAudioUrl = await upload(audioPath, event.audioOutputKey ?? event.outputKey.replace(/\.mp4$/, '.wav'), 'audio/wav');
     } else {
-      trimmedAudioUrl = await upload(outputPath, event.outputKey, 'audio/mp4');
+      trimmedAudioUrl = await upload(outputPath, event.outputKey, 'audio/wav');
     }
 
     return {
