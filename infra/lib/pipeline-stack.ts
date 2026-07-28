@@ -508,7 +508,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
     }],
     Default: 'ConcatenateVideos',
   };
-  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn));
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn, 'basic', shortsTriggerArn));
   def.States.BuildMergedVoiceResult.Next = 'SetNoLocalizedAssets';
   def.States.SetNoLocalizedAssets = {
     Type: 'Pass',
@@ -586,6 +586,7 @@ function shortsTriggerStates(shortsTriggerArn: string, finalizeStateName: string
         'videoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
         'srtUrl.$': '$.mergedVoiceResult.captionsUrl',
         'bgmUrl.$': '$.bgmResult.cdnUrl',
+        language: 'en',
         'convexEndpoint.$': '$.convexEndpoint',
         'shortsOptions.$': '$.shortsOptions',
       },
@@ -2239,11 +2240,14 @@ function removeSilenceFourLangBranch(removeSilenceArn: string, fieldKey: string,
 
 function finalizeLocalizedBranch(
   qmGenerateArn: string, fieldKey: string, langCode: string, omissionField: string, transcribeIndex: number,
-  mode: 'basic' | 'premium' = 'basic', targetResolution?: string, timeoutSeconds = 3600,
+  mode: 'basic' | 'premium' = 'basic', targetResolution: string | undefined = undefined, timeoutSeconds = 3600,
+  shortsTriggerArn: string = '',
 ): { StartAt: string; States: Record<string, unknown> } {
   const check = `CheckOmitted${fieldKey}`;
   const omitted = `Omitted${fieldKey}`;
   const prepare = `PrepareFinalize${fieldKey}`;
+  const routeShorts = `RouteShorts${fieldKey}`;
+  const triggerShorts = `TriggerShortsFourLang${fieldKey}`;
   const finalize = `FinalizeVideo${fieldKey}`;
   const finalizeFailed = `FinalizeFailed${fieldKey}`;
   const buildAsset = `BuildLocalizedAsset${fieldKey}`;
@@ -2279,8 +2283,35 @@ function finalizeLocalizedBranch(
           'convexEndpoint.$': '$.convexEndpoint',
         },
         ResultPath: taskInputPath,
-        Next: finalize,
+        Next: shortsTriggerArn ? routeShorts : finalize,
       },
+      ...(shortsTriggerArn ? {
+        [routeShorts]: {
+          Type: 'Choice',
+          Comment: `Fire ${langCode}'s own long-to-shorts job when the project asked for shorts — mirrors CheckGenerateShorts, just per-language.`,
+          Choices: [{ Variable: '$.generateShorts', BooleanEquals: true, Next: triggerShorts }],
+          Default: finalize,
+        },
+        [triggerShorts]: {
+          Type: 'Task',
+          Resource: shortsTriggerArn,
+          Comment: `Fire-and-forget long-to-shorts trigger for ${langCode}, sourced from this language's own pre-finalize concat video/SRT (same precedent as English's own trigger using its pre-finalize concat video, not the finalized master). projectId/jobId are language-suffixed — the shorts worker's R2 keys and Convex webhook correlation are otherwise global/unsuffixed and would collide across 4 parallel per-language triggers for the same project.`,
+          Parameters: {
+            'projectId.$': `States.Format('{}-${fieldKey}', $.projectId)`,
+            'jobId.$': `States.Format('{}-${fieldKey}', $.jobId)`,
+            'videoUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`,
+            'srtUrl.$': `$.transcribeResultsFourLang[${transcribeIndex}].srtUrl`,
+            'bgmUrl.$': '$.bgmResult.cdnUrl',
+            language: langCode,
+            'convexEndpoint.$': '$.convexEndpoint',
+            'shortsOptions.$': '$.shortsOptions',
+          },
+          ResultPath: `$.shortsExecution${fieldKey}`,
+          TimeoutSeconds: 30,
+          Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Shorts trigger failure is non-fatal — always proceed to finalize.', ResultPath: `$.shortsError${fieldKey}`, Next: finalize }],
+          Next: finalize,
+        },
+      } : {}),
       [finalize]: {
         Type: 'Task',
         Resource: 'arn:aws:states:::ecs:runTask.sync',
@@ -2338,7 +2369,7 @@ function finalizeLocalizedBranch(
  * via SetNoLocalizedAssets instead.
  */
 function fourLangConcatFinalizeStates(
-  qmGenerateArn: string, removeSilenceArn: string, mode: 'basic' | 'premium' = 'basic',
+  qmGenerateArn: string, removeSilenceArn: string, mode: 'basic' | 'premium' = 'basic', shortsTriggerArn: string = '',
 ): Record<string, unknown> {
   const targetResolution = mode === 'premium' ? '1080p' : undefined;
   const finalizeTimeoutSeconds = mode === 'premium' ? 5400 : 3600;
@@ -2480,9 +2511,9 @@ function fourLangConcatFinalizeStates(
       Type: 'Parallel',
       Comment: 'es/pt-BR/hi finalize fan-out — English is deliberately NOT a branch here (see BuildMergedVoiceResultFourLangEn). Output array (order: es, pt-BR, hi) becomes $.localizedAssets directly, matching the doc\'s array-of-{language,...} shape.',
       Branches: [
-        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 'esOmitted', 1, mode, targetResolution, finalizeTimeoutSeconds),
-        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 'ptBrOmitted', 2, mode, targetResolution, finalizeTimeoutSeconds),
-        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 'hiOmitted', 3, mode, targetResolution, finalizeTimeoutSeconds),
+        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 'esOmitted', 1, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
+        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 'ptBrOmitted', 2, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
+        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 'hiOmitted', 3, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
       ],
       ResultPath: '$.localizedAssets',
       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
@@ -2856,7 +2887,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   // branch on $.fourLang — so they're left as-is, not deleted.
   def.States.GenerateImagesFourLang = qmPremiumFourLangFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
   def.States.GenerateImagesFourLang.Next = 'RouteBGM';
-  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn, 'premium'));
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn, 'premium', shortsTriggerArn));
 
   // No whole-script localizationStates() call for Premium anymore: once the
   // per-frame fourLang path above is wired in, RouteFrameGeneration/

@@ -42,6 +42,8 @@ interface ShortsTriggerEvent {
   srtUrl?: string;
   bgmUrl?: string;
   convexEndpoint?: string;
+  /** Language of videoUrl/srtUrl's narration (e.g. 'en', 'es', 'pt-BR', 'hi') — drives the worker's own final-clip re-transcription. */
+  language?: string;
   /** Raw passthrough merged into RunPod's job.input — see file header. */
   shortsOptions?: Record<string, unknown>;
 }
@@ -60,6 +62,7 @@ export const handler = async (event: ShortsTriggerEvent): Promise<Record<string,
     defaults.segments_source = 'ai';
   }
   if (event.bgmUrl) defaults.bgm_url = event.bgmUrl;
+  if (event.language) defaults.language = event.language;
 
   const input: Record<string, unknown> = {
     ...defaults,
