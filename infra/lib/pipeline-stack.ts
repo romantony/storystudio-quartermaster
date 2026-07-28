@@ -1337,7 +1337,7 @@ const STD_RETRY = [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyReq
  */
 function localizedFrameTtsKokoroBranch(
   qmGenerateArn: string, langCode: string, langKey: string, langName: string,
-  narrationField: string, idField: string,
+  narrationField: string, idField: string, tier: string,
 ): { StartAt: string; States: Record<string, unknown> } {
   const frameIdExpr = `States.Format('{}:${langCode}', $.frameId)`;
   return {
@@ -1373,9 +1373,9 @@ function localizedFrameTtsKokoroBranch(
       [`QMGenerateTTSFourLang${langKey}WithVoice`]: {
         Type: 'Task',
         Resource: qmGenerateArn,
-        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), explicit ${idField}.`,
+        Comment: `Per-frame localized TTS via QM (voice.${tier}.ttsFrameLocalizedKokoro), explicit ${idField}.`,
         Parameters: {
-          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
+          assetType: 'voice', tier, operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
           [`prompt.$`]: `$.${narrationField}`,
           language: langName,
           [`voiceId.$`]: `$$.Execution.Input.${idField}`,
@@ -1391,9 +1391,9 @@ function localizedFrameTtsKokoroBranch(
       [`QMGenerateTTSFourLang${langKey}Default`]: {
         Type: 'Task',
         Resource: qmGenerateArn,
-        Comment: `Per-frame localized TTS via QM (voice.narrationBasic.ttsFrameLocalizedKokoro), no explicit ${idField} — voiceGender.$ lets QM-generate.ts pick a language+gender-appropriate default voice_id (defaultLocalizedKokoroVoiceId).`,
+        Comment: `Per-frame localized TTS via QM (voice.${tier}.ttsFrameLocalizedKokoro), no explicit ${idField} — voiceGender.$ lets QM-generate.ts pick a language+gender-appropriate default voice_id (defaultLocalizedKokoroVoiceId).`,
         Parameters: {
-          assetType: 'voice', tier: 'narrationBasic', operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
+          assetType: 'voice', tier, operation: 'ttsFrameLocalizedKokoro', product: 'narration', queue: 'background', jobType: 'batch',
           [`prompt.$`]: `$.${narrationField}`,
           language: langName,
           'voiceGender.$': '$$.Execution.Input.voiceGender',
@@ -1459,6 +1459,149 @@ function localizedFrameTtsEnBranch(qmGenerateArn: string): { StartAt: string; St
 }
 
 /**
+ * English's TTS branch for Premium fourLang — same clone-vs-design routing
+ * qmPremiumFrameAssetsMap's RouteTTSEngine/QMGenerateTTSClone/QMGenerateTTS
+ * uses for the single-language flow, reshaped as a standalone Parallel
+ * branch (End:true, no ResultPath) mirroring localizedFrameTtsEnBranch's
+ * shape above. Premium's English voice is always Qwen (design or clone),
+ * never Kokoro — unlike Basic's fourLang English branch.
+ */
+function localizedFrameTtsEnBranchPremium(qmGenerateArn: string): { StartAt: string; States: Record<string, unknown> } {
+  return {
+    StartAt: 'RouteTTSFourLangEnPremium',
+    States: {
+      RouteTTSFourLangEnPremium: {
+        Type: 'Choice',
+        Comment: 'Frame already carries a voiceUrl -> reuse it; otherwise route to Qwen clone (if the project has a voiceCloneArtifactUrl) or Qwen voice-design.',
+        Choices: [{
+          And: [
+            { Variable: '$.voiceUrl', IsPresent: true },
+            { Variable: '$.voiceUrl', IsString: true },
+            { Not: { Variable: '$.voiceUrl', StringEquals: '' } },
+          ],
+          Next: 'UseProvidedVoiceFourLangEnPremium',
+        }],
+        Default: 'RouteTTSEngineFourLangEnPremium',
+      },
+      UseProvidedVoiceFourLangEnPremium: { Type: 'Pass', Parameters: { 'cdnUrl.$': '$.voiceUrl', 'durationS.$': '$.duration' }, End: true },
+      RouteTTSEngineFourLangEnPremium: {
+        Type: 'Choice',
+        Comment: 'Same clone-vs-design routing as qmPremiumFrameAssetsMap.RouteTTSEngine, reshaped as a standalone branch for the fourLang TTS x4 Parallel.',
+        Choices: [{
+          And: [
+            { Variable: '$$.Execution.Input.voiceCloneArtifactUrl', IsPresent: true },
+            { Variable: '$$.Execution.Input.voiceCloneArtifactUrl', IsString: true },
+            { Not: { Variable: '$$.Execution.Input.voiceCloneArtifactUrl', StringEquals: '' } },
+          ],
+          Next: 'QMGenerateTTSCloneFourLangEn',
+        }],
+        Default: 'QMGenerateTTSFourLangEnPremium',
+      },
+      QMGenerateTTSCloneFourLangEn: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: 'English TTS via QM (voice.narrationPremium.tts, Qwen3-TTS clone_artifact_url fast path) — same rung the single-language frame Map uses.',
+        Parameters: {
+          assetType: 'voice', tier: 'narrationPremium', operation: 'tts', product: 'narration', queue: 'background', jobType: 'batch',
+          'prompt.$': '$.narrationText',
+          'cloneArtifactUrl.$': '$$.Execution.Input.voiceCloneArtifactUrl',
+          'language.$': '$$.Execution.Input.voiceLanguage',
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': '$.frameId',
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsErrorEn', Next: 'TtsFailedFourLangEnPremium' }],
+        End: true,
+      },
+      QMGenerateTTSFourLangEnPremium: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: 'English TTS via QM (voice.narrationPremium.tts: self-hosted Qwen3-TTS voice-design) — same rung the single-language frame Map uses.',
+        Parameters: {
+          assetType: 'voice', tier: 'narrationPremium', operation: 'tts', product: 'narration', queue: 'background', jobType: 'batch',
+          'prompt.$': '$.narrationText',
+          'speaker.$': '$$.Execution.Input.voiceSpeaker',
+          'instruct.$': '$$.Execution.Input.voiceInstruct',
+          'language.$': '$$.Execution.Input.voiceLanguage',
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': '$.frameId',
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsErrorEn', Next: 'TtsFailedFourLangEnPremium' }],
+        End: true,
+      },
+      TtsFailedFourLangEnPremium: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, failed: true }, End: true },
+    },
+  };
+}
+
+/**
+ * Es/PtBr per-frame localized TTS branch for Premium fourLang — Qwen
+ * voice-clone only (no design-voice fallback: Premium's product decision is
+ * that localized non-English voices always come from the project's
+ * precomputed clone artifact, mirroring the whole-script localizationStates()
+ * flow's RouteLocalizedTTS clone path, just per-frame). `cloneField` is the
+ * project-level voiceCloneArtifactUrlEs/PtBr execution-input field — IsPresent-
+ * guarded alongside narrationField before either is referenced via `.$` (a
+ * bare reference to an absent optional field throws States.Runtime, same
+ * gotcha localizedFrameTtsKokoroBranch's RouteVoiceIdFourLang guards against).
+ * Missing clone artifact for a language that's otherwise configured is
+ * treated the same as empty narration text: skip that language for this
+ * frame rather than crashing the execution.
+ */
+function localizedFrameTtsQwenCloneBranch(
+  qmGenerateArn: string, langCode: string, langKey: string, langName: string,
+  narrationField: string, cloneField: string,
+): { StartAt: string; States: Record<string, unknown> } {
+  const frameIdExpr = `States.Format('{}:${langCode}', $.frameId)`;
+  return {
+    StartAt: `RouteTTSFourLang${langKey}`,
+    States: {
+      [`RouteTTSFourLang${langKey}`]: {
+        Type: 'Choice',
+        Comment: `Empty ${narrationField} (StoryStudio always sends this key on a fourLang project — "" means ${langCode} generation failed for this frame) OR missing project-level ${cloneField} (required — no design-voice fallback for localized Premium voices) -> skip ${langCode} for this frame.`,
+        Choices: [{
+          And: [
+            { Variable: `$.${narrationField}`, IsPresent: true },
+            { Variable: `$.${narrationField}`, IsString: true },
+            { Not: { Variable: `$.${narrationField}`, StringEquals: '' } },
+            { Variable: `$$.Execution.Input.${cloneField}`, IsPresent: true },
+            { Variable: `$$.Execution.Input.${cloneField}`, IsString: true },
+            { Not: { Variable: `$$.Execution.Input.${cloneField}`, StringEquals: '' } },
+          ],
+          Next: `QMGenerateTTSFourLang${langKey}`,
+        }],
+        Default: `SkipTTSFourLang${langKey}`,
+      },
+      [`SkipTTSFourLang${langKey}`]: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, skipped: true }, End: true },
+      [`QMGenerateTTSFourLang${langKey}`]: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: `Per-frame localized TTS via QM (voice.narrationPremium.ttsFrameLocalizedQwen), Qwen voice-clone fast path using the project-level ${cloneField}.`,
+        Parameters: {
+          assetType: 'voice', tier: 'narrationPremium', operation: 'ttsFrameLocalizedQwen', product: 'narration', queue: 'background', jobType: 'batch',
+          'prompt.$': `$.${narrationField}`,
+          language: langName,
+          'cloneArtifactUrl.$': `$$.Execution.Input.${cloneField}`,
+          'projectId.$': '$$.Execution.Input.projectId',
+          'frameId.$': frameIdExpr,
+          'userId.$': '$$.Execution.Input.userId',
+        },
+        TimeoutSeconds: 920,
+        Retry: STD_RETRY,
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.ttsError${langKey}`, Next: `TtsFailedFourLang${langKey}` }],
+        End: true,
+      },
+      [`TtsFailedFourLang${langKey}`]: { Type: 'Pass', Parameters: { cdnUrl: '', durationS: 0, failed: true }, End: true },
+    },
+  };
+}
+
+/**
  * Merge branch for one language — same video.narrationBasic.merge rung the
  * single-language flow uses, plus a new `durationS` param (the frame's shared
  * max-across-4-languages duration) so a language whose TTS came in shorter
@@ -1495,7 +1638,10 @@ function localizedFrameTtsEnBranch(qmGenerateArn: string): { StartAt: string; St
  * `localizedFrameTtsEnBranch` already guard against for TTS — merge never
  * got the same treatment when this Parallel was built.
  */
-function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey: string, langCode: string): { StartAt: string; States: Record<string, unknown> } {
+function fourLangMergeBranch(
+  qmGenerateArn: string, langKey: string, ttsFieldKey: string, langCode: string,
+  tier: string, videoUrlPath: string,
+): { StartAt: string; States: Record<string, unknown> } {
   const route = `RouteMergeFourLang${langKey}`;
   const skip = `MergeSkip${langKey}`;
   const task = `QMMergeFourLang${langKey}`;
@@ -1522,10 +1668,10 @@ function fourLangMergeBranch(qmGenerateArn: string, langKey: string, ttsFieldKey
       [task]: {
         Type: 'Task',
         Resource: qmGenerateArn,
-        Comment: `Merge this frame's ${langKey} TTS audio onto the SHARED animated clip (video.narrationBasic.merge) — same rung, same clip, every language merges onto it independently. durationS = the frame's max-across-4-languages duration (target for silence-padding a shorter track, see this function's header comment).`,
+        Comment: `Merge this frame's ${langKey} TTS audio onto the SHARED animated/video clip (video.${tier}.merge) — same rung, same clip, every language merges onto it independently. durationS = the frame's max-across-4-languages duration (target for silence-padding a shorter track, see this function's header comment).`,
         Parameters: {
-          assetType: 'video', tier: 'narrationBasic', operation: 'merge', product: 'narration', queue: 'background', jobType: 'batch',
-          'initImageUrls.$': 'States.Array($.animateResult.cdnUrl)',
+          assetType: 'video', tier, operation: 'merge', product: 'narration', queue: 'background', jobType: 'batch',
+          'initImageUrls.$': `States.Array(${videoUrlPath})`,
           'audioUrl.$': `$.ttsResults.${ttsFieldKey}.cdnUrl`,
           'durationS.$': '$.maxDuration.value',
           'projectId.$': '$$.Execution.Input.projectId',
@@ -1770,9 +1916,9 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
           Comment: 'TTS x4, one branch per language. Each branch outputs {cdnUrl, durationS} (skipped/failed languages get durationS:0, cdnUrl:\'\').',
           Branches: [
             localizedFrameTtsEnBranch(qmGenerateArn),
-            localizedFrameTtsKokoroBranch(qmGenerateArn, 'es', 'Es', 'Spanish', 'narrationTextEs', 'voiceIdEs'),
-            localizedFrameTtsKokoroBranch(qmGenerateArn, 'pt-BR', 'PtBr', 'Portuguese', 'narrationTextPtBr', 'voiceIdPtBr'),
-            localizedFrameTtsKokoroBranch(qmGenerateArn, 'hi', 'Hi', 'Hindi', 'narrationTextHi', 'voiceIdHi'),
+            localizedFrameTtsKokoroBranch(qmGenerateArn, 'es', 'Es', 'Spanish', 'narrationTextEs', 'voiceIdEs', 'narrationBasic'),
+            localizedFrameTtsKokoroBranch(qmGenerateArn, 'pt-BR', 'PtBr', 'Portuguese', 'narrationTextPtBr', 'voiceIdPtBr', 'narrationBasic'),
+            localizedFrameTtsKokoroBranch(qmGenerateArn, 'hi', 'Hi', 'Hindi', 'narrationTextHi', 'voiceIdHi', 'narrationBasic'),
           ],
           ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
           ResultPath: '$.ttsResults',
@@ -1820,10 +1966,10 @@ function qmFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: str
           Type: 'Parallel',
           Comment: 'Merge x4 — each language\'s TTS audio onto the SAME shared animated clip. A language whose TTS was skipped/failed for this frame skips merge too.',
           Branches: [
-            fourLangMergeBranch(qmGenerateArn, 'En', 'en', 'en'),
-            fourLangMergeBranch(qmGenerateArn, 'Es', 'es', 'es'),
-            fourLangMergeBranch(qmGenerateArn, 'PtBr', 'ptBr', 'pt-BR'),
-            fourLangMergeBranch(qmGenerateArn, 'Hi', 'hi', 'hi'),
+            fourLangMergeBranch(qmGenerateArn, 'En', 'en', 'en', 'narrationBasic', '$.animateResult.cdnUrl'),
+            fourLangMergeBranch(qmGenerateArn, 'Es', 'es', 'es', 'narrationBasic', '$.animateResult.cdnUrl'),
+            fourLangMergeBranch(qmGenerateArn, 'PtBr', 'ptBr', 'pt-BR', 'narrationBasic', '$.animateResult.cdnUrl'),
+            fourLangMergeBranch(qmGenerateArn, 'Hi', 'hi', 'hi', 'narrationBasic', '$.animateResult.cdnUrl'),
           ],
           ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
           ResultPath: '$.mergeResults',
@@ -2093,6 +2239,7 @@ function removeSilenceFourLangBranch(removeSilenceArn: string, fieldKey: string,
 
 function finalizeLocalizedBranch(
   qmGenerateArn: string, fieldKey: string, langCode: string, omissionField: string, transcribeIndex: number,
+  mode: 'basic' | 'premium' = 'basic', targetResolution?: string, timeoutSeconds = 3600,
 ): { StartAt: string; States: Record<string, unknown> } {
   const check = `CheckOmitted${fieldKey}`;
   const omitted = `Omitted${fieldKey}`;
@@ -2114,9 +2261,9 @@ function finalizeLocalizedBranch(
       [omitted]: { Type: 'Pass', Parameters: { language: langCode, failed: true, error: 'PartialFailure' }, End: true },
       [prepare]: {
         Type: 'Pass',
-        Comment: `Same finalizeTaskInput shape PrepareFinalizeBasic builds for English, for ${langCode}.`,
+        Comment: `Same finalizeTaskInput shape PrepareFinalize${mode === 'premium' ? 'Premium' : 'Basic'} builds for English, for ${langCode}.`,
         Parameters: {
-          mode: 'basic',
+          mode,
           'jobId.$': '$.jobId',
           'projectId.$': '$.projectId',
           'projectType.$': '$.projectType',
@@ -2127,6 +2274,7 @@ function finalizeLocalizedBranch(
           'bgmUrl.$': '$.bgmResult.cdnUrl',
           language: langCode,
           'outputKey.$': outputKeyExpr,
+          ...(targetResolution ? { targetResolution } : {}),
           'jwtToken.$': '$.jwtToken',
           'convexEndpoint.$': '$.convexEndpoint',
         },
@@ -2136,7 +2284,7 @@ function finalizeLocalizedBranch(
       [finalize]: {
         Type: 'Task',
         Resource: 'arn:aws:states:::ecs:runTask.sync',
-        Comment: `Finalize on Fargate for ${langCode} — same cluster/task-def as FinalizeVideoBasic. See this function's header comment for the cross-repo outputKey dependency.`,
+        Comment: `Finalize on Fargate for ${langCode} — same cluster/task-def as FinalizeVideo${mode === 'premium' ? 'Premium' : 'Basic'}. See this function's header comment for the cross-repo outputKey dependency.`,
         Parameters: {
           Cluster: 'arn:aws:ecs:us-east-1:929075264324:cluster/storystudio-e2e',
           LaunchType: 'FARGATE',
@@ -2156,7 +2304,7 @@ function finalizeLocalizedBranch(
           },
         },
         ResultPath: `$.finalizeEcs${fieldKey}`,
-        TimeoutSeconds: 3600,
+        TimeoutSeconds: timeoutSeconds,
         Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
         Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.finalizeError${fieldKey}`, Next: finalizeFailed }],
         Next: buildAsset,
@@ -2189,7 +2337,11 @@ function finalizeLocalizedBranch(
  * BuildMergedVoiceResult, all unchanged) reaches the same UpdateStatusApplyingBgm
  * via SetNoLocalizedAssets instead.
  */
-function fourLangConcatFinalizeStates(qmGenerateArn: string, removeSilenceArn: string): Record<string, unknown> {
+function fourLangConcatFinalizeStates(
+  qmGenerateArn: string, removeSilenceArn: string, mode: 'basic' | 'premium' = 'basic',
+): Record<string, unknown> {
+  const targetResolution = mode === 'premium' ? '1080p' : undefined;
+  const finalizeTimeoutSeconds = mode === 'premium' ? 5400 : 3600;
   return {
     BuildLangVideoArrays: {
       Type: 'Parallel',
@@ -2328,14 +2480,337 @@ function fourLangConcatFinalizeStates(qmGenerateArn: string, removeSilenceArn: s
       Type: 'Parallel',
       Comment: 'es/pt-BR/hi finalize fan-out — English is deliberately NOT a branch here (see BuildMergedVoiceResultFourLangEn). Output array (order: es, pt-BR, hi) becomes $.localizedAssets directly, matching the doc\'s array-of-{language,...} shape.',
       Branches: [
-        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 'esOmitted', 1),
-        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 'ptBrOmitted', 2),
-        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 'hiOmitted', 3),
+        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 'esOmitted', 1, mode, targetResolution, finalizeTimeoutSeconds),
+        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 'ptBrOmitted', 2, mode, targetResolution, finalizeTimeoutSeconds),
+        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 'hiOmitted', 3, mode, targetResolution, finalizeTimeoutSeconds),
       ],
       ResultPath: '$.localizedAssets',
       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
       Next: 'UpdateStatusApplyingBgm',
     },
+  };
+}
+
+/**
+ * fourLang per-frame Map for Narration-Premium-QM-New (2026-07-28, porting
+ * Basic's 2026-07-25 redesign — see qmFourLangFrameAssetsMap's header
+ * comment for the shared design). Per frame: image ONCE (Qwen t2i/i2i, or
+ * Qwen-Image-Gen for text-overlay genres) -> TTS x4 in parallel (English via
+ * Qwen design/clone, es/pt-BR via Qwen voice-clone only, Hindi via Kokoro —
+ * Premium's product decision, no design-voice fallback for localized voices)
+ * -> the frame's video duration is the MAX of whichever languages succeeded
+ * -> ONE silent Wan2 i2v clip per frame at that max duration (shared/common
+ * across languages, only the audio differs) -> merge x4 (each language's TTS
+ * audio onto the SAME shared clip) -> text overlay x4 (reused verbatim from
+ * Basic's fourLang — direct Lambda invoke, no tier coupling) -> emit
+ * videoUrls{en,es,ptBr,hi} + per-language failure flags, consumed downstream
+ * by fourLangConcatFinalizeStates()'s all-or-nothing per-language omission
+ * (identical to Basic's — that function is already tier-agnostic there).
+ *
+ * KEY DIFFERENCE from qmFourLangFrameAssetsMap: Wan2 has a 7s max
+ * duration_s (Flux's animate rung does not), so the shared-clip step needs
+ * the same short-clip+concat workaround qmPremiumFrameAssetsMap's
+ * RouteVideoLength/QMGenerateVideoShort/QMConcatVideo already uses for the
+ * single-language flow — just keyed off $.maxDuration.value (max across 4
+ * languages) instead of a single TTS result's durationS.
+ *
+ * MaxConcurrency conservative for the same reason as Basic's fourLang Map
+ * (4 vs the single-language Map's 8): each frame fires up to 4 TTS + up to 2
+ * video calls + 4 merge calls against the same runpod:flux-tts-s2t pool
+ * Premium's own single-language TTS/merge/image calls already share. Wan2
+ * load itself is unchanged (still <=2 Wan2-family calls/frame regardless of
+ * language count, since the clip is shared) — needs live tuning like Basic's
+ * did.
+ */
+function qmPremiumFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: string): object {
+  return {
+    Type: 'Map',
+    Comment: 'Premium fourLang per-frame video via Quartermaster gateway: image once, TTS x4 (en via Qwen design/clone, es/pt-BR via Qwen clone, hi via Kokoro), ONE silent Wan2 clip per frame at the max TTS duration across languages, merge x4 onto the shared clip. Supersedes the old whole-script post-concat localization for fourLang:true Narration-Premium projects.',
+    ItemsPath: '$.frames',
+    MaxConcurrency: 4,
+    ResultPath: '$.videoResults',
+    Iterator: {
+      StartAt: 'NormalizeTextManifestFourLangPremium',
+      States: {
+        NormalizeTextManifestFourLangPremium: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifest is a real string before BuildFrameVideoFourLangPremium references it — same gotcha as Basic\'s NormalizeTextManifestFourLang.',
+          Choices: [{
+            And: [
+              { Variable: '$.textManifest', IsPresent: true },
+              { Variable: '$.textManifest', IsString: true },
+              { Not: { Variable: '$.textManifest', StringEquals: '' } },
+            ],
+            Next: 'NormalizeTextManifestEsFourLangPremium',
+          }],
+          Default: 'SetTextManifestDefaultFourLangPremium',
+        },
+        SetTextManifestDefaultFourLangPremium: { Type: 'Pass', Result: '', ResultPath: '$.textManifest', Next: 'NormalizeTextManifestEsFourLangPremium' },
+        NormalizeTextManifestEsFourLangPremium: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifestEs is a real string before TextOverlayFourLangPremium references it.',
+          Choices: [{
+            And: [{ Variable: '$.textManifestEs', IsPresent: true }, { Variable: '$.textManifestEs', IsString: true }],
+            Next: 'NormalizeTextManifestPtBrFourLangPremium',
+          }],
+          Default: 'SetTextManifestEsDefaultFourLangPremium',
+        },
+        SetTextManifestEsDefaultFourLangPremium: { Type: 'Pass', Result: '', ResultPath: '$.textManifestEs', Next: 'NormalizeTextManifestPtBrFourLangPremium' },
+        NormalizeTextManifestPtBrFourLangPremium: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifestPtBr is a real string before TextOverlayFourLangPremium references it.',
+          Choices: [{
+            And: [{ Variable: '$.textManifestPtBr', IsPresent: true }, { Variable: '$.textManifestPtBr', IsString: true }],
+            Next: 'NormalizeTextManifestHiFourLangPremium',
+          }],
+          Default: 'SetTextManifestPtBrDefaultFourLangPremium',
+        },
+        SetTextManifestPtBrDefaultFourLangPremium: { Type: 'Pass', Result: '', ResultPath: '$.textManifestPtBr', Next: 'NormalizeTextManifestHiFourLangPremium' },
+        NormalizeTextManifestHiFourLangPremium: {
+          Type: 'Choice',
+          Comment: 'Guarantee $.textManifestHi is a real string before TextOverlayFourLangPremium references it.',
+          Choices: [{
+            And: [{ Variable: '$.textManifestHi', IsPresent: true }, { Variable: '$.textManifestHi', IsString: true }],
+            Next: 'RouteImageModelFourLangPremium',
+          }],
+          Default: 'SetTextManifestHiDefaultFourLangPremium',
+        },
+        SetTextManifestHiDefaultFourLangPremium: { Type: 'Pass', Result: '', ResultPath: '$.textManifestHi', Next: 'RouteImageModelFourLangPremium' },
+        RouteImageModelFourLangPremium: {
+          Type: 'Choice',
+          Comment: 'Same imageModel routing rule as qmPremiumFrameAssetsMap\'s RouteImageGen — always a standalone image call for fourLang frames.',
+          Choices: [{
+            Or: [
+              { And: [{ Variable: '$.imageModel', IsPresent: true }, { Variable: '$.imageModel', IsString: true }, { Variable: '$.imageModel', StringEquals: 'ernie' }] },
+              { And: [{ Variable: '$.imageModel', IsPresent: true }, { Variable: '$.imageModel', IsString: true }, { Variable: '$.imageModel', StringEquals: 'qwen-image-gen' }] },
+            ],
+            Next: 'QMGenerateImageExplainerFourLangPremium',
+          }],
+          Default: 'RouteImageI2IFourLangPremium',
+        },
+        RouteImageI2IFourLangPremium: {
+          Type: 'Choice',
+          Choices: [{
+            And: [
+              { Variable: '$.referenceImageUrl', IsPresent: true },
+              { Variable: '$.referenceImageUrl', IsString: true },
+              { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateImageI2IFourLangPremium',
+          }],
+          Default: 'QMGenerateImageT2IFourLangPremium',
+        },
+        QMGenerateImageExplainerFourLangPremium: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Text-to-image via QM (image.explainer.t2i) — same rung/rule as qmPremiumFrameAssetsMap\'s QMGenerateImageExplainer.',
+          Parameters: {
+            assetType: 'image', tier: 'explainer', operation: 't2i', product: 'narration', queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt', 'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'GenerateFourLangTtsPremium',
+        },
+        QMGenerateImageT2IFourLangPremium: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Text-to-image via QM (image.narrationPremium.t2i), standalone (not the single-language flow\'s image/TTS/video/merge steps).',
+          Parameters: {
+            assetType: 'image', tier: 'narrationPremium', operation: 't2i', product: 'narration', queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt', 'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'GenerateFourLangTtsPremium',
+        },
+        QMGenerateImageI2IFourLangPremium: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Image-to-image via QM (image.narrationPremium.i2i), standalone.',
+          Parameters: {
+            assetType: 'image', tier: 'narrationPremium', operation: 'i2i', product: 'narration', queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt', 'initImageUrls.$': 'States.Array($.referenceImageUrl)', 'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'GenerateFourLangTtsPremium',
+        },
+        QMFrameFailedFourLangPremium: {
+          Type: 'Pass',
+          Comment: 'Reached from image gen AND from the TTS/video/merge/overlay Catches below — mirrors Basic\'s QMFrameFailedFourLang exactly (same videoUrls/esFailed/ptBrFailed/hiFailed shape required downstream).',
+          Parameters: {
+            failed: true,
+            error: 'QMFrameFailed',
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            videoUrls: { en: '', es: '', ptBr: '', hi: '' },
+            esFailed: true,
+            ptBrFailed: true,
+            hiFailed: true,
+          },
+          End: true,
+        },
+        GenerateFourLangTtsPremium: {
+          Type: 'Parallel',
+          Comment: 'TTS x4, one branch per language. English: Qwen design/clone. Es/PtBr: Qwen voice-clone only (no design fallback). Hindi: Kokoro (Qwen has no Hindi voices).',
+          Branches: [
+            localizedFrameTtsEnBranchPremium(qmGenerateArn),
+            localizedFrameTtsQwenCloneBranch(qmGenerateArn, 'es', 'Es', 'Spanish', 'narrationTextEs', 'voiceCloneArtifactUrlEs'),
+            localizedFrameTtsQwenCloneBranch(qmGenerateArn, 'pt-BR', 'PtBr', 'Portuguese', 'narrationTextPtBr', 'voiceCloneArtifactUrlPtBr'),
+            localizedFrameTtsKokoroBranch(qmGenerateArn, 'hi', 'Hi', 'Hindi', 'narrationTextHi', 'voiceIdHi', 'narrationPremium'),
+          ],
+          ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
+          ResultPath: '$.ttsResults',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsResultsError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'ComputeMaxDurationStep1Premium',
+        },
+        // Same no-max()-intrinsic pairwise Choice/Pass chain as Basic's fourLang Map.
+        ComputeMaxDurationStep1Premium: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.ttsResults.en.durationS', NumericGreaterThanPath: '$.ttsResults.es.durationS', Next: 'SetMaxDurationStep1EnPremium' }],
+          Default: 'SetMaxDurationStep1EsPremium',
+        },
+        SetMaxDurationStep1EnPremium: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.en.durationS' }, ResultPath: '$.maxDurationStep1', Next: 'ComputeMaxDurationStep2Premium' },
+        SetMaxDurationStep1EsPremium: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.es.durationS' }, ResultPath: '$.maxDurationStep1', Next: 'ComputeMaxDurationStep2Premium' },
+        ComputeMaxDurationStep2Premium: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.maxDurationStep1.value', NumericGreaterThanPath: '$.ttsResults.ptBr.durationS', Next: 'SetMaxDurationStep2PrevPremium' }],
+          Default: 'SetMaxDurationStep2PtBrPremium',
+        },
+        SetMaxDurationStep2PrevPremium: { Type: 'Pass', Parameters: { 'value.$': '$.maxDurationStep1.value' }, ResultPath: '$.maxDurationStep2', Next: 'ComputeMaxDurationStep3Premium' },
+        SetMaxDurationStep2PtBrPremium: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.ptBr.durationS' }, ResultPath: '$.maxDurationStep2', Next: 'ComputeMaxDurationStep3Premium' },
+        ComputeMaxDurationStep3Premium: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.maxDurationStep2.value', NumericGreaterThanPath: '$.ttsResults.hi.durationS', Next: 'SetMaxDurationFinalPrevPremium' }],
+          Default: 'SetMaxDurationFinalHiPremium',
+        },
+        SetMaxDurationFinalPrevPremium: { Type: 'Pass', Parameters: { 'value.$': '$.maxDurationStep2.value' }, ResultPath: '$.maxDuration', Next: 'RouteVideoLengthFourLangPremium' },
+        SetMaxDurationFinalHiPremium: { Type: 'Pass', Parameters: { 'value.$': '$.ttsResults.hi.durationS' }, ResultPath: '$.maxDuration', Next: 'RouteVideoLengthFourLangPremium' },
+        // Wan2's 7s duration_s ceiling (Flux's animate rung has none) — mirrors
+        // qmPremiumFrameAssetsMap's RouteVideoLength/QMGenerateVideoShort/
+        // QMConcatVideo/QMGenerateVideo/UseSingleClipVideo, keyed off the max
+        // TTS duration across all 4 languages instead of a single TTS result.
+        RouteVideoLengthFourLangPremium: {
+          Type: 'Choice',
+          Comment: 'Max TTS duration across all 4 languages > 7s (Wan2\'s max duration_s) -> generate a fixed 5s clip and extend it via concat.',
+          Choices: [{ Variable: '$.maxDuration.value', NumericGreaterThan: 7, Next: 'QMGenerateVideoShortFourLangPremium' }],
+          Default: 'QMGenerateVideoFourLangPremium',
+        },
+        QMGenerateVideoShortFourLangPremium: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Image-to-video via QM (video.narrationPremium.i2v), fixed 5s clip — same workaround as qmPremiumFrameAssetsMap\'s QMGenerateVideoShort, keyed off $.maxDuration.value.',
+          Parameters: {
+            assetType: 'video', tier: 'narrationPremium', operation: 'i2v', product: 'narration', queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'prompt.$': '$.narrationText',
+            durationS: 5,
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.videoResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'QMConcatVideoFourLangPremium',
+        },
+        QMConcatVideoFourLangPremium: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Extend the 5s clip via QM (video.narrationPremium.concat) — duplicates the same clip URL twice (5+5=10s), mirrors qmPremiumFrameAssetsMap\'s QMConcatVideo. merge below trims to the real max-duration length.',
+          Parameters: {
+            assetType: 'video', tier: 'narrationPremium', operation: 'concat', product: 'narration', queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.videoResult.cdnUrl, $.videoResult.cdnUrl)',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.finalVideoResult', TimeoutSeconds: 300, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.concatError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'MergeFourLangAudioPremium',
+        },
+        QMGenerateVideoFourLangPremium: {
+          Type: 'Task', Resource: qmGenerateArn,
+          Comment: 'Image-to-video via QM (video.narrationPremium.i2v) — ONE silent clip per frame, sized to the max TTS duration across all 4 languages (shared/common across languages). Mirrors Basic\'s QMGenerateAnimateFourLang but for Wan2.',
+          Parameters: {
+            assetType: 'video', tier: 'narrationPremium', operation: 'i2v', product: 'narration', queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'prompt.$': '$.narrationText',
+            'durationS.$': '$.maxDuration.value',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId', 'frameId.$': '$.frameId', 'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.videoResult', TimeoutSeconds: 920, Retry: STD_RETRY,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'UseSingleClipVideoFourLangPremium',
+        },
+        UseSingleClipVideoFourLangPremium: {
+          Type: 'Pass',
+          Comment: 'Max TTS duration across all 4 languages <= 7s — the single Wan2 clip already covers it, no extension needed.',
+          Parameters: { 'cdnUrl.$': '$.videoResult.cdnUrl' },
+          ResultPath: '$.finalVideoResult',
+          Next: 'MergeFourLangAudioPremium',
+        },
+        MergeFourLangAudioPremium: {
+          Type: 'Parallel',
+          Comment: 'Merge x4 — each language\'s TTS audio onto the SAME shared Wan2 clip (video.narrationPremium.merge → aliases the QM-owned Lambda merge, correct padding). A language whose TTS was skipped/failed for this frame skips merge too.',
+          Branches: [
+            fourLangMergeBranch(qmGenerateArn, 'En', 'en', 'en', 'narrationPremium', '$.finalVideoResult.cdnUrl'),
+            fourLangMergeBranch(qmGenerateArn, 'Es', 'es', 'es', 'narrationPremium', '$.finalVideoResult.cdnUrl'),
+            fourLangMergeBranch(qmGenerateArn, 'PtBr', 'ptBr', 'pt-BR', 'narrationPremium', '$.finalVideoResult.cdnUrl'),
+            fourLangMergeBranch(qmGenerateArn, 'Hi', 'hi', 'hi', 'narrationPremium', '$.finalVideoResult.cdnUrl'),
+          ],
+          ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
+          ResultPath: '$.mergeResults',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeResultsError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'BuildFrameVideoFourLangPremium',
+        },
+        BuildFrameVideoFourLangPremium: {
+          Type: 'Pass',
+          Comment: 'Emit the per-frame multi-language item fourLangConcatFinalizeStates() consumes — same shape Basic\'s BuildFrameVideoFourLang emits.',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'duration.$': '$.maxDuration.value',
+            'textManifest.$': '$.textManifest',
+            'textManifestEs.$': '$.textManifestEs',
+            'textManifestPtBr.$': '$.textManifestPtBr',
+            'textManifestHi.$': '$.textManifestHi',
+            videoUrls: {
+              'en.$': '$.mergeResults.en.cdnUrl',
+              'es.$': '$.mergeResults.es.cdnUrl',
+              'ptBr.$': '$.mergeResults.ptBr.cdnUrl',
+              'hi.$': '$.mergeResults.hi.cdnUrl',
+            },
+            'esFailed.$': '$.mergeResults.es.failed',
+            'ptBrFailed.$': '$.mergeResults.ptBr.failed',
+            'hiFailed.$': '$.mergeResults.hi.failed',
+          },
+          Next: 'TextOverlayFourLangPremium',
+        },
+        TextOverlayFourLangPremium: {
+          Type: 'Parallel',
+          Comment: 'Text overlay x4 — reuses fourLangTextOverlayBranch verbatim (direct Remotion Lambda invoke, no tier coupling), same as Basic\'s TextOverlayFourLang.',
+          Branches: [
+            fourLangTextOverlayBranch(remotionOverlayArn, 'En', 'en', 'textManifest'),
+            fourLangTextOverlayBranch(remotionOverlayArn, 'Es', 'es', 'textManifestEs'),
+            fourLangTextOverlayBranch(remotionOverlayArn, 'PtBr', 'ptBr', 'textManifestPtBr'),
+            fourLangTextOverlayBranch(remotionOverlayArn, 'Hi', 'hi', 'textManifestHi'),
+          ],
+          ResultSelector: { 'en.$': '$[0].cdnUrl', 'es.$': '$[1].cdnUrl', 'ptBr.$': '$[2].cdnUrl', 'hi.$': '$[3].cdnUrl' },
+          ResultPath: '$.overlaidVideoUrls',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.overlayResultsError', Next: 'QMFrameFailedFourLangPremium' }],
+          Next: 'FinalizeFrameVideoFourLangPremium',
+        },
+        FinalizeFrameVideoFourLangPremium: {
+          Type: 'Pass',
+          Comment: 'Reshape TextOverlayFourLangPremium\'s Parallel result back into the per-frame item fourLangConcatFinalizeStates() consumes.',
+          Parameters: {
+            'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber', 'duration.$': '$.duration',
+            'videoUrls.$': '$.overlaidVideoUrls',
+            'esFailed.$': '$.esFailed', 'ptBrFailed.$': '$.ptBrFailed', 'hiFailed.$': '$.hiFailed',
+          },
+          End: true,
+        },
+      },
+    },
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'DropFrameData',
   };
 }
 
@@ -2367,43 +2842,30 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   def.States.GenerateImages.Next = 'RouteBGM';
   Object.assign(def.States, bgmStates(qmGenerateArn, 'narrationPremium'));
 
-  // Neutralize the fourLang PER-FRAME full-video pipeline inherited from the
-  // Basic clone (2026-07-25, storystudio-4lang-video-pipeline-handoff.md) —
-  // that flow is Basic-only for now (Premium is an explicit followup once
-  // Basic is proven), and its per-frame Map/catalog rungs are Basic-tiered
-  // (image.narrationBasic.*, voice.narrationBasic.*, video.narrationBasic.*),
-  // wrong for a Premium project. Without this, a Premium execution with
-  // fourLang:true would silently route through Basic's rungs via the
-  // inherited RouteFrameGeneration/RouteConcatFourLang Choices. Delete the
-  // inherited states outright (rather than leaving them unreferenced dead
-  // weight — every added sibling here compounds this file's overall ASL
-  // definition size) and repoint straight back to the pre-fourLang-per-frame
-  // wiring, restoring Premium's existing whole-script localizationStates()
-  // flow exactly as it was before this feature existed.
-  delete def.States.RouteFrameGeneration;
-  delete def.States.GenerateImagesFourLang;
-  delete def.States.RouteConcatFourLang;
-  delete def.States.BuildLangVideoArrays;
-  delete def.States.ComputeLanguageOmissions;
-  delete def.States.ConcatenateVideosFourLang;
-  delete def.States.RemoveSilenceFourLang;
-  delete def.States.PrepareTranscribeFourLang;
-  delete def.States.TranscribeAudioFourLang;
-  delete def.States.BuildMergedVoiceResultFourLangEn;
-  delete def.States.FinalizeLocalizedVideos;
-  delete def.States.SetNoLocalizedAssets;
-  def.States.UpdateStatusGeneratingImages.Next = 'GenerateImages';
-  def.States.UpdateStatusGeneratingImages.Catch[0].Next = 'GenerateImages';
-  def.States.UpdateStatusConcatenating.Next = 'ConcatenateVideos';
+  // fourLang PER-FRAME full-video pipeline (2026-07-28, porting Basic's
+  // 2026-07-25 redesign to Premium's primitives — Qwen image, Qwen TTS
+  // design/clone, Wan2 i2v, generic merge). Swap the inherited Basic-tiered
+  // fourLang Map for Premium's own (qmPremiumFourLangFrameAssetsMap), and
+  // re-tier fourLangConcatFinalizeStates' finalize fan-out to Premium
+  // (1080p, longer Fargate timeout, mode:'premium') — everything else that
+  // function returns (BuildLangVideoArrays/ComputeLanguageOmissions/
+  // ConcatenateVideosFourLang/RemoveSilenceFourLang/PrepareTranscribeFourLang/
+  // TranscribeAudioFourLang/BuildMergedVoiceResultFourLangEn) is tier-agnostic
+  // already, reused verbatim. RouteFrameGeneration/RouteConcatFourLang (both
+  // inherited from the Basic clone) are also tier-agnostic — they only
+  // branch on $.fourLang — so they're left as-is, not deleted.
+  def.States.GenerateImagesFourLang = qmPremiumFourLangFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
+  def.States.GenerateImagesFourLang.Next = 'RouteBGM';
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn, 'premium'));
 
-  // Same re-tier for the cloned 4lang localization states — the clone above
-  // inherited buildQmNewDefinition's tier:'narrationBasic' localized-TTS
-  // states (voice.narrationBasic.ttsLocalized{Qwen,Kokoro}); overwrite with
-  // the narrationPremium-tiered versions for correct billing/audit
-  // attribution (same physical rungs either way — mirrors the BGM re-tier
-  // immediately above).
-  Object.assign(def.States, localizationStates(qmGenerateArn, 'narrationPremium', removeSilenceArn));
-  def.States.BuildMergedVoiceResult.Next = 'RouteLocalization';
+  // No whole-script localizationStates() call for Premium anymore: once the
+  // per-frame fourLang path above is wired in, RouteFrameGeneration/
+  // RouteConcatFourLang divert fourLang:true away from GenerateImages/
+  // ConcatenateVideos/BuildMergedVoiceResult before they'd ever reach
+  // RouteLocalization — so the whole-script flow is genuinely unreachable
+  // for Premium now, exactly as it already is for Basic (buildQmNewDefinition
+  // never calls localizationStates() either). BuildMergedVoiceResult.Next
+  // stays 'SetNoLocalizedAssets' as inherited from the Basic clone.
 
   // Finalize becomes Premium-flavored (1080p upscale, longer Fargate timeout),
   // renaming the Basic finalize states to match buildPremiumDefinition's own
