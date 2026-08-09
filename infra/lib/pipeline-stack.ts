@@ -4449,10 +4449,14 @@ function overrideDialogueValidateInput(
     Choices: [{ And: conditions, Next: successNext }],
     Default: 'FailValidation',
   };
-  // CheckValidation is now unreferenced (ValidateInput routes around it
-  // directly) but left in place rather than deleted — same reasoning as the
-  // fourLang scaffolding above: its own Next/Default targets still resolve,
-  // so it's harmless dead JSON, and deleting it risks missing a reference.
+  // CheckValidation is now truly unreachable (ValidateInput routes around it
+  // directly, and nothing else points to it) — unlike the fourLang
+  // scaffolding elsewhere in these builders, which stays reachable through
+  // other paths. AWS's own ASL validator rejects orphaned states at deploy
+  // time ('MISSING_TRANSITION_TARGET: State "CheckValidation" is not
+  // reachable', confirmed against the live API on the first deploy attempt
+  // of this fix), so it must be deleted, not just left unreferenced.
+  delete def.States.CheckValidation;
   def.States.FailValidation.Parameters.error = {
     Error: 'InvalidInput',
     Cause: `Dialogue input missing required fields: ${[...requireAllOf, ...(requireAnyOf ? [requireAnyOf.join(' or ')] : [])].join(', ')}`,
