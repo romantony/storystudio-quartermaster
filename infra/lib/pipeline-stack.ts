@@ -4,7 +4,13 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as codebuild from 'aws-cdk-lib/aws-codebuild';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as path from 'path';
 
 interface PipelineStackProps extends StackProps {
@@ -237,6 +243,351 @@ export class PipelineStack extends Stack {
       action: 'lambda:InvokeFunction',
     });
 
+    // ── Concat-and-trim payload uploader ─────────────────────────────────────
+    // `ecs:runTask`'s Overrides field has a hard 8192-byte limit. ConcatAndTrim
+    // used to inline its entire per-frame video-URL array as JSON straight into
+    // the ContainerOverrides environment — fine at small frame counts, but a
+    // real 69-frame fourLang test hit `ECS.InvalidParameterException:
+    // Container Overrides length must be at most 8192` on all 4 language
+    // branches simultaneously (every ecs:runTask call rejected synchronously,
+    // before any container ever launched — see qm-concat-trim-ecs-migration
+    // memory). This Lambda writes the payload to S3 first so only a short key
+    // crosses the ContainerOverrides boundary; the task fetches the real
+    // payload from S3 instead of reading it from an env var.
+    const uploadPayloadFn = new nodejs.NodejsFunction(this, 'UploadPayloadFunction', {
+      functionName: 'QM-upload-payload',
+      entry: path.join(__dirname, '../../src/handlers/upload-payload.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(60),
+      memorySize: 256,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+      environment: {
+        OUTPUT_BUCKET: removeSilenceBucket.bucketName,
+      },
+    });
+    removeSilenceBucket.grantPut(uploadPayloadFn);
+    uploadPayloadFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
+    // ── Concat-and-trim ECS Fargate task ─────────────────────────────────────
+    // Replaces two things that used to be separate hops through S3/R2 for
+    // the same file: per-frame video concat (previously the external,
+    // storystudio-unified-owned E2E-video-concat-premium Lambda — ported
+    // faithfully from its actually-deployed source, see
+    // infra/docker/concat-and-trim/index.ts's header comment) and post-concat
+    // silence removal (previously QM-remove-silence above, which failed
+    // systematically on large projects — 12/12 real attempts on a 69-frame
+    // project, split between Runtime.OutOfMemory at its 2048MB ceiling and
+    // States.Timeout at 600s). Fargate has neither ceiling.
+    //
+    // Built via CodeBuild -> ECR, not CDK's local-Docker fromAsset: the S3
+    // asset below is just a zip+upload of the build context (no local Docker
+    // needed for that step), CodeBuild's own privileged environment runs the
+    // actual `docker build`/`docker push`. Two-phase, matching every other
+    // deploy this session's explicit-verify-each-step posture: `cdk deploy`
+    // creates the (empty) repo + task def referencing `:latest` by URI; a
+    // manual `aws codebuild start-build` (polled to SUCCEEDED) actually
+    // publishes the image before any task launch can succeed.
+    const concatTrimRepo = new ecr.Repository(this, 'ConcatAndTrimRepo', {
+      repositoryName: 'qm-concat-and-trim',
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    const concatTrimBuildContext = new s3assets.Asset(this, 'ConcatAndTrimBuildContext', {
+      path: path.join(__dirname, '../docker/concat-and-trim'),
+    });
+
+    const concatTrimBuildProject = new codebuild.Project(this, 'ConcatAndTrimBuildProject', {
+      projectName: 'qm-concat-and-trim-build',
+      source: codebuild.Source.s3({
+        bucket: concatTrimBuildContext.bucket,
+        path: concatTrimBuildContext.s3ObjectKey,
+      }),
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+        privileged: true,
+      },
+      environmentVariables: {
+        REPOSITORY_URI: { value: concatTrimRepo.repositoryUri },
+        AWS_ACCOUNT_ID: { value: this.account },
+        AWS_DEFAULT_REGION: { value: this.region },
+      },
+      buildSpec: codebuild.BuildSpec.fromSourceFilename('buildspec.yml'),
+    });
+    concatTrimRepo.grantPullPush(concatTrimBuildProject);
+
+    // Dedicated, narrowly-scoped task role (S3 write to
+    // qm-remove-silence-output only) — E2E-StepFunction-Role's iam:PassRole
+    // allowlist needs this exact ARN added (done once, manually via AWS
+    // CLI — see verification notes; that role is shared across ~15 other
+    // Lambdas/pipelines, not something to fold into a routine `cdk deploy`
+    // whose blast radius should stay scoped to QM's own stack). Explicit
+    // roleName so the ARN is known/predictable before that manual step.
+    const concatTrimTaskRole = new iam.Role(this, 'ConcatAndTrimTaskRole', {
+      roleName: 'qm-concat-and-trim-task-role',
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+    });
+    removeSilenceBucket.grantPut(concatTrimTaskRole);
+    // Reads its own payload back from S3 now (PAYLOAD_S3_KEY workaround above).
+    removeSilenceBucket.grantRead(concatTrimTaskRole);
+
+    // Reuse the existing, already-broadly-permissioned execution role
+    // (AmazonECSTaskExecutionRolePolicy — confirmed via `aws iam
+    // list-attached-role-policies` to already grant account-wide ECR pull +
+    // CloudWatch Logs write) rather than creating a new one.
+    // `mutable:false` stops CDK's automatic `grantPull`/logging grants from
+    // trying to attach yet another policy to this shared role — unnecessary
+    // (already covered by the managed policy) and avoids touching a role
+    // used by resources outside this stack.
+    const concatTrimExecutionRole = iam.Role.fromRoleName(this, 'ConcatAndTrimExecutionRole', 'ecsTaskExecutionRole', { mutable: false });
+
+    // Default VPC, public subnets, no NAT gateway — the task only needs
+    // outbound internet (download frame clips, write to S3) and takes no
+    // inbound traffic at all (invoked via ecs:runTask, not a service).
+    // Looked up (and passed explicitly to the Cluster below) rather than
+    // left implicit — an ecs.Cluster with no `vpc` prop auto-creates its
+    // own brand-new VPC (2 NAT gateways, private subnets, real ongoing
+    // cost), which is not what we want.
+    const concatTrimVpc = ec2.Vpc.fromLookup(this, 'ConcatAndTrimVpc', { isDefault: true });
+    const concatTrimSg = new ec2.SecurityGroup(this, 'ConcatAndTrimSg', {
+      vpc: concatTrimVpc,
+      description: 'QM concat-and-trim Fargate task - outbound only',
+      allowAllOutbound: true,
+    });
+    const concatTrimSubnetIds = concatTrimVpc.publicSubnets.map(s => s.subnetId);
+
+    const concatTrimCluster = new ecs.Cluster(this, 'ConcatAndTrimCluster', {
+      clusterName: 'qm-concat-and-trim',
+      vpc: concatTrimVpc,
+    });
+
+    const concatTrimLogGroup = new logs.LogGroup(this, 'ConcatAndTrimLogGroup', {
+      logGroupName: '/qm/concat-and-trim',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    // Sizing: 8 vCPU / 32GB (bumped 2026-07-29 from the original 4 vCPU/16GB
+    // floor — the first real fourLang test, post ContainerOverrides fix,
+    // measured concat+trim taking 10-12 min per language on 4 vCPU; this is
+    // CPU-bound work (libx264 encode across a filter_complex normalize pass
+    // over up to 69 source clips, then a second silence-cut re-encode pass),
+    // so doubling vCPU is the direct lever — libx264 parallelizes well
+    // across cores, unlike I/O-bound work where more vCPU wouldn't help.
+    // Memory doubled alongside it for headroom, not because memory was the
+    // constraint (16GB was never close to full on a 69-frame project).
+    // 50GB ephemeral storage (Fargate default 20GB already exceeds Lambda's
+    // 10GB hard ceiling; going further gives real margin over large-project
+    // disk pressure without needing the S3-streaming workaround the
+    // external Lambda needed under Lambda's tighter limits).
+    const concatTrimTaskDef = new ecs.FargateTaskDefinition(this, 'ConcatAndTrimTaskDef', {
+      family: 'qm-concat-and-trim',
+      cpu: 8192,
+      memoryLimitMiB: 32768,
+      ephemeralStorageGiB: 50,
+      taskRole: concatTrimTaskRole,
+      executionRole: concatTrimExecutionRole,
+    });
+    concatTrimTaskDef.addContainer('concat-and-trim', {
+      containerName: 'concat-and-trim',
+      image: ecs.ContainerImage.fromEcrRepository(concatTrimRepo, 'latest'),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'concat-and-trim', logGroup: concatTrimLogGroup }),
+      environment: {
+        OUTPUT_BUCKET: removeSilenceBucket.bucketName,
+      },
+    });
+
+    // ── Dialogue Basic / Dialogue Premium — new Lambdas + Fargate task
+    // (storystudio-dialogue-qm-sfn-handoff.md) ───────────────────────────────
+
+    // QM-build-turn-tracks — pure text/data transform (Dialogue Premium).
+    const buildTurnTracksFn = new nodejs.NodejsFunction(this, 'BuildTurnTracksFunction', {
+      functionName: 'QM-build-turn-tracks',
+      entry: path.join(__dirname, '../../src/handlers/build-turn-tracks.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(30),
+      memorySize: 256,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+    });
+    buildTurnTracksFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
+    // QM-trim-clip — plain ffmpeg -t trim (Dialogue Premium's
+    // TrimToTrackLength + Dialogue Basic's ReconcileSegmentTiming trim leg).
+    const trimClipFn = new nodejs.NodejsFunction(this, 'TrimClipFunction', {
+      functionName: 'QM-trim-clip',
+      entry: path.join(__dirname, '../../src/handlers/trim-clip.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(120),
+      memorySize: 1024,
+      ephemeralStorageSize: Size.mebibytes(1024),
+      bundling: { minify: true, sourceMap: false, externalModules: [], nodeModules: ['@ffmpeg-installer/ffmpeg'] },
+      environment: { OUTPUT_BUCKET: removeSilenceBucket.bucketName },
+    });
+    removeSilenceBucket.grantPut(trimClipFn);
+    trimClipFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
+    // QM-reconcile-segment-timing — Dialogue Basic only (§4.5).
+    const reconcileSegmentTimingFn = new nodejs.NodejsFunction(this, 'ReconcileSegmentTimingFunction', {
+      functionName: 'QM-reconcile-segment-timing',
+      entry: path.join(__dirname, '../../src/handlers/reconcile-segment-timing.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(600),
+      memorySize: 1024,
+      ephemeralStorageSize: Size.mebibytes(2048),
+      bundling: { minify: true, sourceMap: false, externalModules: [], nodeModules: ['@ffmpeg-installer/ffmpeg'] },
+      environment: { OUTPUT_BUCKET: removeSilenceBucket.bucketName },
+    });
+    removeSilenceBucket.grantPut(reconcileSegmentTimingFn);
+    reconcileSegmentTimingFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
+    // QM-append-tail-beat — Dialogue Premium only (§7.3).
+    const appendTailBeatFn = new nodejs.NodejsFunction(this, 'AppendTailBeatFunction', {
+      functionName: 'QM-append-tail-beat',
+      entry: path.join(__dirname, '../../src/handlers/append-tail-beat.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(120),
+      memorySize: 1024,
+      ephemeralStorageSize: Size.mebibytes(1024),
+      bundling: { minify: true, sourceMap: false, externalModules: [], nodeModules: ['@ffmpeg-installer/ffmpeg'] },
+      environment: { OUTPUT_BUCKET: removeSilenceBucket.bucketName },
+    });
+    removeSilenceBucket.grantPut(appendTailBeatFn);
+    appendTailBeatFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
+    // QM-build-ambience-bed-specs — Dialogue Premium only (§7.7). Pure JS
+    // grouping/summing, no ffmpeg.
+    const buildAmbienceBedSpecsFn = new nodejs.NodejsFunction(this, 'BuildAmbienceBedSpecsFunction', {
+      functionName: 'QM-build-ambience-bed-specs',
+      entry: path.join(__dirname, '../../src/handlers/build-ambience-bed-specs.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(30),
+      memorySize: 256,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+    });
+    buildAmbienceBedSpecsFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
+    // QM-fetch-shots-manifest — Dialogue Premium only (§7.2's shotsManifestUrl fallback).
+    const fetchShotsManifestFn = new nodejs.NodejsFunction(this, 'FetchShotsManifestFunction', {
+      functionName: 'QM-fetch-shots-manifest',
+      entry: path.join(__dirname, '../../src/handlers/fetch-shots-manifest.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: Duration.seconds(60),
+      memorySize: 256,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+    });
+    fetchShotsManifestFn.addPermission('E2ESfnInvoke', {
+      principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
+      action: 'lambda:InvokeFunction',
+    });
+
+    // ── qm-dialogue-mix ECS Fargate task (PiP composite + ambience-bed mix)
+    // ─────────────────────────────────────────────────────────────────────
+    // Same CodeBuild -> ECR pattern as concat-and-trim above — the doc's own
+    // named fallback (§3.4/§10 Q3) for "inside finalize," since e2e-finalize
+    // isn't part of this repo (only referenced by ARN, on the storystudio-e2e
+    // cluster). One task family, two ffmpeg recipes selected by a `mode`
+    // field in its payload (infra/docker/dialogue-mix/index.ts) — reduces
+    // infra footprint (one ECR repo/task-def/CodeBuild pipeline) the same way
+    // concat-and-trim's own trimSilence on/off branch does.
+    const dialogueMixRepo = new ecr.Repository(this, 'DialogueMixRepo', {
+      repositoryName: 'qm-dialogue-mix',
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    const dialogueMixBuildContext = new s3assets.Asset(this, 'DialogueMixBuildContext', {
+      path: path.join(__dirname, '../docker/dialogue-mix'),
+    });
+
+    const dialogueMixBuildProject = new codebuild.Project(this, 'DialogueMixBuildProject', {
+      projectName: 'qm-dialogue-mix-build',
+      source: codebuild.Source.s3({
+        bucket: dialogueMixBuildContext.bucket,
+        path: dialogueMixBuildContext.s3ObjectKey,
+      }),
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+        privileged: true,
+      },
+      environmentVariables: {
+        REPOSITORY_URI: { value: dialogueMixRepo.repositoryUri },
+        AWS_ACCOUNT_ID: { value: this.account },
+        AWS_DEFAULT_REGION: { value: this.region },
+      },
+      buildSpec: codebuild.BuildSpec.fromSourceFilename('buildspec.yml'),
+    });
+    dialogueMixRepo.grantPullPush(dialogueMixBuildProject);
+
+    const dialogueMixTaskRole = new iam.Role(this, 'DialogueMixTaskRole', {
+      roleName: 'qm-dialogue-mix-task-role',
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+    });
+    removeSilenceBucket.grantPut(dialogueMixTaskRole);
+    removeSilenceBucket.grantRead(dialogueMixTaskRole);
+
+    const dialogueMixExecutionRole = iam.Role.fromRoleName(this, 'DialogueMixExecutionRole', 'ecsTaskExecutionRole', { mutable: false });
+
+    const dialogueMixSg = new ec2.SecurityGroup(this, 'DialogueMixSg', {
+      vpc: concatTrimVpc,
+      description: 'QM dialogue-mix Fargate task - outbound only',
+      allowAllOutbound: true,
+    });
+
+    const dialogueMixCluster = new ecs.Cluster(this, 'DialogueMixCluster', {
+      clusterName: 'qm-dialogue-mix',
+      vpc: concatTrimVpc,
+    });
+
+    const dialogueMixLogGroup = new logs.LogGroup(this, 'DialogueMixLogGroup', {
+      logGroupName: '/qm/dialogue-mix',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    // Same sizing rationale as concat-and-trim: CPU-bound filter_complex
+    // work (multi-input overlay/geq/boxblur for the composite, acrossfade/
+    // amix for the ambience mix), libx264 encode parallelizes well across
+    // cores.
+    const dialogueMixTaskDef = new ecs.FargateTaskDefinition(this, 'DialogueMixTaskDef', {
+      family: 'qm-dialogue-mix',
+      cpu: 4096,
+      memoryLimitMiB: 16384,
+      ephemeralStorageGiB: 30,
+      taskRole: dialogueMixTaskRole,
+      executionRole: dialogueMixExecutionRole,
+    });
+    dialogueMixTaskDef.addContainer('dialogue-mix', {
+      containerName: 'dialogue-mix',
+      image: ecs.ContainerImage.fromEcrRepository(dialogueMixRepo, 'latest'),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'dialogue-mix', logGroup: dialogueMixLogGroup }),
+      environment: {
+        OUTPUT_BUCKET: removeSilenceBucket.bucketName,
+      },
+    });
+
     // ── State machine definition ─────────────────────────────────────────────
     const brokerArn = brokerFn.functionArn;
 
@@ -281,7 +632,17 @@ export class PipelineStack extends Stack {
     // generated through the Quartermaster gateway (QM-generate). Separate
     // machine so we can validate the gateway end-to-end without altering
     // Basic-QM/Premium-QM.
-    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn);
+    const concatTrimEcsConfig: ConcatTrimEcsConfig = {
+      clusterArn: concatTrimCluster.clusterArn,
+      taskDefinitionArn: concatTrimTaskDef.taskDefinitionArn,
+      containerName: 'concat-and-trim',
+      subnetIds: concatTrimSubnetIds,
+      securityGroupId: concatTrimSg.securityGroupId,
+      outputBucket: removeSilenceBucket.bucketName,
+      uploadPayloadArn: uploadPayloadFn.functionArn,
+    };
+
+    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn, concatTrimEcsConfig);
 
     const qmNewStateMachine = new sfn.CfnStateMachine(this, 'QMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
@@ -298,7 +659,7 @@ export class PipelineStack extends Stack {
     // (Qwen voice-design) → Wan2 i2v → merge, all through the Quartermaster
     // gateway. Finalize is Premium-flavored (1080p upscale), mirroring
     // buildPremiumDefinition's FinalizeVideoPremium exactly.
-    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn);
+    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn, concatTrimEcsConfig);
 
     const narrationPremiumQmNewStateMachine = new sfn.CfnStateMachine(this, 'NarrationPremiumQMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Premium-QM-New',
@@ -309,6 +670,57 @@ export class PipelineStack extends Stack {
     });
 
     new CfnOutput(this, 'NarrationPremiumQMNewStateMachineArn', { value: narrationPremiumQmNewStateMachine.attrArn });
+
+    // ── Dialogue-Basic-QM-New pipeline ───────────────────────────────────────
+    const dialogueMixEcsConfig: DialogueMixEcsConfig = {
+      clusterArn: dialogueMixCluster.clusterArn,
+      taskDefinitionArn: dialogueMixTaskDef.taskDefinitionArn,
+      containerName: 'dialogue-mix',
+      subnetIds: concatTrimSubnetIds,
+      securityGroupId: dialogueMixSg.securityGroupId,
+      outputBucket: removeSilenceBucket.bucketName,
+      uploadPayloadArn: uploadPayloadFn.functionArn,
+    };
+
+    const dialogueBasicQmNewDefinition = buildDialogueBasicQmNewDefinition(
+      qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn,
+      concatTrimEcsConfig, dialogueMixEcsConfig, reconcileSegmentTimingFn.functionArn,
+    );
+
+    const dialogueBasicQmNewStateMachine = new sfn.CfnStateMachine(this, 'DialogueBasicQMNewPipeline', {
+      stateMachineName: 'E2E-VideoGenerationPipeline-Dialogue-Basic-QM-New',
+      stateMachineType: 'STANDARD',
+      roleArn: sfnRole.roleArn,
+      definitionString: JSON.stringify(dialogueBasicQmNewDefinition),
+      tags: [{ key: 'batchjob', value: 'true' }, { key: 'qmGateway', value: 'true' }],
+    });
+
+    new CfnOutput(this, 'DialogueBasicQMNewStateMachineArn', { value: dialogueBasicQmNewStateMachine.attrArn });
+
+    // ── Dialogue-Premium-QM-New pipeline ─────────────────────────────────────
+    const dialoguePremiumQmNewDefinition = buildDialoguePremiumQmNewDefinition({
+      qmGenerateArn: qmGenerateFn.functionArn,
+      brokerArn,
+      shortsTriggerArn: shortsTriggerFn.functionArn,
+      remotionOverlayArn: remotionOverlayFn.functionArn,
+      concatTrimEcs: concatTrimEcsConfig,
+      dialogueMixEcs: dialogueMixEcsConfig,
+      buildTurnTracksArn: buildTurnTracksFn.functionArn,
+      trimClipArn: trimClipFn.functionArn,
+      appendTailBeatArn: appendTailBeatFn.functionArn,
+      buildAmbienceBedSpecsArn: buildAmbienceBedSpecsFn.functionArn,
+      fetchShotsManifestArn: fetchShotsManifestFn.functionArn,
+    });
+
+    const dialoguePremiumQmNewStateMachine = new sfn.CfnStateMachine(this, 'DialoguePremiumQMNewPipeline', {
+      stateMachineName: 'E2E-VideoGenerationPipeline-Dialogue-Premium-QM-New',
+      stateMachineType: 'STANDARD',
+      roleArn: sfnRole.roleArn,
+      definitionString: JSON.stringify(dialoguePremiumQmNewDefinition),
+      tags: [{ key: 'batchjob', value: 'true' }, { key: 'qmGateway', value: 'true' }],
+    });
+
+    new CfnOutput(this, 'DialoguePremiumQMNewStateMachineArn', { value: dialoguePremiumQmNewStateMachine.attrArn });
   }
 }
 
@@ -321,7 +733,7 @@ export class PipelineStack extends Stack {
 // that Map, replacing it removes every broker reference — the cloned brokerArn
 // never survives into the QM-new definition.
 // ---------------------------------------------------------------------------
-function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string): object {
+function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string, concatTrimEcs: ConcatTrimEcsConfig): object {
   const def = JSON.parse(JSON.stringify(buildDefinition(brokerArn))) as {
     Comment: string;
     States: Record<string, any>;
@@ -508,7 +920,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
     }],
     Default: 'ConcatenateVideos',
   };
-  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn, 'basic', shortsTriggerArn));
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, concatTrimEcs, 'basic', shortsTriggerArn));
   def.States.BuildMergedVoiceResult.Next = 'SetNoLocalizedAssets';
   def.States.SetNoLocalizedAssets = {
     Type: 'Pass',
@@ -517,6 +929,88 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
     ResultPath: '$.localizedAssets',
     Next: 'UpdateStatusApplyingBgm',
   };
+
+  // Plain non-fourLang concat, moved off the external E2E-video-concat-premium
+  // Lambda onto the same QM-owned Fargate task the fourLang branches use
+  // (concatAndTrimFourLangBranch), trimSilence:false — this path never had a
+  // silence-removal step and this change doesn't add one (would be scope
+  // creep beyond "replace concat"), same {videoUrl,audioUrl} output shape
+  // and same output key convention as before, so TranscribeAudio/
+  // BuildMergedVoiceResult downstream need zero changes. Inherited from
+  // buildDefinition's own clone (the legacy Basic-QM pipeline keeps its own
+  // unmodified copy, calling the external Lambda exactly as it did before —
+  // untouched by this whole session's work) — overridden here the same way
+  // GenerateImages/RouteFrameGeneration etc. already are.
+  {
+    const concatVideoUrlExpr = "States.Format('https://" + concatTrimEcs.outputBucket + ".s3.us-east-1.amazonaws.com/projects/{}/videos/concatenated.mp4', $.projectId)";
+    const concatAudioUrlExpr = "States.Format('https://" + concatTrimEcs.outputBucket + ".s3.us-east-1.amazonaws.com/projects/{}/videos/concatenated.wav', $.projectId)";
+    def.States.ConcatenateVideos = {
+      Type: 'Pass',
+      Comment: 'Build the concat-and-trim container payload (trimSilence:false).',
+      Parameters: {
+        'videos.$': '$.videoResults',
+        'aspectRatio.$': '$.aspectRatio',
+        'outputKey.$': "States.Format('projects/{}/videos/concatenated.mp4', $.projectId)",
+        'audioOutputKey.$': "States.Format('projects/{}/videos/concatenated.wav', $.projectId)",
+        trimSilence: false,
+      },
+      ResultPath: '$.concatPayload',
+      Next: 'UploadConcatPayload',
+    };
+    def.States.UploadConcatPayload = {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::lambda:invoke',
+      Comment: 'ecs:runTask\'s ContainerOverrides has a hard 8192-byte limit — inlining the full per-frame video-URL array there breaks past roughly 40+ frames. Upload the payload to S3 here and pass only the short key across that boundary.',
+      Parameters: {
+        FunctionName: concatTrimEcs.uploadPayloadArn,
+        Payload: {
+          'key.$': "States.Format('projects/{}/payloads/concat.json', $.projectId)",
+          'body.$': 'States.JsonToString($.concatPayload)',
+        },
+      },
+      ResultSelector: { 'key.$': '$.Payload.key' },
+      ResultPath: '$.concatPayloadUpload',
+      TimeoutSeconds: 60,
+      Retry: [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: 'ConcatenateVideosTask',
+    };
+    def.States.ConcatenateVideosTask = {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::ecs:runTask.sync',
+      Comment: 'Concat all frame videos into one, on QM\'s own Fargate task — no Lambda timeout/memory ceiling.',
+      Parameters: {
+        Cluster: concatTrimEcs.clusterArn,
+        TaskDefinition: concatTrimEcs.taskDefinitionArn,
+        LaunchType: 'FARGATE',
+        NetworkConfiguration: {
+          AwsvpcConfiguration: {
+            Subnets: concatTrimEcs.subnetIds,
+            SecurityGroups: [concatTrimEcs.securityGroupId],
+            AssignPublicIp: 'ENABLED',
+          },
+        },
+        Overrides: {
+          ContainerOverrides: [{
+            Name: concatTrimEcs.containerName,
+            Environment: [{ Name: 'PAYLOAD_S3_KEY', 'Value.$': '$.concatPayloadUpload.key' }],
+          }],
+        },
+      },
+      ResultPath: '$.concatenateVideosEcs',
+      TimeoutSeconds: 1800,
+      Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: 'BuildConcatenatedVideoResult',
+    };
+    def.States.BuildConcatenatedVideoResult = {
+      Type: 'Pass',
+      Comment: 'Deterministic URLs — the ECS task writes to exactly these keys, no result read back.',
+      Parameters: { 'videoUrl.$': concatVideoUrlExpr, 'audioUrl.$': concatAudioUrlExpr },
+      ResultPath: '$.concatenatedVideo',
+      Next: 'TranscribeAudio',
+    };
+  }
 
   // Surface $.localizedAssets in both the Convex status callback and the
   // execution's final output, so StoryStudio gets the 3 per-language
@@ -2100,146 +2594,162 @@ function langFailureFlagBranch(field: string): { StartAt: string; States: Record
  * failed:true}` shape the Catch-path already produces guarantees
  * `$.concatenatedVideosFourLang.<lang>.audioUrl` always resolves (to '' when
  * omitted), and skips a pointless external call besides. */
-function concatFourLangBranch(
-  fieldKey: string, langCode: string, omissionField?: string,
+/** ECS resources a concat-and-trim branch needs to launch its Fargate task —
+ * bundled into one object rather than 5 more positional params, threaded
+ * through from where they're defined (near removeSilenceFn/removeSilenceBucket)
+ * down through fourLangConcatFinalizeStates and the plain ConcatenateVideos
+ * state alike. */
+interface ConcatTrimEcsConfig {
+  clusterArn: string;
+  taskDefinitionArn: string;
+  containerName: string;
+  subnetIds: string[];
+  securityGroupId: string;
+  outputBucket: string;
+  /** Lambda that uploads a JSON payload to S3 and returns its key — see this
+   * config's threading-through comment. Used to keep ecs:runTask's
+   * ContainerOverrides under its hard 8192-byte limit at large frame counts. */
+  uploadPayloadArn: string;
+}
+
+/** Replaces concatFourLangBranch + removeSilenceFourLangBranch (both
+ * deleted) — what used to be two separate Lambda hops through S3/R2 for the
+ * same file (external E2E-video-concat-premium Lambda, then QM-remove-silence
+ * Lambda) is now one QM-owned ECS Fargate task
+ * (infra/docker/concat-and-trim/index.ts) that downloads the frame clips,
+ * concats them, and — since fourLang always wants this — trims silence in
+ * the same container run, uploading straight to the final trimmed keys (no
+ * intermediate untrimmed upload, since nothing downstream ever consumed
+ * that separately). Ported faithfully from the external Lambda's actually-
+ * deployed source (confirmed by reading it directly) plus the already-proven
+ * remove-silence.ts algorithm — see the container's own header comment for
+ * the full list of what was ported vs deliberately dropped (JWT auth, hook/
+ * avatar-clip splicing — both confirmed unused by QM-New's own calls).
+ *
+ * Same omission-gate contract as the old concatFourLangBranch: a language
+ * already known omitted (every frame failed/skipped it upstream, per
+ * ComputeLanguageOmissions) skips the Fargate task entirely rather than
+ * sending it an all-empty video array. On any failure (omitted, or the ECS
+ * task itself erroring/timing out), produces the same `{videoUrl:'',
+ * audioUrl:'',failed:true}` shape the old two-step version did, so
+ * everything downstream (PrepareTranscribeFourLang, finalizeLocalizedBranch)
+ * needs zero changes — same `{videoUrl,audioUrl}` shape either way. */
+function concatAndTrimFourLangBranch(
+  ecs: ConcatTrimEcsConfig, fieldKey: string, langCode: string, omissionField?: string,
 ): { StartAt: string; States: Record<string, unknown> } {
-  const state = `Concat${fieldKey}`;
+  const prepare = `PrepareConcatTrim${fieldKey}`;
+  const upload = `UploadConcatTrimPayload${fieldKey}`;
+  const state = `ConcatAndTrim${fieldKey}`;
   const failed = `${state}Failed`;
-  const concatTask = {
-    Type: 'Task',
-    Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-video-concat-premium',
-    Comment: `Concatenate all frame videos for ${langCode} (external Lambda, storystudio-unified-owned — unchanged {videoUrl,frameNumber}[] contract).`,
+  const applied = `ConcatAndTrimApplied${fieldKey}`;
+  const payloadPath = `$.concatTrimPayload${fieldKey}`;
+  const uploadResultPath = `$.concatTrimPayloadUpload${fieldKey}`;
+  const outputKeyExpr = `States.Format('projects/{}/videos/${langCode}/concatenated-trimmed.mp4', $.projectId)`;
+  const audioOutputKeyExpr = `States.Format('projects/{}/videos/${langCode}/concatenated-trimmed.wav', $.projectId)`;
+  // Independent (not nested inside outputKeyExpr's own States.Format call —
+  // ASL intrinsic nesting support is inconsistent enough across the fleet
+  // that every other deterministic-URL construction in this file avoids it
+  // too) full-URL expressions for the final {videoUrl,audioUrl} shape.
+  const videoUrlExpr = `States.Format('https://${ecs.outputBucket}.s3.us-east-1.amazonaws.com/projects/{}/videos/${langCode}/concatenated-trimmed.mp4', $.projectId)`;
+  const audioUrlExpr = `States.Format('https://${ecs.outputBucket}.s3.us-east-1.amazonaws.com/projects/{}/videos/${langCode}/concatenated-trimmed.wav', $.projectId)`;
+
+  const prepareState = {
+    Type: 'Pass',
+    Comment: `Build the concat-and-trim container's payload for ${langCode}.`,
     Parameters: {
       'videos.$': `$.fourLangConcatPrep.${fieldKey}`,
       'aspectRatio.$': '$.aspectRatio',
-      'projectId.$': '$.projectId',
-      'outputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated.mp4', $.projectId)`,
-      'jwtToken.$': '$.jwtToken',
-      'apiKey.$': '$.apiKey',
+      'outputKey.$': outputKeyExpr,
+      'audioOutputKey.$': audioOutputKeyExpr,
+      trimSilence: true,
     },
-    TimeoutSeconds: 900,
-    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 1.5 }],
-    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.concatError${fieldKey}`, Next: failed }],
+    ResultPath: payloadPath,
+    Next: upload,
+  };
+
+  const uploadState = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::lambda:invoke',
+    Comment: `Same ContainerOverrides 8192-byte workaround as the plain concat path (see UploadConcatPayload) — upload ${langCode}'s payload to S3 first, pass only the key.`,
+    Parameters: {
+      FunctionName: ecs.uploadPayloadArn,
+      Payload: {
+        'key.$': `States.Format('projects/{}/payloads/concat-${langCode}.json', $.projectId)`,
+        'body.$': `States.JsonToString(${payloadPath})`,
+      },
+    },
+    ResultSelector: { 'key.$': '$.Payload.key' },
+    ResultPath: uploadResultPath,
+    TimeoutSeconds: 60,
+    Retry: [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.concatTrimError${fieldKey}`, Next: failed }],
+    Next: state,
+  };
+
+  const runTaskState = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::ecs:runTask.sync',
+    Comment: `Concat + trim silence for ${langCode} on QM's own Fargate task — no Lambda timeout/memory ceiling (see QM-remove-silence's 12/12-attempt failure on a 69-frame project).`,
+    Parameters: {
+      Cluster: ecs.clusterArn,
+      TaskDefinition: ecs.taskDefinitionArn,
+      LaunchType: 'FARGATE',
+      NetworkConfiguration: {
+        AwsvpcConfiguration: {
+          Subnets: ecs.subnetIds,
+          SecurityGroups: [ecs.securityGroupId],
+          AssignPublicIp: 'ENABLED',
+        },
+      },
+      Overrides: {
+        ContainerOverrides: [{
+          Name: ecs.containerName,
+          Environment: [{ Name: 'PAYLOAD_S3_KEY', 'Value.$': `${uploadResultPath}.key` }],
+        }],
+      },
+    },
+    ResultPath: `$.concatTrimEcs${fieldKey}`,
+    TimeoutSeconds: 1800,
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.concatTrimError${fieldKey}`, Next: failed }],
+    Next: applied,
+  };
+
+  const appliedState = {
+    Type: 'Pass',
+    Comment: 'Deterministic URLs — the ECS task writes to exactly these keys, no result read back (ecs:runTask.sync has no return value the way a Lambda invoke does). `failed:false` explicit (not omitted) — downstream Pass states (PrepareTranscribeFourLang) reference .failed via a Parameters `.$` path, which throws States.Runtime if the key is absent, unlike a Choice Variable which just silently non-matches on a missing key.',
+    Parameters: { 'videoUrl.$': videoUrlExpr, 'audioUrl.$': audioUrlExpr, failed: false },
     End: true,
   };
-  const failedState = { Type: 'Pass', Comment: 'Isolate this language\'s concat failure from the other 3 — mirrors ConcatenateVideos\' own Catch->HandleFailure, but scoped per-language here.', Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true };
+
+  const failedState = { Type: 'Pass', Comment: 'Isolate this language\'s concat/trim failure from the other 3.', Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true };
 
   if (!omissionField) {
-    return { StartAt: state, States: { [state]: concatTask, [failed]: failedState } };
+    return { StartAt: prepare, States: { [prepare]: prepareState, [upload]: uploadState, [state]: runTaskState, [applied]: appliedState, [failed]: failedState } };
   }
 
-  const route = `RouteConcat${fieldKey}`;
+  const route = `RouteConcatTrim${fieldKey}`;
   const omitted = `${state}Omitted`;
   return {
     StartAt: route,
     States: {
       [route]: {
         Type: 'Choice',
-        Comment: `${langCode} already known omitted (every frame failed/skipped it upstream, per ComputeLanguageOmissions) — skip the concat Lambda call entirely rather than sending it an all-empty video array.`,
+        Comment: `${langCode} already known omitted (every frame failed/skipped it upstream, per ComputeLanguageOmissions) — skip the Fargate task entirely rather than sending it an all-empty video array.`,
         Choices: [{ Variable: `$.languageOmissions.${omissionField}`, BooleanEquals: true, Next: omitted }],
-        Default: state,
+        Default: prepare,
       },
-      [state]: concatTask,
-      [omitted]: { Type: 'Pass', Comment: `${langCode} omitted before concat was ever attempted — same shape as ${failed} so downstream (PrepareTranscribeFourLang, FinalizeLocalizedVideos) can't tell the two apart.`, Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true },
+      [prepare]: prepareState,
+      [upload]: uploadState,
+      [state]: runTaskState,
+      [applied]: appliedState,
+      [omitted]: { Type: 'Pass', Comment: `${langCode} omitted before concat/trim was ever attempted — same shape as ${failed} so downstream can't tell the two apart.`, Parameters: { videoUrl: '', audioUrl: '', failed: true }, End: true },
       [failed]: failedState,
     },
   };
 }
-
-/** One branch of FinalizeLocalizedVideos — es/pt-BR/hi only (English reuses
- * the EXISTING ValidateFinalizeInputsBasic/PrepareFinalizeBasic/FinalizeVideoBasic
- * chain unchanged, via BuildMergedVoiceResultFourLangEn below, so its Fargate
- * finalize call is written once, not duplicated here).
- *
- * CROSS-REPO DEPENDENCY, not verified from this repo: `outputKey`/`language`
- * are NEW fields e2e-finalize (storystudio-unified) doesn't read today — the
- * existing FinalizeVideoBasic payload has no outputKey at all, meaning
- * e2e-finalize currently determines its own output location internally and
- * reports completion straight to Convex, never back through this ASL. For
- * the 3 new localized finalize calls to land at distinct, known locations
- * (rather than 3 languages racing to overwrite English's single default
- * output), e2e-finalize needs a corresponding change to honor a caller-
- * supplied outputKey. `finalVideoUrl` below is therefore a DETERMINISTIC
- * construction from that same outputKey (mirroring how qm-generate.ts's own
- * finalize() treats `cdnUrl` as literally the storage key, no separate CDN
- * base concatenation happening in this codebase) — not a value read back
- * from the Fargate task, which today never reports anything into SFN state.
- */
-/** One branch of RemoveSilenceFourLang — post-concat dead-air removal for one
- * language's finished narration video (2026-07-27 product decision: cut
- * silence out entirely with a small ~130ms pad, not just cap long pauses —
- * see QM-remove-silence's own header comment for the validated algorithm and
- * why it lives here rather than in the still-unfixed flux4B-Wan2 TTS-level
- * fix). Gated on this language actually HAVING a concatenated video
- * (`concatFourLangBranch`'s omission/failure short-circuit already produces
- * `videoUrl:''` for an omitted/failed language) — nothing to trim there,
- * pass it through unchanged rather than sending the Lambda an empty URL.
- * Passthrough-on-failure if the RemoveSilence call itself errors, same
- * policy `fourLangTextOverlayBranch` already uses: degrade to the
- * pre-trim clip rather than failing the whole language. Output shape is
- * identical to `concatFourLangBranch`'s own `{videoUrl,audioUrl}` — this
- * REPLACES `$.concatenatedVideosFourLang` in place, so PrepareTranscribeFourLang
- * and finalizeLocalizedBranch downstream need zero changes. */
-function removeSilenceFourLangBranch(removeSilenceArn: string, fieldKey: string, langCode: string): { StartAt: string; States: Record<string, unknown> } {
-  const route = `RouteRemoveSilence${fieldKey}`;
-  const task = `RemoveSilence${fieldKey}`;
-  const applied = `RemoveSilenceApplied${fieldKey}`;
-  const skip = `RemoveSilenceSkip${fieldKey}`;
-  return {
-    StartAt: route,
-    States: {
-      [route]: {
-        Type: 'Choice',
-        Comment: `${langCode} has no concatenated video (omitted upstream, or ConcatenateVideosFourLang failed for it) — nothing to trim.`,
-        Choices: [{
-          And: [
-            { Variable: `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`, IsPresent: true },
-            { Not: { Variable: `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`, StringEquals: '' } },
-          ],
-          Next: task,
-        }],
-        Default: skip,
-      },
-      [task]: {
-        Type: 'Task',
-        Resource: removeSilenceArn,
-        Comment: `Cut dead-air silence out of ${langCode}'s finished concatenated narration video/audio (QM-remove-silence).`,
-        Parameters: {
-          'mediaUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`,
-          hasVideo: true,
-          'outputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated-trimmed.mp4', $.projectId)`,
-          'audioOutputKey.$': `States.Format('projects/{}/videos/${langCode}/concatenated-trimmed.wav', $.projectId)`,
-        },
-        ResultPath: `$.removeSilenceResult${fieldKey}`,
-        TimeoutSeconds: 600,
-        Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 10, MaxAttempts: 2, BackoffRate: 1.5 }],
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.removeSilenceError${fieldKey}`, Next: skip }],
-        Next: applied,
-      },
-      [applied]: {
-        Type: 'Pass',
-        Comment: 'Swap in the trimmed video+audio URLs — same {videoUrl,audioUrl} shape ConcatenateVideosFourLang itself produces.',
-        Parameters: {
-          'videoUrl.$': `$.removeSilenceResult${fieldKey}.trimmedVideoUrl`,
-          'audioUrl.$': `$.removeSilenceResult${fieldKey}.trimmedAudioUrl`,
-        },
-        End: true,
-      },
-      [skip]: {
-        Type: 'Pass',
-        Comment: 'No trimming applied (omitted/failed concat, or the RemoveSilence call itself failed) — pass the original concat output through unchanged.',
-        Parameters: {
-          'videoUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.videoUrl`,
-          'audioUrl.$': `$.concatenatedVideosFourLang.${fieldKey}.audioUrl`,
-        },
-        End: true,
-      },
-    },
-  };
-}
-
 function finalizeLocalizedBranch(
-  qmGenerateArn: string, fieldKey: string, langCode: string, omissionField: string, transcribeIndex: number,
+  qmGenerateArn: string, fieldKey: string, langCode: string, transcribeIndex: number,
   mode: 'basic' | 'premium' = 'basic', targetResolution: string | undefined = undefined, timeoutSeconds = 3600,
   shortsTriggerArn: string = '',
 ): { StartAt: string; States: Record<string, unknown> } {
@@ -2258,8 +2768,8 @@ function finalizeLocalizedBranch(
     States: {
       [check]: {
         Type: 'Choice',
-        Comment: `All-or-nothing per language (locked-in product decision): if ANY frame failed ${langCode}'s TTS/merge, skip finalize entirely and omit finalVideoUrl rather than shipping a video with silent gaps.`,
-        Choices: [{ Variable: `$.languageOmissions.${omissionField}`, BooleanEquals: true, Next: omitted }],
+        Comment: `Skip finalize entirely (and omit finalVideoUrl) if ${langCode}'s concat/trim failed OR was already known omitted upstream — $.concatenatedVideosFourLang.${fieldKey}.failed is set by concatAndTrimFourLangBranch in both cases, so this one flag covers both failure modes (was $.languageOmissions.<x>Omitted, which only covered the upstream case and let a concat/trim failure cascade into a doomed Fargate finalize against an empty videoUrl — see qm-concat-trim-ecs-migration memory).`,
+        Choices: [{ Variable: `$.concatenatedVideosFourLang.${fieldKey}.failed`, BooleanEquals: true, Next: omitted }],
         Default: prepare,
       },
       [omitted]: { Type: 'Pass', Parameters: { language: langCode, failed: true, error: 'PartialFailure' }, End: true },
@@ -2369,7 +2879,7 @@ function finalizeLocalizedBranch(
  * via SetNoLocalizedAssets instead.
  */
 function fourLangConcatFinalizeStates(
-  qmGenerateArn: string, removeSilenceArn: string, mode: 'basic' | 'premium' = 'basic', shortsTriggerArn: string = '',
+  qmGenerateArn: string, concatTrimEcs: ConcatTrimEcsConfig, mode: 'basic' | 'premium' = 'basic', shortsTriggerArn: string = '',
 ): Record<string, unknown> {
   const targetResolution = mode === 'premium' ? '1080p' : undefined;
   const finalizeTimeoutSeconds = mode === 'premium' ? 5400 : 3600;
@@ -2402,25 +2912,12 @@ function fourLangConcatFinalizeStates(
     },
     ConcatenateVideosFourLang: {
       Type: 'Parallel',
+      Comment: 'Concat + trim silence, one QM-owned Fargate task per language (replaces what used to be two separate Lambda hops through S3/R2 for the same file — see concatAndTrimFourLangBranch\'s header comment).',
       Branches: [
-        concatFourLangBranch('en', 'en'),
-        concatFourLangBranch('es', 'es', 'esOmitted'),
-        concatFourLangBranch('ptBr', 'pt-BR', 'ptBrOmitted'),
-        concatFourLangBranch('hi', 'hi', 'hiOmitted'),
-      ],
-      ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
-      ResultPath: '$.concatenatedVideosFourLang',
-      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
-      Next: 'RemoveSilenceFourLang',
-    },
-    RemoveSilenceFourLang: {
-      Type: 'Parallel',
-      Comment: '2026-07-27: cut dead-air silence out of each language\'s finished concatenated narration video before transcribe/finalize (see QM-remove-silence\'s header comment) — replaces $.concatenatedVideosFourLang with the SAME {en,es,ptBr,hi}:{videoUrl,audioUrl} shape ConcatenateVideosFourLang itself produces, so PrepareTranscribeFourLang/FinalizeLocalizedVideos below need no changes.',
-      Branches: [
-        removeSilenceFourLangBranch(removeSilenceArn, 'en', 'en'),
-        removeSilenceFourLangBranch(removeSilenceArn, 'es', 'es'),
-        removeSilenceFourLangBranch(removeSilenceArn, 'ptBr', 'pt-BR'),
-        removeSilenceFourLangBranch(removeSilenceArn, 'hi', 'hi'),
+        concatAndTrimFourLangBranch(concatTrimEcs, 'en', 'en'),
+        concatAndTrimFourLangBranch(concatTrimEcs, 'es', 'es', 'esOmitted'),
+        concatAndTrimFourLangBranch(concatTrimEcs, 'ptBr', 'pt-BR', 'ptBrOmitted'),
+        concatAndTrimFourLangBranch(concatTrimEcs, 'hi', 'hi', 'hiOmitted'),
       ],
       ResultSelector: { 'en.$': '$[0]', 'es.$': '$[1]', 'ptBr.$': '$[2]', 'hi.$': '$[3]' },
       ResultPath: '$.concatenatedVideosFourLang',
@@ -2429,13 +2926,13 @@ function fourLangConcatFinalizeStates(
     },
     PrepareTranscribeFourLang: {
       Type: 'Pass',
-      Comment: 'Fan-out config for TranscribeAudioFourLang below — mirrors localizationStates()\'s PrepareLocalization idiom. en has no whisperLang hint (\'\'), matching today\'s single-language TranscribeAudio, which sends no language field at all. `omitted` (always false for en, which is never omitted) carries $.languageOmissions through per-item so the Map iterator below can skip the Whisper call entirely for a language already known omitted, rather than transcribing a known-empty audioUrl.',
+      Comment: 'Fan-out config for TranscribeAudioFourLang below — mirrors localizationStates()\'s PrepareLocalization idiom. en has no whisperLang hint (\'\'), matching today\'s single-language TranscribeAudio, which sends no language field at all. `omitted` sources from $.concatenatedVideosFourLang.<lang>.failed (not $.languageOmissions) so the Map iterator below skips the Whisper call for a language that failed EITHER upstream (every frame failed/skipped it) OR at concat/trim itself — both produce {videoUrl:\'\',audioUrl:\'\',failed:true} in concatAndTrimFourLangBranch, so this one flag is a strict superset of the old upstream-only signal. Without this, a concat/trim failure used to cascade into a doomed Whisper call against an empty audioUrl for every language, and then a doomed Fargate finalize (see qm-concat-trim-ecs-migration memory).',
       Parameters: {
         transcribeConfigs: [
-          { code: 'en', whisperLang: '', omitted: false, 'audioUrl.$': '$.concatenatedVideosFourLang.en.audioUrl' },
-          { code: 'es', whisperLang: 'es', 'omitted.$': '$.languageOmissions.esOmitted', 'audioUrl.$': '$.concatenatedVideosFourLang.es.audioUrl' },
-          { code: 'pt-BR', whisperLang: 'pt', 'omitted.$': '$.languageOmissions.ptBrOmitted', 'audioUrl.$': '$.concatenatedVideosFourLang.ptBr.audioUrl' },
-          { code: 'hi', whisperLang: 'hi', 'omitted.$': '$.languageOmissions.hiOmitted', 'audioUrl.$': '$.concatenatedVideosFourLang.hi.audioUrl' },
+          { code: 'en', whisperLang: '', 'omitted.$': '$.concatenatedVideosFourLang.en.failed', 'audioUrl.$': '$.concatenatedVideosFourLang.en.audioUrl' },
+          { code: 'es', whisperLang: 'es', 'omitted.$': '$.concatenatedVideosFourLang.es.failed', 'audioUrl.$': '$.concatenatedVideosFourLang.es.audioUrl' },
+          { code: 'pt-BR', whisperLang: 'pt', 'omitted.$': '$.concatenatedVideosFourLang.ptBr.failed', 'audioUrl.$': '$.concatenatedVideosFourLang.ptBr.audioUrl' },
+          { code: 'hi', whisperLang: 'hi', 'omitted.$': '$.concatenatedVideosFourLang.hi.failed', 'audioUrl.$': '$.concatenatedVideosFourLang.hi.audioUrl' },
         ],
       },
       ResultPath: '$.transcribePrep',
@@ -2511,9 +3008,9 @@ function fourLangConcatFinalizeStates(
       Type: 'Parallel',
       Comment: 'es/pt-BR/hi finalize fan-out — English is deliberately NOT a branch here (see BuildMergedVoiceResultFourLangEn). Output array (order: es, pt-BR, hi) becomes $.localizedAssets directly, matching the doc\'s array-of-{language,...} shape.',
       Branches: [
-        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 'esOmitted', 1, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
-        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 'ptBrOmitted', 2, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
-        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 'hiOmitted', 3, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
+        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 1, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
+        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 2, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
+        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 3, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
       ],
       ResultPath: '$.localizedAssets',
       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
@@ -2854,8 +3351,8 @@ function qmPremiumFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayA
 // the finalize section is Premium-flavored (1080p upscale), matching
 // buildPremiumDefinition's FinalizeVideoPremium exactly.
 // ---------------------------------------------------------------------------
-function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string): object {
-  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, removeSilenceArn))) as {
+function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string, concatTrimEcs: ConcatTrimEcsConfig): object {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, removeSilenceArn, concatTrimEcs))) as {
     Comment: string;
     States: Record<string, any>;
   };
@@ -2887,7 +3384,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   // branch on $.fourLang — so they're left as-is, not deleted.
   def.States.GenerateImagesFourLang = qmPremiumFourLangFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
   def.States.GenerateImagesFourLang.Next = 'RouteBGM';
-  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, removeSilenceArn, 'premium', shortsTriggerArn));
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, concatTrimEcs, 'premium', shortsTriggerArn));
 
   // No whole-script localizationStates() call for Premium anymore: once the
   // per-frame fourLang path above is wired in, RouteFrameGeneration/
@@ -2909,8 +3406,14 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
 
   def.States.ValidateFinalizeInputsPremium = {
     Type: 'Choice',
-    Comment: 'Verify required fields exist before finalize; fail fast on missing data',
-    Choices: [{ Variable: '$.mergedVoiceResult.mergedVideoUrl', IsPresent: true, Next: 'PrepareFinalizePremium' }],
+    Comment: 'Verify required fields exist AND are non-empty before finalize — same fix as ValidateFinalizeInputsBasic (see qm-concat-trim-ecs-migration memory).',
+    Choices: [{
+      And: [
+        { Variable: '$.mergedVoiceResult.mergedVideoUrl', IsPresent: true },
+        { Not: { Variable: '$.mergedVoiceResult.mergedVideoUrl', StringEquals: '' } },
+      ],
+      Next: 'PrepareFinalizePremium',
+    }],
     Default: 'FinalizeInputsMissingPremium',
   };
   delete def.States.ValidateFinalizeInputsBasic;
@@ -3390,6 +3893,1796 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: stri
 }
 
 // ---------------------------------------------------------------------------
+// Dialogue Basic / Dialogue Premium — storystudio-dialogue-qm-sfn-handoff.md
+// ---------------------------------------------------------------------------
+// Both clone buildQmNewDefinition's OUTPUT (not the deep legacy buildDefinition
+// directly) — same strategy buildNarrationPremiumQmNewDefinition already uses.
+// That inherits the entire shared plumbing (ValidateInput/CheckValidation/
+// HandleFailure/Complete/status-update Tasks/DropFrameData's allowlist
+// convention/shortsTriggerStates/the fourLang+shorts field-normalization
+// chain) fully assembled, so only the per-project-type pieces need writing.
+//
+// The inherited fourLang/localization states (RouteFrameGeneration,
+// GenerateImagesFourLang, RouteConcatFourLang, and everything
+// fourLangConcatFinalizeStates() produced) are deliberately left in place,
+// UNREFERENCED, rather than deleted — fourLang is explicitly out of scope
+// for both dialogue tiers (handoff doc §3.7/§1), and Step Functions does not
+// validate state reachability at deploy time, so leaving them as dead JSON
+// is lower-risk than trying to enumerate and delete every name
+// fourLangConcatFinalizeStates() generates internally.
+//
+// The inherited NormalizeFourLang -> ... -> NormalizeShortsOptionsField ->
+// SetShortsOptionsFieldDefault chain IS still wired in and used, though —
+// it's a generic "guarantee these optional fields are present" pass with no
+// dialogue-specific content, its Choice states use bare comparisons on
+// possibly-absent variables that Step Functions treats as non-matching
+// rather than throwing (confirmed by that chain's own existing, deployed
+// code), and it already terminates at 'DropFrameData', which both builders
+// below simply redefine.
+// ---------------------------------------------------------------------------
+
+interface DialogueMixEcsConfig {
+  clusterArn: string;
+  taskDefinitionArn: string;
+  containerName: string;
+  subnetIds: string[];
+  securityGroupId: string;
+  outputBucket: string;
+  /** Same QM-upload-payload Lambda concat-and-trim uses — both modes' payloads
+   * are small, but reusing the S3-indirection habit avoids ever re-learning
+   * the 8192-byte ecs:runTask ContainerOverrides lesson concat-and-trim did. */
+  uploadPayloadArn: string;
+}
+
+/**
+ * Dialogue Basic's narrator branch (storystudio-dialogue-qm-sfn-handoff.md
+ * §4.2): persona still generated ONCE (skipped when narrator.imageUrl is
+ * non-empty), before the segment Map — every segment (including 0) then
+ * anchors on the SAME personaImageUrl, which is precisely what removes any
+ * ordering constraint between segments (the doc's recommended approach over
+ * a segmentIndex===0 Choice). personaImageUrl is threaded into each Map
+ * iteration via the Map state's own `Parameters` block (which can reference
+ * both `$$.Map.Item.Value` for the current item AND `$` for the Map's own
+ * input) rather than injected per-item into $.segments, since ASL's JSONPath
+ * dialect has no per-item array transform.
+ *
+ * TTS routes clone-vs-design INSIDE runpod.ts's own 'tts' mode handler
+ * (`if (p.cloneArtifactUrl)`) — no RouteTTSEngine Choice needed here, unlike
+ * narration-premium's SFN-level split, because voice.dialogueBasic.tts has
+ * only the one physical rung either way.
+ *
+ * InfiniteTalk is poll-only (plain lambda:invoke, not .waitForTaskToken) —
+ * RunComfy has no webhook mechanism of its own (adapters/runcomfy.ts,
+ * supportsWebhook:false), so the doc's originally-envisioned ">45s RunPod
+ * webhook" branch (§4.3) doesn't apply to the RunComfy integration actually
+ * built (that framing predates the 2026-08-08 live testing that settled on
+ * RunComfy over documentary-premium's RunPod-hosted InfiniteTalk). §7.12.1
+ * measured only ~106s server-side elapsed even for a 26s narrator clip —
+ * comfortably inside qm-generate.ts's 850s blocking-poll ceiling — and
+ * explicitly downgrades the webhook branch to "unlikely needed in practice."
+ */
+function dialogueBasicNarratorBranch(qmGenerateArn: string): object {
+  const carry = {
+    'jobId.$': '$.jobId',
+    'projectId.$': '$.projectId',
+    'projectType.$': '$.projectType',
+    'aspectRatio.$': '$.aspectRatio',
+    'narrator.$': '$.narrator',
+    'narratorOverlay.$': '$.narratorOverlay',
+    'segments.$': '$.segments',
+    'bgmPrompt.$': '$.bgmPrompt',
+    'textOverlayEnabled.$': '$.textOverlayEnabled',
+    'apiKey.$': '$.apiKey',
+    'jwtToken.$': '$.jwtToken',
+    'convexEndpoint.$': '$.convexEndpoint',
+    'userId.$': '$.userId',
+    'admissionId.$': '$.admissionId',
+  };
+  return {
+    StartAt: 'RouteNarratorPersona',
+    States: {
+      RouteNarratorPersona: {
+        Type: 'Choice',
+        Comment: 'narrator.imageUrl non-empty -> use it directly, skip persona generation entirely (§3.3/§4.2).',
+        Choices: [{
+          And: [
+            { Variable: '$.narrator.imageUrl', IsPresent: true },
+            { Variable: '$.narrator.imageUrl', IsString: true },
+            { Not: { Variable: '$.narrator.imageUrl', StringEquals: '' } },
+          ],
+          Next: 'UseNarratorImageUrl',
+        }],
+        Default: 'QMGenerateNarratorPersona',
+      },
+      UseNarratorImageUrl: {
+        Type: 'Pass',
+        Parameters: { ...carry, 'personaImageUrl.$': '$.narrator.imageUrl' },
+        Next: 'GenerateNarratorSegments',
+      },
+      QMGenerateNarratorPersona: {
+        Type: 'Task',
+        Resource: qmGenerateArn,
+        Comment: 'Narrator persona still via QM (image.dialogueBasic.persona: self-hosted Qwen-Image-Gen -> nano-banana fallback). Generated ONCE, before the segment Map.',
+        Parameters: {
+          assetType: 'image',
+          tier: 'dialogueBasic',
+          operation: 'persona',
+          product: 'dialogue',
+          queue: 'background',
+          jobType: 'batch',
+          'prompt.$': '$.narrator.imagePrompt',
+          'aspectRatio.$': '$.aspectRatio',
+          'projectId.$': '$.projectId',
+          'userId.$': '$.userId',
+        },
+        ResultPath: '$.personaResult',
+        TimeoutSeconds: 920,
+        Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.personaError', Next: 'NarratorBranchFailed' }],
+        Next: 'SetPersonaFromResult',
+      },
+      SetPersonaFromResult: {
+        Type: 'Pass',
+        Parameters: { ...carry, 'personaImageUrl.$': '$.personaResult.cdnUrl' },
+        Next: 'GenerateNarratorSegments',
+      },
+      GenerateNarratorSegments: {
+        Type: 'Map',
+        Comment: 'One QM TTS call + one RunComfy InfiniteTalk call per narrator segment (30-45s each). MaxConcurrency=3 — every segment uses the SAME personaImageUrl, so there is no cross-segment ordering dependency (§4.2).',
+        ItemsPath: '$.segments',
+        MaxConcurrency: 3,
+        Parameters: {
+          'segmentIndex.$': '$$.Map.Item.Value.segmentIndex',
+          'scriptText.$': '$$.Map.Item.Value.scriptText',
+          'personaImageUrl.$': '$.personaImageUrl',
+          'narrator.$': '$.narrator',
+          'projectId.$': '$.projectId',
+          'userId.$': '$.userId',
+        },
+        ResultPath: '$.segmentResults',
+        Iterator: {
+          StartAt: 'QMGenerateNarratorTTS',
+          States: {
+            QMGenerateNarratorTTS: {
+              Type: 'Task',
+              Resource: qmGenerateArn,
+              Comment: 'Narrator segment TTS via QM (voice.dialogueBasic.tts: Qwen voice-clone clone_artifact_url fast path when narrator.voiceCloneArtifactUrl is set, else voice-design fallback via voiceInstruct — routed inside runpod.ts\'s own tts handler, not an SFN Choice). Returns the EXACT spoken duration (durationS) — what ReconcileSegmentTiming reconciles the scene track against (§4.5).',
+              Parameters: {
+                assetType: 'voice',
+                tier: 'dialogueBasic',
+                operation: 'tts',
+                product: 'dialogue',
+                queue: 'background',
+                jobType: 'batch',
+                'prompt.$': '$.scriptText',
+                'cloneArtifactUrl.$': '$.narrator.voiceCloneArtifactUrl',
+                'language.$': '$.narrator.voiceLanguage',
+                'instruct.$': '$.narrator.voiceInstruct',
+                'projectId.$': '$.projectId',
+                'frameId.$': "States.Format('segment-{}', $.segmentIndex)",
+                'userId.$': '$.userId',
+              },
+              ResultPath: '$.ttsResult',
+              TimeoutSeconds: 920,
+              Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+              Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'NarratorSegmentFailed' }],
+              Next: 'RouteNarratorLipSync',
+            },
+            // Cost-based routing (2026-08-09 product decision, threshold
+            // revised same day 20s->15s): RunComfy bills $0.015/second,
+            // RunPod's legacy InfiniteTalk route bills a FLAT $0.25/generation
+            // regardless of duration. Mathematical breakeven is
+            // $0.25/$0.015 ≈ 16.7s, so a literal 15s threshold means the
+            // 15-16.7s band is technically cheaper on RunComfy — an explicit
+            // product call (simplicity over squeezing the last ~$0.02/clip in
+            // a band StoryStudio's 30-40s planning never actually sends
+            // anyway), not a rounding error; if that changes, this comment
+            // is the first thing to revisit. StoryStudio plans every narrator
+            // segment at 30-40s, so in practice RunPod is the path every real
+            // segment takes — RunComfy's mono rung stays wired for the
+            // rare/theoretical short-segment case rather than being deleted,
+            // since this must react to the segment's ACTUAL measured TTS
+            // duration, not an assumption about what StoryStudio usually
+            // sends (same "trust the returned value" posture as
+            // ReconcileSegmentTiming/§4.4/§4.5).
+            RouteNarratorLipSync: {
+              Type: 'Choice',
+              Comment: 'actualDurationSeconds > 15s -> RunPod InfiniteTalk (flat-fee, cheaper for long clips); otherwise RunComfy InfiniteTalk mono (per-second, cheaper for short clips).',
+              Choices: [{ Variable: '$.ttsResult.durationS', NumericGreaterThan: 15, Next: 'QMGenerateInfiniteTalkRunpod' }],
+              Default: 'QMGenerateInfiniteTalk',
+            },
+            QMGenerateInfiniteTalk: {
+              Type: 'Task',
+              Resource: qmGenerateArn,
+              Comment: 'Narrator lip-sync via QM (video.dialogueBasic.narrator: RunComfy InfiniteTalk mono, $0.015/s) — segments <=15s only (RouteNarratorLipSync). Poll only — see this function\'s header comment for why the doc\'s >45s webhook branch does not apply here.',
+              Parameters: {
+                assetType: 'video',
+                tier: 'dialogueBasic',
+                operation: 'narrator',
+                product: 'dialogue',
+                queue: 'background',
+                jobType: 'batch',
+                'audioUrl.$': '$.ttsResult.cdnUrl',
+                'initImageUrls.$': 'States.Array($.personaImageUrl)',
+                'projectId.$': '$.projectId',
+                'frameId.$': "States.Format('segment-{}', $.segmentIndex)",
+                'userId.$': '$.userId',
+              },
+              ResultPath: '$.infiniteTalkResult',
+              TimeoutSeconds: 920,
+              Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+              Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.infiniteTalkError', Next: 'NarratorSegmentFailed' }],
+              Next: 'BuildSegmentResult',
+            },
+            QMGenerateInfiniteTalkRunpod: {
+              Type: 'Task',
+              Resource: qmGenerateArn,
+              Comment: 'Narrator lip-sync via QM (video.dialogueBasic.narratorRunpod: legacy named-route RunPod InfiniteTalk, $0.25/generation flat — same integration Documentary Premium already uses, no new adapter code). Segments >15s (RouteNarratorLipSync) — i.e. the common case, since segments are planned at 30-40s.',
+              Parameters: {
+                assetType: 'video',
+                tier: 'dialogueBasic',
+                operation: 'narratorRunpod',
+                product: 'dialogue',
+                queue: 'background',
+                jobType: 'batch',
+                'prompt.$': '$.narrator.imagePrompt',
+                'audioUrl.$': '$.ttsResult.cdnUrl',
+                'initImageUrls.$': 'States.Array($.personaImageUrl)',
+                'projectId.$': '$.projectId',
+                'frameId.$': "States.Format('segment-{}', $.segmentIndex)",
+                'userId.$': '$.userId',
+              },
+              ResultPath: '$.infiniteTalkResult',
+              TimeoutSeconds: 920,
+              Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+              Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.infiniteTalkError', Next: 'NarratorSegmentFailed' }],
+              Next: 'BuildSegmentResult',
+            },
+            BuildSegmentResult: {
+              Type: 'Pass',
+              Comment: 'frameNumber aliases segmentIndex so this item is ALSO a valid concat-and-trim FrameVideo — ConcatenateNarrator feeds $.segmentResults straight in as `videos` with no reshaping.',
+              Parameters: {
+                'segmentIndex.$': '$.segmentIndex',
+                'frameNumber.$': '$.segmentIndex',
+                'audioUrl.$': '$.ttsResult.cdnUrl',
+                'videoUrl.$': '$.infiniteTalkResult.cdnUrl',
+                'actualDurationSeconds.$': '$.ttsResult.durationS',
+              },
+              End: true,
+            },
+            NarratorSegmentFailed: {
+              Type: 'Pass',
+              Comment: 'QM exhausted all rungs for this segment\'s TTS/InfiniteTalk — graceful degradation, mirrors QMFrameFailed.',
+              Parameters: { failed: true, error: 'NarratorSegmentFailed', 'segmentIndex.$': '$.segmentIndex' },
+              End: true,
+            },
+          },
+        },
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'NarratorBranchFailed' }],
+        End: true,
+      },
+      NarratorBranchFailed: {
+        Type: 'Fail',
+        Error: 'NarratorBranchFailed',
+        Cause: 'Dialogue Basic narrator branch (persona or segment generation) failed unrecoverably',
+      },
+    },
+  };
+}
+
+/**
+ * Dialogue Basic's scenes branch: silent Wan2 clips only (image -> Wan2 i2v),
+ * no merge — the narrator branch is the ONLY audio source (§4.6). videoPrompt
+ * (not narrationText — dialogue-basic frames carry no narration at all)
+ * drives the motion prompt (§3.6's core delta from the narration contract).
+ * `duration` on each result is Wan2's RETURNED frame-derived value
+ * ($.videoResult.durationS, surfaced automatically by runpod.ts's generic
+ * duration_s digger — §4.4), never the requested integer.
+ */
+function dialogueBasicScenesBranch(qmGenerateArn: string): object {
+  return {
+    StartAt: 'GenerateScenes',
+    States: {
+      GenerateScenes: {
+        Type: 'Map',
+        Comment: 'Silent Wan2 scene clips, MaxConcurrency=15 (matches Narration-Basic-QM-New\'s per-frame Map; Wan2 itself is throttled independently via wan2-i2v\'s counterKey/fleet.ts).',
+        ItemsPath: '$.frames',
+        MaxConcurrency: 15,
+        ResultPath: '$.sceneResults',
+        Iterator: {
+          StartAt: 'CheckSceneImageCache',
+          States: {
+            CheckSceneImageCache: {
+              Type: 'Task',
+              Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-asset-cache-check',
+              Comment: 'Check S3 metadata cache — skip image generation if it already exists',
+              Parameters: {
+                'projectId.$': '$$.Execution.Input.projectId',
+                'frameId.$': '$.frameId',
+                assetType: 'image',
+              },
+              ResultPath: '$.imageCacheResult',
+              TimeoutSeconds: 10,
+              Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 2, MaxAttempts: 1, BackoffRate: 1.5 }],
+              Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.cacheError', Next: 'RouteSceneImageGen' }],
+              Next: 'CheckSceneImageCacheResult',
+            },
+            CheckSceneImageCacheResult: {
+              Type: 'Choice',
+              Choices: [{ Variable: '$.imageCacheResult.cached', BooleanEquals: true, Next: 'UseSceneImageCache' }],
+              Default: 'RouteSceneImageGen',
+            },
+            UseSceneImageCache: {
+              Type: 'Pass',
+              Parameters: { 'cdnUrl.$': '$.imageCacheResult.cdnUrl' },
+              ResultPath: '$.imageResult',
+              Next: 'QMGenerateSceneVideo',
+            },
+            RouteSceneImageGen: {
+              Type: 'Choice',
+              Comment: 'Character reference present -> i2i; else t2i (image.dialogueBasic.*).',
+              Choices: [{
+                And: [
+                  { Variable: '$.referenceImageUrl', IsPresent: true },
+                  { Variable: '$.referenceImageUrl', IsString: true },
+                  { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
+                ],
+                Next: 'QMGenerateSceneImageI2I',
+              }],
+              Default: 'QMGenerateSceneImageT2I',
+            },
+            QMGenerateSceneImageT2I: {
+              Type: 'Task',
+              Resource: qmGenerateArn,
+              Comment: 'Scene still via QM (image.dialogueBasic.t2i: self-hosted Qwen-Image-Gen -> nano-banana fallback).',
+              Parameters: {
+                assetType: 'image', tier: 'dialogueBasic', operation: 't2i', product: 'dialogue',
+                queue: 'background', jobType: 'batch',
+                'prompt.$': '$.imagePrompt',
+                'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+                'projectId.$': '$$.Execution.Input.projectId',
+                'frameId.$': '$.frameId',
+                'userId.$': '$$.Execution.Input.userId',
+              },
+              ResultPath: '$.imageResult',
+              TimeoutSeconds: 920,
+              Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+              Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'SceneFailed' }],
+              Next: 'QMGenerateSceneVideo',
+            },
+            QMGenerateSceneImageI2I: {
+              Type: 'Task',
+              Resource: qmGenerateArn,
+              Comment: 'Scene still with character reference via QM (image.dialogueBasic.i2i: self-hosted Qwen-Image-Edit).',
+              Parameters: {
+                assetType: 'image', tier: 'dialogueBasic', operation: 'i2i', product: 'dialogue',
+                queue: 'background', jobType: 'batch',
+                'prompt.$': '$.imagePrompt',
+                'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+                'initImageUrls.$': 'States.Array($.referenceImageUrl)',
+                'projectId.$': '$$.Execution.Input.projectId',
+                'frameId.$': '$.frameId',
+                'userId.$': '$$.Execution.Input.userId',
+              },
+              ResultPath: '$.imageResult',
+              TimeoutSeconds: 920,
+              Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+              Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'SceneFailed' }],
+              Next: 'QMGenerateSceneVideo',
+            },
+            QMGenerateSceneVideo: {
+              Type: 'Task',
+              Resource: qmGenerateArn,
+              Comment: 'Silent scene clip via QM (video.dialogueBasic.i2v: self-hosted Wan 2.2 I2V-A14B -> Replicate fallback). videoPrompt drives motion (NOT narrationText — §3.6). Server validates durationS against Wan2\'s legal {3,4,5,6,7} set.',
+              Parameters: {
+                assetType: 'video', tier: 'dialogueBasic', operation: 'i2v', product: 'dialogue',
+                queue: 'background', jobType: 'batch',
+                'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+                'prompt.$': '$.videoPrompt',
+                'durationS.$': '$.duration',
+                'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+                'projectId.$': '$$.Execution.Input.projectId',
+                'frameId.$': '$.frameId',
+                'userId.$': '$$.Execution.Input.userId',
+              },
+              ResultPath: '$.videoResult',
+              TimeoutSeconds: 920,
+              Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+              Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'SceneFailed' }],
+              Next: 'BuildSceneResult',
+            },
+            BuildSceneResult: {
+              Type: 'Pass',
+              Parameters: {
+                'frameId.$': '$.frameId',
+                'frameNumber.$': '$.frameNumber',
+                'segmentIndex.$': '$.segmentIndex',
+                'isSegmentLastFrame.$': '$.isSegmentLastFrame',
+                'videoUrl.$': '$.videoResult.cdnUrl',
+                'duration.$': '$.videoResult.durationS',
+              },
+              End: true,
+            },
+            SceneFailed: {
+              Type: 'Pass',
+              Comment: 'QM exhausted all rungs for this scene\'s image/video — graceful degradation, mirrors QMFrameFailed.',
+              Parameters: { failed: true, error: 'SceneFailed', 'frameId.$': '$.frameId', 'frameNumber.$': '$.frameNumber' },
+              End: true,
+            },
+          },
+        },
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'ScenesBranchFailed' }],
+        End: true,
+      },
+      ScenesBranchFailed: {
+        Type: 'Fail',
+        Error: 'ScenesBranchFailed',
+        Cause: 'Dialogue Basic scenes branch failed unrecoverably',
+      },
+    },
+  };
+}
+
+/**
+ * Builds a 4-state concat-and-trim invocation chain (Pass payload -> upload
+ * -> ecs:runTask.sync -> deterministic-URL Pass), the exact pattern
+ * buildQmNewDefinition's own ConcatenateVideos/UploadConcatPayload/
+ * ConcatenateVideosTask/BuildConcatenatedVideoResult uses, parameterized so
+ * Dialogue Basic can run it twice (scenes, narrator) under different names.
+ */
+function concatChain(opts: {
+  namePrefix: string; ecs: ConcatTrimEcsConfig; videosPath: string; outputSubpath: string; next: string;
+}): Record<string, unknown> {
+  const { namePrefix, ecs, videosPath, outputSubpath, next } = opts;
+  const videoUrlExpr = `States.Format('https://${ecs.outputBucket}.s3.us-east-1.amazonaws.com/projects/{}/${outputSubpath}.mp4', $.projectId)`;
+  const audioUrlExpr = `States.Format('https://${ecs.outputBucket}.s3.us-east-1.amazonaws.com/projects/{}/${outputSubpath}.wav', $.projectId)`;
+  return {
+    [`${namePrefix}`]: {
+      Type: 'Pass',
+      Comment: `Build the concat-and-trim container payload for ${namePrefix} (trimSilence:false — see §7.6.6, neither dialogue tier needs it).`,
+      Parameters: {
+        'videos.$': videosPath,
+        'aspectRatio.$': '$.aspectRatio',
+        'outputKey.$': `States.Format('projects/{}/${outputSubpath}.mp4', $.projectId)`,
+        'audioOutputKey.$': `States.Format('projects/{}/${outputSubpath}.wav', $.projectId)`,
+        trimSilence: false,
+      },
+      ResultPath: '$.concatPayload',
+      Next: `Upload${namePrefix}Payload`,
+    },
+    [`Upload${namePrefix}Payload`]: {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::lambda:invoke',
+      Comment: 'ecs:runTask\'s ContainerOverrides has a hard 8192-byte limit — upload the payload to S3 here and pass only the short key across that boundary.',
+      Parameters: {
+        FunctionName: ecs.uploadPayloadArn,
+        Payload: {
+          'key.$': `States.Format('projects/{}/payloads/${outputSubpath}.json', $.projectId)`,
+          'body.$': 'States.JsonToString($.concatPayload)',
+        },
+      },
+      ResultSelector: { 'key.$': '$.Payload.key' },
+      ResultPath: '$.concatPayloadUpload',
+      TimeoutSeconds: 60,
+      Retry: [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: `${namePrefix}Task`,
+    },
+    [`${namePrefix}Task`]: {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::ecs:runTask.sync',
+      Comment: `Concat via QM's own Fargate task (${namePrefix}) — no Lambda timeout/memory ceiling.`,
+      Parameters: {
+        Cluster: ecs.clusterArn,
+        TaskDefinition: ecs.taskDefinitionArn,
+        LaunchType: 'FARGATE',
+        NetworkConfiguration: {
+          AwsvpcConfiguration: {
+            Subnets: ecs.subnetIds,
+            SecurityGroups: [ecs.securityGroupId],
+            AssignPublicIp: 'ENABLED',
+          },
+        },
+        Overrides: {
+          ContainerOverrides: [{
+            Name: ecs.containerName,
+            Environment: [{ Name: 'PAYLOAD_S3_KEY', 'Value.$': '$.concatPayloadUpload.key' }],
+          }],
+        },
+      },
+      ResultPath: `$.${namePrefix}Ecs`,
+      TimeoutSeconds: 1800,
+      Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+      Next: `Build${namePrefix}Result`,
+    },
+    [`Build${namePrefix}Result`]: {
+      Type: 'Pass',
+      Comment: 'Deterministic URLs — the ECS task writes to exactly these keys, no result read back.',
+      Parameters: { 'videoUrl.$': videoUrlExpr, 'audioUrl.$': audioUrlExpr },
+      ResultPath: `$.${namePrefix}Result`,
+      Next: next,
+    },
+  };
+}
+
+/**
+ * Both dialogue builders clone buildQmNewDefinition's ValidateInput verbatim
+ * (see the big comment block above dialogueBasicNarratorBranch), which
+ * inherits E2E-validate-input — the narration pipeline's own Lambda, which
+ * requires voiceUrls/bgmUrl. Dialogue never sends either: the narrator's TTS
+ * is generated inside this SFN (from narrator.voiceCloneArtifactUrl for
+ * Basic, voiceBank for Premium), and BGM is generated via ACE-Step, also
+ * inside this SFN. Every real dialogue execution has failed at ValidateInput
+ * as a result (storystudio-reply-dialogue-validate-input-gap.md).
+ * E2E-validate-input isn't defined in this repo (invoked by hardcoded
+ * cross-account ARN, no local source to branch on projectType), so replace
+ * the inherited ValidateInput Task outright with an in-ASL Choice that
+ * checks the fields the calling builder's own contract actually requires
+ * (handoff doc §3.2 for Basic, §7.2 for Premium — the two tiers don't share
+ * a shape: Premium has no top-level narrator/segments/frames at all).
+ *
+ * `requireAllOf` are fields that must be IsPresent (ANDed together).
+ * `requireAnyOf`, if given, adds one more ANDed condition requiring at least
+ * one of its fields to be present — for Premium's shots-vs-shotsManifestUrl
+ * fallback (§7.2), so ValidateInput doesn't reject the manifest-URL path
+ * that RouteShotsSource downstream already handles.
+ *
+ * Reads CheckValidation's current success target so it keeps working
+ * whichever state each builder has already repointed it to (plain
+ * UpdateStatusGeneratingImages for Basic, RouteShotsSource for Premium) —
+ * call this only after any such CheckValidation.Choices[0].Next rewrite.
+ */
+function overrideDialogueValidateInput(
+  def: { States: Record<string, any> },
+  requireAllOf: string[],
+  requireAnyOf?: string[],
+): void {
+  const successNext = def.States.CheckValidation.Choices[0].Next;
+  const conditions: unknown[] = requireAllOf.map((field) => ({ Variable: `$.${field}`, IsPresent: true }));
+  if (requireAnyOf) {
+    conditions.push({ Or: requireAnyOf.map((field) => ({ Variable: `$.${field}`, IsPresent: true })) });
+  }
+  def.States.ValidateInput = {
+    Type: 'Choice',
+    Comment: 'Dialogue-aware replacement for the inherited narration ValidateInput Lambda (which requires voiceUrls/bgmUrl, neither of which dialogue sends) — checks this tier\'s own required fields directly in ASL instead.',
+    Choices: [{ And: conditions, Next: successNext }],
+    Default: 'FailValidation',
+  };
+  // CheckValidation is now unreferenced (ValidateInput routes around it
+  // directly) but left in place rather than deleted — same reasoning as the
+  // fourLang scaffolding above: its own Next/Default targets still resolve,
+  // so it's harmless dead JSON, and deleting it risks missing a reference.
+  def.States.FailValidation.Parameters.error = {
+    Error: 'InvalidInput',
+    Cause: `Dialogue input missing required fields: ${[...requireAllOf, ...(requireAnyOf ? [requireAnyOf.join(' or ')] : [])].join(', ')}`,
+  };
+}
+
+function buildDialogueBasicQmNewDefinition(
+  qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string,
+  concatTrimEcs: ConcatTrimEcsConfig, dialogueMixEcs: DialogueMixEcsConfig, reconcileSegmentTimingArn: string,
+): object {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, '', concatTrimEcs))) as {
+    Comment: string;
+    States: Record<string, any>;
+  };
+  def.Comment = 'E2E Video Generation Pipeline - Dialogue-Basic-QM-New — narrator persona (RunComfy InfiniteTalk) PiP composited over silent Wan2 scenes via Quartermaster gateway.';
+
+  // CheckValidation's success target is still the clone's default
+  // (UpdateStatusGeneratingImages, untouched by this builder), so this can
+  // run before any of the overrides below. Required fields per handoff §3.2.
+  overrideDialogueValidateInput(def, ['narrator', 'narratorOverlay', 'segments', 'frames']);
+
+  // Replace the per-frame Map with the two-branch Parallel (§4.1: scene
+  // generation and narrator generation share no inputs and their latencies
+  // are wildly different — 18 Wan2 clips at MaxConcurrency 15 vs 3
+  // sequential-ish InfiniteTalk jobs at up to ~504s each).
+  def.States.UpdateStatusGeneratingImages.Next = 'GenerateNarratorAndScenes';
+  def.States.UpdateStatusGeneratingImages.Catch[0].Next = 'GenerateNarratorAndScenes';
+  delete def.States.GenerateImages;
+
+  // Step Functions validates EVERY Next/Default reference at deploy time,
+  // even on states unreachable from StartAt — so the fourLang/localization
+  // scaffolding this clone inherited (now unreferenced, since nothing routes
+  // into RouteFrameGeneration/RouteConcatFourLang anymore) must be deleted
+  // outright rather than just left orphaned, or CreateStateMachine rejects
+  // the definition over RouteFrameGeneration's now-dangling reference to the
+  // deleted GenerateImages state. Confirmed by a structural Next/Default
+  // reachability check against this function's actual synth output.
+  for (const deadState of [
+    'RouteFrameGeneration', 'GenerateImagesFourLang', 'RouteConcatFourLang',
+    'BuildLangVideoArrays', 'ComputeLanguageOmissions', 'ConcatenateVideosFourLang',
+    'PrepareTranscribeFourLang', 'TranscribeAudioFourLang', 'BuildMergedVoiceResultFourLangEn',
+    'FinalizeLocalizedVideos', 'ConcatenateVideos', 'UploadConcatPayload',
+    'ConcatenateVideosTask', 'BuildConcatenatedVideoResult',
+  ]) delete def.States[deadState];
+
+  // Wire the inherited UpdateStatusConcatenating status update into the flow
+  // (right before the concat chains) rather than leaving it orphaned too.
+  def.States.UpdateStatusConcatenating.Next = 'ConcatenateScenes';
+  def.States.UpdateStatusConcatenating.Catch[0].Next = 'ConcatenateScenes';
+
+  def.States.GenerateNarratorAndScenes = {
+    Type: 'Parallel',
+    Comment: 'Branch A: narrator persona + per-segment TTS/InfiniteTalk. Branch B: silent Wan2 scene clips. §4.1.',
+    Branches: [dialogueBasicNarratorBranch(qmGenerateArn), dialogueBasicScenesBranch(qmGenerateArn)],
+    ResultPath: '$.parallelResult',
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'MergeParallelResults',
+  };
+  def.States.MergeParallelResults = {
+    Type: 'Pass',
+    Comment: 'Destructure the Parallel state\'s [branchA, branchB] result array into $.segmentResults/$.sceneResults — Parallel branch outputs are only ever addressable by array index, not by name.',
+    Parameters: {
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'narrator.$': '$.narrator',
+      'narratorOverlay.$': '$.narratorOverlay',
+      'bgmPrompt.$': '$.bgmPrompt',
+      'textOverlayEnabled.$': '$.textOverlayEnabled',
+      'apiKey.$': '$.apiKey',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+      'userId.$': '$.userId',
+      'admissionId.$': '$.admissionId',
+      'segmentResults.$': '$.parallelResult[0].segmentResults',
+      'sceneResults.$': '$.parallelResult[1].sceneResults',
+    },
+    Next: 'ReconcileSegmentTiming',
+  };
+
+  def.States.ReconcileSegmentTiming = {
+    Type: 'Task',
+    Resource: reconcileSegmentTimingArn,
+    Comment: 'Trim/extend each segment\'s last scene clip so its scenes sum to that segment\'s actual narrator duration (§4.5). One invocation covers every segment (groups internally by segmentIndex — ASL has no JSONPath filter/group-by).',
+    Parameters: {
+      'sceneResults.$': '$.sceneResults',
+      'segmentResults.$': '$.segmentResults',
+      'outputKeyPrefix.$': "States.Format('projects/{}/dialogue-basic/reconcile', $.projectId)",
+    },
+    ResultPath: '$.reconcileResult',
+    TimeoutSeconds: 600,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'UpdateStatusConcatenating',
+  };
+
+  Object.assign(def.States, concatChain({
+    namePrefix: 'ConcatenateScenes', ecs: concatTrimEcs,
+    videosPath: '$.reconcileResult.sceneResults', outputSubpath: 'dialogue-basic/scenes-concatenated',
+    next: 'ConcatenateNarrator',
+  }));
+  Object.assign(def.States, concatChain({
+    namePrefix: 'ConcatenateNarrator', ecs: concatTrimEcs,
+    videosPath: '$.segmentResults', outputSubpath: 'dialogue-basic/narrator-concatenated',
+    next: 'CompositeNarratorOverlay',
+  }));
+
+  // CompositeNarratorOverlay — new QM-owned Fargate step (qm-dialogue-mix,
+  // mode:"pip-composite"), the doc's own named fallback (§3.4/§10 Q3) for
+  // "inside finalize," since e2e-finalize isn't part of this repo.
+  def.States.CompositeNarratorOverlay = {
+    Type: 'Pass',
+    Comment: 'Build the dialogue-mix container payload (mode:"pip-composite").',
+    Parameters: {
+      mode: 'pip-composite',
+      'sceneTrackUrl.$': '$.ConcatenateScenesResult.videoUrl',
+      'narratorTrackUrl.$': '$.ConcatenateNarratorResult.videoUrl',
+      'narratorOverlay.$': '$.narratorOverlay',
+      'segmentBoundariesSeconds.$': '$.reconcileResult.segmentBoundariesSeconds',
+      'aspectRatio.$': '$.aspectRatio',
+      'outputKey.$': "States.Format('projects/{}/dialogue-basic/composite.mp4', $.projectId)",
+      'audioOutputKey.$': "States.Format('projects/{}/dialogue-basic/composite.wav', $.projectId)",
+    },
+    ResultPath: '$.compositePayload',
+    Next: 'UploadCompositePayload',
+  };
+  def.States.UploadCompositePayload = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::lambda:invoke',
+    Comment: 'Same 8192-byte ContainerOverrides workaround as concat-and-trim.',
+    Parameters: {
+      FunctionName: dialogueMixEcs.uploadPayloadArn,
+      Payload: {
+        'key.$': "States.Format('projects/{}/payloads/composite.json', $.projectId)",
+        'body.$': 'States.JsonToString($.compositePayload)',
+      },
+    },
+    ResultSelector: { 'key.$': '$.Payload.key' },
+    ResultPath: '$.compositePayloadUpload',
+    TimeoutSeconds: 60,
+    Retry: [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'CompositeNarratorOverlayTask',
+  };
+  def.States.CompositeNarratorOverlayTask = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::ecs:runTask.sync',
+    Comment: 'PiP composite via QM\'s own Fargate task (qm-dialogue-mix). Composite audio = narrator track only — Wan2\'s scene track has no audio at all (§4.6).',
+    Parameters: {
+      Cluster: dialogueMixEcs.clusterArn,
+      TaskDefinition: dialogueMixEcs.taskDefinitionArn,
+      LaunchType: 'FARGATE',
+      NetworkConfiguration: {
+        AwsvpcConfiguration: {
+          Subnets: dialogueMixEcs.subnetIds,
+          SecurityGroups: [dialogueMixEcs.securityGroupId],
+          AssignPublicIp: 'ENABLED',
+        },
+      },
+      Overrides: {
+        ContainerOverrides: [{
+          Name: dialogueMixEcs.containerName,
+          Environment: [{ Name: 'PAYLOAD_S3_KEY', 'Value.$': '$.compositePayloadUpload.key' }],
+        }],
+      },
+    },
+    ResultPath: '$.compositeEcs',
+    TimeoutSeconds: 1800,
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'BuildCompositeResult',
+  };
+  def.States.BuildCompositeResult = {
+    Type: 'Pass',
+    Comment: 'Deterministic URLs — the ECS task writes to exactly these keys.',
+    Parameters: {
+      'videoUrl.$': `States.Format('https://${dialogueMixEcs.outputBucket}.s3.us-east-1.amazonaws.com/projects/{}/dialogue-basic/composite.mp4', $.projectId)`,
+      'audioUrl.$': `States.Format('https://${dialogueMixEcs.outputBucket}.s3.us-east-1.amazonaws.com/projects/{}/dialogue-basic/composite.wav', $.projectId)`,
+    },
+    ResultPath: '$.compositeResult',
+    Next: 'TranscribeAudio',
+  };
+
+  // SRT off the composited audio (Whisper — same rung as narration, tier
+  // dropped to 'narration' since srt.dialogueBasic aliases srt.narration).
+  def.States.TranscribeAudio = {
+    Type: 'Task',
+    Resource: qmGenerateArn,
+    Comment: 'SRT via QM (srt.dialogueBasic, alias of srt.narration -> self-hosted RunPod Whisper large-v3-turbo), transcribing the PiP composite\'s audio.',
+    Parameters: {
+      assetType: 'srt',
+      tier: 'dialogueBasic',
+      operation: 'transcribe',
+      product: 'dialogue',
+      queue: 'background',
+      jobType: 'batch',
+      'audioUrl.$': '$.compositeResult.audioUrl',
+      'projectId.$': '$.projectId',
+    },
+    ResultPath: '$.transcribeResult',
+    TimeoutSeconds: 920,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.transcribeError', Next: 'SkipSrt' }],
+    Next: 'BuildMergedVoiceResult',
+  };
+  def.States.BuildMergedVoiceResult.Parameters = {
+    'mergedVideoUrl.$': '$.compositeResult.videoUrl',
+    'audioUrl.$': '$.compositeResult.audioUrl',
+    'srtUrl.$': '$.transcribeResult.cdnUrl',
+    'captionsUrl.$': '$.transcribeResult.cdnUrl',
+  };
+  // BuildMergedVoiceResult.Next stays 'SetNoLocalizedAssets' (inherited) —
+  // harmless static {} localizedAssets, keeps the same execution-output
+  // shape every other QM-New pipeline produces. Retarget its OWN Next to
+  // BGM (doc §4's exact ordering: composite -> transcribe -> BGM -> drop).
+  def.States.SetNoLocalizedAssets.Next = 'RouteBGM';
+
+  Object.assign(def.States, bgmStates(qmGenerateArn, 'dialogueBasic'));
+  def.States.QMGenerateBGM.Comment = 'Generate background music via QM (bgm.dialogueBasic, alias of bgm.narration). Duration = Σ ACTUAL segment durations (§3.2), not Σ frame durations — the narrator track\'s real length.';
+  def.States.QMGenerateBGM.Parameters = {
+    assetType: 'bgm',
+    tier: 'dialogueBasic',
+    operation: 'generate',
+    product: 'dialogue',
+    queue: 'background',
+    jobType: 'batch',
+    'prompt.$': '$.bgmPrompt',
+    'segments.$': '$.segmentResults',
+    'projectId.$': '$.projectId',
+    'userId.$': '$.userId',
+  };
+  // RouteBGM/SkipBgm/QMGenerateBGM/BgmGenerationFailed all still Next to the
+  // inherited 'NormalizeFourLang' chain by default (untouched) — it's a
+  // generic optional-field normalizer that terminates at 'DropFrameData',
+  // which is redefined immediately below.
+
+  def.States.DropFrameData = {
+    Type: 'Pass',
+    Comment: 'Allowlist per §9: segmentResults (BGM duration already consumed, kept for the status write-back below) + mergedVoiceResult (carries the composite video/audio/SRT URLs) + bgmResult.',
+    Parameters: {
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'mergedVoiceResult.$': '$.mergedVoiceResult',
+      'bgmResult.$': '$.bgmResult',
+      'segmentResults.$': '$.segmentResults',
+      'localizedAssets.$': '$.localizedAssets',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+      'apiKey.$': '$.apiKey',
+      'userId.$': '$.userId',
+      'admissionId.$': '$.admissionId',
+      'generateShorts.$': '$.generateShorts',
+      'shortsOptions.$': '$.shortsOptions',
+    },
+    Next: 'UpdateStatusApplyingBgm',
+  };
+  def.States.UpdateStatusApplyingBgm.Parameters.assets = {
+    'mergedVideoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
+    'segments.$': '$.segmentResults',
+    'localizedAssets.$': '$.localizedAssets',
+  };
+
+  // Rename the Basic-named finalize cluster to DialogueBasic — same rename
+  // pattern buildNarrationPremiumQmNewDefinition uses for Premium. No
+  // targetResolution: concat-and-trim and the PiP composite both already
+  // render at the project's full target resolution (their own aspect-ratio
+  // canvas scale+pad), matching narration-basic's own no-upscale convention.
+  def.States.ValidateFinalizeInputsDialogueBasic = {
+    Type: 'Choice',
+    Comment: 'Verify required fields exist AND are non-empty before finalize (qm-concat-trim-ecs-migration memory).',
+    Choices: [{
+      And: [
+        { Variable: '$.mergedVoiceResult.mergedVideoUrl', IsPresent: true },
+        { Not: { Variable: '$.mergedVoiceResult.mergedVideoUrl', StringEquals: '' } },
+      ],
+      Next: 'PrepareFinalizeDialogueBasic',
+    }],
+    Default: 'FinalizeInputsMissingDialogueBasic',
+  };
+  delete def.States.ValidateFinalizeInputsBasic;
+  def.States.UpdateStatusApplyingBgm.Next = 'ValidateFinalizeInputsDialogueBasic';
+  def.States.UpdateStatusApplyingBgm.Catch = [
+    { ErrorEquals: ['States.ALL'], ResultPath: '$.statusError', Next: 'FinalizeVideoDialogueBasic' },
+  ];
+
+  def.States.FinalizeInputsMissingDialogueBasic = {
+    Type: 'Fail', Error: 'FinalizeInputsMissing', Cause: 'Required finalize input(s) missing: $.mergedVoiceResult.mergedVideoUrl',
+  };
+  delete def.States.FinalizeInputsMissingBasic;
+
+  def.States.PrepareFinalizeDialogueBasic = {
+    Type: 'Pass',
+    Comment: 'Prepare a small payload for the Fargate finalize task.',
+    Parameters: {
+      mode: 'basic',
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'videoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
+      'voiceAudioUrl.$': '$.mergedVoiceResult.audioUrl',
+      'captionsUrl.$': '$.mergedVoiceResult.captionsUrl',
+      'bgmUrl.$': '$.bgmResult.cdnUrl',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+    },
+    ResultPath: '$.finalizeTaskInput',
+    Next: 'NormalizeShortsOptions',
+  };
+  delete def.States.PrepareFinalizeBasic;
+
+  def.States.FinalizeVideoDialogueBasic = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::ecs:runTask.sync',
+    Comment: 'Finalize on Fargate (unmodified e2e-finalize): captions + BGM overlay/duck.',
+    Parameters: {
+      Cluster: 'arn:aws:ecs:us-east-1:929075264324:cluster/storystudio-e2e',
+      LaunchType: 'FARGATE',
+      TaskDefinition: 'e2e-finalize',
+      NetworkConfiguration: {
+        AwsvpcConfiguration: {
+          Subnets: ['subnet-02557f42e07118380', 'subnet-0389bf7ebb5a497ac'],
+          SecurityGroups: ['sg-0c2549fa2cb194dc6'],
+          AssignPublicIp: 'ENABLED',
+        },
+      },
+      Overrides: {
+        ContainerOverrides: [{
+          Name: 'finalize',
+          Environment: [{ Name: 'PAYLOAD_JSON', 'Value.$': 'States.JsonToString($.finalizeTaskInput)' }],
+        }],
+      },
+    },
+    ResultPath: '$.finalizeEcs',
+    TimeoutSeconds: 5400,
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'Complete',
+  };
+  delete def.States.FinalizeVideoBasic;
+
+  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoDialogueBasic'));
+
+  return def;
+}
+
+/**
+ * Dialogue Premium's per-shot Map. Not a variant of Basic's per-frame Maps —
+ * three different generators chosen per shot by an explicit `kind` field
+ * StoryStudio has already resolved (§1/§6): `action` (Wan2 i2v, optional VO),
+ * `monologue` (RunComfy mono, no trim — §7.6.5), `dialogue` (RunComfy multi,
+ * trimmed to left+right — the endpoint's fixed +1.00s pad, §7.4/§7.6.6).
+ * `kind`/`imageModel` are routed on directly, never re-derived (§7.3's own
+ * "resolve on our side, send an explicit value" convention).
+ *
+ * TTS is per TURN (QM-build-turn-tracks), not per line (§7.4/§7.9.2 — half
+ * the calls, 12% shorter audio, better prosody). The "common tail" (spot
+ * SFX, authored tail beat, text overlay) runs after any of the three kind
+ * branches converge on a common `{shotVideoUrl, shotDurationSeconds}` shape.
+ */
+function dialoguePremiumShotMap(opts: {
+  qmGenerateArn: string; remotionOverlayArn: string; buildTurnTracksArn: string;
+  trimClipArn: string; appendTailBeatArn: string;
+}): object {
+  const { qmGenerateArn, remotionOverlayArn, buildTurnTracksArn, trimClipArn, appendTailBeatArn } = opts;
+  return {
+    Type: 'Map',
+    Comment: 'Per-shot via Quartermaster gateway + RunComfy InfiniteTalk (Dialogue Premium). MaxConcurrency=12, lower than Basic\'s 15 — a "dialogue" shot fans out into 2 TTS calls plus one RunComfy job, so 12 concurrent shots is materially more load than 12 concurrent frames (§8.1).',
+    ItemsPath: '$.shots',
+    MaxConcurrency: 12,
+    ResultPath: '$.shotResults',
+    Iterator: {
+      StartAt: 'CheckShotImageCache',
+      States: {
+        CheckShotImageCache: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-asset-cache-check',
+          Comment: 'Check S3 metadata cache — skip image generation if it already exists',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            assetType: 'image',
+          },
+          ResultPath: '$.imageCacheResult',
+          TimeoutSeconds: 10,
+          Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 2, MaxAttempts: 1, BackoffRate: 1.5 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.cacheError', Next: 'RouteShotImageGen' }],
+          Next: 'CheckShotImageCacheResult',
+        },
+        CheckShotImageCacheResult: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.imageCacheResult.cached', BooleanEquals: true, Next: 'UseShotImageCache' }],
+          Default: 'RouteShotImageGen',
+        },
+        UseShotImageCache: {
+          Type: 'Pass',
+          Parameters: { 'cdnUrl.$': '$.imageCacheResult.cdnUrl' },
+          ResultPath: '$.imageResult',
+          Next: 'RouteShotKind',
+        },
+        RouteShotImageGen: {
+          Type: 'Choice',
+          Comment: 'Route on the explicit imageModel value StoryStudio already resolved — do not re-derive from referenceImageUrl presence (§7.3).',
+          Choices: [{ Variable: '$.imageModel', StringEquals: 'qwen-image-edit', Next: 'QMGenerateShotImageI2I' }],
+          Default: 'QMGenerateShotImageT2I',
+        },
+        QMGenerateShotImageI2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Shot still via QM (image.dialoguePremium.i2i: self-hosted Qwen-Image-Edit), anchored on the character referenceImageUrl — coverage singles are i2i-dominant (§7.10.2: the identity anchor is the character reference image, never a previous shot\'s rendered frame).',
+          Parameters: {
+            assetType: 'image', tier: 'dialoguePremium', operation: 'i2i', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'initImageUrls.$': 'States.Array($.referenceImageUrl)',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'ShotFailed' }],
+          Next: 'StoreShotImageMeta',
+        },
+        QMGenerateShotImageT2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Shot still via QM (image.dialoguePremium.t2i: self-hosted Qwen-Image-Gen -> nano-banana fallback).',
+          Parameters: {
+            assetType: 'image', tier: 'dialoguePremium', operation: 't2i', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.imageError', Next: 'ShotFailed' }],
+          Next: 'StoreShotImageMeta',
+        },
+        StoreShotImageMeta: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-store-asset-meta',
+          Comment: 'Persist image metadata to S3 for cache reuse',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            assetType: 'image',
+            'cdnUrl.$': '$.imageResult.cdnUrl',
+            's3Key.$': '$.imageResult.s3Key',
+            'width.$': '$.imageResult.width',
+            'height.$': '$.imageResult.height',
+          },
+          ResultPath: null,
+          TimeoutSeconds: 10,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.metaStoreError', Next: 'RouteShotKind' }],
+          Next: 'RouteShotKind',
+        },
+
+        RouteShotKind: {
+          Type: 'Choice',
+          Comment: 'kind is a required field, already resolved by StoryStudio\'s planner — route on it directly, never re-derive (§7.3).',
+          Choices: [
+            { Variable: '$.kind', StringEquals: 'action', Next: 'QMGenerateActionVideo' },
+            { Variable: '$.kind', StringEquals: 'monologue', Next: 'QMBuildMonologueTurn' },
+            { Variable: '$.kind', StringEquals: 'dialogue', Next: 'QMBuildDialogueTurns' },
+          ],
+          Default: 'ShotFailed',
+        },
+
+        // ── action ──────────────────────────────────────────────────────
+        QMGenerateActionVideo: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Action shot via QM (video.dialoguePremium.i2v: self-hosted Wan 2.2 I2V-A14B -> Replicate fallback). No on-screen speech — motion/reaction shots only. Reaction shots must carry an explicit "mouth closed, lips together, not speaking" videoPrompt (§7.11.1) — StoryStudio\'s responsibility, not QM\'s.',
+          Parameters: {
+            assetType: 'video', tier: 'dialoguePremium', operation: 'i2v', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'prompt.$': '$.videoPrompt',
+            'durationS.$': '$.durationSeconds',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.actionVideoResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'ShotFailed' }],
+          Next: 'RouteShotNarration',
+        },
+        RouteShotNarration: {
+          Type: 'Choice',
+          Comment: 'VO/internal-monologue over an action shot, when authored.',
+          Choices: [{
+            And: [
+              { Variable: '$.narrationText', IsPresent: true },
+              { Variable: '$.narrationText', IsString: true },
+              { Not: { Variable: '$.narrationText', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateShotNarrationTTS',
+          }],
+          Default: 'SetActionVideoAsIs',
+        },
+        SetActionVideoAsIs: {
+          Type: 'Pass',
+          Parameters: { 'shotVideoUrl.$': '$.actionVideoResult.cdnUrl', 'shotDurationSeconds.$': '$.actionVideoResult.durationS' },
+          Next: 'RouteShotSfx',
+        },
+        QMGenerateShotNarrationTTS: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'VO/internal-monologue TTS via QM (voice.dialoguePremium.tts). Voice = the voiceBank entry for narrationKind\'s characterId, or the project narrator voice if absent — StoryStudio resolves which voiceBank entry to reference; this call trusts whatever the shot\'s own fields already carry.',
+          Parameters: {
+            assetType: 'voice', tier: 'dialoguePremium', operation: 'tts', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.narrationText',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.narrationTtsResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'ShotFailed' }],
+          Next: 'QMMergeShotNarration',
+        },
+        QMMergeShotNarration: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Merge VO onto the action clip via QM (video.dialoguePremium.merge, alias of the generic Lambda mux).',
+          Parameters: {
+            assetType: 'video', tier: 'dialoguePremium', operation: 'merge', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.actionVideoResult.cdnUrl)',
+            'audioUrl.$': '$.narrationTtsResult.cdnUrl',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.narrationMergeResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.mergeError', Next: 'ShotFailed' }],
+          Next: 'SetActionVideoWithNarration',
+        },
+        SetActionVideoWithNarration: {
+          Type: 'Pass',
+          Parameters: { 'shotVideoUrl.$': '$.narrationMergeResult.cdnUrl', 'shotDurationSeconds.$': '$.narrationMergeResult.durationS' },
+          Next: 'RouteShotSfx',
+        },
+
+        // ── monologue ───────────────────────────────────────────────────
+        QMBuildMonologueTurn: {
+          Type: 'Task',
+          Resource: buildTurnTracksArn,
+          Comment: 'Join this shot\'s dialogueLines into one turn (§7.4/§7.9.2 — one TTS call, not one per line).',
+          Parameters: { kind: 'monologue', 'dialogueLines.$': '$.dialogueLines', 'voiceBank.$': '$$.Execution.Input.voiceBank' },
+          ResultPath: '$.turnResult',
+          TimeoutSeconds: 30,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 3, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.turnError', Next: 'ShotFailed' }],
+          Next: 'QMGenerateMonologueTTS',
+        },
+        QMGenerateMonologueTTS: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'TTS via QM (voice.dialoguePremium.tts).',
+          Parameters: {
+            assetType: 'voice', tier: 'dialoguePremium', operation: 'tts', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.turnResult.mono.text',
+            'cloneArtifactUrl.$': '$.turnResult.mono.voiceCloneArtifactUrl',
+            'language.$': '$.turnResult.mono.voiceLanguage',
+            'instruct.$': '$.turnResult.mono.voiceInstruct',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.monologueTtsResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'ShotFailed' }],
+          Next: 'QMGenerateTalkingHead',
+        },
+        QMGenerateTalkingHead: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Lip-sync via QM (video.dialoguePremium.monologue: RunComfy InfiniteTalk mono). No trim — mono endpoint has no trailing pad, output_duration == input audio duration exactly (§7.6.5).',
+          Parameters: {
+            assetType: 'video', tier: 'dialoguePremium', operation: 'monologue', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'audioUrl.$': '$.monologueTtsResult.cdnUrl',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.talkingHeadResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'ShotFailed' }],
+          Next: 'SetMonologueVideoAsIs',
+        },
+        SetMonologueVideoAsIs: {
+          Type: 'Pass',
+          Parameters: { 'shotVideoUrl.$': '$.talkingHeadResult.cdnUrl', 'shotDurationSeconds.$': '$.monologueTtsResult.durationS' },
+          Next: 'RouteShotSfx',
+        },
+
+        // ── dialogue (two-hander) ───────────────────────────────────────
+        QMBuildDialogueTurns: {
+          Type: 'Task',
+          Resource: buildTurnTracksArn,
+          Comment: 'Join left/right speaker lines into two turns (§7.4/§7.5 — StoryStudio guarantees at most 2 speakerSlots, no interleaving, left always opens).',
+          Parameters: { kind: 'dialogue', 'dialogueLines.$': '$.dialogueLines', 'voiceBank.$': '$$.Execution.Input.voiceBank' },
+          ResultPath: '$.turnResult',
+          TimeoutSeconds: 30,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 3, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.turnError', Next: 'ShotFailed' }],
+          Next: 'QMGenerateLeftTTS',
+        },
+        QMGenerateLeftTTS: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Camera-left speaker\'s turn TTS via QM (voice.dialoguePremium.tts).',
+          Parameters: {
+            assetType: 'voice', tier: 'dialoguePremium', operation: 'tts', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.turnResult.left.text',
+            'cloneArtifactUrl.$': '$.turnResult.left.voiceCloneArtifactUrl',
+            'language.$': '$.turnResult.left.voiceLanguage',
+            'instruct.$': '$.turnResult.left.voiceInstruct',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': "States.Format('{}-left', $.shotId)",
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.leftTtsResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'ShotFailed' }],
+          Next: 'QMGenerateRightTTS',
+        },
+        QMGenerateRightTTS: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Camera-right speaker\'s turn TTS via QM (voice.dialoguePremium.tts).',
+          Parameters: {
+            assetType: 'voice', tier: 'dialoguePremium', operation: 'tts', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.turnResult.right.text',
+            'cloneArtifactUrl.$': '$.turnResult.right.voiceCloneArtifactUrl',
+            'language.$': '$.turnResult.right.voiceLanguage',
+            'instruct.$': '$.turnResult.right.voiceInstruct',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': "States.Format('{}-right', $.shotId)",
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.rightTtsResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ttsError', Next: 'ShotFailed' }],
+          Next: 'QMGenerateTalkingHead2',
+        },
+        QMGenerateTalkingHead2: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Lip-sync via QM (video.dialoguePremium.dialogue: RunComfy InfiniteTalk fast/multi). output_duration = left+right+1.00s exactly (§7.4/§7.6.4) — trimmed next.',
+          Parameters: {
+            assetType: 'video', tier: 'dialoguePremium', operation: 'dialogue', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'leftAudioUrl.$': '$.leftTtsResult.cdnUrl',
+            'rightAudioUrl.$': '$.rightTtsResult.cdnUrl',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.talkingHead2Result',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'ShotFailed' }],
+          Next: 'ComputeDialogueTrimTarget',
+        },
+        ComputeDialogueTrimTarget: {
+          Type: 'Pass',
+          Comment: 'Trim target = left_duration + right_duration, known at BuildTurnTracks time — not detected (§7.6.6).',
+          Parameters: { 'value.$': 'States.MathAdd($.leftTtsResult.durationS, $.rightTtsResult.durationS)' },
+          ResultPath: '$.trimTarget',
+          Next: 'QMTrimDialogueClip',
+        },
+        QMTrimDialogueClip: {
+          Type: 'Task',
+          Resource: trimClipArn,
+          Comment: 'Remove RunComfy fast/multi\'s fixed +1.00s trailing pad (§7.4/§7.6.6) — plain -t cut, no silencedetect.',
+          Parameters: {
+            'videoUrl.$': '$.talkingHead2Result.cdnUrl',
+            'targetDurationSeconds.$': '$.trimTarget.value',
+            'outputKey.$': "States.Format('projects/{}/dialogue-premium/trim/{}.mp4', $$.Execution.Input.projectId, $.shotId)",
+          },
+          ResultPath: '$.trimResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.trimError', Next: 'ShotFailed' }],
+          Next: 'SetDialogueVideoTrimmed',
+        },
+        SetDialogueVideoTrimmed: {
+          Type: 'Pass',
+          Parameters: { 'shotVideoUrl.$': '$.trimResult.cdnUrl', 'shotDurationSeconds.$': '$.trimResult.durationS' },
+          Next: 'RouteShotSfx',
+        },
+
+        // ── common tail: spot SFX, authored tail beat, text overlay ─────
+        RouteShotSfx: {
+          Type: 'Choice',
+          Choices: [{
+            And: [
+              { Variable: '$.sfxPrompt', IsPresent: true },
+              { Variable: '$.sfxPrompt', IsString: true },
+              { Not: { Variable: '$.sfxPrompt', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateShotSfx',
+          }],
+          Default: 'RouteTailBeat',
+        },
+        QMGenerateShotSfx: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Spot SFX via QM (sfx.dialoguePremium: self-hosted ACE-Step). Authored moment, not a gap-filler (§7.7 rule 2) — a short, fixed default duration, since the shot object carries no explicit SFX-length field.',
+          Parameters: {
+            assetType: 'sfx', tier: 'dialoguePremium', operation: 'generate', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.sfxPrompt',
+            durationS: 3,
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.sfxResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.sfxError', Next: 'RouteTailBeat' }],
+          Next: 'QMMixShotSfx',
+        },
+        QMMixShotSfx: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Mix the SFX ONTO the shot\'s existing audio (video.dialoguePremium.merge, mixMode:"additive" — adapters/lambdamerge.ts/merge.ts) rather than replacing it. Falls back to plain replace if the clip turns out to have no audio at all (a silent action shot with no VO).',
+          Parameters: {
+            assetType: 'video', tier: 'dialoguePremium', operation: 'merge', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.shotVideoUrl)',
+            'audioUrl.$': '$.sfxResult.cdnUrl',
+            mixMode: 'additive',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.shotId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.sfxMixResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.sfxMixError', Next: 'RouteTailBeat' }],
+          Next: 'SetVideoAfterSfx',
+        },
+        SetVideoAfterSfx: {
+          Type: 'Pass',
+          Parameters: { 'shotVideoUrl.$': '$.sfxMixResult.cdnUrl', 'shotDurationSeconds.$': '$.sfxMixResult.durationS' },
+          Next: 'RouteTailBeat',
+        },
+        RouteTailBeat: {
+          Type: 'Choice',
+          Comment: 'Authored hold after this shot\'s last line (§7.3) — default 0, a hard cut.',
+          Choices: [{
+            And: [
+              { Variable: '$.tailBeatSeconds', IsPresent: true },
+              { Variable: '$.tailBeatSeconds', IsNumeric: true },
+              { Variable: '$.tailBeatSeconds', NumericGreaterThan: 0 },
+            ],
+            Next: 'QMAppendTailBeat',
+          }],
+          Default: 'RouteShotTextOverlay',
+        },
+        QMAppendTailBeat: {
+          Type: 'Task',
+          Resource: appendTailBeatArn,
+          Comment: 'Frozen-last-frame hold (ffmpeg tpad) — filled by the ambience bed at mix time, so it reads as a beat, not dead air (§7.3/§7.7).',
+          Parameters: {
+            'videoUrl.$': '$.shotVideoUrl',
+            'tailBeatSeconds.$': '$.tailBeatSeconds',
+            'outputKey.$': "States.Format('projects/{}/dialogue-premium/tailbeat/{}.mp4', $$.Execution.Input.projectId, $.shotId)",
+          },
+          ResultPath: '$.tailBeatResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.tailBeatError', Next: 'RouteShotTextOverlay' }],
+          Next: 'SetVideoAfterTailBeat',
+        },
+        SetVideoAfterTailBeat: {
+          Type: 'Pass',
+          Parameters: { 'shotVideoUrl.$': '$.tailBeatResult.cdnUrl', 'shotDurationSeconds.$': '$.tailBeatResult.durationS' },
+          Next: 'RouteShotTextOverlay',
+        },
+        RouteShotTextOverlay: {
+          Type: 'Choice',
+          Choices: [{
+            And: [
+              { Variable: '$.textManifest', IsPresent: true },
+              { Variable: '$.textManifest', IsString: true },
+              { Not: { Variable: '$.textManifest', StringEquals: '' } },
+              { Variable: '$$.Execution.Input.textOverlayEnabled', IsPresent: true },
+              { Variable: '$$.Execution.Input.textOverlayEnabled', BooleanEquals: true },
+            ],
+            Next: 'RenderShotTextOverlay',
+          }],
+          Default: 'BuildShotVideo',
+        },
+        RenderShotTextOverlay: {
+          Type: 'Task',
+          Resource: remotionOverlayArn,
+          Comment: 'Per-shot Remotion text-overlay render (same Lambda narration uses, direct invoke). Passthrough failure policy — an overlay failure degrades to the un-overlaid clip rather than failing the shot.',
+          Parameters: {
+            'clipUrl.$': '$.shotVideoUrl',
+            'textManifest.$': '$.textManifest',
+            'frameId.$': '$.shotId',
+            'duration.$': '$.shotDurationSeconds',
+          },
+          ResultPath: '$.overlayResult',
+          TimeoutSeconds: 180,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.overlayError', Next: 'BuildShotVideo' }],
+          Next: 'ApplyShotTextOverlay',
+        },
+        ApplyShotTextOverlay: {
+          Type: 'Pass',
+          Parameters: { 'shotVideoUrl.$': '$.overlayResult.overlayRenderedUrl' },
+          Next: 'BuildShotVideo',
+        },
+        BuildShotVideo: {
+          Type: 'Pass',
+          Comment: 'frameNumber aliases shotNumber so this item is ALSO a valid concat-and-trim FrameVideo — ConcatenateShots feeds $.shotResults straight in.',
+          Parameters: {
+            'shotId.$': '$.shotId',
+            'shotNumber.$': '$.shotNumber',
+            'frameNumber.$': '$.shotNumber',
+            'videoUrl.$': '$.shotVideoUrl',
+            'actualDurationSeconds.$': '$.shotDurationSeconds',
+          },
+          End: true,
+        },
+        ShotFailed: {
+          Type: 'Pass',
+          Comment: 'QM exhausted all rungs for this shot — graceful degradation, mirrors QMFrameFailed.',
+          Parameters: { failed: true, error: 'ShotFailed', 'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber' },
+          End: true,
+        },
+      },
+    },
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'GenerateAmbienceBedSpecs',
+  };
+}
+
+function buildDialoguePremiumQmNewDefinition(opts: {
+  qmGenerateArn: string; brokerArn: string; shortsTriggerArn: string; remotionOverlayArn: string;
+  concatTrimEcs: ConcatTrimEcsConfig; dialogueMixEcs: DialogueMixEcsConfig;
+  buildTurnTracksArn: string; trimClipArn: string; appendTailBeatArn: string;
+  buildAmbienceBedSpecsArn: string; fetchShotsManifestArn: string;
+}): object {
+  const {
+    qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, concatTrimEcs, dialogueMixEcs,
+    buildTurnTracksArn, trimClipArn, appendTailBeatArn, buildAmbienceBedSpecsArn, fetchShotsManifestArn,
+  } = opts;
+
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, '', concatTrimEcs))) as {
+    Comment: string;
+    States: Record<string, any>;
+  };
+  def.Comment = 'E2E Video Generation Pipeline - Dialogue-Premium-QM-New — per-shot screenplay (Wan2 action / RunComfy InfiniteTalk monologue+dialogue) via Quartermaster gateway.';
+
+  // Inline shots vs shotsManifestUrl fallback (§7.2 — "cheap now, painful
+  // later"). Spliced between CheckValidation and UpdateStatusGeneratingImages.
+  def.States.CheckValidation.Choices[0].Next = 'RouteShotsSource';
+  def.States.RouteShotsSource = {
+    Type: 'Choice',
+    Comment: 'shots sent inline (the common case) vs a shotsManifestUrl (R2 JSON URL) for large films approaching the 256KB SFN input limit (§7.2).',
+    Choices: [{ Variable: '$.shots', IsPresent: true, Next: 'UpdateStatusGeneratingImages' }],
+    Default: 'FetchShotsManifest',
+  };
+  // Runs after the CheckValidation.Choices[0].Next rewrite just above, so
+  // ValidateInput's success branch inherits 'RouteShotsSource' rather than
+  // the clone's original 'UpdateStatusGeneratingImages'. Required fields per
+  // handoff §7.2 — no top-level narrator/segments/frames on this tier, and
+  // 'shots' is satisfied by either the inline array or shotsManifestUrl,
+  // same fallback RouteShotsSource itself checks just above.
+  overrideDialogueValidateInput(def, ['shotCounts', 'voiceBank'], ['shots', 'shotsManifestUrl']);
+
+  def.States.FetchShotsManifest = {
+    Type: 'Task',
+    Resource: fetchShotsManifestArn,
+    Comment: 'Plain HTTPS GET + JSON parse — shotsManifestUrl is an R2 URL, not AWS S3, so the SFN\'s native aws-sdk:s3:getObject integration can\'t fetch it directly.',
+    Parameters: { 'shotsManifestUrl.$': '$.shotsManifestUrl' },
+    ResultPath: '$.manifestResult',
+    TimeoutSeconds: 60,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'SetShotsFromManifest',
+  };
+  def.States.SetShotsFromManifest = {
+    Type: 'Pass',
+    Comment: 'InputPath+ResultPath (no Parameters) copies just the array to $.shots without disturbing the rest of the state.',
+    InputPath: '$.manifestResult.shots',
+    ResultPath: '$.shots',
+    Next: 'UpdateStatusGeneratingImages',
+  };
+
+  def.States.UpdateStatusGeneratingImages.Next = 'GenerateShots';
+  def.States.UpdateStatusGeneratingImages.Catch[0].Next = 'GenerateShots';
+  delete def.States.GenerateImages;
+
+  // Same reasoning as buildDialogueBasicQmNewDefinition above: delete the
+  // now-unreferenced fourLang/localization scaffolding outright rather than
+  // leaving it orphaned, since Step Functions validates every Next/Default
+  // reference regardless of reachability.
+  for (const deadState of [
+    'RouteFrameGeneration', 'GenerateImagesFourLang', 'RouteConcatFourLang',
+    'BuildLangVideoArrays', 'ComputeLanguageOmissions', 'ConcatenateVideosFourLang',
+    'PrepareTranscribeFourLang', 'TranscribeAudioFourLang', 'BuildMergedVoiceResultFourLangEn',
+    'FinalizeLocalizedVideos', 'ConcatenateVideos', 'UploadConcatPayload',
+    'ConcatenateVideosTask', 'BuildConcatenatedVideoResult',
+  ]) delete def.States[deadState];
+
+  def.States.GenerateShots = dialoguePremiumShotMap({
+    qmGenerateArn, remotionOverlayArn, buildTurnTracksArn, trimClipArn, appendTailBeatArn,
+  });
+
+  def.States.GenerateAmbienceBedSpecs = {
+    Type: 'Task',
+    Resource: buildAmbienceBedSpecsArn,
+    Comment: 'Group shots by sceneNumber into one ambience-bed spec per scene (§7.7) — pure grouping/summing, no ffmpeg; ASL has no group-by/dedup to do this in-line.',
+    Parameters: { 'shots.$': '$.shots', 'shotResults.$': '$.shotResults' },
+    ResultPath: '$.ambienceBedSpecsResult',
+    TimeoutSeconds: 60,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'GenerateAmbienceBeds',
+  };
+  def.States.GenerateAmbienceBeds = {
+    Type: 'Map',
+    Comment: 'One ACE-Step bed per SCENE (not per shot) — an empty ambienceBedSpecs array (no shot in the project set an ambiencePrompt) just produces zero iterations, no Choice needed.',
+    ItemsPath: '$.ambienceBedSpecsResult.ambienceBedSpecs',
+    MaxConcurrency: 5,
+    ResultPath: '$.ambienceBeds',
+    Iterator: {
+      StartAt: 'QMGenerateAmbience',
+      States: {
+        QMGenerateAmbience: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Ambience bed via QM (bgm.dialoguePremium, operation:"ambience" — same physical ACE-Step rung as the project BGM call below, split by operation for attribution). Generated at the scene\'s full length directly — no looping (§7.7.1).',
+          Parameters: {
+            assetType: 'bgm', tier: 'dialoguePremium', operation: 'ambience', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.ambiencePrompt',
+            'durationS.$': '$.totalDurationSeconds',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': "States.Format('scene-{}', $.sceneNumber)",
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.ambienceResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.ambienceError', Next: 'AmbienceBedFailed' }],
+          Next: 'BuildAmbienceBedResult',
+        },
+        BuildAmbienceBedResult: {
+          Type: 'Pass',
+          Parameters: { 'sceneNumber.$': '$.sceneNumber', 'audioUrl.$': '$.ambienceResult.cdnUrl' },
+          End: true,
+        },
+        AmbienceBedFailed: {
+          Type: 'Pass',
+          Comment: 'A missing bed just means that scene\'s silences are unfilled at mix time (§7.7\'s ffmpeg task tolerates a shorter/absent bed) — not worth failing the whole film over.',
+          Parameters: { failed: true, 'sceneNumber.$': '$.sceneNumber', audioUrl: '' },
+          End: true,
+        },
+      },
+    },
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'RouteBGM',
+  };
+
+  Object.assign(def.States, bgmStates(qmGenerateArn, 'dialoguePremium'));
+  def.States.QMGenerateBGM.Parameters = {
+    assetType: 'bgm', tier: 'dialoguePremium', operation: 'generate', product: 'dialogue',
+    queue: 'background', jobType: 'batch',
+    'prompt.$': '$.bgmPrompt',
+    'segments.$': '$.shotResults',
+    'projectId.$': '$.projectId',
+    'userId.$': '$.userId',
+  };
+  // RouteBGM/SkipBgm/QMGenerateBGM/BgmGenerationFailed all still Next to the
+  // inherited 'NormalizeFourLang' -> ... -> 'DropFrameData' chain, untouched
+  // (same reasoning as Dialogue Basic's builder above).
+
+  def.States.DropFrameData = {
+    Type: 'Pass',
+    Comment: 'Allowlist per §9: shotResults[], bgmResult, ambienceBeds[] — §9 names ambienceBeds as exactly the kind of field this allowlist has silently dropped before (generateShorts/shortsOptions, fourLang).',
+    Parameters: {
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'shotResults.$': '$.shotResults',
+      'bgmResult.$': '$.bgmResult',
+      'ambienceBeds.$': '$.ambienceBeds',
+      'localizedAssets.$': '$.localizedAssets',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+      'apiKey.$': '$.apiKey',
+      'userId.$': '$.userId',
+      'admissionId.$': '$.admissionId',
+      'generateShorts.$': '$.generateShorts',
+      'shortsOptions.$': '$.shortsOptions',
+    },
+    Next: 'UpdateStatusConcatenating',
+  };
+  delete def.States.UpdateStatusApplyingBgm.Catch; // reinstated below, retargeted
+
+  def.States.UpdateStatusConcatenating.Next = 'ConcatenateShots';
+  def.States.UpdateStatusConcatenating.Catch[0].Next = 'ConcatenateShots';
+
+  Object.assign(def.States, concatChain({
+    namePrefix: 'ConcatenateShots', ecs: concatTrimEcs,
+    videosPath: '$.shotResults', outputSubpath: 'dialogue-premium/shots-concatenated',
+    next: 'TranscribeAudio',
+  }));
+
+  def.States.TranscribeAudio = {
+    Type: 'Task',
+    Resource: qmGenerateArn,
+    Comment: 'SRT via QM (srt.dialoguePremium, alias of srt.narration -> self-hosted RunPod Whisper).',
+    Parameters: {
+      assetType: 'srt', tier: 'dialoguePremium', operation: 'transcribe', product: 'dialogue',
+      queue: 'background', jobType: 'batch',
+      'audioUrl.$': '$.ConcatenateShotsResult.audioUrl',
+      'projectId.$': '$.projectId',
+    },
+    ResultPath: '$.transcribeResult',
+    TimeoutSeconds: 920,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.transcribeError', Next: 'SkipSrt' }],
+    Next: 'BuildMergedVoiceResult',
+  };
+  def.States.BuildMergedVoiceResult.Parameters = {
+    'mergedVideoUrl.$': '$.ConcatenateShotsResult.videoUrl',
+    'audioUrl.$': '$.ConcatenateShotsResult.audioUrl',
+    'srtUrl.$': '$.transcribeResult.cdnUrl',
+    'captionsUrl.$': '$.transcribeResult.cdnUrl',
+  };
+  def.States.SetNoLocalizedAssets.Next = 'MixAmbienceBeds';
+
+  // MixAmbienceBeds — new QM-owned Fargate step (qm-dialogue-mix,
+  // mode:"ambience-mix"). Runs BEFORE PrepareFinalizeDialoguePremium so its
+  // output can be used as voiceAudioUrl directly, with no post-hoc overwrite.
+  def.States.MixAmbienceBeds = {
+    Type: 'Pass',
+    Comment: 'Build the dialogue-mix container payload (mode:"ambience-mix").',
+    Parameters: {
+      mode: 'ambience-mix',
+      'mainAudioUrl.$': '$.mergedVoiceResult.audioUrl',
+      'ambienceBeds.$': '$.ambienceBeds',
+      crossfadeSeconds: 0.5,
+      ambienceVolume: 0.04,
+      'outputKey.$': "States.Format('projects/{}/dialogue-premium/mixed-audio.wav', $.projectId)",
+    },
+    ResultPath: '$.mixPayload',
+    Next: 'UploadMixPayload',
+  };
+  def.States.UploadMixPayload = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::lambda:invoke',
+    Comment: 'Same 8192-byte ContainerOverrides workaround as concat-and-trim.',
+    Parameters: {
+      FunctionName: dialogueMixEcs.uploadPayloadArn,
+      Payload: {
+        'key.$': "States.Format('projects/{}/payloads/ambience-mix.json', $.projectId)",
+        'body.$': 'States.JsonToString($.mixPayload)',
+      },
+    },
+    ResultSelector: { 'key.$': '$.Payload.key' },
+    ResultPath: '$.mixPayloadUpload',
+    TimeoutSeconds: 60,
+    Retry: [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'MixAmbienceBedsTask',
+  };
+  def.States.MixAmbienceBedsTask = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::ecs:runTask.sync',
+    Comment: 'Ambience-bed mix via QM\'s own Fargate task (qm-dialogue-mix). Output becomes voiceAudioUrl at finalize — e2e-finalize\'s existing BGM overlay/duck then layers project BGM on top of it unchanged (§7.7).',
+    Parameters: {
+      Cluster: dialogueMixEcs.clusterArn,
+      TaskDefinition: dialogueMixEcs.taskDefinitionArn,
+      LaunchType: 'FARGATE',
+      NetworkConfiguration: {
+        AwsvpcConfiguration: {
+          Subnets: dialogueMixEcs.subnetIds,
+          SecurityGroups: [dialogueMixEcs.securityGroupId],
+          AssignPublicIp: 'ENABLED',
+        },
+      },
+      Overrides: {
+        ContainerOverrides: [{
+          Name: dialogueMixEcs.containerName,
+          Environment: [{ Name: 'PAYLOAD_S3_KEY', 'Value.$': '$.mixPayloadUpload.key' }],
+        }],
+      },
+    },
+    ResultPath: '$.mixEcs',
+    TimeoutSeconds: 1800,
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'BuildMixedAudioResult',
+  };
+  def.States.BuildMixedAudioResult = {
+    Type: 'Pass',
+    Comment: 'Deterministic URL — the ECS task writes to exactly this key.',
+    Parameters: {
+      'cdnUrl.$': `States.Format('https://${dialogueMixEcs.outputBucket}.s3.us-east-1.amazonaws.com/projects/{}/dialogue-premium/mixed-audio.wav', $.projectId)`,
+    },
+    ResultPath: '$.mixedAudioResult',
+    Next: 'UpdateStatusApplyingBgm',
+  };
+
+  def.States.UpdateStatusApplyingBgm.Next = 'ValidateFinalizeInputsDialoguePremium';
+  def.States.UpdateStatusApplyingBgm.Catch = [
+    { ErrorEquals: ['States.ALL'], ResultPath: '$.statusError', Next: 'FinalizeVideoDialoguePremium' },
+  ];
+  def.States.UpdateStatusApplyingBgm.Parameters.assets = {
+    'mergedVideoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
+    'shots.$': '$.shotResults',
+    'localizedAssets.$': '$.localizedAssets',
+  };
+
+  def.States.ValidateFinalizeInputsDialoguePremium = {
+    Type: 'Choice',
+    Comment: 'Verify required fields exist AND are non-empty before finalize (qm-concat-trim-ecs-migration memory).',
+    Choices: [{
+      And: [
+        { Variable: '$.mergedVoiceResult.mergedVideoUrl', IsPresent: true },
+        { Not: { Variable: '$.mergedVoiceResult.mergedVideoUrl', StringEquals: '' } },
+      ],
+      Next: 'PrepareFinalizeDialoguePremium',
+    }],
+    Default: 'FinalizeInputsMissingDialoguePremium',
+  };
+  delete def.States.ValidateFinalizeInputsBasic;
+
+  def.States.FinalizeInputsMissingDialoguePremium = {
+    Type: 'Fail', Error: 'FinalizeInputsMissing', Cause: 'Required finalize input(s) missing: $.mergedVoiceResult.mergedVideoUrl',
+  };
+  delete def.States.FinalizeInputsMissingBasic;
+
+  def.States.PrepareFinalizeDialoguePremium = {
+    Type: 'Pass',
+    Comment: 'Prepare a small payload for the Fargate finalize task. targetResolution upscale is MANDATORY — RunComfy\'s fixed 624x352 output is a resolution floor below even Wan2\'s 480p (§7.6.4).',
+    Parameters: {
+      mode: 'premium',
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'videoUrl.$': '$.mergedVoiceResult.mergedVideoUrl',
+      'voiceAudioUrl.$': '$.mixedAudioResult.cdnUrl',
+      'captionsUrl.$': '$.mergedVoiceResult.captionsUrl',
+      'bgmUrl.$': '$.bgmResult.cdnUrl',
+      targetResolution: '1080p',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+    },
+    ResultPath: '$.finalizeTaskInput',
+    Next: 'NormalizeShortsOptions',
+  };
+  delete def.States.PrepareFinalizeBasic;
+
+  def.States.FinalizeVideoDialoguePremium = {
+    Type: 'Task',
+    Resource: 'arn:aws:states:::ecs:runTask.sync',
+    Comment: 'Finalize on Fargate (unmodified e2e-finalize): 480p->1080p upscale + captions + BGM overlay/duck (over the ambience-mixed voice track).',
+    Parameters: {
+      Cluster: 'arn:aws:ecs:us-east-1:929075264324:cluster/storystudio-e2e',
+      LaunchType: 'FARGATE',
+      TaskDefinition: 'e2e-finalize',
+      NetworkConfiguration: {
+        AwsvpcConfiguration: {
+          Subnets: ['subnet-02557f42e07118380', 'subnet-0389bf7ebb5a497ac'],
+          SecurityGroups: ['sg-0c2549fa2cb194dc6'],
+          AssignPublicIp: 'ENABLED',
+        },
+      },
+      Overrides: {
+        ContainerOverrides: [{
+          Name: 'finalize',
+          Environment: [{ Name: 'PAYLOAD_JSON', 'Value.$': 'States.JsonToString($.finalizeTaskInput)' }],
+        }],
+      },
+    },
+    ResultPath: '$.finalizeEcs',
+    TimeoutSeconds: 5400,
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 30, MaxAttempts: 1, BackoffRate: 2 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'Complete',
+  };
+  delete def.States.FinalizeVideoBasic;
+
+  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoDialoguePremium'));
+
+  return def;
+}
+
+// ---------------------------------------------------------------------------
 // SFN definition
 // ---------------------------------------------------------------------------
 function buildDefinition(brokerArn: string): object {
@@ -3829,8 +6122,14 @@ function buildDefinition(brokerArn: string): object {
       },
       ValidateFinalizeInputsBasic: {
         Type: 'Choice',
-        Comment: 'Verify required fields exist before finalize; fail fast on missing data',
-        Choices: [{ Variable: '$.mergedVoiceResult.mergedVideoUrl', IsPresent: true, Next: 'PrepareFinalizeBasic' }],
+        Comment: 'Verify required fields exist AND are non-empty before finalize; fail fast rather than launching a doomed Fargate finalize against an empty videoUrl. Non-empty check matters for fourLang\'s English branch (BuildMergedVoiceResultFourLangEn): IsPresent alone is true even when concat/trim failed and left mergedVideoUrl as \'\' (the key is always present, just empty) — see qm-concat-trim-ecs-migration memory.',
+        Choices: [{
+          And: [
+            { Variable: '$.mergedVoiceResult.mergedVideoUrl', IsPresent: true },
+            { Not: { Variable: '$.mergedVoiceResult.mergedVideoUrl', StringEquals: '' } },
+          ],
+          Next: 'PrepareFinalizeBasic',
+        }],
         Default: 'FinalizeInputsMissingBasic',
       },
       FinalizeInputsMissingBasic: {
