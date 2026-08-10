@@ -35,6 +35,7 @@ sdk/python/.pytest_cache/
 infra/node_modules/
 infra/dist/
 infra/cdk.out/
+cdk.context.json
 
 # misc
 .DS_Store
