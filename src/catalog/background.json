@@ -9,7 +9,9 @@
     "runpod":    { "limit": 10, "secretEnv": "RUNPOD_API_KEY",
                    "note": "Self-hosted RunPod-serverless models (Flux-TTS-S2T, qwen-image-gen/edit). Concurrency is gated per-endpoint (COUNTER#runpod:*), not by this global limit; account-wide worker cap is 10 (20 post-$200)." },
     "lambda":    { "limit": 30, "secretEnv": "",
-                   "note": "QM-owned Lambda rungs (currently just QM-merge — see adapters/lambdamerge.ts). IAM-authenticated same-account invoke, no API secret. Not a fleet.ts entry — Lambda concurrency isn't a fixed pod count the way RunPod worker counts are, so this global limit (not a per-endpoint counterKey) is the concurrency gate." }
+                   "note": "QM-owned Lambda rungs (currently just QM-merge — see adapters/lambdamerge.ts). IAM-authenticated same-account invoke, no API secret. Not a fleet.ts entry — Lambda concurrency isn't a fixed pod count the way RunPod worker counts are, so this global limit (not a per-endpoint counterKey) is the concurrency gate." },
+    "runcomfy":  { "limit": 12, "secretEnv": "RUNCOMFY_API_KEY",
+                   "note": "RunComfy InfiniteTalk (community/infinite-talk fast + fast/multi) — Dialogue Basic/Premium lip-sync. External, per-second billed — NOT part of the RunPod fleet/ACCOUNT_CAP (fleet.ts has no entry for it; router.ts's isInternalRung() correctly treats it as external since it carries no endpointId). No spend-ceiling mechanism yet (storystudio-dialogue-qm-sfn-handoff.md §10 open question 5, unresolved as of 2026-08-08)." }
   },
   "circuit": {
     "errorThreshold": 0.5,
@@ -149,6 +151,52 @@
       { "provider": "runpod", "model": "flux-concat", "mode": "concat", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
         "note": "Narration Premium video extension — Flux-TTS-S2T concat, duplicates a single Wan2 clip (video_urls: [url, url]) to cover TTS audio longer than Wan2's 7s max duration_s, before merge trims it to the real audio length. Internal-only: no external DR equivalent, but this only fires for the rare >7s-narration frame, not the hot path." }
     ],
+
+    "image.dialogueBasic.persona": [
+      { "provider": "runpod", "model": "qwen-image-gen", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
+        "note": "Dialogue Basic narrator persona still — one per project, generated once before GenerateNarratorSegments so every segment (including 0) anchors on the same identity image (storystudio-dialogue-qm-sfn-handoff.md §4.2, §5). Skipped entirely when narrator.imageUrl is non-empty. Self-hosted Qwen-Image-Gen per the handoff doc's catalog table — same physical rung as image.dialogueBasic.t2i/image.explainer.t2i; split key purely for billing/audit attribution." },
+      { "provider": "kie", "model": "google/nano-banana", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true }
+    ],
+    "image.dialogueBasic.t2i": { "aliasOf": "image.explainer.t2i" },
+    "image.dialogueBasic.i2i": { "aliasOf": "image.narrationPremium.i2i" },
+    "voice.dialogueBasic.tts": [
+      { "provider": "runpod", "model": "qwen-voice-clone", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Dialogue Basic narrator TTS — per SEGMENT (30-45s script), not per frame (storystudio-dialogue-qm-sfn-handoff.md §3.3/§5). clone_artifact_url fast path when narrator.voiceCloneArtifactUrl is non-empty (runpod.ts); falls back to voice-design using voiceInstruct when empty. Same physical Qwen rung as voice.narrationPremium.tts." }
+    ],
+    "video.dialogueBasic.i2v": { "aliasOf": "video.premium.i2v" },
+    "video.dialogueBasic.narrator": [
+      { "provider": "runcomfy", "model": "community/infinite-talk/fast", "endpoint": "v1/models/community/infinite-talk/fast", "routingMode": "direct", "lane": "video",
+        "note": "Dialogue Basic narrator lip-sync — SHORT segments only (actualDurationSeconds <= 15s, routed by RouteNarratorLipSync in pipeline-stack.ts's narrator branch; segments are normally 30-40s, so this rung is a rarely-hit edge case in practice, not the common path). RunComfy InfiniteTalk mono endpoint (audio+image -> talking-head clip), $0.015/second billed. External, NOT part of the RunPod fleet (no counterKey/endpointId — see providers.runcomfy). Verified live 2026-08-08/2026-08-09 with both a synthetic tone AND a real TTS voice clip (real speech confirmed genuine dynamic lip movement, not just a duration match): output_duration == input_audio_duration exactly, no trailing pad, 624x352@25fps regardless of input resolution (storystudio-dialogue-qm-sfn-handoff.md §7.6.5). Poll-only (adapters/runcomfy.ts, supportsWebhook:false)." }
+    ],
+    "video.dialogueBasic.narratorRunpod": [
+      { "provider": "runpod", "model": "infinitetalk", "endpoint": "v2/infinitetalk/run", "routingMode": "direct", "lane": "video", "resolution": "480p", "needs": ["image", "audio"],
+        "note": "Dialogue Basic narrator lip-sync — LONG segments (actualDurationSeconds > 15s), which in practice is EVERY real segment (StoryStudio plans narrator segments at 30-40s, per product decision 2026-08-09). Same legacy named-route RunPod InfiniteTalk integration Documentary Premium already uses (lipsync.premium.video in foreground.json) — no new adapter code, adapters/runpod.ts already branches to POST {}/infinitetalk/run whenever a runpod rung carries no endpointId. $0.25/generation FLAT regardless of duration, vs RunComfy's $0.015/second — mathematical breakeven ~16.7s; the 15s threshold is a deliberate product simplification (not a rounding error — see RouteNarratorLipSync's comment in pipeline-stack.ts), not a safety margin above breakeven. Verified live 2026-08-09 with both a synthetic tone AND a real TTS voice clip (real speech confirmed genuine dynamic lip movement): submit/status/result all matched the existing adapter's expectations exactly, no new parsing needed." }
+    ],
+    "bgm.dialogueBasic": { "aliasOf": "bgm.narration" },
+    "srt.dialogueBasic": { "aliasOf": "srt.narration" },
+
+    "image.dialoguePremium.t2i": { "aliasOf": "image.explainer.t2i" },
+    "image.dialoguePremium.i2i": { "aliasOf": "image.narrationPremium.i2i" },
+    "voice.dialoguePremium.tts": [
+      { "provider": "runpod", "model": "qwen-voice-clone", "mode": "tts", "engine": "qwen", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Dialogue Premium per-character TTS — one call per TURN, not per line (storystudio-dialogue-qm-sfn-handoff.md §7.4/§7.9.2: half the calls, 12% shorter audio, better prosody than per-line-and-concatenate, and sidesteps hosting a concatenated track). Voice resolved per shot from voiceBank[characterId] via QM-build-turn-tracks. Same physical rung as voice.dialogueBasic.tts, split key for attribution." }
+    ],
+    "video.dialoguePremium.i2v": { "aliasOf": "video.premium.i2v" },
+    "video.dialoguePremium.monologue": [
+      { "provider": "runcomfy", "model": "community/infinite-talk/fast", "endpoint": "v1/models/community/infinite-talk/fast", "routingMode": "direct", "lane": "video",
+        "note": "Dialogue Premium single-speaker shots (kind:\"monologue\") — same physical RunComfy endpoint as video.dialogueBasic.narrator, split key for attribution. Coverage singles (2x mono calls) beat a fast/multi two-shot on every axis tested (mouth articulation, no trailing pad, no speaker-order constraint) — monologue is the dominant shot kind as of the 2026-08-08 planning revision (§1, §7.10). No trim needed post-generation (§7.6.5 — mono endpoint has no pad)." }
+    ],
+    "video.dialoguePremium.dialogue": [
+      { "provider": "runcomfy", "model": "community/infinite-talk/fast/multi", "endpoint": "v1/models/community/infinite-talk/fast/multi", "routingMode": "direct", "lane": "video",
+        "note": "Dialogue Premium two-speaker shots (kind:\"dialogue\") — RunComfy InfiniteTalk multi endpoint (left_audio+right_audio+image, exactly one exchange per call — §7.5). Verified live 2026-08-08: plays left track in full then right track in full (sequential, not mixed), output_duration = left_duration+right_duration+1.00s exactly on 4/4 real calls (not max(), not frame-quantised) — the +1.00s trailing pad MUST be trimmed post-generation (TrimToTrackLength, §7.4/§7.6.6) or a multi-shot film accumulates seconds of dead air. External, per-second billed, not RunPod-fleet-managed (no counterKey)." }
+    ],
+    "video.dialoguePremium.merge": { "aliasOf": "video.narrationBasic.merge" },
+    "sfx.dialoguePremium": [
+      { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "6apg6j7suzuezw", "endpoint": "v2/6apg6j7suzuezw", "counterKey": "runpod:bgm-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Dialogue Premium spot SFX (door slam, stone grinding, etc — authored per-shot moments, not gap-fillers, storystudio-dialogue-qm-sfn-handoff.md §7.7 rule 2). Same physical ACE-Step rung as bgm.narration; split key for attribution against the per-scene ambience-bed calls (which route through bgm.dialoguePremium with operation:\"ambience\", falling through this key's alias to the same model — no separate ambience.* key needed). Verified: requested duration_s honoured exactly (+0.024s mp3 frame padding only, no duration enum unlike Wan2 — §7.7.1)." }
+    ],
+    "bgm.dialoguePremium": { "aliasOf": "bgm.narration" },
+    "srt.dialoguePremium": { "aliasOf": "srt.narration" },
 
     "video.basic": [
       { "provider": "consumer", "model": "stock-footage",    "routingMode": "stock",  "lane": "none", "note": "Documentary Basic: free Pexels/Pixabay footage" },

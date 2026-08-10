@@ -43,6 +43,7 @@ const apiStack = new ApiStack(app, 'QMApiStack', {
   kieKeySecretArn: ctx('KIE_AI_API_KEY_ARN'),
   runpodKeySecretArn: ctx('RUNPOD_API_KEY_ARN'),
   anthropicKeySecretArn: ctx('ANTHROPIC_API_KEY_ARN'),
+  runcomfyKeySecretArn: ctx('RUNCOMFY_API_KEY_ARN'),
   s3CacheBucket: app.node.tryGetContext('S3_CACHE_BUCKET') ?? process.env['S3_CACHE_BUCKET'] ?? '',
   // Base URL external providers call back to (set after the webhook stack's
   // first deploy, or a custom domain). Empty is fine for internal-only flows.

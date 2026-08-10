@@ -5,7 +5,7 @@ import {
   getReservationByRequestId, listActiveReservations, releaseReservation, saveReservation,
 } from '../gate/reservation-gate';
 import { projectAssetLoad } from '../shared/assetLoad';
-import type { AssetLoad } from '../shared/assetLoad';
+import type { AssetLoad, ShotCounts } from '../shared/assetLoad';
 import { MAX_ACTIVE_PROJECTS, PROJECT_FLEET, endpointWorkers } from '../shared/fleet';
 import { gatherQueuedDetailed, prewarmEndpoints } from './provisioner';
 import type { BaselineItem, LambdaFunctionUrlEvent, LambdaFunctionUrlResponse, ReservationItem } from '../types';
@@ -64,6 +64,9 @@ interface AdmissionRequest {
   tier: string;
   durationSeconds: number;
   userId?: string;
+  /** Dialogue Premium only — see assetLoad.ts's ShotCounts doc comment. Every
+   * other projectType omits this and gets the duration-derived estimate. */
+  shotCounts?: ShotCounts;
 }
 
 type Decision =
@@ -85,7 +88,7 @@ export async function handleAdmission(evt: LambdaFunctionUrlEvent): Promise<Lamb
     return json(200, grantedResponse(existing));
   }
 
-  const load = projectAssetLoad(body.projectType, body.durationSeconds);
+  const load = projectAssetLoad(body.projectType, body.durationSeconds, body.shotCounts);
   if (!load.supported) {
     return json(400, { error: `unsupported projectType: ${body.projectType}` });
   }
@@ -218,6 +221,10 @@ async function grant(
     neededWorkers, perEndpointJobs: load.perEndpoint,
     status: 'active', drainEstMs,
     createdAt: now, expiresAt: now + BRAIN_WINDOW_MS + drainEstMs + RESERVATION_BUFFER_MS,
+    // Backstop cleanup only (listActiveReservations already filters on status via
+    // reservation-status-index) — 7 days past expiresAt is generous vs. any real
+    // project lifecycle, just stops released/expired reservations piling up forever.
+    ttl: Math.floor((now + BRAIN_WINDOW_MS + drainEstMs + RESERVATION_BUFFER_MS) / 1000) + 7 * 24 * 3600,
   };
   await saveReservation(reservation);
   // Best-effort, synchronous pre-warm (§WS-C3) — the next sweeper tick (≤2 min)

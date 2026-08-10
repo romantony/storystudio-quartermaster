@@ -32,6 +32,7 @@ export const lambdamerge: Adapter = {
         videoUrl: job.initImageUrls?.[0],
         audioUrl: job.audioUrl,
         ...(job.params.durationS !== undefined ? { durationS: job.params.durationS } : {}),
+        ...(job.params.mixMode === 'additive' ? { mixMode: 'additive' as const } : {}),
         outputKey,
       },
     };

@@ -50,6 +50,11 @@ interface QMGenerateEvent {
   effect?: string;
   initImageUrls?: string[];
   audioUrl?: string;
+  // Dialogue Premium `kind:"dialogue"` shots only — RunComfy fast/multi's two
+  // input tracks (adapters/runcomfy.ts). Every other rung leaves both undefined.
+  leftAudioUrl?: string;
+  rightAudioUrl?: string;
+  mixMode?: 'replace' | 'additive';
   // BGM only: the project's frames, used to compute the generated track's
   // length (sum of frame durations) — ASL has no native array-sum function,
   // and by the time BGM would otherwise run near finalize, the pipeline has
@@ -57,6 +62,13 @@ interface QMGenerateEvent {
   // SFN passes the full array here (while it's still available) and lets this
   // Lambda do the sum. Ignored unless durationS is omitted.
   frames?: Array<{ duration?: number }>;
+  // Dialogue Basic's BGM only (storystudio-dialogue-qm-sfn-handoff.md §3.2):
+  // duration = Σ actual segment durations, NOT Σ frame durations — the
+  // narrator track's real (TTS/InfiniteTalk-measured) length, which can
+  // differ from the sum of its scene clips even after ReconcileSegmentTiming
+  // absorbs per-segment drift (§4.5's own ±1-frame residual note). Checked
+  // after `frames` above, so a caller would never send both.
+  segments?: Array<{ actualDurationSeconds?: number }>;
   projectId: string;
   frameId?: string;
   userId?: string;
@@ -141,7 +153,8 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
   const s3Target = event.s3Target
     ?? `storystudio/${event.assetType}s/${event.projectId}_${event.frameId ?? 'na'}_${operation}`;
   const durationS = event.durationS
-    ?? (event.frames?.length ? event.frames.reduce((sum, f) => sum + (f.duration ?? 0), 0) : undefined);
+    ?? (event.frames?.length ? event.frames.reduce((sum, f) => sum + (f.duration ?? 0), 0) : undefined)
+    ?? (event.segments?.length ? event.segments.reduce((sum, s) => sum + (s.actualDurationSeconds ?? 0), 0) : undefined);
 
   const body = {
     assetType: event.assetType,
@@ -169,6 +182,9 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
         ?? (operation === 'ttsFrameLocalizedKokoro' ? defaultLocalizedKokoroVoiceId(event.language, event.voiceGender) : undefined),
       voiceText: event.voiceText,
       effect: event.effect,
+      leftAudioUrl: event.leftAudioUrl,
+      rightAudioUrl: event.rightAudioUrl,
+      mixMode: event.mixMode,
     },
     s3Target,
     projectId: event.projectId,

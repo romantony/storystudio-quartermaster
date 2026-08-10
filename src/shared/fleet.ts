@@ -17,19 +17,19 @@
  *     overwhelmed external fallback) absorb the overflow.
  *   - The narration-serving endpoints (flux-tts-s2t, qwen-image-gen/edit,
  *     wan2-i2v, bgm-s2t) are a *static* allocation, never dynamically
- *     reshuffled, summing to 26 of ACCOUNT_CAP's 30 (account-wide cap raised
- *     20→30 on 2026-07-27; qwen-image-gen raised 0→2 on 2026-07-21 when the
+ *     reshuffled, summing to 35 of ACCOUNT_CAP's 40 (account-wide cap raised
+ *     30→40 on 2026-08-04; qwen-image-gen raised 0→2 on 2026-07-21 when the
  *     explainer/educational/advertisement/documentary/product-promotion T2I
  *     rung moved onto it from the now-retired ernie-image endpoint — see
  *     image.explainer.t2i in background.json).
- *     Re-confirmed against the dashboard 2026-07-27 ("30/30 Workers
- *     deployed"): Flux-TTS-ANIM=10 (was 6), qwen-image-gen=2, qwen-image-
- *     edit=2, Wan2-14b-fp8-RTX6000ADA=8 (was 6), BGM-S2T=4 (was 2). The
- *     other 4 of the account's 30 total deployed workers are outside this
- *     pool entirely (long2shorts=4, was 2 — a direct RunPod call, see
- *     pipeline-stack.ts's ShortsTriggerFunction — not routed through QM's
- *     catalog/provisioner, so it isn't tracked here; story-studio-ernie and
- *     story-studio-stable-video are both at 0).
+ *     Re-confirmed against the dashboard 2026-08-04 ("39/40 Workers
+ *     deployed"): Flux-TTS-ANIM=12 (was 10), qwen-image-gen=3 (was 2),
+ *     qwen-image-edit=4 (was 2), Wan2-14b-fp8-RTX6000ADA=12 (was 8),
+ *     BGM-S2T=4 (unchanged). The other 4 of the account's 40 total deployed
+ *     workers are outside this pool entirely (long2shorts=4 — a direct
+ *     RunPod call, see pipeline-stack.ts's ShortsTriggerFunction — not
+ *     routed through QM's catalog/provisioner, so it isn't tracked here;
+ *     story-studio-ernie and story-studio-stable-video are both at 0).
  *   - Idle floor is 0 (true scale-to-zero) — we don't pay for a warm worker with
  *     no job in front of it. Pre-warm raises workers only on admission, timed to
  *     overlap the ~2-3 min cold start with Convex's brain window.
@@ -57,26 +57,32 @@ export const FLEET: FleetEndpoint[] = [
   // day. BGM (ACE-Step) + SRT (Whisper) were split off to the dedicated
   // bgm-s2t endpoint so once-per-project audio-gen/STT can't steal
   // workers/VRAM from the pipeline. Concurrency = worker count (one req/worker).
-  // Raised 6→10 (2026-07-27): RunPod account cap doubled 20→30 same day
-  // (partly in response to that contention); confirmed against the
-  // dashboard ("30/30 Workers deployed", Flux-TTS-ANIM 0/10 running, 6 idle).
-  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 10 },
+  // Raised 10→12 (2026-08-04): RunPod account cap raised 30→40 same day;
+  // confirmed against the dashboard ("39/40 Workers deployed", Flux-TTS-ANIM
+  // 0/12 running, 9 idle).
+  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 12 },
   // Raised 0→2 (2026-07-21): now the primary rung for image.explainer.t2i
   // (explainer/educational/advertisement/documentary/product-promotion T2I —
   // see background.json), replacing the retired ernie-image endpoint. Premium
   // frames without a character reference still route to Flux4b t2i on
   // flux-tts-s2t, not here — this endpoint is explainer-tier only for now.
-  { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 2 },
-  { counterKey: QWEN_IMAGE_EDIT, endpointId: 'oxwx8o879qwtla', workers: 2 },
-  // Raised 6→8 (2026-07-27, RunPod cap 20→30 — see FLUX_TTS_S2T's entry).
+  // Raised 2→3 (2026-08-04, RunPod cap 30→40 — see FLUX_TTS_S2T's entry);
+  // confirmed against the dashboard ("39/40 Workers deployed", qwen-image-gen
+  // 0/3 running, 2 idle).
+  { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 3 },
+  // Raised 2→4 (2026-08-04, RunPod cap 30→40 — see FLUX_TTS_S2T's entry);
+  // confirmed against the dashboard ("39/40 Workers deployed", qwen-image-edit
+  // 1/4 running, 0 idle).
+  { counterKey: QWEN_IMAGE_EDIT, endpointId: 'oxwx8o879qwtla', workers: 4 },
+  // Raised 8→12 (2026-08-04, RunPod cap 30→40 — see FLUX_TTS_S2T's entry).
   // Keep this number matched to the real pod count: a prior mismatch (4
   // claimed vs 3 real) silently failed 13+ of 17 frames in a live premium
   // run (2026-07-05) because QM's own concurrency gate (endpointWorkers())
   // let jobs submit believing there was room, when they actually queued
   // invisibly behind RunPod's real workers. Re-confirmed against the
-  // dashboard 2026-07-27 ("30/30 Workers deployed", Wan2-14b-fp8-RTX6000ADA
-  // 0/8 running, 6 idle).
-  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 8 },
+  // dashboard 2026-08-04 ("39/40 Workers deployed", Wan2-14b-fp8-RTX6000ADA
+  // 3/12 running, 1 queued, 5 idle).
+  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 12 },
   // bgm-s2t (ENDPOINT_ROLE=audio) — ACE-Step BGM + Whisper SRT, shared by
   // Basic + Premium. Off the per-frame hot path in terms of call volume
   // (~1 BGM call/project), but fourLang's TranscribeAudioFourLang fires up
@@ -84,14 +90,14 @@ export const FLEET: FleetEndpoint[] = [
   // found live 2026-07-27: 2 of 4 concurrent SRT calls failed ("all rungs
   // exhausted", both the internal rung and the Replicate fallback) on a
   // real fourLang execution when this was still only 2 workers. Raised
-  // 2→4 same day (RunPod cap 20→30 — see FLUX_TTS_S2T's entry); confirmed
-  // against the dashboard ("30/30 Workers deployed", BGM-S2T 0/4 running,
-  // 2 idle). Shares the flux2-TTS-S2T-Bgm network volume with flux-tts-s2t
-  // (each endpoint loads only its own models).
+  // 2→4 (2026-07-27, RunPod cap 20→30 — see FLUX_TTS_S2T's entry); left at 4
+  // through the 2026-08-04 30→40 cap raise (dashboard confirmed BGM-S2T
+  // 0/4 running, 4 idle — unchanged). Shares the flux2-TTS-S2T-Bgm network
+  // volume with flux-tts-s2t (each endpoint loads only its own models).
   { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 4 },
 ];
 
-export const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 30);
+export const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 40);
 
 /** Static worker count / concurrency limit for an endpoint (0 if unknown/off). */
 export function endpointWorkers(counterKey: string): number {
@@ -161,6 +167,32 @@ export const PROJECT_FLEET: Record<string, ProjectFleetPlan> = {
     endpoints: [QWEN_IMAGE_EDIT, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T, QWEN_IMAGE_GEN],
     gateEndpoint: WAN2_I2V,
     gateMax: 8, // "<= 8"
+  },
+  // Dialogue Basic (storystudio-dialogue-qm-sfn-handoff.md): narrator persona +
+  // per-segment TTS on flux-tts-s2t, silent Wan2 scenes (~1 clip/5s, same
+  // proportion as narration-premium), narrator lip-sync on RunComfy
+  // (external — deliberately NOT pre-warmed here, it isn't a RunPod
+  // endpoint), project-level SRT+BGM on bgm-s2t. Wan2 is still the shared
+  // RunPod bottleneck, so it gates admission the same way narration-premium's
+  // does — starting from the same gateMax until real dialogue-basic traffic
+  // says otherwise.
+  'dialogue-basic': {
+    endpoints: [QWEN_IMAGE_GEN, QWEN_IMAGE_EDIT, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T],
+    gateEndpoint: WAN2_I2V,
+    gateMax: 8, // "<= 8" — same starting point as narration-premium
+  },
+  // Dialogue Premium: image per shot (mostly i2i — coverage singles anchor on
+  // a character reference, §7.10.2), Wan2 only for `action` shots (NOT
+  // derivable from duration — see assetLoad.ts's shotCounts-aware estimate),
+  // per-turn TTS on flux-tts-s2t, monologue/dialogue lip-sync on RunComfy
+  // (external, not pre-warmed here — same reasoning as dialogue-basic),
+  // project-level SRT+BGM+ambience beds on bgm-s2t. Wan2 still gates
+  // admission even though its share of shots is now the minority (§1) —
+  // it remains the slowest per-job endpoint this tier touches.
+  'dialogue-premium': {
+    endpoints: [QWEN_IMAGE_EDIT, QWEN_IMAGE_GEN, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T],
+    gateEndpoint: WAN2_I2V,
+    gateMax: 8,
   },
 };
 

@@ -1,6 +1,6 @@
 import {
   projectAssetLoad, frameCount, SECONDS_PER_FRAME,
-  FLUX_TTS_S2T, QWEN_IMAGE_GEN, QWEN_IMAGE_EDIT, WAN2_I2V,
+  FLUX_TTS_S2T, QWEN_IMAGE_GEN, QWEN_IMAGE_EDIT, WAN2_I2V, BGM_S2T,
 } from '../src/shared/assetLoad';
 
 describe('frameCount', () => {
@@ -42,6 +42,41 @@ describe('projectAssetLoad — narration-premium (three endpoints)', () => {
     expect(load.perEndpoint[WAN2_I2V]).toBe(20);              // video
     expect(load.total).toBe(20 + 42 + 20);
     expect(load.tier).toBe('premium');
+  });
+});
+
+describe('projectAssetLoad — dialogue-basic (duration-derived, no shotCounts concept)', () => {
+  it('100s → 20 frames → Wan2 + qwen-image-gen scale with frames, flux-tts-s2t/bgm-s2t are fixed per-project', () => {
+    const load = projectAssetLoad('dialogue-basic', 100);
+    expect(load.frameCount).toBe(20);
+    expect(load.perEndpoint[WAN2_I2V]).toBe(20);
+    expect(load.perEndpoint[QWEN_IMAGE_GEN]).toBe(20 + 1); // t2i per frame + 1 persona
+    expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(2);        // per-segment TTS not modeled here — fixed per-project
+    expect(load.perEndpoint[BGM_S2T]).toBe(2);             // SRT + BGM
+    expect(load.tier).toBe('basic');
+  });
+});
+
+describe('projectAssetLoad — dialogue-premium (shotCounts-aware)', () => {
+  it('falls back to duration-derived perFrame when no shotCounts supplied', () => {
+    const load = projectAssetLoad('dialogue-premium', 100); // 20 frames
+    expect(load.perEndpoint[WAN2_I2V]).toBe(20);
+    expect(load.perEndpoint[QWEN_IMAGE_EDIT]).toBe(20);
+    expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(20 * 2); // perFrame only — the fixed +3 lands on BGM_S2T, not this endpoint
+    expect(load.perEndpoint[BGM_S2T]).toBe(3);
+    expect(load.tier).toBe('premium');
+  });
+
+  it('uses shotCounts instead of duration when supplied — Wan2 = action shots only, not duration/5', () => {
+    // A dialogue-dense film: long duration but very few action shots — the
+    // whole point of shotCounts (handoff doc §2): duration-derived estimate
+    // would badly overstate Wan2 demand here.
+    const load = projectAssetLoad('dialogue-premium', 300, { total: 68, monologue: 45, dialogue: 3, action: 20 });
+    expect(load.perEndpoint[WAN2_I2V]).toBe(20);           // action shots only, NOT frameCount(300)=60
+    expect(load.perEndpoint[QWEN_IMAGE_EDIT]).toBe(68);    // every shot gets an image
+    expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(45 + 3 * 2); // mono 1 turn + dialogue 2 turns (fromShotCounts REPLACES perFrame; perProject's +3 still lands on BGM_S2T)
+    expect(load.perEndpoint[BGM_S2T]).toBe(3);
+    expect(load.supported).toBe(true);
   });
 });
 

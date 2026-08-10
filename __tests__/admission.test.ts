@@ -78,6 +78,9 @@ function mockScenario(s: Scenario) {
         const jobs = (s.queuedJobs ?? []).filter(j => j.lane === lane);
         return { Items: jobs.map(j => marshall(j, { removeUndefinedValues: true })) };
       }
+      if (cmd.input.IndexName === 'reservation-status-index') {
+        return { Items: (s.activeReservations ?? []).map(r => marshall(r as Record<string, unknown>)) };
+      }
       const vals = valuesOf(cmd);
       if (typeof vals[':pk'] === 'string' && vals[':pk'].startsWith('BASELINE#')) {
         const ck = vals[':pk'].slice('BASELINE#'.length);
@@ -85,10 +88,6 @@ function mockScenario(s: Scenario) {
         return { Items: samples.map(ewmaMs => marshall({ ewmaMs })) };
       }
       return { Items: [] };
-    }
-
-    if (name === 'ScanCommand') {
-      return { Items: (s.activeReservations ?? []).map(r => marshall(r as Record<string, unknown>)) };
     }
 
     if (name === 'PutItemCommand' || name === 'UpdateItemCommand') return {};
@@ -228,6 +227,59 @@ describe('handleAdmission — defer on the bottleneck gate', () => {
     const body = JSON.parse(res.body!);
     expect(body.decision).toBe('deferred');
     expect(body.reason).toBe('max_projects');
+  });
+});
+
+describe('handleAdmission — dialogue-basic/dialogue-premium', () => {
+  it('grants dialogue-basic and pre-warms exactly its PROJECT_FLEET endpoint set', async () => {
+    mockScenario({ inflight: {}, workersMax: {}, baselines: {} });
+    const res = await handleAdmission(evt({
+      requestId: 'r-dialogue-basic', projectType: 'dialogue-basic', tier: 'basic', durationSeconds: 100,
+    }));
+    const body = JSON.parse(res.body!);
+    expect(body.decision).toBe('granted');
+    // RunComfy (the narrator's InfiniteTalk provider) must NOT appear — it's
+    // external, not RunPod-fleet-managed, so fleet.ts's dialogue-basic entry
+    // deliberately excludes it from pre-warm.
+    expect([...body.warmedEndpoints].sort()).toEqual([
+      'runpod:bgm-s2t', 'runpod:flux-tts-s2t', 'runpod:qwen-image-edit', 'runpod:qwen-image-gen', 'runpod:wan2-i2v',
+    ]);
+  });
+
+  it('grants dialogue-premium and threads shotCounts through to the reservation\'s perEndpointJobs (Wan2 = action shots, not duration-derived)', async () => {
+    mockScenario({ inflight: {}, workersMax: {}, baselines: {} });
+    const res = await handleAdmission(evt({
+      requestId: 'r-dialogue-premium', projectType: 'dialogue-premium', tier: 'premium', durationSeconds: 300,
+      shotCounts: { total: 68, monologue: 45, dialogue: 3, action: 20 },
+    }));
+    const body = JSON.parse(res.body!);
+    expect(body.decision).toBe('granted');
+
+    const putCalls = sendMock.mock.calls.filter(c => cmdName(c[0]) === 'PutItemCommand');
+    const reservationWrite = putCalls
+      .map(c => unmarshall((c[0] as any).input.Item))
+      .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
+    expect(reservationWrite).toBeDefined();
+    const perEndpointJobs = reservationWrite!.perEndpointJobs as Record<string, number>;
+    // frameCount(300) would be 60 — if shotCounts hadn't flowed through, Wan2
+    // demand would badly overstate a dialogue-dense film's real needs (§2).
+    expect(perEndpointJobs['runpod:wan2-i2v']).toBe(20);
+    expect(perEndpointJobs['runpod:qwen-image-edit']).toBe(68);
+  });
+
+  it('defers dialogue-premium when the wan2-i2v backlog exceeds its gate, same as narration-premium', async () => {
+    const wan2Jobs = Array.from({ length: 9 }, (_, i) => ({
+      lane: 'video', status: 'QUEUED', requestId: `dp${i}`, jobId: `dp${i}`,
+      assetType: 'video', tier: 'dialoguePremium', operation: 'i2v', queue: 'background',
+    }));
+    mockScenario({ inflight: {}, workersMax: {}, baselines: {}, queuedJobs: wan2Jobs });
+    const res = await handleAdmission(evt({
+      requestId: 'r-dialogue-premium-busy', projectType: 'dialogue-premium', tier: 'premium', durationSeconds: 100,
+      shotCounts: { total: 30, monologue: 20, dialogue: 2, action: 8 },
+    }));
+    const body = JSON.parse(res.body!);
+    expect(body.decision).toBe('deferred');
+    expect(body.reason).toBe('endpoint_busy');
   });
 });
 

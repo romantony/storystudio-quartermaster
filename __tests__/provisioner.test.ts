@@ -31,11 +31,10 @@ function mockScenario(s: Scenario) {
 
     if (name === 'QueryCommand') {
       if (cmd.input.IndexName === 'queue-index') return { Items: [] }; // no queued jobs
+      if (cmd.input.IndexName === 'reservation-status-index') {
+        return { Items: (s.activeReservations ?? []).map(r => marshall(r as Record<string, unknown>)) };
+      }
       return { Items: [] };
-    }
-
-    if (name === 'ScanCommand') {
-      return { Items: (s.activeReservations ?? []).map(r => marshall(r as Record<string, unknown>)) };
     }
 
     if (name === 'GetItemCommand') {
@@ -76,12 +75,12 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(flux.demand.reserved).toBe(4);
     expect(flux.toMin).toBe(1); // pre-warm, not scaled to zero
     expect(flux.reason).toBe('reservation-prewarm');
-    // flux alone wants max(reserved=4, its own baseline=6)=6 — the baseline
+    // flux alone wants max(reserved=4, its own baseline=12)=12 — the baseline
     // already covers this reservation, and with every endpoint's real
-    // per-endpoint baseline (flux=6, qwen-gen=2, qwen-edit=2, wan2=6) the four
-    // IDLE sums to only 6+2+2+6=16 <= ACCOUNT_CAP(20), so rebalanceUnderCap
-    // never fires.
-    expect(flux.toMax).toBe(6);
+    // per-endpoint baseline (flux=12, qwen-gen=3, qwen-edit=4, wan2=12) the
+    // four IDLE sums to only 12+3+4+12=31 <= ACCOUNT_CAP(40), so
+    // rebalanceUnderCap never fires.
+    expect(flux.toMax).toBe(12);
 
     // Untouched endpoints stay at the idle baseline (unaffected by the reservation).
     const wan2 = plans.find(p => p.counterKey === 'runpod:wan2-i2v')!;
@@ -89,23 +88,22 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(wan2.reason).toBe('scale-to-zero');
   });
 
-  it('idles to each endpoint\'s real per-endpoint baseline, not a uniform default (2026-07-07 account-confirmed values)', async () => {
+  it('idles to each endpoint\'s real per-endpoint baseline, not a uniform default (2026-08-04 account-confirmed values)', async () => {
     mockScenario({ inflight: {} }); // fully idle fleet, no reservations, no organic demand
     const plans = await runProvisioner();
     const byKey = Object.fromEntries(plans.map(p => [p.counterKey, p]));
-    expect(byKey['runpod:flux-tts-s2t'].toMax).toBe(6);
-    expect(byKey['runpod:qwen-image-gen'].toMax).toBe(2);
-    expect(byKey['runpod:qwen-image-edit'].toMax).toBe(2);
-    expect(byKey['runpod:wan2-i2v'].toMax).toBe(6);
-    expect(byKey['runpod:bgm-s2t'].toMax).toBe(2);
-    // Pooled sum is 18 of the account's 20-worker cap (re-confirmed via the
-    // RunPod dashboard 2026-07-21 — wan2 corrected 8→6, a stale count from
-    // 2026-07-07 that was never re-checked). The remaining 2 units are
-    // deployed outside this pool entirely (long2shorts, a direct RunPod call
-    // not routed through QM's catalog/provisioner — see fleet.ts's top
-    // comment), not idle headroom in this pool.
+    expect(byKey['runpod:flux-tts-s2t'].toMax).toBe(12);
+    expect(byKey['runpod:qwen-image-gen'].toMax).toBe(3);
+    expect(byKey['runpod:qwen-image-edit'].toMax).toBe(4);
+    expect(byKey['runpod:wan2-i2v'].toMax).toBe(12);
+    expect(byKey['runpod:bgm-s2t'].toMax).toBe(4);
+    // Pooled sum is 35 of the account's 40-worker cap (re-confirmed via the
+    // RunPod dashboard 2026-08-04 — "39/40 Workers deployed"). The remaining
+    // 4 units are deployed outside this pool entirely (long2shorts, a direct
+    // RunPod call not routed through QM's catalog/provisioner — see
+    // fleet.ts's top comment), not idle headroom in this pool.
     const pooled = ['runpod:flux-tts-s2t', 'runpod:qwen-image-gen', 'runpod:qwen-image-edit', 'runpod:wan2-i2v', 'runpod:bgm-s2t'];
-    expect(pooled.reduce((a, ck) => a + byKey[ck].toMax, 0)).toBe(18);
+    expect(pooled.reduce((a, ck) => a + byKey[ck].toMax, 0)).toBe(35);
     // STANDALONE_ENDPOINTS is empty since 2026-07-21 (ernie-image, its one
     // entry, was retired when image.explainer.t2i's primary rung moved to
     // qwen-image-gen — a pooled endpoint, already asserted above).
@@ -113,14 +111,17 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
   });
 
   it('does not starve a reservation-only endpoint when heavy organic demand elsewhere exceeds the cap', async () => {
-    // qwen-image-gen has heavy live traffic (40 inflight -> 10 workers wanted);
-    // flux-tts-s2t has ZERO live traffic but a granted reservation for 4 workers.
-    // Combined organic-only sizing (10 + 2 + 2 + 2 = 16) already exceeds the
-    // default cap of 10 even before the reservation, so rebalancing must fire —
-    // the assertion is that flux's reserved commitment still gets weighted
-    // fairly instead of collapsing to 0 for lack of "real" queued/inflight jobs.
+    // qwen-image-gen has heavy live traffic (200 inflight -> 50 workers wanted,
+    // dwarfing its own baseline and everyone else's baselineMax); flux-tts-s2t
+    // has ZERO live traffic but a granted reservation for 4 workers. Pooled
+    // baseline-only sizing (12+3+4+12+4=35) is already close to ACCOUNT_CAP(40),
+    // and qwen-image-gen's organic pull alone (50) pushes the pooled total well
+    // past it, so rebalancing must fire — the assertion is that flux's reserved
+    // commitment still gets weighted fairly instead of collapsing to 0 for lack
+    // of "real" queued/inflight jobs, while qwen-image-gen's much larger organic
+    // demand still wins the bigger share.
     mockScenario({
-      inflight: { 'runpod:qwen-image-gen': 40 },
+      inflight: { 'runpod:qwen-image-gen': 200 },
       activeReservations: [{
         pk: 'RESERVATION#qm_adm_y', sk: 'META', admissionId: 'qm_adm_y', requestId: 'r2',
         status: 'active', neededWorkers: { 'runpod:flux-tts-s2t': 4 },
@@ -134,7 +135,7 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     // is empty since 2026-07-21 (see the idle-baseline test above), so every plan
     // here is already in the pooled group; no exclusion needed.
     const pooledTotal = plans.reduce((a, p) => a + p.toMax, 0);
-    expect(pooledTotal).toBeLessThanOrEqual(20); // ACCOUNT_CAP respected
+    expect(pooledTotal).toBeLessThanOrEqual(40); // ACCOUNT_CAP respected
 
     const flux = plans.find(p => p.counterKey === 'runpod:flux-tts-s2t')!;
     const qwenGen = plans.find(p => p.counterKey === 'runpod:qwen-image-gen')!;

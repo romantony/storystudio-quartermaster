@@ -1,5 +1,5 @@
 import {
-  AttributeValue, DynamoDBClient, GetItemCommand, PutItemCommand, ScanCommand, UpdateItemCommand,
+  AttributeValue, DynamoDBClient, GetItemCommand, PutItemCommand, QueryCommand, UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
 import type { ReservationItem } from '../types';
@@ -22,7 +22,10 @@ export async function saveReservation(reservation: ReservationItem): Promise<voi
   await db.send(new PutItemCommand({
     TableName: TABLE,
     Item: marshall(
-      { pk: `RESERVATIONREQ#${reservation.requestId}`, sk: 'META', admissionId: reservation.admissionId },
+      {
+        pk: `RESERVATIONREQ#${reservation.requestId}`, sk: 'META',
+        admissionId: reservation.admissionId, ttl: reservation.ttl,
+      },
       { removeUndefinedValues: true },
     ),
   }));
@@ -83,20 +86,24 @@ export async function expireStaleReservations(): Promise<{ expired: number }> {
 }
 
 /**
- * Active reservations are few (concurrent MCP projects, not per-asset jobs), so a
- * filtered Scan is cheap — mirrors the existing LEASE# reclaim pattern in
- * dynamo-gate.ts. `RESERVATION#` never matches the `RESERVATIONREQ#` pointer items
- * (the character right after "RESERVATION" differs: '#' vs 'R').
+ * Active reservations are few (concurrent MCP projects, not per-asset jobs). Queries
+ * the sparse reservation-status-index (sk:'META' + status — only ReservationItem
+ * records ever set both; the RESERVATIONREQ# pointer items share sk:'META' but never
+ * have `status`, so they're naturally excluded) instead of scanning the whole table.
+ * The prior full-table Scan was billed for every item in the table, not just active
+ * reservations, and this is called every 2 minutes by the sweeper plus on every
+ * admission check.
  */
 export async function listActiveReservations(): Promise<ReservationItem[]> {
   const items: ReservationItem[] = [];
   let lastKey: Record<string, AttributeValue> | undefined;
   do {
-    const result = await db.send(new ScanCommand({
+    const result = await db.send(new QueryCommand({
       TableName: TABLE,
-      FilterExpression: 'begins_with(pk, :pfx) AND #s = :active',
+      IndexName: 'reservation-status-index',
+      KeyConditionExpression: 'sk = :sk AND #s = :active',
       ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: marshall({ ':pfx': 'RESERVATION#', ':active': 'active' }),
+      ExpressionAttributeValues: marshall({ ':sk': 'META', ':active': 'active' }),
       ExclusiveStartKey: lastKey,
     }));
     for (const raw of result.Items ?? []) items.push(unmarshall(raw) as ReservationItem);

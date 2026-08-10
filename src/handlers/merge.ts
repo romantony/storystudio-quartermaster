@@ -2,9 +2,18 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import * as https from 'https';
-import * as http from 'http';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import {
+  download, FFMPEG, getDuration, getSampleRate, parseDurationFromStderr, run, uploadFile,
+} from '../shared/ffmpeg-io';
+
+/** additive mixMode needs an existing `0:a` stream to mix into — an action
+ * shot with no narration VO is still silent (Wan2 has no audio at all) even
+ * on the "common tail," so this falls back to plain replace behavior rather
+ * than erroring on a nonexistent audio stream. */
+function hasAudioStream(input: string): boolean {
+  const r = spawnSync(FFMPEG, ['-i', input], { maxBuffer: 1024 * 1024 * 16 });
+  return /Stream .* Audio:/.test(r.stderr?.toString() ?? '');
+}
 
 /**
  * QM-merge — audio+video mux for the narration-basic per-frame pipeline
@@ -39,68 +48,21 @@ interface MergeEvent {
   audioUrl: string;
   /** Target duration in seconds. Present (fourLang per-frame): pad shorter
    * audio with trailing silence to reach it. Absent: trim to the shorter of
-   * video/audio (legacy -shortest behavior). */
+   * video/audio (legacy -shortest behavior). Ignored when mixMode==='additive'
+   * (the video's own audio duration is always canonical there). */
   durationS?: number;
+  /** 'replace' (default): audioUrl REPLACES the video's own audio track,
+   * same as always. 'additive': audioUrl is MIXED in on top of the video's
+   * EXISTING audio (amix, not apad) — Dialogue Premium's QMMixShotAudio
+   * layering a spot SFX over a shot that already carries dialogue/narration
+   * audio (storystudio-dialogue-qm-sfn-handoff.md §8). */
+  mixMode?: 'replace' | 'additive';
   outputKey: string;
 }
 
 interface MergeResult {
   cdnUrl: string;
   durationS: number;
-}
-
-const FFMPEG = require('@ffmpeg-installer/ffmpeg').path as string;
-const BUCKET = process.env.OUTPUT_BUCKET!;
-const REGION = process.env.AWS_REGION ?? 'us-east-1';
-
-const s3 = new S3Client({ region: REGION });
-
-function run(args: string[]): { stdout: string; stderr: string; status: number } {
-  const r = spawnSync(FFMPEG, args, { maxBuffer: 1024 * 1024 * 128 });
-  if (r.error) throw r.error;
-  return { stdout: r.stdout?.toString() ?? '', stderr: r.stderr?.toString() ?? '', status: r.status ?? 1 };
-}
-
-function download(url: string, dest: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https:') ? https : http;
-    const file = fs.createWriteStream(dest);
-    client.get(url, (res) => {
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        download(res.headers.location, dest).then(resolve, reject);
-        return;
-      }
-      if (res.statusCode !== 200) {
-        reject(new Error(`Download failed: ${url} -> HTTP ${res.statusCode}`));
-        return;
-      }
-      res.pipe(file);
-      file.on('finish', () => file.close(() => resolve()));
-    }).on('error', reject);
-  });
-}
-
-function parseDurationFromStderr(stderr: string): number {
-  const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
-  if (!m) return 0;
-  const [, h, mnt, s] = m;
-  return Number(h) * 3600 + Number(mnt) * 60 + Number(s);
-}
-
-function getDuration(input: string): number {
-  const { stderr } = run(['-i', input, '-f', 'null', '-']);
-  return parseDurationFromStderr(stderr);
-}
-
-/** `@ffmpeg-installer/ffmpeg`'s bundled static binary is an old build (2018,
- * libavfilter 7.46) whose `apad` filter predates the `whole_dur`/`pad_dur`
- * options (seconds-based) — found live 2026-07-27 smoke-testing against
- * real production media, both trim and pad cases: `Option 'whole_dur' not
- * found`. Only `pad_len`/`whole_len` (SAMPLE-count based) exist in this
- * build, so a sample rate has to be parsed out of ffmpeg's own stderr. */
-function getSampleRate(stderr: string): number {
-  const m = stderr.match(/(\d+)\s*Hz/);
-  return m ? Number(m[1]) : 48000;
 }
 
 export const handler = async (event: MergeEvent): Promise<MergeResult> => {
@@ -113,19 +75,34 @@ export const handler = async (event: MergeEvent): Promise<MergeResult> => {
     await Promise.all([download(event.videoUrl, videoPath), download(event.audioUrl, audioPath)]);
 
     const videoDuration = getDuration(videoPath);
-    const audioProbe = run(['-i', audioPath, '-f', 'null', '-']);
-    const audioDuration = parseDurationFromStderr(audioProbe.stderr);
-    const sampleRate = getSampleRate(audioProbe.stderr);
-    const target = event.durationS ?? Math.min(videoDuration, audioDuration);
 
-    // Always pad by a fixed, generous sample count (a full minute of
-    // silence) rather than computing the exact gap — the `-t target` output
-    // cap below trims it to the exact right length either way, so this
-    // works uniformly for both the pad case (audio shorter than target) and
-    // the trim case (audio already >= target, where the padding is simply
-    // never reached before the cutoff).
-    const padLenSamples = sampleRate * 60;
-    const filter = `[1:a]apad=pad_len=${padLenSamples}[aout]`;
+    let filter: string;
+    let target: number;
+    if (event.mixMode === 'additive' && hasAudioStream(videoPath)) {
+      // Mix audioUrl IN ON TOP of the video's own existing audio (a spot SFX
+      // over dialogue/narration that's already there) rather than replacing
+      // it — normalize=0 so ffmpeg doesn't attenuate every input by 1/n
+      // (same amix gotcha as the dialogue-mix ECS task's ambience-bed mix).
+      // The video's own audio duration is canonical; the SFX clip is
+      // typically much shorter and just plays under it.
+      filter = '[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]';
+      target = videoDuration;
+    } else {
+      const audioProbe = run(['-i', audioPath, '-f', 'null', '-']);
+      const audioDuration = parseDurationFromStderr(audioProbe.stderr);
+      const sampleRate = getSampleRate(audioProbe.stderr);
+      target = event.durationS ?? Math.min(videoDuration, audioDuration);
+
+      // Always pad by a fixed, generous sample count (a full minute of
+      // silence) rather than computing the exact gap — the `-t target` output
+      // cap below trims it to the exact right length either way, so this
+      // works uniformly for both the pad case (audio shorter than target) and
+      // the trim case (audio already >= target, where the padding is simply
+      // never reached before the cutoff).
+      const padLenSamples = sampleRate * 60;
+      filter = `[1:a]apad=pad_len=${padLenSamples}[aout]`;
+    }
+
     const { status, stderr } = run([
       '-y', '-i', videoPath, '-i', audioPath,
       '-filter_complex', filter,
@@ -137,18 +114,9 @@ export const handler = async (event: MergeEvent): Promise<MergeResult> => {
     if (status !== 0) throw new Error(`ffmpeg merge failed: ${stderr.slice(-1500)}`);
 
     const finalDuration = getDuration(outputPath) || target;
+    const url = await uploadFile(outputPath, event.outputKey, 'video/mp4');
 
-    await s3.send(new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: event.outputKey,
-      Body: fs.readFileSync(outputPath),
-      ContentType: 'video/mp4',
-    }));
-
-    return {
-      cdnUrl: `https://${BUCKET}.s3.${REGION}.amazonaws.com/${event.outputKey}`,
-      durationS: finalDuration,
-    };
+    return { cdnUrl: url, durationS: finalDuration };
   } finally {
     fs.rmSync(workDir, { recursive: true, force: true });
   }

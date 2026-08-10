@@ -108,6 +108,20 @@ export interface CanonicalJobParams {
   // one call does image + Kokoro TTS + animate + merge on flux-tts-s2t.
   voiceText?: string;
   effect?: string;
+  // Dialogue Premium `kind:"dialogue"` shots only — RunComfy fast/multi's two
+  // input tracks (adapters/runcomfy.ts). left_audio drives the camera-left
+  // face, right_audio the camera-right face (storystudio-dialogue-qm-sfn-
+  // handoff.md §7.4/§7.6.3). Every other rung leaves both undefined.
+  leftAudioUrl?: string;
+  rightAudioUrl?: string;
+  // lambdamerge (video.*.merge) only — 'replace' (default) swaps the video's
+  // audio for audioUrl, same as always. 'additive' MIXES audioUrl in on top
+  // of the video's own existing audio track instead (amix, not apad) — used
+  // by Dialogue Premium's QMMixShotAudio to lay a spot SFX over a shot that
+  // already carries dialogue/narration audio (storystudio-dialogue-qm-sfn-
+  // handoff.md §8, "Common tail"). Every other merge caller omits this and
+  // gets the existing replace behavior unchanged.
+  mixMode?: 'replace' | 'additive';
 }
 
 export interface CanonicalJob {
@@ -195,6 +209,7 @@ export interface JobItem {
   updatedAt: number;    // epoch ms
   degraded?: Array<{ jobId: string; reason: string }>;
   errorReason?: string;
+  ttl?: number;         // Unix epoch seconds for DynamoDB TTL auto-delete (safety-net cleanup, not job-lifetime enforcement)
   // SFN Task Token (waitForTaskToken integration) — present when the caller
   // (qm-generate.ts) submitted this job on behalf of a paused Step Functions
   // task. Threaded onto ProviderTaskItem so webhook.ts (or executor.ts's own
@@ -225,6 +240,10 @@ export interface LeaseItem {
   // Set for RunPod-style single-counter leases (COUNTER#runpod:*). When absent,
   // the lease belongs to the modelslab video/rest floor semaphore.
   counterKey?: string;
+  // Unix epoch seconds for DynamoDB TTL auto-delete — fixed, generous window from
+  // creation (not tied to leaseExpiry/heartbeat), purely a backstop so leases the
+  // sweeper marked `deleted` but never physically removed don't accumulate forever.
+  ttl?: number;
 }
 
 // ─── Webhook Token Map ────────────────────────────────────────────────────────
@@ -373,6 +392,7 @@ export interface ReservationItem {
   expiresAt: number;                   // now + brain window + drain estimate + buffer (dynamic)
   releasedAt?: number;
   outcome?: string;                    // "completed" | "failed", as reported by StoryStudio on release
+  ttl?: number;                        // Unix epoch seconds for DynamoDB TTL auto-delete (backstop past expiresAt)
 }
 
 // ─── RunPod endpoint provisioning state (§Pillar 2) ──────────────────────────

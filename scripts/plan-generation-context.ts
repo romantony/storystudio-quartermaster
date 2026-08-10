@@ -6,11 +6,14 @@
  * can reason about a generation plan with real numbers instead of guessing.
  *
  * Usage:
- *   npx ts-node scripts/plan-generation-context.ts [projectType] [durationSeconds]
+ *   npx ts-node scripts/plan-generation-context.ts [projectType] [durationSeconds] [shotCountsJson]
  *
  * projectType/durationSeconds are optional — when given, also prints the
  * projected per-endpoint job load for that project (via projectAssetLoad),
- * so the plan can be sized against a specific incoming request.
+ * so the plan can be sized against a specific incoming request. shotCountsJson
+ * (dialogue-premium only — e.g. '{"total":68,"monologue":21,"dialogue":24,"action":23}')
+ * is optional on top of that; passed straight through to projectAssetLoad,
+ * same as admission.ts's AdmissionRequest.shotCounts.
  */
 
 import { DynamoDBClient, QueryCommand } from '@aws-sdk/client-dynamodb';
@@ -25,7 +28,7 @@ const db = new DynamoDBClient({});
 
 // Kept in sync by hand with admission.ts's own module-level consts (same env
 // vars, same defaults) — this script only reads state, it doesn't decide.
-const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 10);
+const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 40);
 const JOBS_PER_WORKER = Number(process.env.RUNPOD_JOBS_PER_WORKER ?? 4);
 const SFN_MAP_MAX_CONCURRENCY = Number(process.env.ADMISSION_MAP_CONCURRENCY ?? 15);
 // narration-premium touches 3 endpoints/frame, so it gets its own (lower) ceiling
@@ -90,8 +93,9 @@ async function getBaselines(counterKey: string): Promise<{ ops: Record<string, {
 }
 
 async function main() {
-  const [projectType, durationArg] = process.argv.slice(2);
+  const [projectType, durationArg, shotCountsArg] = process.argv.slice(2);
   const duration = durationArg ? Number(durationArg) : undefined;
+  const shotCounts = shotCountsArg ? JSON.parse(shotCountsArg) : undefined;
 
   const [queuedByEndpoint, activeReservations] = await Promise.all([
     gatherQueuedByEndpoint(),
@@ -148,7 +152,7 @@ async function main() {
   };
 
   if (projectType && duration) {
-    out.requestedProject = projectAssetLoad(projectType, duration);
+    out.requestedProject = projectAssetLoad(projectType, duration, shotCounts);
   }
 
   console.log(JSON.stringify(out, null, 2));

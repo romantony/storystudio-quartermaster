@@ -210,6 +210,9 @@ const canonicalJobSchema = z.object({
     voiceId: z.string().optional(),
     voiceText: z.string().optional(),
     effect: z.string().optional(),
+    leftAudioUrl: z.string().optional(),
+    rightAudioUrl: z.string().optional(),
+    mixMode: z.enum(['replace', 'additive']).optional(),
   }).default({}),
   s3Target: z.string(),
   manifestRef: z.string().optional(),
@@ -285,6 +288,11 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
     createdAt: now,
     updatedAt: now,
     taskToken: input.taskToken,
+    // Backstop cleanup — 30 days is generous vs. any real job lifetime (including
+    // admission queueing waits); this is what lets the queue-index GSI (and the
+    // table generally) stop growing unbounded instead of every job record living
+    // forever (nothing else ever deletes a JobItem).
+    ttl: Math.floor(now / 1000) + 30 * 24 * 3600,
   };
 
   // Overwrite is allowed when the existing record is absent OR already in a

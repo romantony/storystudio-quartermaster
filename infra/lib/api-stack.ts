@@ -21,6 +21,12 @@ interface ApiStackProps extends StackProps {
   kieKeySecretArn: string;
   runpodKeySecretArn: string;
   anthropicKeySecretArn: string;
+  /** RunComfy InfiniteTalk (Dialogue Basic/Premium — adapters/runcomfy.ts).
+   * Plumbing only as of this stack revision: wired the same way as every
+   * other provider secret below, but no real secret has been created/
+   * populated yet — ctx()'s placeholder fallback keeps `cdk synth` working
+   * until one is. */
+  runcomfyKeySecretArn: string;
   s3CacheBucket: string;
   webhookBaseUrl: string;
   /**
@@ -47,6 +53,7 @@ export class ApiStack extends Stack {
       props.kieKeySecretArn,
       props.runpodKeySecretArn,
       props.anthropicKeySecretArn,
+      props.runcomfyKeySecretArn,
     ];
     const providerSecretEnv = {
       MODELSLAB_API_KEY_ARN: props.modeslabKeySecretArn,
@@ -54,6 +61,7 @@ export class ApiStack extends Stack {
       KIE_AI_API_KEY_ARN: props.kieKeySecretArn,
       RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
       ANTHROPIC_API_KEY_ARN: props.anthropicKeySecretArn,
+      RUNCOMFY_API_KEY_ARN: props.runcomfyKeySecretArn,
     };
 
     // ── Executor: execute-with-failover loop. Longer timeout for RunPod cold
@@ -83,10 +91,20 @@ export class ApiStack extends Stack {
       environment: {
         TABLE_NAME: props.table.tableName,
         WEBHOOK_BASE_URL: props.webhookBaseUrl,
+        GATEWAY_STATIC_KEY_ARN: props.gatewayKeySecretArn,
         ...providerSecretEnv,
       },
     });
     props.table.grantReadWriteData(this.executorFunction);
+    // getGatewayKey() (executor.ts) embeds this as the webhook callbackUrl's
+    // `?key=` param — webhook.ts's coarse gate checks it there instead of a
+    // header no provider can be told to send (fixes the live 2026-08-09
+    // "every RunPod callback 401s" gap — see storystudio-reply-dialogue-
+    // validate-input-gap.md's sibling investigation).
+    this.executorFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [props.gatewayKeySecretArn],
+    }));
     this.executorFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ['secretsmanager:GetSecretValue'],
       resources: providerSecretArns,

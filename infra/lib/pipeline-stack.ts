@@ -818,8 +818,14 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
   // overwritten when Premium recreates fresh BGM state objects.
   def.States.NormalizeFourLang = {
     Type: 'Choice',
-    Comment: 'Guarantee $.fourLang is a real boolean before DropFrameData\'s Parameters allowlist would otherwise silently drop it if the caller omitted the key entirely.',
-    Choices: [{ Variable: '$.fourLang', BooleanEquals: true, Next: 'SetFourLangTrue' }],
+    Comment: 'Guarantee $.fourLang is a real boolean before DropFrameData\'s Parameters allowlist would otherwise silently drop it if the caller omitted the key entirely. IsPresent-guarded (BUGFIX 2026-08-10, confirmed live on a real dialogue-basic execution, which never sends fourLang at all): a bare BooleanEquals on a path that does not resolve at all throws States.Runtime (\'Invalid path\') — same gotcha RouteFrameGeneration above already guards against — rather than the non-matching/Default fallthrough this state\'s original comment assumed.',
+    Choices: [{
+      And: [
+        { Variable: '$.fourLang', IsPresent: true },
+        { Variable: '$.fourLang', BooleanEquals: true },
+      ],
+      Next: 'SetFourLangTrue',
+    }],
     Default: 'SetFourLangFalse',
   };
   def.States.SetFourLangTrue = { Type: 'Pass', Result: true, ResultPath: '$.fourLang', Next: 'NormalizeGenerateShortsField' };
@@ -840,8 +846,14 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
   // block, not surviving the DropFrameData allowlist).
   def.States.NormalizeGenerateShortsField = {
     Type: 'Choice',
-    Comment: 'Guarantee $.generateShorts is a real boolean before DropFrameData\'s Parameters allowlist would otherwise silently drop it if the caller omitted the key entirely.',
-    Choices: [{ Variable: '$.generateShorts', BooleanEquals: true, Next: 'SetGenerateShortsFieldTrue' }],
+    Comment: 'Guarantee $.generateShorts is a real boolean before DropFrameData\'s Parameters allowlist would otherwise silently drop it if the caller omitted the key entirely. IsPresent-guarded — same fix/reason as NormalizeFourLang above (dialogue-basic never sends generateShorts either, and would hit the identical States.Runtime the very next state after fourLang).',
+    Choices: [{
+      And: [
+        { Variable: '$.generateShorts', IsPresent: true },
+        { Variable: '$.generateShorts', BooleanEquals: true },
+      ],
+      Next: 'SetGenerateShortsFieldTrue',
+    }],
     Default: 'SetGenerateShortsFieldFalse',
   };
   def.States.SetGenerateShortsFieldTrue = { Type: 'Pass', Result: true, ResultPath: '$.generateShorts', Next: 'NormalizeShortsOptionsField' };
@@ -3902,23 +3914,35 @@ function qmPremiumFrameAssetsMap(qmGenerateArn: string, remotionOverlayArn: stri
 // convention/shortsTriggerStates/the fourLang+shorts field-normalization
 // chain) fully assembled, so only the per-project-type pieces need writing.
 //
-// The inherited fourLang/localization states (RouteFrameGeneration,
-// GenerateImagesFourLang, RouteConcatFourLang, and everything
-// fourLangConcatFinalizeStates() produced) are deliberately left in place,
-// UNREFERENCED, rather than deleted — fourLang is explicitly out of scope
-// for both dialogue tiers (handoff doc §3.7/§1), and Step Functions does not
-// validate state reachability at deploy time, so leaving them as dead JSON
-// is lower-risk than trying to enumerate and delete every name
-// fourLangConcatFinalizeStates() generates internally.
+// CORRECTION (2026-08-10, learned the hard way across two real dialogue-basic
+// executions — see storystudio-reply-dialogue-validate-input-gap.md): both
+// claims this comment used to make here were wrong.
 //
-// The inherited NormalizeFourLang -> ... -> NormalizeShortsOptionsField ->
-// SetShortsOptionsFieldDefault chain IS still wired in and used, though —
-// it's a generic "guarantee these optional fields are present" pass with no
-// dialogue-specific content, its Choice states use bare comparisons on
-// possibly-absent variables that Step Functions treats as non-matching
-// rather than throwing (confirmed by that chain's own existing, deployed
-// code), and it already terminates at 'DropFrameData', which both builders
-// below simply redefine.
+// 1. "Step Functions does not validate state reachability at deploy time" —
+//    false. The live CreateStateMachine/UpdateStateMachine API rejects any
+//    declared-but-unreachable state at deploy time (confirmed:
+//    MISSING_TRANSITION_TARGET on an orphaned CheckValidation, first deploy
+//    attempt of the ValidateInput fix). CDK's own `synth` does NOT catch
+//    this — only the real API call does. RouteFrameGeneration/
+//    GenerateImagesFourLang/RouteConcatFourLang/fourLangConcatFinalizeStates'
+//    output are therefore explicitly `delete`d below in both builders (see
+//    the `deadState` loops), not left as unreferenced dead JSON — leaving
+//    any of them unreferenced would fail deployment outright.
+//
+// 2. The inherited NormalizeFourLang -> NormalizeGenerateShortsField ->
+//    NormalizeShortsOptionsField -> SetShortsOptionsFieldDefault chain IS
+//    still wired in and used (terminates at 'DropFrameData', which both
+//    builders below redefine) — but its first two Choice states' bare
+//    `BooleanEquals` comparisons on $.fourLang/$.generateShorts (fields
+//    dialogue never sends at all) do NOT get treated as a harmless
+//    non-match/Default fallthrough — they throw States.Runtime ('Invalid
+//    path'), an uncatchable execution-ending error, exactly like
+//    UpdateStatusConcatenating's $.videoResults bug below. Both are now
+//    IsPresent-guarded (same pattern as RouteFrameGeneration), fixed at the
+//    shared buildQmNewDefinition source rather than per-builder, since
+//    narration tiers omitting these same optional fields are equally
+//    exposed. NormalizeShortsOptionsField was already correctly
+//    IsPresent-guarded and needed no fix.
 // ---------------------------------------------------------------------------
 
 interface DialogueMixEcsConfig {
@@ -4114,26 +4138,51 @@ function dialogueBasicNarratorBranch(qmGenerateArn: string): object {
               Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.infiniteTalkError', Next: 'NarratorSegmentFailed' }],
               Next: 'BuildSegmentResult',
             },
+            // waitForTaskToken (2026-08-09): confirmed live — every real
+            // narrator segment (30-40s scripts, the norm per product
+            // decision) blew past qm-generate.ts's 850s blocking-poll
+            // ceiling, throwing "timed out after 850000ms" even though the
+            // underlying RunPod job was still running (RunPod InfiniteTalk
+            // can take up to ~15min for audio >45s). That cascaded into
+            // ReconcileSegmentTiming crashing on NaN (a segment with no
+            // actualDurationSeconds) and killing the whole execution — see
+            // storystudio-reply-dialogue-validate-input-gap.md's sibling
+            // report on this failure. Same fix as localizationStates'
+            // ttsTask() (§ above): this rung is already treated as
+            // "external"/webhook-completing by executor.ts (isInternalRung()
+            // is false here — no endpointId, just the legacy named
+            // /infinitetalk route — see router.ts), so RunPod already POSTs
+            // to our webhook on completion regardless of whether anything is
+            // still polling for it. Switching to .waitForTaskToken just stops
+            // qm-generate.ts from blocking-polling inside a single Lambda
+            // invocation (which can never safely exceed ~850s given Lambda's
+            // 900s hard ceiling) and lets webhook.ts's resumeStepFunction
+            // resolve this task whenever RunPod actually finishes, no matter
+            // how long that takes.
             QMGenerateInfiniteTalkRunpod: {
               Type: 'Task',
-              Resource: qmGenerateArn,
-              Comment: 'Narrator lip-sync via QM (video.dialogueBasic.narratorRunpod: legacy named-route RunPod InfiniteTalk, $0.25/generation flat — same integration Documentary Premium already uses, no new adapter code). Segments >15s (RouteNarratorLipSync) — i.e. the common case, since segments are planned at 30-40s.',
+              Resource: 'arn:aws:states:::lambda:invoke.waitForTaskToken',
+              Comment: "Narrator lip-sync via QM (video.dialogueBasic.narratorRunpod: legacy named-route RunPod InfiniteTalk, $0.25/generation flat — same integration Documentary Premium already uses, no new adapter code). Segments >15s (RouteNarratorLipSync) — i.e. the common case, since segments are planned at 30-40s. RunPod can take up to ~15min for audio >45s, so this waits on webhook.ts's callback rather than blocking-polling inside qm-generate.ts.",
               Parameters: {
-                assetType: 'video',
-                tier: 'dialogueBasic',
-                operation: 'narratorRunpod',
-                product: 'dialogue',
-                queue: 'background',
-                jobType: 'batch',
-                'prompt.$': '$.narrator.imagePrompt',
-                'audioUrl.$': '$.ttsResult.cdnUrl',
-                'initImageUrls.$': 'States.Array($.personaImageUrl)',
-                'projectId.$': '$.projectId',
-                'frameId.$': "States.Format('segment-{}', $.segmentIndex)",
-                'userId.$': '$.userId',
+                FunctionName: qmGenerateArn,
+                Payload: {
+                  assetType: 'video',
+                  tier: 'dialogueBasic',
+                  operation: 'narratorRunpod',
+                  product: 'dialogue',
+                  queue: 'background',
+                  jobType: 'batch',
+                  'prompt.$': '$.narrator.imagePrompt',
+                  'audioUrl.$': '$.ttsResult.cdnUrl',
+                  'initImageUrls.$': 'States.Array($.personaImageUrl)',
+                  'projectId.$': '$.projectId',
+                  'frameId.$': "States.Format('segment-{}', $.segmentIndex)",
+                  'userId.$': '$.userId',
+                  'taskToken.$': '$$.Task.Token',
+                },
               },
               ResultPath: '$.infiniteTalkResult',
-              TimeoutSeconds: 920,
+              TimeoutSeconds: 1800,
               Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
               Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.infiniteTalkError', Next: 'NarratorSegmentFailed' }],
               Next: 'BuildSegmentResult',
@@ -4506,6 +4555,16 @@ function buildDialogueBasicQmNewDefinition(
   // (right before the concat chains) rather than leaving it orphaned too.
   def.States.UpdateStatusConcatenating.Next = 'ConcatenateScenes';
   def.States.UpdateStatusConcatenating.Catch[0].Next = 'ConcatenateScenes';
+  // The inherited Parameters block still references narration's $.videoResults
+  // (there is no such field on dialogue-basic's state — this point in the flow
+  // carries sceneResults/reconcileResult instead). A bad `.$` field reference
+  // in Parameters throws States.Runtime, which — unlike a normal Task error —
+  // is NOT caught by this state's own Catch: [States.ALL] and fails the whole
+  // execution outright (confirmed live 2026-08-09, first real execution to
+  // reach this state: "The JSONPath '$.videoResults' ... could not be
+  // found", uncaught despite the Catch clause). Point it at the corrected
+  // (post-ReconcileSegmentTiming) scene clips instead.
+  def.States.UpdateStatusConcatenating.Parameters.assets = { 'frames.$': '$.reconcileResult.sceneResults' };
 
   def.States.GenerateNarratorAndScenes = {
     Type: 'Parallel',
@@ -5496,6 +5555,11 @@ function buildDialoguePremiumQmNewDefinition(opts: {
 
   def.States.UpdateStatusConcatenating.Next = 'ConcatenateShots';
   def.States.UpdateStatusConcatenating.Catch[0].Next = 'ConcatenateShots';
+  // Same latent bug as Dialogue Basic's builder above (see that comment) —
+  // this tier's DropFrameData allowlists shotResults, not videoResults, so
+  // the inherited Parameters.assets.frames.$ would throw an uncatchable
+  // States.Runtime the first time a real premium execution reached here.
+  def.States.UpdateStatusConcatenating.Parameters.assets = { 'frames.$': '$.shotResults' };
 
   Object.assign(def.States, concatChain({
     namePrefix: 'ConcatenateShots', ecs: concatTrimEcs,

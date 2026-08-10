@@ -17,6 +17,7 @@ export const FLUX_TTS_S2T = 'runpod:flux-tts-s2t';
 export const QWEN_IMAGE_GEN = 'runpod:qwen-image-gen';
 export const QWEN_IMAGE_EDIT = 'runpod:qwen-image-edit';
 export const WAN2_I2V = 'runpod:wan2-i2v';
+export const BGM_S2T = 'runpod:bgm-s2t';
 
 /**
  * Seconds of finished video per generated frame (capacity estimate — the real
@@ -40,12 +41,31 @@ export interface AssetLoad {
   supported: boolean;
 }
 
+/** Dialogue Premium's per-shot-kind breakdown (storystudio-dialogue-qm-sfn-
+ * handoff.md §2/§7.2) — sent by StoryStudio precisely so admission doesn't
+ * have to guess Wan2 demand from duration, which a dialogue-dense film would
+ * badly overstate (§2: "a dialogue-dense film may have only 20% action shots"). */
+export interface ShotCounts {
+  total: number;
+  monologue: number;
+  dialogue: number;
+  action: number;
+}
+
 interface LoadSpec {
   tier: string;
-  /** counterKey → jobs generated per frame. */
+  /** counterKey → jobs generated per frame. Used when the caller has no
+   * shotCounts (or the spec has no fromShotCounts estimator). */
   perFrame: Record<string, number>;
-  /** counterKey → fixed jobs per project (e.g. 1 SRT + 1 BGM). */
+  /** counterKey → fixed jobs per project (e.g. 1 SRT + 1 BGM). Always added,
+   * regardless of which per-frame/per-shot estimate was used. */
   perProject: Record<string, number>;
+  /** When set and the caller supplies shotCounts, this REPLACES the
+   * perFrame x frameCount(duration) estimate for the per-frame portion —
+   * a shot-mix-driven job count is more accurate than a duration-derived one
+   * whenever demand isn't proportional to duration (Wan2 for dialogue-premium:
+   * only `action` shots use it, and the action share varies film to film). */
+  fromShotCounts?: (shotCounts: ShotCounts) => Record<string, number>;
 }
 
 /**
@@ -72,6 +92,41 @@ const LOAD_SPECS: Record<string, LoadSpec> = {
     perFrame: { [QWEN_IMAGE_EDIT]: 1, [FLUX_TTS_S2T]: 2, [WAN2_I2V]: 1 },
     perProject: { [FLUX_TTS_S2T]: 2 },
   },
+  // Dialogue Basic: Wan2-heavy in the same proportion as narration-premium
+  // (~1 clip per 5s of output — storystudio-dialogue-qm-sfn-handoff.md §2),
+  // plus a scene image per frame (qwen-image-gen — image.dialogueBasic.t2i).
+  // Narrator persona (1) + per-segment TTS land on RunPod (qwen-image-gen +
+  // flux-tts-s2t) and ARE counted; the narrator's InfiniteTalk lip-sync runs
+  // on RunComfy, which is external/not RunPod-fleet-managed, so it
+  // deliberately has no counterKey here (see fleet.ts's dialogue-basic entry
+  // for the same omission on the pre-warm side). Segment count (~duration/35s)
+  // isn't captured either — TTS+InfiniteTalk demand is real but off this
+  // RunPod-only capacity model by design.
+  'dialogue-basic': {
+    tier: 'basic',
+    perFrame: { [WAN2_I2V]: 1, [QWEN_IMAGE_GEN]: 1 },
+    perProject: { [QWEN_IMAGE_GEN]: 1, [FLUX_TTS_S2T]: 2, [BGM_S2T]: 2 },
+  },
+  // Dialogue Premium: Wan2 demand is NOT derivable from duration (§2) — a
+  // dialogue-dense film may be 80% monologue/dialogue shots (RunComfy, not
+  // RunPod) and only 20% action (Wan2). fromShotCounts computes the accurate
+  // per-endpoint estimate when the caller supplies shotCounts (§7.2); perFrame
+  // below is only the fallback used when a caller has no shotCounts yet
+  // (duration/5, same proportion as narration-premium — an overestimate for
+  // a dialogue-heavy film, which is exactly the inaccuracy shotCounts exists
+  // to fix). Every shot gets one image (mostly i2i — coverage singles anchor
+  // on a character reference, §7.10.2) and roughly one TTS turn-pair;
+  // monologue/dialogue lip-sync itself is RunComfy (external, no counterKey).
+  'dialogue-premium': {
+    tier: 'premium',
+    perFrame: { [WAN2_I2V]: 1, [QWEN_IMAGE_EDIT]: 1, [FLUX_TTS_S2T]: 2 },
+    perProject: { [BGM_S2T]: 3 }, // SRT + project BGM + a representative ambience-bed call
+    fromShotCounts: (shotCounts) => ({
+      [WAN2_I2V]: shotCounts.action,
+      [QWEN_IMAGE_EDIT]: shotCounts.total,
+      [FLUX_TTS_S2T]: shotCounts.monologue + shotCounts.dialogue * 2, // 1 turn (mono) / 2 turns (dialogue)
+    }),
+  },
 };
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -86,8 +141,16 @@ export function frameCount(durationSeconds: number): number {
 /**
  * Project the per-endpoint job load for a project. Unknown projectTypes return
  * `supported:false` with an empty load so callers can reject/handle explicitly.
+ *
+ * `shotCounts` (Dialogue Premium only, storystudio-dialogue-qm-sfn-handoff.md
+ * §7.2) lets a caller replace the duration-derived perFrame estimate with an
+ * accurate per-shot-kind one, via the project type's `fromShotCounts` spec.
+ * Every other caller/project type ignores this parameter entirely — the
+ * signature stays backward compatible.
  */
-export function projectAssetLoad(projectType: string, durationSeconds: number): AssetLoad {
+export function projectAssetLoad(
+  projectType: string, durationSeconds: number, shotCounts?: ShotCounts,
+): AssetLoad {
   const key = projectType.toLowerCase();
   const spec = LOAD_SPECS[key];
   const frames = frameCount(durationSeconds);
@@ -100,8 +163,11 @@ export function projectAssetLoad(projectType: string, durationSeconds: number): 
   }
 
   const perEndpoint: Record<string, number> = {};
-  for (const [ck, per] of Object.entries(spec.perFrame)) {
-    perEndpoint[ck] = (perEndpoint[ck] ?? 0) + per * frames;
+  const perFrameEndpoint = shotCounts && spec.fromShotCounts
+    ? spec.fromShotCounts(shotCounts)
+    : mapValues(spec.perFrame, per => per * frames);
+  for (const [ck, jobs] of Object.entries(perFrameEndpoint)) {
+    perEndpoint[ck] = (perEndpoint[ck] ?? 0) + jobs;
   }
   for (const [ck, fixed] of Object.entries(spec.perProject)) {
     perEndpoint[ck] = (perEndpoint[ck] ?? 0) + fixed;
@@ -109,4 +175,8 @@ export function projectAssetLoad(projectType: string, durationSeconds: number): 
 
   const total = Object.values(perEndpoint).reduce((a, b) => a + b, 0);
   return { projectType, tier: spec.tier, durationSeconds, frameCount: frames, perEndpoint, total, supported: true };
+}
+
+function mapValues(rec: Record<string, number>, fn: (n: number) => number): Record<string, number> {
+  return Object.fromEntries(Object.entries(rec).map(([k, v]) => [k, fn(v)]));
 }

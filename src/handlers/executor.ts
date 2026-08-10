@@ -47,6 +47,23 @@ const MAX_DISPATCH_CHAIN = Number(process.env.MAX_DISPATCH_CHAIN ?? 10);
 const db = new DynamoDBClient({});
 const sm = new SecretsManagerClient({});
 
+// Embedded in every webhook callbackUrl below as a `?key=` query param —
+// webhook.ts's coarse gate checks this (queryStringParameters, not a header:
+// providers like RunPod have no mechanism to attach a custom auth header to
+// their callback POST, so a header-only check silently 401s every real
+// webhook — confirmed live 2026-08-09, 18/18 RunPod callbacks rejected while
+// RunPod's own dashboard showed the jobs completing cleanly in ~5min. See
+// storystudio-reply-dialogue-validate-input-gap.md's sibling investigation.
+let cachedGatewayKey: string | undefined;
+async function getGatewayKey(): Promise<string> {
+  if (cachedGatewayKey) return cachedGatewayKey;
+  const arn = process.env.GATEWAY_STATIC_KEY_ARN;
+  if (!arn) return '';
+  const res = await sm.send(new GetSecretValueCommand({ SecretId: arn }));
+  cachedGatewayKey = res.SecretString ?? '';
+  return cachedGatewayKey;
+}
+
 interface ExecutorEvent {
   requestId: string;
   jobId: string;
@@ -147,7 +164,9 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
         // callbackUrl like an external rung and is handed off to webhook.ts —
         // see the "Webhook-capable rung" branch below.
         const useWebhook = !internal || rung.webhookCompletion;
-        const callbackUrl = useWebhook ? `${WEBHOOK_BASE}/webhooks/${rung.provider}` : undefined;
+        const callbackUrl = useWebhook
+          ? `${WEBHOOK_BASE}/webhooks/${rung.provider}?key=${encodeURIComponent(await getGatewayKey())}`
+          : undefined;
         const raw = await submit(adapter, job, rung, callbackUrl);
         const result = adapter.parseSubmit(raw);
 

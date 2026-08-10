@@ -5,7 +5,6 @@ import {
   QueryCommand,
   GetItemCommand,
   PutItemCommand,
-  ScanCommand,
   TransactWriteItemsCommand,
 } from '@aws-sdk/client-dynamodb';
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';
@@ -93,6 +92,7 @@ export async function acquireSimple(
     leaseExpiry: expiry,
     acquiredAt: now,
     counterKey,
+    ttl: Math.floor(now / 1000) + 24 * 3600,
   };
   await client.send(new PutItemCommand({ TableName: TABLE, Item: marshall(leaseItem) }));
 
@@ -222,6 +222,7 @@ export async function acquire(
     tenant,
     leaseExpiry: expiry,
     acquiredAt: now,
+    ttl: Math.floor(now / 1000) + 24 * 3600,
   };
   await client.send(new PutItemCommand({
     TableName: TABLE,
@@ -524,11 +525,13 @@ export async function reconcileCounter(): Promise<{ video: number; rest: number 
   let lastKey: Record<string, AttributeValue> | undefined;
 
   do {
-    const result = await client.send(new ScanCommand({
+    // Same lease-index Query as reclaimExpiredLeases() — was a full-table Scan.
+    const result = await client.send(new QueryCommand({
       TableName: TABLE,
-      FilterExpression:
-        'begins_with(pk, :pfx) AND leaseExpiry >= :now AND attribute_not_exists(deleted)',
-      ExpressionAttributeValues: marshall({ ':pfx': 'LEASE#', ':now': now }),
+      IndexName: 'lease-index',
+      KeyConditionExpression: 'sk = :sk AND leaseExpiry >= :now',
+      FilterExpression: 'attribute_not_exists(deleted)',
+      ExpressionAttributeValues: marshall({ ':sk': 'LEASE', ':now': now }),
       ProjectionExpression: 'lane, counterKey',
       ExclusiveStartKey: lastKey,
     }));
@@ -586,11 +589,15 @@ export async function reclaimExpiredLeases(): Promise<{ reclaimed: number }> {
   let lastKey: Record<string, AttributeValue> | undefined;
 
   do {
-    const result = await client.send(new ScanCommand({
+    // Query the sparse lease-index (sk='LEASE') instead of scanning the whole
+    // table — a Scan here was billed for every item in the table, not just the
+    // handful of live leases, every 2 minutes via the sweeper (see database-stack.ts).
+    const result = await client.send(new QueryCommand({
       TableName: TABLE,
-      FilterExpression:
-        'begins_with(pk, :pfx) AND leaseExpiry < :now AND attribute_not_exists(deleted)',
-      ExpressionAttributeValues: marshall({ ':pfx': 'LEASE#', ':now': now }),
+      IndexName: 'lease-index',
+      KeyConditionExpression: 'sk = :sk AND leaseExpiry < :now',
+      FilterExpression: 'attribute_not_exists(deleted)',
+      ExpressionAttributeValues: marshall({ ':sk': 'LEASE', ':now': now }),
       ExclusiveStartKey: lastKey,
     }));
 

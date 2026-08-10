@@ -42,9 +42,19 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
       return ok;
     }
 
-    // 2. Coarse gate: X-Gateway-Key
+    // 2. Coarse gate: shared secret, delivered as a `?key=` query param on the
+    // callbackUrl QM itself hands each provider (executor.ts's callbackUrl) —
+    // providers have no mechanism to attach a custom auth header to their
+    // callback POST, so checking only a header 401s every real webhook
+    // (confirmed live 2026-08-09: RunPod's own dashboard showed a job
+    // completing in ~5min, but every callback here was rejected, so QM's job
+    // record never left PROCESSING and the SFN task eventually timed out
+    // waiting on it). The header is still accepted too, for manual/curl
+    // testing — see storystudio-reply-dialogue-validate-input-gap.md's
+    // sibling investigation for the live symptom this fixes.
     const gatewayKey = await getSecret(process.env.GATEWAY_STATIC_KEY_ARN ?? '');
-    if (evt.headers['x-gateway-key'] !== gatewayKey) {
+    const presentedKey = evt.queryStringParameters?.key ?? evt.headers['x-gateway-key'];
+    if (presentedKey !== gatewayKey) {
       console.warn('[webhook] invalid gateway key');
       return { statusCode: 401 };
     }
