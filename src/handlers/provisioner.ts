@@ -33,11 +33,11 @@ const sm = new SecretsManagerClient({});
 // account-confirmed idle floor — NOT a uniform guess. Using one global
 // constant here previously caused the provisioner's shadow model to silently
 // diverge from RunPod's actual config, which the periodic scale-to-zero tick
-// would have kept re-asserting forever. Raised 2026-08-04 (RunPod account cap
-// raised 30→40) to match the dashboard ("39/40 Workers deployed"):
-// Flux-TTS-ANIM=12 (was 10), qwen-image-gen=3 (was 2), qwen-image-edit=4
-// (was 2), Wan2-14b-fp8-RTX6000ADA=12 (was 8), BGM-S2T=4 (unchanged) —
-// matches fleet.ts's "35 of ACCOUNT_CAP's 40" accounting exactly (bgm-s2t is
+// would have kept re-asserting forever. Re-synced 2026-08-11 to match the
+// dashboard ("39/40 Workers deployed"): Flux-TTS-ANIM=8 (was 12),
+// qwen-image-gen=6 (was 3), qwen-image-edit=4 (unchanged),
+// Wan2-14b-fp8-RTX6000ADA=10 (was 12), BGM-S2T=4 (unchanged) — matches
+// fleet.ts's "32 of ACCOUNT_CAP's 40" accounting exactly (bgm-s2t is
 // a real shared-account endpoint split off flux-tts-s2t for VRAM isolation,
 // not a separate GPU — see STANDALONE_ENDPOINTS below for the one that
 // genuinely is).
@@ -47,10 +47,10 @@ const sm = new SecretsManagerClient({});
 // prewarmEndpoints (below) silently no-op'd for any counterKey absent here, so
 // that pre-warm never actually reached RunPod. Added to close the gap.
 export const ENDPOINTS: Array<{ counterKey: string; endpointId: string; baselineMax: number }> = [
-  { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 12 },
-  { counterKey: 'runpod:qwen-image-gen',  endpointId: 'e165se4r3eo5hp', baselineMax: 3 },
+  { counterKey: 'runpod:flux-tts-s2t',    endpointId: 'rnqxi6c0mlq517', baselineMax: 8 },
+  { counterKey: 'runpod:qwen-image-gen',  endpointId: 'e165se4r3eo5hp', baselineMax: 6 },
   { counterKey: 'runpod:qwen-image-edit', endpointId: 'oxwx8o879qwtla', baselineMax: 4 },
-  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 12 },
+  { counterKey: 'runpod:wan2-i2v',        endpointId: 'nd7wloyvj09xwy', baselineMax: 10 },
   { counterKey: 'runpod:bgm-s2t',         endpointId: '6apg6j7suzuezw', baselineMax: 4 },
 ];
 
