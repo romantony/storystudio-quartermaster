@@ -117,8 +117,16 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
       };
     }
     case 't2i': {
-      // Standalone qwen-image-gen endpoint.
+      // qwen-image-gen endpoint — hosts both Qwen-Image and Flux Klein 4B,
+      // selected per-request via `model` ("qwen"|"flux"; see
+      // ~/Qwen-Edit/docs/quartermaster-endpoint-integration.md). Derived from
+      // the rung's catalog `model` label, not hardcoded, so explainer/dialogue
+      // rungs (model:"qwen-image-gen") keep requesting Qwen while the
+      // Narration rungs re-pointed here 2026-08-11 (model:"flux-klein-4b")
+      // keep requesting Flux, matching what they got from flux-tts-s2t's old
+      // mode:"image" before rnqxi6c0mlq517 was cut down to TTS-only.
       return {
+        model: rung.model === 'flux-klein-4b' ? 'flux' : 'qwen',
         prompt: job.prompt,
         aspect_ratio: p.aspectRatio ?? '16:9',
         ...attribution,

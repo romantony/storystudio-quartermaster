@@ -36,20 +36,33 @@
  *     no job in front of it. Pre-warm raises workers only on admission, timed to
  *     overlap the ~2-3 min cold start with Convex's brain window.
  *
- * Per-tier T2I/I2I routing (confirmed against background.json 2026-08-11 — easy to
- * mischaracterize as one uniform split, so spelled out explicitly here):
- *   - Dialogue Basic/Premium: real T2I → qwen-image-gen (e165se4r3eo5hp, `mode:"t2i"`),
- *     real I2I → qwen-image-edit (oxwx8o879qwtla, `mode:"i2i"`). flux-tts-s2t does
- *     NOT serve image gen for these tiers at all.
- *   - Narration Basic: BOTH T2I and I2I still go to flux-tts-s2t (rnqxi6c0mlq517,
- *     `mode:"image"`, Flux Klein 4B) — never qwen-image-gen/edit (see
- *     PROJECT_FLEET's narration-basic comment below for why).
- *   - Narration Premium: T2I for reference-less frames goes to flux-tts-s2t
- *     (`mode:"image"`); I2I (frames with a character reference) goes to
- *     qwen-image-edit. So it's split, but not the same way Dialogue is.
- *   There is no `model:"flux"/"qwen"` request-level selector on any endpoint —
- *   routing is purely which catalog rung (mode) fires, itself driven by the
- *   tier and (for Dialogue/explainer paths) `imageModel`.
+ * Per-tier T2I/I2I routing (confirmed against background.json 2026-08-11, THEN
+ * corrected same day — see below):
+ *   - ALL tiers' real T2I now goes to qwen-image-gen (e165se4r3eo5hp,
+ *     `mode:"t2i"`); real I2I now goes to qwen-image-edit (oxwx8o879qwtla,
+ *     `mode:"i2i"`). flux-tts-s2t (rnqxi6c0mlq517) serves NO image gen at
+ *     all anymore.
+ *   - qwen-image-gen hosts two models, selected per-request via the RunPod
+ *     payload's `model` field (`"flux"`|`"qwen"` — see runpod.ts's `t2i`
+ *     case, derived from the rung's catalog `model` label so Narration
+ *     rungs keep requesting Flux Klein 4B while explainer/Dialogue rungs
+ *     keep requesting Qwen-Image). qwen-image-edit hosts one model
+ *     (Qwen-Image-Edit) — no Flux variant to select there.
+ *   CORRECTION (2026-08-11, same day as the note above): this file previously
+ *   documented Narration Basic/Premium's T2I (and Basic's I2I) as still
+ *   living on flux-tts-s2t's `mode:"image"` — that was accurate until a live
+ *   RunPod error ("mode 'image' not served by the TTS endpoint (this
+ *   endpoint serves: ['tts','voice_clone_prompt'])") revealed rnqxi6c0mlq517
+ *   had been cut down to TTS-only in production. Re-pointed
+ *   image.narrationBasic.t2i/i2i and image.narrationPremium.t2i (plus
+ *   image.basic.t2i/image.premium.t2i) to qwen-image-gen/qwen-image-edit in
+ *   background.json the same day. NOT yet fixed: `movie.premium.image.t2i`
+ *   is aliased by `movie.premium.image.i2i` (one Flux `mode:"image"` rung
+ *   handling both via `reference_images`) — qwen-image-gen's `t2i` case has
+ *   no reference-image support, so blindly re-pointing it would silently
+ *   drop the reference on i2i calls instead of erroring. Left on the (now
+ *   broken) flux-tts-s2t rung, relying on its `fb:true` KIE fallback
+ *   (nano-banana-2) until this gets a real fix.
  */
 
 export const FLUX_TTS_S2T = 'runpod:flux-tts-s2t';
@@ -66,12 +79,12 @@ export interface FleetEndpoint {
 }
 
 export const FLEET: FleetEndpoint[] = [
-  // flux-tts-s2t (ENDPOINT_ROLE=media) hosts TTS-kokoro/TTS-qwen (all tiers),
-  // animate, the one-shot `pipeline`, concat, and merge-fallback — PLUS
-  // Narration-tier T2I/I2I via `mode:"image"` (Basic: both; Premium: T2I only
-  // for reference-less frames — see this file's top comment for the full
-  // per-tier table). Dialogue Basic/Premium do NOT route image gen here at
-  // all — theirs goes to qwen-image-gen/qwen-image-edit instead. merge moved
+  // flux-tts-s2t (ENDPOINT_ROLE, effectively TTS-only in production as of
+  // 2026-08-11 — see this file's top comment) hosts TTS-kokoro/TTS-qwen (all
+  // tiers), animate, the one-shot `pipeline`, concat, and merge-fallback. NO
+  // tier routes image gen here anymore — every tier's T2I/I2I lives on
+  // qwen-image-gen/qwen-image-edit (see top comment), except the still-broken
+  // movie.premium.image.t2i/i2i (also documented there). merge moved
   // off this pool onto QM-owned Lambda 2026-07-27 (see qm-merge-lambda-migration
   // memory), directly relieving the contention that caused real image-t2i/TTS
   // timeouts here the same day. BGM (ACE-Step) + SRT (Whisper) were split off
@@ -84,11 +97,13 @@ export const FLEET: FleetEndpoint[] = [
   { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 8 },
   // Raised 0→2 (2026-07-21): now the primary rung for image.explainer.t2i
   // (explainer/educational/advertisement/documentary/product-promotion T2I —
-  // see background.json), replacing the retired ernie-image endpoint. Premium
-  // frames without a character reference still route to Flux4b t2i on
-  // flux-tts-s2t, not here — this endpoint is explainer-tier only for now.
-  // Raised 3→6 (2026-08-11): re-synced against the dashboard ("39/40 Workers
-  // deployed", qwen-image-gen 0/6 running, 3 idle).
+  // see background.json), replacing the retired ernie-image endpoint. No
+  // longer explainer-only as of 2026-08-11: EVERY tier's real T2I lives here
+  // now (see this file's top comment) after flux-tts-s2t's mode:"image" broke
+  // in production. Raised 3→6 (2026-08-11): re-synced against the dashboard
+  // ("39/40 Workers deployed", qwen-image-gen 0/6 running, 3 idle) — this
+  // number predates the routing fix and may need another real look now that
+  // demand here is materially higher.
   { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 6 },
   // Unchanged at 4 (2026-08-11): re-confirmed against the dashboard ("39/40
   // Workers deployed", qwen-image-edit 0/4 running, 0 idle).
@@ -162,13 +177,14 @@ export const PROJECT_FLEET: Record<string, ProjectFleetPlan> = {
   // overlay, not by asking the image model for a clean text-free frame, so
   // narration-basic always sends imageModel:"flux-klein-4b" and
   // RouteImageModelFourLang's ernie/qwen-image-gen branch is dead code for
-  // this tier. Pre-warming qwen-image-gen here was real wasted RunPod spend
-  // on every single narration-basic admission for a path that never fires.
-  // (Premium's PROJECT_FLEET entry below keeps its own qwen-image-gen
-  // pre-warm — Premium's text-free-genre frames are confirmed live traffic,
-  // per that entry's own comment.)
+  // this tier.
+  // RE-ADDED 2026-08-11, for an unrelated reason: rnqxi6c0mlq517
+  // (Flux-TTS-ANIM) got cut down to TTS-only in production (confirmed via a
+  // live "mode 'image' not served" error), so image.narrationBasic.t2i/i2i
+  // moved off it onto qwen-image-gen/qwen-image-edit (background.json) —
+  // this tier now genuinely needs both warm, same as every other tier.
   'narration-basic': {
-    endpoints: [FLUX_TTS_S2T, BGM_S2T],
+    endpoints: [FLUX_TTS_S2T, BGM_S2T, QWEN_IMAGE_GEN, QWEN_IMAGE_EDIT],
     gateEndpoint: FLUX_TTS_S2T,
     gateOperation: 'animate',
     gateMax: 9, // "< 10"

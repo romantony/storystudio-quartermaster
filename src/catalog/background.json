@@ -22,8 +22,8 @@
   },
   "ladders": {
     "image.basic.t2i": [
-      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "T2I standardized on self-hosted Flux Klein 4B (Flux-TTS-S2T mode:image) across all project types." },
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
+        "note": "Re-pointed 2026-08-11: rnqxi6c0mlq517 (Flux-TTS-ANIM) now serves TTS only (['tts','voice_clone_prompt'] per a live RunPod error) — T2I moved to the qwen-image-gen endpoint, still requesting the Flux Klein 4B model via the `model` field (see runpod.ts's t2i case)." },
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.explainer.t2i": [
@@ -37,8 +37,8 @@
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest" }
     ],
     "image.premium.t2i": [
-      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "T2I standardized on self-hosted Flux Klein 4B. (Also the movie-basic image t2i via alias.)" },
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
+        "note": "Re-pointed 2026-08-11 (see image.basic.t2i's note) — still Flux Klein 4B via qwen-image-gen's `model` field. (Also the movie-basic image t2i via alias — not aliased for i2i, so this move is safe here.)" },
       { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true },
       { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true, "fixed": { "rendering_speed": "TURBO" } }
     ],
@@ -48,13 +48,13 @@
     ],
 
     "image.narrationBasic.t2i": [
-      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "Narration Basic image T2I — self-hosted Flux Klein 4B (Flux-TTS-S2T mode:image)." },
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Basic image T2I — re-pointed 2026-08-11 (see image.basic.t2i's note) from flux-tts-s2t mode:image to qwen-image-gen mode:t2i, still Flux Klein 4B via the `model` field." },
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "image.narrationBasic.i2i": [
-      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "Narration Basic image I2I — Flux Klein 4B with reference_images (Flux-TTS-S2T mode:image)." },
+      { "provider": "runpod", "model": "qwen-image-edit", "mode": "i2i", "endpointId": "oxwx8o879qwtla", "endpoint": "v2/oxwx8o879qwtla", "counterKey": "runpod:qwen-image-edit", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Basic image I2I — re-pointed 2026-08-11 (see image.basic.t2i's note) from flux-tts-s2t mode:image+reference_images to the dedicated qwen-image-edit endpoint (mode:i2i, single reference image via image_url — see runpod.ts's i2i case). Model is qwen-image-edit's own editing model, not Flux; unlike t2i, this endpoint has no Flux variant to select via `model`." },
       { "provider": "replicate", "model": "black-forest-labs/flux-2-klein-9b", "routingMode": "aggregated", "lane": "rest", "fb": true }
     ],
     "voice.narrationBasic.tts": [
@@ -64,8 +64,8 @@
     ],
 
     "image.narrationPremium.t2i": [
-      { "provider": "runpod", "model": "flux-klein-4b", "mode": "image", "endpointId": "rnqxi6c0mlq517", "endpoint": "v2/rnqxi6c0mlq517", "counterKey": "runpod:flux-tts-s2t", "routingMode": "direct", "lane": "rest",
-        "note": "Narration Premium image T2I — Flux Klein 4B on flux-tts-s2t. StoryStudio always sends a character reference (→ i2i on qwen-image-edit); reference-less premium frames (scene shots) land here rather than qwen-image-gen, which is held at 0 workers (fleet.ts). Re-point to qwen-image-gen + raise its workers only if a dedicated premium t2i model is needed." },
+      { "provider": "runpod", "model": "flux-klein-4b", "mode": "t2i", "endpointId": "e165se4r3eo5hp", "endpoint": "v2/e165se4r3eo5hp", "counterKey": "runpod:qwen-image-gen", "routingMode": "direct", "lane": "rest",
+        "note": "Narration Premium image T2I (reference-less scene-shot frames — StoryStudio always sends a character reference for the rest, → i2i on qwen-image-edit). Re-pointed 2026-08-11 (see image.basic.t2i's note) from flux-tts-s2t mode:image to qwen-image-gen mode:t2i, still Flux Klein 4B via the `model` field — the old 'held at 0 workers' caveat is moot now that this tier's T2I lives on qwen-image-gen for real, not just as an unused fallback slot." },
       { "provider": "kie", "model": "google/nano-banana",        "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true },
       { "provider": "kie", "model": "ideogram/v3-text-to-image", "endpoint": "v1/jobs/createTask", "routingMode": "aggregated", "lane": "rest", "fb": true, "fixed": { "rendering_speed": "TURBO" } }
     ],
