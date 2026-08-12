@@ -116,6 +116,23 @@ function durationSeconds(input: string): number {
   }
 }
 
+/** Scene-track audio (2026-08-12): Wan2 clips are silent by default, but a
+ * per-frame SFX baked in via ApplySceneSfxMap (pipeline-stack.ts) gives the
+ * concatenated scene track a real audio stream. Same "don't assume, probe"
+ * caution as merge.ts's hasAudioStream, just via ffprobeJson (already used
+ * here for probeVideoDimensions) instead of parsing ffmpeg -i stderr. */
+function hasAudioStream(input: string): boolean {
+  const data = ffprobeJson(input);
+  return (data.streams || []).some((s: any) => s.codec_type === 'audio');
+}
+
+function probeVideoDimensions(input: string): { width: number; height: number } {
+  const data = ffprobeJson(input);
+  const stream = (data.streams || []).find((s: any) => s.codec_type === 'video');
+  if (!stream) throw new Error(`ffprobe: no video stream in ${input}`);
+  return { width: stream.width, height: stream.height };
+}
+
 function download(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https:') ? https : http;
@@ -207,6 +224,41 @@ function fadeFactorExpr(fadeSeconds: number, totalDuration: number, interiorBoun
   return factors.join('*');
 }
 
+/** Renders the rounded-corner alpha mask ONCE, as a single still frame at the
+ * PIP's exact output resolution — geq's cost is O(pixels), so paying it once
+ * per composite (instead of once per output FRAME, as the fused single-geq
+ * approach below used to) is what makes this cheap. The mask never depends
+ * on time, only X/Y, so one frame is correct for the whole clip. */
+function renderCornerMaskPng(pipW: number, pipH: number, cornerRadiusPx: number, workDir: string): string {
+  const maskPath = path.join(workDir, 'corner-mask.png');
+  const expr = roundedRectAlphaExpr(cornerRadiusPx);
+  const { status, stderr } = run([
+    '-y', '-f', 'lavfi', '-i', `color=black:size=${pipW}x${pipH}`,
+    '-vf', `format=gray,geq='${expr}'`,
+    '-frames:v', '1', maskPath,
+  ], 3 * 60_000);
+  if (status !== 0) throw new Error(`corner-mask render failed: ${stderr.slice(-1500)}`);
+  return maskPath;
+}
+
+/** Renders the time-varying fade factor as a video, but at a tiny 8x8
+ * resolution rather than the PIP's real size — the fade expression never
+ * depends on X/Y, so every pixel in every frame is identical, and evaluating
+ * geq's per-pixel expression against 64 pixels instead of ~140,000 (500x280)
+ * is what makes this cheap despite running once per output frame. Upscaled
+ * (uniformly, so this is lossless) to the real PIP size and multiplied
+ * against the corner mask by the caller. */
+function renderFadeMaskVideo(fadeExprScaled255: string, totalDurationSeconds: number, workDir: string): string {
+  const maskPath = path.join(workDir, 'fade-mask.mp4');
+  const { status, stderr } = run([
+    '-y', '-f', 'lavfi', '-i', `color=black:size=8x8:rate=${TARGET_FPS}:duration=${totalDurationSeconds.toFixed(3)}`,
+    '-vf', `format=gray,geq='${fadeExprScaled255}'`,
+    maskPath,
+  ], 3 * 60_000);
+  if (status !== 0) throw new Error(`fade-mask render failed: ${stderr.slice(-1500)}`);
+  return maskPath;
+}
+
 async function runPipComposite(payload: PipCompositePayload, workDir: string): Promise<void> {
   const { width: W, height: H } = ASPECT_RATIOS[payload.aspectRatio] ?? ASPECT_RATIOS['9:16'];
   const scenePath = path.join(workDir, 'scene.mp4');
@@ -228,6 +280,7 @@ async function runPipComposite(payload: PipCompositePayload, workDir: string): P
 
   let narratorFilter: string;
   let overlayFilter: string;
+  const extraInputArgs: string[] = [];
 
   if (cfg.mode === 'split') {
     // Narrator and scene side by side — vertical split for 16:9, horizontal
@@ -242,14 +295,48 @@ async function runPipComposite(payload: PipCompositePayload, workDir: string): P
       ? `${sceneHalfFilter};[scenehalf][narr]hstack=inputs=2[outv]`
       : `${sceneHalfFilter};[scenehalf][narr]vstack=inputs=2[outv]`;
   } else {
-    const rMask = roundedRectAlphaExpr(cfg.cornerRadiusPx);
+    // pipH mirrors what `scale=${pipW}:-2` used to compute implicitly (round
+    // to nearest even height preserving the source's own aspect ratio) — now
+    // explicit because the mask-generation steps below need the exact PIP
+    // pixel size up front, independently of the main scale filter.
+    const { width: srcW, height: srcH } = probeVideoDimensions(narratorPath);
+    const pipH = Math.max(2, Math.round((pipW * srcH / srcW) / 2) * 2);
+
     const fadeFactor = fadeFactorExpr(fadeSeconds, narratorDuration, payload.segmentBoundariesSeconds);
-    const alphaExpr = `(${rMask})*(${fadeFactor})`;
+
+    // Perf: a single geq alpha expression (rounded-corner mask * fade factor)
+    // evaluated per-pixel-per-frame over the full PIP resolution took 20min+
+    // for a real ~400s narrator track — two consecutive live attempts both
+    // hit the hardcoded spawnSync timeout and never finished (confirmed
+    // 2026-08-10). Isolated on a synthetic same-size clip: the geq version
+    // ran ~10.8x slower than an equivalent overlay with no geq at all — geq's
+    // interpreted per-pixel expression is the bottleneck, not the shadow/
+    // overlay/encode stages. Decomposed below into a spatially-static corner
+    // mask (geq run ONCE on a single still frame — the rounded-corner formula
+    // never depends on T) multiplied against a temporally-varying but
+    // spatially-uniform fade mask (geq run on an 8x8 dummy frame per output
+    // frame — the fade formula never depends on X/Y — then upscaled
+    // uniformly). Multiplying the two recombines to the exact original alpha
+    // (verified bit-for-bit identical across 250 synthetic test frames
+    // spanning fade-in/flat/boundary-dip/fade-out against the old fused-geq
+    // output), at ~19x less compute.
+    const cornerMaskPath = renderCornerMaskPng(pipW, pipH, cfg.cornerRadiusPx, workDir);
+    const fadeMaskPath = renderFadeMaskVideo(`(${fadeFactor})*255`, narratorDuration, workDir);
+    // Appended after scenePath/narratorPath in the main run() call below, so
+    // these land at input indices 2 and 3.
+    extraInputArgs.push('-loop', '1', '-i', cornerMaskPath, '-i', fadeMaskPath);
+
+    const maskCombineFilter =
+      `[1:v]scale=${pipW}:${pipH},format=rgba[pipcolor];`
+      + `[3:v]scale=${pipW}:${pipH}:flags=neighbor[fadescaled];`
+      + `[2:v][fadescaled]blend=all_mode=multiply:shortest=1[combinedmask];`
+      + `[pipcolor][combinedmask]alphamerge`;
+
     narratorFilter = cfg.dropShadow
-      ? `[1:v]scale=${pipW}:-2,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='${alphaExpr}'[pipmasked];`
+      ? `${maskCombineFilter}[pipmasked];`
         + `[pipmasked]split=2[pipshadowsrc][pipmain];`
         + `[pipshadowsrc]lutrgb=r=0:g=0:b=0,colorchannelmixer=aa=0.5,boxblur=8:1[pipshadow]`
-      : `[1:v]scale=${pipW}:-2,format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='${alphaExpr}'[pipmain]`;
+      : `${maskCombineFilter}[pipmain]`;
 
     const { x, y } = cornerXY(cfg.corner, marginPx);
     if (cfg.mode === 'cutaway') {
@@ -277,13 +364,28 @@ async function runPipComposite(payload: PipCompositePayload, workDir: string): P
 
   const filterComplex = cfg.mode === 'split' ? `${sceneFilter};${overlayFilter}` : `${sceneFilter};${overlayFilter}`;
 
-  // Audio = narrator track only (§4.6 — Wan2's scene track has no audio at
-  // all, so there is nothing else to mix at this stage; project BGM is
-  // still overlaid/ducked later, unchanged, at the existing finalize call).
+  // Audio: narrator track always, PLUS the scene track's own audio if it has
+  // one (2026-08-12 — previously Wan2's scene track was unconditionally
+  // silent, §4.6's original reasoning; ApplySceneSfxMap in pipeline-stack.ts
+  // can now bake per-frame spot SFX into individual scene clips before they
+  // reach ConcatenateScenes). Narrator listed FIRST in amix — its duration
+  // is the canonical one this composite is built around (the trailing `-t
+  // narratorDuration` cap below is the real safety net either way, same
+  // reasoning merge.ts uses for treating the pre-existing track as
+  // canonical). normalize=0 so ffmpeg doesn't attenuate both inputs by 1/n
+  // (same amix gotcha noted on runAmbienceMix's own amix below). Project
+  // BGM is still overlaid/ducked later, unchanged, at the existing finalize
+  // call — this only adds the per-frame SFX layer.
+  const sceneHasAudio = hasAudioStream(scenePath);
+  const finalFilterComplex = sceneHasAudio
+    ? `${filterComplex};[1:a:0][0:a]amix=inputs=2:duration=first:normalize=0[outa]`
+    : filterComplex;
+  const audioMapArgs = sceneHasAudio ? ['-map', '[outa]'] : ['-map', '1:a:0'];
+
   const { status, stderr } = run([
-    '-y', '-i', scenePath, '-i', narratorPath,
-    '-filter_complex', filterComplex,
-    '-map', '[outv]', '-map', '1:a:0',
+    '-y', '-i', scenePath, '-i', narratorPath, ...extraInputArgs,
+    '-filter_complex', finalFilterComplex,
+    '-map', '[outv]', ...audioMapArgs,
     '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
     '-c:a', 'aac', '-b:a', '192k',
     '-t', narratorDuration.toFixed(3),

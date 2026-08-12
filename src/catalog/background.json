@@ -164,6 +164,7 @@
         "note": "Dialogue Basic narrator TTS — per SEGMENT (30-45s script), not per frame (storystudio-dialogue-qm-sfn-handoff.md §3.3/§5). clone_artifact_url fast path when narrator.voiceCloneArtifactUrl is non-empty (runpod.ts); falls back to voice-design using voiceInstruct when empty. Same physical Qwen rung as voice.narrationPremium.tts." }
     ],
     "video.dialogueBasic.i2v": { "aliasOf": "video.premium.i2v" },
+    "video.dialogueBasic.i2vRework": { "aliasOf": "video.dialogueRework.i2v" },
     "video.dialogueBasic.narrator": [
       { "provider": "runcomfy", "model": "community/infinite-talk/fast", "endpoint": "v1/models/community/infinite-talk/fast", "routingMode": "direct", "lane": "video",
         "note": "Dialogue Basic narrator lip-sync — SHORT segments only (actualDurationSeconds <= 15s, routed by RouteNarratorLipSync in pipeline-stack.ts's narrator branch; segments are normally 30-40s, so this rung is a rarely-hit edge case in practice, not the common path). RunComfy InfiniteTalk mono endpoint (audio+image -> talking-head clip), $0.015/second billed. External, NOT part of the RunPod fleet (no counterKey/endpointId — see providers.runcomfy). Verified live 2026-08-08/2026-08-09 with both a synthetic tone AND a real TTS voice clip (real speech confirmed genuine dynamic lip movement, not just a duration match): output_duration == input_audio_duration exactly, no trailing pad, 624x352@25fps regardless of input resolution (storystudio-dialogue-qm-sfn-handoff.md §7.6.5). Poll-only (adapters/runcomfy.ts, supportsWebhook:false)." }
@@ -191,9 +192,14 @@
         "note": "Dialogue Premium two-speaker shots (kind:\"dialogue\") — RunComfy InfiniteTalk multi endpoint (left_audio+right_audio+image, exactly one exchange per call — §7.5). Verified live 2026-08-08: plays left track in full then right track in full (sequential, not mixed), output_duration = left_duration+right_duration+1.00s exactly on 4/4 real calls (not max(), not frame-quantised) — the +1.00s trailing pad MUST be trimmed post-generation (TrimToTrackLength, §7.4/§7.6.6) or a multi-shot film accumulates seconds of dead air. External, per-second billed, not RunPod-fleet-managed (no counterKey)." }
     ],
     "video.dialoguePremium.merge": { "aliasOf": "video.narrationBasic.merge" },
+    "video.dialogueBasic.merge": { "aliasOf": "video.narrationBasic.merge" },
     "sfx.dialoguePremium": [
       { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "6apg6j7suzuezw", "endpoint": "v2/6apg6j7suzuezw", "counterKey": "runpod:bgm-s2t", "routingMode": "direct", "lane": "rest",
         "note": "Dialogue Premium spot SFX (door slam, stone grinding, etc — authored per-shot moments, not gap-fillers, storystudio-dialogue-qm-sfn-handoff.md §7.7 rule 2). Same physical ACE-Step rung as bgm.narration; split key for attribution against the per-scene ambience-bed calls (which route through bgm.dialoguePremium with operation:\"ambience\", falling through this key's alias to the same model — no separate ambience.* key needed). Verified: requested duration_s honoured exactly (+0.024s mp3 frame padding only, no duration enum unlike Wan2 — §7.7.1)." }
+    ],
+    "sfx.dialogueBasic": [
+      { "provider": "runpod", "model": "ace-step", "mode": "bgm", "endpointId": "6apg6j7suzuezw", "endpoint": "v2/6apg6j7suzuezw", "counterKey": "runpod:bgm-s2t", "routingMode": "direct", "lane": "rest",
+        "note": "Dialogue Basic per-frame spot SFX, added 2026-08-12 per storystudio-qm-sfx-vocal-audio-contract.md §4/§7.1 — mirrors sfx.dialoguePremium's bgm-mode-trick exactly (same physical ACE-Step rung, split key for attribution). Applied to a scene's Wan2 clip AFTER ReconcileSegmentTiming (once its duration is final), same ordering rationale as dialoguePremium's post-trim RouteShotSfx." }
     ],
     "bgm.dialoguePremium": { "aliasOf": "bgm.narration" },
     "srt.dialoguePremium": { "aliasOf": "srt.narration" },
@@ -210,6 +216,10 @@
       { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video", "fb": true }
     ],
     "video.narrationPremium.i2v": { "aliasOf": "video.premium.i2v" },
+    "video.dialogueRework.i2v": [
+      { "provider": "replicate", "model": "wan-video/wan-2.2-i2v-fast", "routingMode": "aggregated", "lane": "video",
+        "note": "Dialogue rework video regen ONLY — deliberately does NOT include the self-hosted Wan 2.2 4-step Lightning rung from video.premium.i2v. Root-caused 2026-08-12 (dialogue-basic-qa-agent's first real 78-scene audit, 269 issues/47 scenes flagged): the self-hosted pod's 4-step Lightning distillation runs with prompt conformity effectively off (fast path, ~90s/gen) — 195 of those 269 findings were PROMPT_VISUAL_MISMATCH on the video, the model structurally dropping subtle/secondary motion cues regardless of prompt wording. Bumping the self-hosted pod's conformity to get real CFG costs 300-480s/gen instead of 90s; rather than pay that everywhere, only the already-flagged rework subset routes here, straight to Replicate's hosted (non-distilled) wan-2.2-i2v-fast — already proven as this exact ladder's realtime-jobType fallback. Shared key so video.dialoguePremium.i2vRework can alias it once Dialogue Premium gets its own QA/rework loop." }
+    ],
     "movie.basic.image.t2i":  { "aliasOf": "image.premium.t2i" },
     "movie.basic.image.i2i":  { "aliasOf": "image.premium.i2i" },
     "movie.basic.video.i2v": [

@@ -60,6 +60,16 @@ interface ReconcileEvent {
   segmentResults: SegmentActual[];
   /** S3 key prefix for any corrected clip(s) this invocation writes. */
   outputKeyPrefix: string;
+  /** QA rework results (dialogue-basic QA+rework, 2026-08-10) — scenes QM
+   * regenerated after a hallucination/anatomy defect, keyed by frameId. When
+   * present, spliced into `sceneResults` (replacing the matching frameId)
+   * BEFORE the normal trim/extend pass below runs — ASL has no array-join
+   * intrinsic, so the merge happens here rather than in the state machine.
+   * A freshly regenerated last-of-segment clip won't already match its
+   * previously-reconciled length, so re-running the normal reconcile logic
+   * on the merged array (not just splicing and returning) is required, not
+   * optional, to keep segment sums correct after rework. */
+  reworkedScenes?: SceneClip[];
 }
 
 interface ReconcileResult {
@@ -77,6 +87,10 @@ const NOOP_THRESHOLD_S = 0.05;
 
 export const handler = async (event: ReconcileEvent): Promise<ReconcileResult> => {
   let out = [...event.sceneResults];
+  if (event.reworkedScenes?.length) {
+    const reworkedById = new Map(event.reworkedScenes.map(s => [s.frameId, s]));
+    out = out.map(c => reworkedById.get(c.frameId) ?? c);
+  }
   const residualsBySegment: Record<number, number> = {};
 
   for (const seg of event.segmentResults) {
