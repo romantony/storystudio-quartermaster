@@ -4063,7 +4063,17 @@ function dialogueBasicNarratorBranch(qmGenerateArn: string): object {
           'projectId.$': '$.projectId',
           'userId.$': '$.userId',
         },
-        ResultPath: '$.segmentResults',
+        // ResultPath '$' (replace, not merge) — mirrors Premium-QM's
+        // GenerateAllFrames pattern. Merging into '$.segmentResults' instead
+        // would carry the whole branch state (narrator prompt, every
+        // segment's scriptText) into this branch's output; doubled across
+        // both Parallel branches that pushed GenerateNarratorAndScenes over
+        // Step Functions' 256KB States.DataLimitExceeded ceiling (confirmed
+        // live 2026-08-10, execution js7bd2ep...3l70g77m9). BuildSegmentResult
+        // already returns a slim per-segment object, so replacing the whole
+        // state with the bare Map result array is exactly what downstream
+        // MergeParallelResults needs.
+        ResultPath: '$',
         Iterator: {
           StartAt: 'QMGenerateNarratorTTS',
           States: {
@@ -4237,7 +4247,13 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
         Comment: 'Silent Wan2 scene clips, MaxConcurrency=15 (matches Narration-Basic-QM-New\'s per-frame Map; Wan2 itself is throttled independently via wan2-i2v\'s counterKey/fleet.ts).',
         ItemsPath: '$.frames',
         MaxConcurrency: 15,
-        ResultPath: '$.sceneResults',
+        // ResultPath '$' (replace, not merge) — see GenerateNarratorSegments'
+        // sibling comment in dialogueBasicNarratorBranch. Merging into
+        // '$.sceneResults' carried all 18 frames' full imagePrompt/videoPrompt
+        // text into this branch's output too, the other half of what pushed
+        // GenerateNarratorAndScenes over the 256KB States.DataLimitExceeded
+        // ceiling (confirmed live 2026-08-10, execution js7bd2ep...3l70g77m9).
+        ResultPath: '$',
         Iterator: {
           StartAt: 'CheckSceneImageCache',
           States: {
@@ -4338,10 +4354,26 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
               TimeoutSeconds: 920,
               Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
               Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'SceneFailed' }],
+              Next: 'NormalizeSceneSfxPrompt',
+            },
+            // sfxPrompt (2026-08-12, per storystudio-qm-sfx-vocal-audio-contract.md
+            // §4) is optional per-frame, same as referenceImageUrl above — must be
+            // defaulted to '' before BuildSceneResult's unguarded `.$` reference,
+            // or a frame that omits it crashes this whole branch with States.Runtime.
+            NormalizeSceneSfxPrompt: {
+              Type: 'Choice',
+              Choices: [{ Variable: '$.sfxPrompt', IsPresent: true, Next: 'BuildSceneResult' }],
+              Default: 'SetSceneSfxPromptDefault',
+            },
+            SetSceneSfxPromptDefault: {
+              Type: 'Pass',
+              Result: '',
+              ResultPath: '$.sfxPrompt',
               Next: 'BuildSceneResult',
             },
             BuildSceneResult: {
               Type: 'Pass',
+              Comment: 'imageUrl/imagePrompt/videoPrompt/sfxPrompt carried through (not just videoUrl/duration) so a later QA/rework pass can re-evaluate and regenerate this scene without a separate lookup — safe to add: reconcile-segment-timing.ts spreads unknown fields through untouched, and dialogue-basic-qa-agent\'s reworkItems spreads **frame too, so sfxPrompt survives a rework round trip unchanged. referenceImageUrl deliberately NOT carried — RouteSceneImageGen only reads it behind an IsPresent guard, meaning it is not guaranteed present on every frame; an unguarded `.$` reference here would risk a States.Runtime crash across the whole scenes branch for every project, not just reworked ones. Rework falls back to a fresh T2I regen when the original scene used I2I.',
               Parameters: {
                 'frameId.$': '$.frameId',
                 'frameNumber.$': '$.frameNumber',
@@ -4349,6 +4381,10 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
                 'isSegmentLastFrame.$': '$.isSegmentLastFrame',
                 'videoUrl.$': '$.videoResult.cdnUrl',
                 'duration.$': '$.videoResult.durationS',
+                'imageUrl.$': '$.imageResult.cdnUrl',
+                'imagePrompt.$': '$.imagePrompt',
+                'videoPrompt.$': '$.videoPrompt',
+                'sfxPrompt.$': '$.sfxPrompt',
               },
               End: true,
             },
@@ -4576,7 +4612,7 @@ function buildDialogueBasicQmNewDefinition(
   };
   def.States.MergeParallelResults = {
     Type: 'Pass',
-    Comment: 'Destructure the Parallel state\'s [branchA, branchB] result array into $.segmentResults/$.sceneResults — Parallel branch outputs are only ever addressable by array index, not by name.',
+    Comment: 'Destructure the Parallel state\'s [branchA, branchB] result array into $.segmentResults/$.sceneResults — Parallel branch outputs are only ever addressable by array index, not by name. Each branch\'s Map now uses ResultPath \'$\' (replace), so parallelResult[0]/[1] ARE the bare result arrays directly, not nested under .segmentResults/.sceneResults.',
     Parameters: {
       'jobId.$': '$.jobId',
       'projectId.$': '$.projectId',
@@ -4591,8 +4627,8 @@ function buildDialogueBasicQmNewDefinition(
       'convexEndpoint.$': '$.convexEndpoint',
       'userId.$': '$.userId',
       'admissionId.$': '$.admissionId',
-      'segmentResults.$': '$.parallelResult[0].segmentResults',
-      'sceneResults.$': '$.parallelResult[1].sceneResults',
+      'segmentResults.$': '$.parallelResult[0]',
+      'sceneResults.$': '$.parallelResult[1]',
     },
     Next: 'ReconcileSegmentTiming',
   };
@@ -4609,6 +4645,412 @@ function buildDialogueBasicQmNewDefinition(
     ResultPath: '$.reconcileResult',
     TimeoutSeconds: 600,
     Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'DropStaleSceneResults',
+  };
+  def.States.DropStaleSceneResults = {
+    Type: 'Pass',
+    Comment: 'Drop the pre-reconcile $.sceneResults — superseded by $.reconcileResult.sceneResults and unread by anything from here through the QA/rework loop and RestoreContextDialogueBasic. Leaving both alive doubled the payload and, combined with PrepareQAPayloadDialogueBasic\'s own qaInput.frames copy, tripled it — pushing a 78-frame execution over the 256KB States.DataLimitExceeded ceiling (confirmed live 2026-08-12, execution js70vdbsee...xi2pcko5t). Same class of bug as the GenerateScenes ResultPath \'$\' fix above, resurfaced in the QA-payload states added 2026-08-10.',
+    Parameters: {
+      'jobId.$': '$.jobId',
+      'projectId.$': '$.projectId',
+      'projectType.$': '$.projectType',
+      'aspectRatio.$': '$.aspectRatio',
+      'narrator.$': '$.narrator',
+      'narratorOverlay.$': '$.narratorOverlay',
+      'bgmPrompt.$': '$.bgmPrompt',
+      'textOverlayEnabled.$': '$.textOverlayEnabled',
+      'apiKey.$': '$.apiKey',
+      'jwtToken.$': '$.jwtToken',
+      'convexEndpoint.$': '$.convexEndpoint',
+      'userId.$': '$.userId',
+      'admissionId.$': '$.admissionId',
+      'segmentResults.$': '$.segmentResults',
+      'reconcileResult.$': '$.reconcileResult',
+    },
+    Next: 'NormalizeCharacterBible',
+  };
+
+  // ── QA + rework (2026-08-10) ─────────────────────────────────────────────
+  // Catches hallucination/anatomy defects in Wan2 scene clips (two-headed and
+  // five-body duplicate-character defects found live in project
+  // js7bd2ep1edm9d4zqxvkg6sz458c6cg5) before they get baked into the
+  // composite. Sits between ReconcileSegmentTiming and UpdateStatusConcatenating
+  // — every scene is generated and duration-corrected, nothing expensive
+  // (concat, PiP composite) has run yet. dialogue-basic-qa-agent/
+  // dialogue-basic-rework-prompts are new Lambdas (storystudio-unified repo,
+  // NOT CDK-managed here, same as narration-premium-qa-agent) — adapted from
+  // narration-premium's QA+rework pair but: (1) reads inline `frames` (no
+  // S3 frames-store — dialogue-basic has no such step), (2) scoring rubric
+  // rebuilt around silent-scene hallucination/anatomy checks instead of
+  // narration-alignment, (3) rework regenerates via qm-generate as native
+  // SFN Tasks below (NOT a Lambda-to-Lambda E2E-generate-* call the way
+  // narration-premium's rework agent does) — qm-generate can take up to
+  // ~850s per call, and narration-premium's pattern loops several such calls
+  // sequentially inside one Lambda, which risks stacking past Lambda's 900s
+  // hard ceiling.
+  def.States.NormalizeCharacterBible = {
+    Type: 'Choice',
+    Comment: 'Guarantee $.characterBible is a real object before QA/rework references it — dialogue-basic\'s ValidateInput only requires narrator/narratorOverlay/segments/frames, so characterBible may be entirely absent. IsPresent-guarded to avoid the States.Runtime (\'Invalid path\') crash this file has hit before on unguarded optional-field references (see NormalizeFourLang above).',
+    Choices: [{ Variable: '$$.Execution.Input.characterBible', IsPresent: true, Next: 'SetCharacterBibleFromInput' }],
+    Default: 'SetCharacterBibleDefault',
+  };
+  def.States.SetCharacterBibleFromInput = {
+    Type: 'Pass',
+    InputPath: '$$.Execution.Input.characterBible',
+    ResultPath: '$.characterBible',
+    Next: 'PrepareQAPayloadDialogueBasic',
+  };
+  def.States.SetCharacterBibleDefault = {
+    Type: 'Pass',
+    Result: {},
+    ResultPath: '$.characterBible',
+    Next: 'PrepareQAPayloadDialogueBasic',
+  };
+  def.States.PrepareQAPayloadDialogueBasic = {
+    Type: 'Pass',
+    Comment: 'Assemble QA agent input from pipeline state.',
+    Parameters: {
+      'projectId.$': '$.projectId',
+      'jobId.$': '$.jobId',
+      'characterBible.$': '$.characterBible',
+      mode: 'review-and-rework',
+      auditPercent: 100,
+      reworkAttempt: 1,
+      _pipelineContext: {
+        'jobId.$': '$.jobId',
+        'projectId.$': '$.projectId',
+        'projectType.$': '$.projectType',
+        'aspectRatio.$': '$.aspectRatio',
+        'narrator.$': '$.narrator',
+        'narratorOverlay.$': '$.narratorOverlay',
+        'bgmPrompt.$': '$.bgmPrompt',
+        'textOverlayEnabled.$': '$.textOverlayEnabled',
+        'apiKey.$': '$.apiKey',
+        'jwtToken.$': '$.jwtToken',
+        'convexEndpoint.$': '$.convexEndpoint',
+        'userId.$': '$.userId',
+        'admissionId.$': '$.admissionId',
+        'segmentResults.$': '$.segmentResults',
+      },
+    },
+    ResultPath: '$.qaInput',
+    Next: 'QaAgentDialogueBasic',
+  };
+  def.States.QaAgentDialogueBasic = {
+    Type: 'Task',
+    Resource: 'arn:aws:lambda:us-east-1:929075264324:function:dialogue-basic-qa-agent',
+    Comment: 'Run QA on all generated scene images/videos. frames reads $.reconcileResult.sceneResults directly (not a qaInput.frames copy) — see PrepareQAPayloadDialogueBasic\'s DataLimitExceeded comment.',
+    Parameters: {
+      'projectId.$': '$.qaInput.projectId',
+      'jobId.$': '$.qaInput.jobId',
+      'frames.$': '$.reconcileResult.sceneResults',
+      'characterBible.$': '$.qaInput.characterBible',
+      'mode.$': '$.qaInput.mode',
+      'auditPercent.$': '$.qaInput.auditPercent',
+      'reworkAttempt.$': '$.qaInput.reworkAttempt',
+    },
+    TimeoutSeconds: 1800,
+    ResultPath: '$.qaAgentResult',
+    Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 15, MaxAttempts: 1, BackoffRate: 1.5 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'QA agent failure is non-fatal — proceed to concat with best-available scenes', ResultPath: '$.qaError', Next: 'QAResultFallbackDialogueBasic' }],
+    Next: 'CheckQAResultDialogueBasic',
+  };
+  def.States.QAResultFallbackDialogueBasic = {
+    Type: 'Pass',
+    Comment: 'QA agent errored — treat as pass to avoid blocking pipeline',
+    Parameters: { passStatus: 'PASS', overallScore: 0, totalIssues: 0, framesNeedingRework: [], reworkItems: [], reportS3Key: null },
+    ResultPath: '$.qaAgentResult',
+    Next: 'RestoreContextDialogueBasic',
+  };
+  def.States.CheckQAResultDialogueBasic = {
+    Type: 'Choice',
+    Comment: 'Route based on QA result: pass -> concat, scenes flagged -> rework Map.',
+    Choices: [
+      { Variable: '$.qaAgentResult.passStatus', StringEquals: 'PASS', Next: 'RestoreContextDialogueBasic' },
+      { And: [{ Variable: '$.qaAgentResult.reworkItems[0]', IsPresent: true }, { Variable: '$.qaInput.reworkAttempt', NumericLessThan: 3 }], Next: 'ReworkScenesMap' },
+    ],
+    Default: 'RestoreContextDialogueBasic',
+  };
+  def.States.ReworkScenesMap = {
+    Type: 'Map',
+    Comment: 'Regenerate every QA-flagged scene. Iterates dialogue-basic-qa-agent\'s own reworkItems (full scene data + issues, already joined server-side — ASL has no array-join intrinsic to do this from framesNeedingRework + sceneResults itself).',
+    ItemsPath: '$.qaAgentResult.reworkItems',
+    MaxConcurrency: 5,
+    ResultPath: '$.reworkScenesResult',
+    Iterator: {
+      StartAt: 'RewritePromptsTask',
+      States: {
+        RewritePromptsTask: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:dialogue-basic-rework-prompts',
+          Comment: 'LLM-only prompt rewrite for this flagged scene — regeneration itself happens via native qm-generate Tasks below, not inside this Lambda.',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'imagePrompt.$': '$.imagePrompt',
+            'videoPrompt.$': '$.videoPrompt',
+            'qaIssues.$': '$.qaIssues',
+            'characterBible.$': '$.characterBible',
+            'reworkAttempt.$': '$.reworkAttempt',
+          },
+          ResultPath: '$.reworkPromptResult',
+          TimeoutSeconds: 180,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkError', Next: 'ReworkSceneFailed' }],
+          Next: 'QMReworkImageT2I',
+        },
+        QMReworkImageT2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Regenerate this scene\'s still image via QM. jobType:\'realtime\' (not \'batch\', unlike the original scene generation) so rework leads with the external fallback rung (KIE qwen/image-edit) instead of waiting on a cold self-hosted RunPod pod — product decision 2026-08-10. Always T2I: referenceImageUrl isn\'t carried through BuildSceneResult (see its own comment above), so a scene originally generated via I2I regenerates as a fresh T2I here.',
+          Parameters: {
+            assetType: 'image', tier: 'dialogueBasic', operation: 't2i', product: 'dialogue',
+            queue: 'background', jobType: 'realtime',
+            'prompt.$': '$.reworkPromptResult.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+            'requestId.$': "States.Format('{}-rework{}-{}-img', $.frameId, $.reworkAttempt, $$.Execution.Name)",
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkError', Next: 'ReworkSceneFailed' }],
+          Next: 'QMReworkVideo',
+        },
+        QMReworkVideo: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Regenerate this scene\'s video from the fresh image via QM. operation:\'i2vRework\' (not the normal \'i2v\') routes to video.dialogueBasic.i2vRework — a dedicated ladder containing ONLY Replicate wan-2.2-i2v-fast, deliberately excluding the self-hosted Wan2 4-step Lightning pod. Root-caused 2026-08-12: that pod\'s Lightning distillation runs with prompt conformity effectively off, causing most of a real run\'s QA findings (195/269, PROMPT_VISUAL_MISMATCH on video) — the ~90s self-hosted generation just isn\'t reliable enough for scenes already known to need a fix. jobType:\'realtime\' kept for intent/consistency though it\'s a no-op now (single-rung ladder, no ordering to influence).',
+          Parameters: {
+            assetType: 'video', tier: 'dialogueBasic', operation: 'i2vRework', product: 'dialogue',
+            queue: 'background', jobType: 'realtime',
+            'initImageUrls.$': 'States.Array($.imageResult.cdnUrl)',
+            'prompt.$': '$.reworkPromptResult.videoPrompt',
+            'durationS.$': '$.duration',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+            'requestId.$': "States.Format('{}-rework{}-{}-vid', $.frameId, $.reworkAttempt, $$.Execution.Name)",
+          },
+          ResultPath: '$.videoResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkError', Next: 'ReworkSceneFailed' }],
+          Next: 'BuildReworkedSceneResult',
+        },
+        BuildReworkedSceneResult: {
+          Type: 'Pass',
+          Comment: 'sfxPrompt (2026-08-12) carried through unchanged from the original scene — rework only touches image/video, never the SFX moment, and reworkItems always has it present (spread from BuildSceneResult\'s already-normalized field), so no IsPresent guard needed here unlike the scenes branch.',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'segmentIndex.$': '$.segmentIndex',
+            'isSegmentLastFrame.$': '$.isSegmentLastFrame',
+            'videoUrl.$': '$.videoResult.cdnUrl',
+            'duration.$': '$.videoResult.durationS',
+            'imageUrl.$': '$.imageResult.cdnUrl',
+            'imagePrompt.$': '$.reworkPromptResult.imagePrompt',
+            'videoPrompt.$': '$.reworkPromptResult.videoPrompt',
+            'sfxPrompt.$': '$.sfxPrompt',
+          },
+          End: true,
+        },
+        ReworkSceneFailed: {
+          Type: 'Pass',
+          Comment: 'Rework failed for this scene — keep its ORIGINAL (still-flawed but valid) asset rather than dropping it, so ReReconcileAfterRework\'s merge always has something to fall back to.',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'segmentIndex.$': '$.segmentIndex',
+            'isSegmentLastFrame.$': '$.isSegmentLastFrame',
+            'videoUrl.$': '$.videoUrl',
+            'duration.$': '$.duration',
+            'imageUrl.$': '$.imageUrl',
+            'imagePrompt.$': '$.imagePrompt',
+            'videoPrompt.$': '$.videoPrompt',
+            'sfxPrompt.$': '$.sfxPrompt',
+          },
+          End: true,
+        },
+      },
+    },
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'ReReconcileAfterRework',
+  };
+  def.States.ReReconcileAfterRework = {
+    Type: 'Task',
+    Resource: reconcileSegmentTimingArn,
+    Comment: 'Re-run reconcile after rework, merging ReworkScenesMap\'s output back into sceneResults by frameId (reconcile-segment-timing.ts\'s new reworkedScenes param). Required, not optional: a freshly regenerated last-of-segment clip won\'t already match its previously-reconciled trimmed/extended length.',
+    Parameters: {
+      'sceneResults.$': '$.reconcileResult.sceneResults',
+      'reworkedScenes.$': '$.reworkScenesResult',
+      'segmentResults.$': '$.qaInput._pipelineContext.segmentResults',
+      'outputKeyPrefix.$': "States.Format('projects/{}/dialogue-basic/reconcile-rework{}', $.qaInput.projectId, $.qaInput.reworkAttempt)",
+    },
+    ResultPath: '$.reconcileResult',
+    TimeoutSeconds: 600,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'PrepareReQAPayloadDialogueBasic',
+  };
+  def.States.PrepareReQAPayloadDialogueBasic = {
+    Type: 'Pass',
+    Comment: 'Second-pass QA input using the re-reconciled scene results.',
+    Parameters: {
+      'projectId.$': '$.qaInput.projectId',
+      'jobId.$': '$.qaInput.jobId',
+      'characterBible.$': '$.qaInput.characterBible',
+      mode: 'review',
+      auditPercent: 100,
+      reworkAttempt: 2,
+      '_pipelineContext.$': '$.qaInput._pipelineContext',
+    },
+    ResultPath: '$.qaInput',
+    Next: 'ReQaAgentDialogueBasic',
+  };
+  def.States.ReQaAgentDialogueBasic = {
+    Type: 'Task',
+    Resource: 'arn:aws:lambda:us-east-1:929075264324:function:dialogue-basic-qa-agent',
+    Comment: 'Second-pass QA on reworked scenes — results are logged but the pipeline always proceeds after this (no further rework loop, matches narration-premium\'s ReQaAgentNarrationPremium). frames reads $.reconcileResult.sceneResults directly, same reasoning as QaAgentDialogueBasic.',
+    Parameters: {
+      'projectId.$': '$.qaInput.projectId',
+      'jobId.$': '$.qaInput.jobId',
+      'frames.$': '$.reconcileResult.sceneResults',
+      'characterBible.$': '$.qaInput.characterBible',
+      'mode.$': '$.qaInput.mode',
+      'auditPercent.$': '$.qaInput.auditPercent',
+      'reworkAttempt.$': '$.qaInput.reworkAttempt',
+    },
+    TimeoutSeconds: 1800,
+    ResultPath: '$.qaAgentResult',
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.qaError', Next: 'RestoreContextDialogueBasic' }],
+    Next: 'RestoreContextDialogueBasic',
+  };
+  def.States.RestoreContextDialogueBasic = {
+    Type: 'Pass',
+    Comment: 'Restore the full pipeline context for the concatenation step.',
+    Parameters: {
+      'jobId.$': '$.qaInput._pipelineContext.jobId',
+      'projectId.$': '$.qaInput._pipelineContext.projectId',
+      'projectType.$': '$.qaInput._pipelineContext.projectType',
+      'aspectRatio.$': '$.qaInput._pipelineContext.aspectRatio',
+      'narrator.$': '$.qaInput._pipelineContext.narrator',
+      'narratorOverlay.$': '$.qaInput._pipelineContext.narratorOverlay',
+      'bgmPrompt.$': '$.qaInput._pipelineContext.bgmPrompt',
+      'textOverlayEnabled.$': '$.qaInput._pipelineContext.textOverlayEnabled',
+      'apiKey.$': '$.qaInput._pipelineContext.apiKey',
+      'jwtToken.$': '$.qaInput._pipelineContext.jwtToken',
+      'convexEndpoint.$': '$.qaInput._pipelineContext.convexEndpoint',
+      'userId.$': '$.qaInput._pipelineContext.userId',
+      'admissionId.$': '$.qaInput._pipelineContext.admissionId',
+      'segmentResults.$': '$.qaInput._pipelineContext.segmentResults',
+      'reconcileResult.$': '$.reconcileResult',
+    },
+    Next: 'ApplySceneSfxMap',
+  };
+
+  // ── Per-frame spot SFX (2026-08-12, storystudio-qm-sfx-vocal-audio-
+  // contract.md §4/§7.1) ───────────────────────────────────────────────────
+  // Runs AFTER ReconcileSegmentTiming/rework, once every scene clip is at
+  // its FINAL duration — applying earlier would risk retarget()'s extend
+  // path (reconcile-segment-timing.ts, hardcoded `-an`) silently stripping a
+  // freshly-baked-in SFX track, since that path assumes scene clips are
+  // silent. Reuses dialoguePremium's proven bgm-mode-trick pattern
+  // (sfx.dialogueBasic catalog key) rather than a new RunPod mode, per §7.1's
+  // recommendation.
+  def.States.ApplySceneSfxMap = {
+    Type: 'Map',
+    Comment: 'Per-scene: generate + mix a spot SFX for any scene whose frame carried a non-empty sfxPrompt (BuildSceneResult/BuildReworkedSceneResult). No sfxPrompt, or generation/mix failure -> scene passes through unchanged (graceful degrade, matches dialoguePremium\'s RouteShotSfx Catch behavior). MaxConcurrency capped well under bgm-s2t\'s 4 physical workers (fleet.ts BGM_S2T) — that pod is shared with once-per-project BGM + dialoguePremium\'s own spot SFX, so bursting all of a project\'s scenes at once queues most of them past QMGenerateSceneSfx\'s own TimeoutSeconds even though the underlying generation is fast once a worker is free (live incident 2026-08-12: MaxConcurrency 15 against 4 workers timed out most scenes at 300s despite jobs completing ~7min later).',
+    ItemsPath: '$.reconcileResult.sceneResults',
+    MaxConcurrency: 3,
+    ResultPath: '$.reconcileResult.sceneResults',
+    Iterator: {
+      StartAt: 'RouteSceneSfx',
+      States: {
+        RouteSceneSfx: {
+          Type: 'Choice',
+          Choices: [{
+            And: [
+              { Variable: '$.sfxPrompt', IsPresent: true },
+              { Variable: '$.sfxPrompt', IsString: true },
+              { Not: { Variable: '$.sfxPrompt', StringEquals: '' } },
+            ],
+            Next: 'QMGenerateSceneSfx',
+          }],
+          Default: 'PassthroughScene',
+        },
+        QMGenerateSceneSfx: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Spot SFX via QM (sfx.dialogueBasic: self-hosted ACE-Step, bgm-mode trick — same physical rung as sfx.dialoguePremium). Fixed short default duration, same reasoning as dialoguePremium\'s QMGenerateShotSfx: the scene object carries no explicit SFX-length field, this is an authored moment, not a gap-filler.',
+          Parameters: {
+            assetType: 'sfx', tier: 'dialogueBasic', operation: 'generate', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.sfxPrompt',
+            durationS: 3,
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.sfxResult',
+          // 600s, not the usual 300s — ApplySceneSfxMap's MaxConcurrency is
+          // capped at 3 to protect bgm-s2t's 4 real workers, but that pod is
+          // shared with once-per-project BGM + dialoguePremium's own spot SFX,
+          // so a scene can still queue for several minutes before a worker
+          // frees up even under this lower concurrency (2026-08-12 incident).
+          TimeoutSeconds: 600,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.sfxError', Next: 'PassthroughScene' }],
+          Next: 'QMMixSceneSfx',
+        },
+        QMMixSceneSfx: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Mix the SFX onto this scene\'s own clip (video.dialogueBasic.merge -> qm-merge Lambda, handlers/merge.ts). durationS MUST be the scene\'s own final duration: Wan2 clips carry no audio stream at all, so mixMode:"additive" always falls through merge.ts\'s replace path there (hasAudioStream() false) — omitting durationS would default target to min(video,audio) and truncate the VIDEO down to the short SFX clip\'s length instead of padding the SFX with trailing silence.',
+          Parameters: {
+            assetType: 'video', tier: 'dialogueBasic', operation: 'merge', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.videoUrl)',
+            'audioUrl.$': '$.sfxResult.cdnUrl',
+            mixMode: 'additive',
+            'durationS.$': '$.duration',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.sfxMixResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.sfxMixError', Next: 'PassthroughScene' }],
+          Next: 'SetSceneAfterSfx',
+        },
+        SetSceneAfterSfx: {
+          Type: 'Pass',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'segmentIndex.$': '$.segmentIndex',
+            'isSegmentLastFrame.$': '$.isSegmentLastFrame',
+            'videoUrl.$': '$.sfxMixResult.cdnUrl',
+            'duration.$': '$.sfxMixResult.durationS',
+            'imageUrl.$': '$.imageUrl',
+            'imagePrompt.$': '$.imagePrompt',
+            'videoPrompt.$': '$.videoPrompt',
+            'sfxPrompt.$': '$.sfxPrompt',
+          },
+          End: true,
+        },
+        PassthroughScene: {
+          Type: 'Pass',
+          Comment: 'No sfxPrompt, or SFX gen/mix failed — keep the scene exactly as reconcile/rework left it rather than failing the whole execution over one spot effect.',
+          End: true,
+        },
+      },
+    },
     Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
     Next: 'UpdateStatusConcatenating',
   };
