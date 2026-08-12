@@ -522,6 +522,25 @@ async function markFailed(job: JobItem, reason: string): Promise<void> {
     ExpressionAttributeValues: marshall({ ':s': 'FAILED', ':r': reason, ':now': Date.now() }),
   }));
   console.warn('[executor] FAILED', job.requestId, job.jobId, reason);
+  // A job invoked via lambda:invoke.waitForTaskToken (job.taskToken set) has an
+  // SFN state paused waiting for SendTaskSuccess/Failure. Exhausting all rungs
+  // at submit() time (before putProviderTask ever runs) means no webhook will
+  // ever arrive to resolve it — without this, the state hangs until its own
+  // TimeoutSeconds fires (e.g. 1800s), turning an instant, precise failure
+  // reason into a generic States.Timeout 30 minutes later (2026-08-12 incident).
+  if (job.taskToken) {
+    const { SFNClient, SendTaskFailureCommand } = await import('@aws-sdk/client-sfn');
+    const sfn = new SFNClient({});
+    await sfn.send(new SendTaskFailureCommand({
+      taskToken: job.taskToken,
+      error: 'AllRungsExhausted',
+      cause: reason,
+    })).catch((err) => {
+      // Token may already be resolved/expired — don't let this mask the
+      // original failure reason already persisted above.
+      console.warn('[executor] SendTaskFailure failed', job.requestId, (err as Error).message);
+    });
+  }
 }
 
 async function putProviderTask(
