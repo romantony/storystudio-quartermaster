@@ -4409,8 +4409,13 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
             // sfxVolume (2026-08-13, same request doc §4) — optional per-frame
             // linear gain applied to the SFX track in QMMixSceneSfx(FromUrl)
             // (merge.ts's ffmpeg `volume=` filter, same convention as dialogue-
-            // mix's ambienceVolume). Defaults to 1 (no-op) so omitting it
-            // reproduces today's unscaled SFX level exactly.
+            // mix's ambienceVolume). Defaulted to 1 (no-op) at launch, but that
+            // meant every SFX played at raw generated/library amplitude summed
+            // straight onto the dialogue track (merge.ts's amix uses
+            // normalize=0, so nothing auto-attenuates it either) — reported
+            // live as overpowering. Reset 2026-08-13 to 0.22, just above BGM's
+            // 0.20 mix level, so SFX reads as a foreground accent without
+            // burying dialogue.
             NormalizeSceneSfxVolume: {
               Type: 'Choice',
               Choices: [{ Variable: '$.sfxVolume', IsPresent: true, Next: 'BuildSceneResult' }],
@@ -4418,7 +4423,7 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
             },
             SetSceneSfxVolumeDefault: {
               Type: 'Pass',
-              Result: 1,
+              Result: 0.22,
               ResultPath: '$.sfxVolume',
               Next: 'BuildSceneResult',
             },
