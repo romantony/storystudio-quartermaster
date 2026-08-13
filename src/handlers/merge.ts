@@ -83,26 +83,34 @@ export const handler = async (event: MergeEvent): Promise<MergeResult> => {
 
     const videoDuration = getDuration(videoPath);
 
-    // sfxVolume, when present, prepends a gain stage on the audioUrl input
-    // (stream 1:a) before whichever branch below consumes it — a no-op
-    // (`[1:a]volume=1[sfxin]`) is functionally identical to referencing
-    // `1:a` directly, but only bother inserting the stage when a caller
-    // actually asked for a non-default level.
-    const sfxLabel = event.sfxVolume !== undefined ? 'sfxin' : '1:a';
-    const gainStage = event.sfxVolume !== undefined ? `[1:a]volume=${event.sfxVolume}[${sfxLabel}];` : '';
-
     let filter: string;
     let target: number;
     if (event.mixMode === 'additive' && hasAudioStream(videoPath)) {
       // Mix audioUrl IN ON TOP of the video's own existing audio (a spot SFX
       // over dialogue/narration that's already there) rather than replacing
-      // it — normalize=0 so ffmpeg doesn't attenuate every input by 1/n
-      // (same amix gotcha as the dialogue-mix ECS task's ambience-bed mix).
-      // The video's own audio duration is canonical; the SFX clip is
-      // typically much shorter and just plays under it.
-      filter = `${gainStage}[0:a][${sfxLabel}]amix=inputs=2:duration=first:normalize=0[aout]`;
+      // it. Root-caused 2026-08-13 (first real exercise of this branch with
+      // a video that already had audio — every prior additive caller hit a
+      // silent Wan2 clip, which has no `0:a` stream at all, so this never
+      // actually ran): @ffmpeg-installer/ffmpeg's bundled binary is 2019-era
+      // (libavfilter 7.46), which predates amix's `normalize` option
+      // entirely (added FFmpeg 4.3) — passing normalize=0 isn't silently
+      // ignored, it's a hard filter-graph init error ("Option 'normalize'
+      // not found"), failing every rung and exhausting the ladder. Without
+      // the option, old amix ALWAYS averages its inputs (sum/N) to prevent
+      // clipping — for 2 inputs that's an automatic 0.5x on each, so
+      // pre-scaling both inputs by 2x with a plain `volume=` filter (which
+      // this old binary DOES support — merge.ts's own sfxVolume path already
+      // relies on it) cancels that out exactly: 0.5*(2a) + 0.5*(2b) = a + b.
+      const sfxGain = (event.sfxVolume ?? 1) * 2;
+      filter = `[0:a]volume=2[dlg];[1:a]volume=${sfxGain}[sfxin];[dlg][sfxin]amix=inputs=2:duration=first[aout]`;
       target = videoDuration;
     } else {
+      // sfxVolume, when present, prepends a gain stage on the audioUrl input
+      // (stream 1:a) — a no-op (`[1:a]volume=1[sfxin]`) is functionally
+      // identical to referencing `1:a` directly, but only bother inserting
+      // the stage when a caller actually asked for a non-default level.
+      const sfxLabel = event.sfxVolume !== undefined ? 'sfxin' : '1:a';
+      const gainStage = event.sfxVolume !== undefined ? `[1:a]volume=${event.sfxVolume}[${sfxLabel}];` : '';
       const audioProbe = run(['-i', audioPath, '-f', 'null', '-']);
       const audioDuration = parseDurationFromStderr(audioProbe.stderr);
       const sampleRate = getSampleRate(audioProbe.stderr);
