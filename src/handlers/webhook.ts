@@ -172,15 +172,39 @@ async function verifySignature(
 ): Promise<boolean> {
   try {
     if (provider === 'replicate') {
+      // Root-caused 2026-08-13 (same day/incident class as the kie fix
+      // below): two bugs, confirmed against replicate-javascript's own
+      // validateWebhook/createHMACSHA256 source (the docs prose alone is
+      // ambiguous on this and got it wrong in one summarized read).
+      // (1) The stored secret is Svix-style `whsec_<base64>` — the actual
+      //     HMAC key is the part after the LAST underscore, BASE64-DECODED
+      //     into raw bytes. We were using the whole raw "whsec_..." string
+      //     as the key.
+      // (2) `webhook-signature` can carry multiple space-delimited
+      //     `v1,<base64>` pairs (key rotation) — we were hashing/comparing
+      //     the entire raw header value, prefix and all, instead of
+      //     stripping "v1," and checking each candidate.
+      // Net effect: identical failure mode to the kie bug — every real
+      // Replicate webhook was silently rejected (confirmed live, a rework
+      // video burst that completed fine on Replicate's own dashboard never
+      // updated here).
       const secretArn = process.env.REPLICATE_WEBHOOK_SECRET_ARN ?? '';
       if (!secretArn) return true; // no secret configured → skip verification in dev
-      const secret = await getSecret(secretArn);
-      const sig = headers['webhook-signature'] ?? headers['x-signature'] ?? '';
+      const rawSecret = await getSecret(secretArn);
+      const secretKey = Buffer.from(rawSecret.split('_').pop() ?? '', 'base64');
       const webhookId = headers['webhook-id'] ?? '';
       const webhookTimestamp = headers['webhook-timestamp'] ?? '';
+      const sigHeader = headers['webhook-signature'] ?? '';
+      if (!sigHeader || !webhookId || !webhookTimestamp) return false;
       const signedContent = `${webhookId}.${webhookTimestamp}.${body}`;
-      const expected = createHmac('sha256', secret).update(signedContent).digest('base64');
-      return timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+      const expected = createHmac('sha256', secretKey).update(signedContent).digest('base64');
+      const expectedBuf = Buffer.from(expected, 'base64');
+      return sigHeader.split(' ').some((part) => {
+        const sig = part.split(',')[1];
+        if (!sig) return false;
+        const sigBuf = Buffer.from(sig, 'base64');
+        return sigBuf.length === expectedBuf.length && timingSafeEqual(sigBuf, expectedBuf);
+      });
     }
 
     if (provider === 'kie') {
