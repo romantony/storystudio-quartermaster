@@ -133,15 +133,30 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
           console.warn('[webhook] job record missing for internal webhookCompletion task', map.requestId, map.jobId);
         }
       } else {
+        // Root-caused 2026-08-13: durationS/text were destructured from
+        // parseWebhook() above but never written here, so an external
+        // provider's (replicate/kie) real generated duration was silently
+        // dropped on every async webhook completion — invisible while the
+        // replicate signature bug (a39bac1) meant no completion ever
+        // reached this branch, then surfaced immediately once that was
+        // fixed: a rework video's videoResult had no durationS field at
+        // all, crashing BuildReworkedSceneResult's unguarded `duration.$`
+        // reference and failing the whole rework Map (no per-scene Catch
+        // covers a Pass state) instead of just that one scene.
         await db.send(new UpdateItemCommand({
           TableName: TABLE,
           Key: marshall({ pk: `REQ#${map.requestId}`, sk: `JOB#${map.jobId}` }),
-          UpdateExpression: 'SET #status = :s, updatedAt = :now' + (assetKey ? ', assetKey = :ak' : ''),
+          UpdateExpression: 'SET #status = :s, updatedAt = :now'
+            + (assetKey ? ', assetKey = :ak' : '')
+            + (durationS !== undefined ? ', durationS = :d' : '')
+            + (text !== undefined ? ', resultText = :rt' : ''),
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: marshall({
             ':s': 'COMPLETE',
             ':now': now,
             ...(assetKey ? { ':ak': assetKey } : {}),
+            ...(durationS !== undefined ? { ':d': durationS } : {}),
+            ...(text !== undefined ? { ':rt': text } : {}),
           }),
         }));
       }

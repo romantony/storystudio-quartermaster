@@ -13,6 +13,32 @@ function normalizeOutput(output: unknown): string[] | undefined {
   return undefined;
 }
 
+// Real output media duration in seconds — NOT Replicate's own metrics.
+// predict_time (that's compute wall-clock, e.g. ~22s to generate a 5s clip;
+// using it would set the scene's video duration to the generation time).
+// Replicate's prediction response echoes back the exact `input` it
+// received, so this is derived from request parameters known to determine
+// the output's actual length, not measured after the fact.
+// Root-caused 2026-08-13: this adapter never populated durationS at all —
+// invisible while the webhook signature bug (a39bac1) meant no replicate
+// completion ever reached the caller, then surfaced immediately once fixed:
+// a video rework's videoResult had no durationS, crashing
+// BuildReworkedSceneResult's unguarded `duration.$` reference.
+function replicateOutDuration(p: Record<string, unknown>): number | undefined {
+  const input = p.input as Record<string, unknown> | undefined;
+  if (!input) return undefined;
+  // wan-2.2-i2v-fast (buildRequest above): num_frames/frames_per_second are
+  // hardcoded constants, not job.params.durationS — output length is fully
+  // deterministic from them.
+  if (typeof input.num_frames === 'number' && typeof input.frames_per_second === 'number' && input.frames_per_second > 0) {
+    return input.num_frames / input.frames_per_second;
+  }
+  // seedance (and any other model taking an explicit `duration` input) —
+  // Replicate honors this input as the output's actual length.
+  if (typeof input.duration === 'number') return input.duration;
+  return undefined;
+}
+
 export const replicate: Adapter = {
   supportsWebhook: true,
 
@@ -105,7 +131,7 @@ export const replicate: Adapter = {
       throw Object.assign(new Error(`Replicate submit error: ${r.error}`), { httpCode: 422, raw });
     }
     const outputUrls = normalizeOutput(r.output);
-    return { taskRef: String(r.id ?? ''), outputUrls, raw };
+    return { taskRef: String(r.id ?? ''), outputUrls, durationS: replicateOutDuration(r), raw };
   },
 
   async poll(taskRef: string, _rung: Rung): Promise<PollResult> {
@@ -116,7 +142,7 @@ export const replicate: Adapter = {
     const status = String(json.status ?? '');
 
     if (status === 'succeeded') {
-      return { done: true, outputUrls: normalizeOutput(json.output) };
+      return { done: true, outputUrls: normalizeOutput(json.output), durationS: replicateOutDuration(json) };
     }
     if (status === 'failed' || status === 'canceled') {
       return { done: true, failed: true };
@@ -128,7 +154,7 @@ export const replicate: Adapter = {
     const p = payload as Record<string, unknown>;
     const outputUrls = normalizeOutput(p.output);
     const failed = p.status === 'failed' || p.status === 'canceled';
-    return { taskRef: String(p.id ?? ''), outputUrls, failed };
+    return { taskRef: String(p.id ?? ''), outputUrls, failed, durationS: replicateOutDuration(p) };
   },
 
   classifyError(code: number, _raw: unknown): ErrClass {
