@@ -4833,8 +4833,58 @@ function buildDialogueBasicQmNewDefinition(
     MaxConcurrency: 5,
     ResultPath: '$.reworkScenesResult',
     Iterator: {
-      StartAt: 'RewritePromptsTask',
+      StartAt: 'CheckReworkVideoCache',
       States: {
+        // Rework-scoped cache (2026-08-13, per user: re-triggering a new
+        // execution for the same project was re-running rework from scratch
+        // on frames that had already been successfully reworked in a PRIOR
+        // execution). Deliberately keyed on `{frameId}-rework{reworkAttempt}`
+        // — NOT the bare frameId the original scene's own CheckSceneImageCache
+        // uses — so this can never cache-hit on the original, QA-flagged
+        // asset rework exists to replace. reworkAttempt resets to 1 at the
+        // start of every execution's first QA/rework pass, so two separate
+        // executions reworking the same frame land on the same key, which is
+        // exactly the reuse this is for.
+        CheckReworkVideoCache: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-asset-cache-check',
+          Comment: 'Check S3 metadata cache before regenerating this rework — skip straight to the previously reworked asset if this exact frame+reworkAttempt was already fixed in an earlier execution.',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': "States.Format('{}-rework{}', $.frameId, $.reworkAttempt)",
+            assetType: 'video',
+          },
+          ResultPath: '$.reworkVideoCacheResult',
+          TimeoutSeconds: 10,
+          Retry: [{ ErrorEquals: ['States.TaskFailed', 'States.Timeout'], IntervalSeconds: 2, MaxAttempts: 1, BackoffRate: 1.5 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkCacheError', Next: 'RewritePromptsTask' }],
+          Next: 'CheckReworkVideoCacheResult',
+        },
+        CheckReworkVideoCacheResult: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.reworkVideoCacheResult.cached', BooleanEquals: true, Next: 'UseReworkVideoCache' }],
+          Default: 'RewritePromptsTask',
+        },
+        UseReworkVideoCache: {
+          Type: 'Pass',
+          Comment: 'Already reworked in a prior execution — skip prompt rewrite + image/video regeneration entirely and reuse it, same output shape as BuildReworkedSceneResult.',
+          Parameters: {
+            'frameId.$': '$.frameId',
+            'frameNumber.$': '$.frameNumber',
+            'segmentIndex.$': '$.segmentIndex',
+            'isSegmentLastFrame.$': '$.isSegmentLastFrame',
+            'videoUrl.$': '$.reworkVideoCacheResult.cdnUrl',
+            'duration.$': '$.reworkVideoCacheResult.durationS',
+            'imageUrl.$': '$.reworkVideoCacheResult.imageUrl',
+            'imagePrompt.$': '$.reworkVideoCacheResult.imagePrompt',
+            'videoPrompt.$': '$.reworkVideoCacheResult.videoPrompt',
+            'sfxPrompt.$': '$.sfxPrompt',
+            'sfxAudioUrl.$': '$.sfxAudioUrl',
+            'sfxVolume.$': '$.sfxVolume',
+            'referenceImageUrl.$': '$.referenceImageUrl',
+          },
+          End: true,
+        },
         RewritePromptsTask: {
           Type: 'Task',
           Resource: 'arn:aws:lambda:us-east-1:929075264324:function:dialogue-basic-rework-prompts',
@@ -4928,6 +4978,26 @@ function buildDialogueBasicQmNewDefinition(
           TimeoutSeconds: 920,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkError', Next: 'ReworkSceneFailed' }],
+          Next: 'StoreReworkVideoMeta',
+        },
+        StoreReworkVideoMeta: {
+          Type: 'Task',
+          Resource: 'arn:aws:lambda:us-east-1:929075264324:function:E2E-store-asset-meta',
+          Comment: 'Persist this rework\'s result under the rework-scoped key (CheckReworkVideoCache) so a future execution reworking the same frame+reworkAttempt reuses it instead of regenerating. Non-fatal: a store failure just means the next execution won\'t get a cache hit, not that this one fails.',
+          Parameters: {
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': "States.Format('{}-rework{}', $.frameId, $.reworkAttempt)",
+            assetType: 'video',
+            'cdnUrl.$': '$.videoResult.cdnUrl',
+            's3Key.$': '$.videoResult.s3Key',
+            'durationS.$': '$.videoResult.durationS',
+            'imageUrl.$': '$.imageResult.cdnUrl',
+            'imagePrompt.$': '$.reworkPromptResult.imagePrompt',
+            'videoPrompt.$': '$.reworkPromptResult.videoPrompt',
+          },
+          ResultPath: null,
+          TimeoutSeconds: 10,
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkMetaStoreError', Next: 'BuildReworkedSceneResult' }],
           Next: 'BuildReworkedSceneResult',
         },
         BuildReworkedSceneResult: {
