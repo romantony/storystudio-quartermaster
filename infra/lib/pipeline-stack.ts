@@ -4354,6 +4354,26 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
               TimeoutSeconds: 920,
               Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
               Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.videoError', Next: 'SceneFailed' }],
+              Next: 'NormalizeSceneReferenceImageUrl',
+            },
+            // referenceImageUrl (2026-08-13) — now carried through the same
+            // guarded normalize-then-BuildSceneResult pattern as sfxPrompt/
+            // sfxAudioUrl below, so a scene originally anchored on a character
+            // reference (RouteSceneImageGen's I2I branch) keeps that anchor
+            // available for rework (RouteSceneReworkImageGen), instead of
+            // rework silently falling back to an unanchored T2I regen and
+            // risking a character-consistency drift from the rest of the
+            // project. Still optional per-frame — same unguarded-`.$`-crash
+            // risk as the others if defaulted incorrectly.
+            NormalizeSceneReferenceImageUrl: {
+              Type: 'Choice',
+              Choices: [{ Variable: '$.referenceImageUrl', IsPresent: true, Next: 'NormalizeSceneSfxPrompt' }],
+              Default: 'SetSceneReferenceImageUrlDefault',
+            },
+            SetSceneReferenceImageUrlDefault: {
+              Type: 'Pass',
+              Result: '',
+              ResultPath: '$.referenceImageUrl',
               Next: 'NormalizeSceneSfxPrompt',
             },
             // sfxPrompt (2026-08-12, per storystudio-qm-sfx-vocal-audio-contract.md
@@ -4362,18 +4382,49 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
             // or a frame that omits it crashes this whole branch with States.Runtime.
             NormalizeSceneSfxPrompt: {
               Type: 'Choice',
-              Choices: [{ Variable: '$.sfxPrompt', IsPresent: true, Next: 'BuildSceneResult' }],
+              Choices: [{ Variable: '$.sfxPrompt', IsPresent: true, Next: 'NormalizeSceneSfxAudioUrl' }],
               Default: 'SetSceneSfxPromptDefault',
             },
             SetSceneSfxPromptDefault: {
               Type: 'Pass',
               Result: '',
               ResultPath: '$.sfxPrompt',
+              Next: 'NormalizeSceneSfxAudioUrl',
+            },
+            // sfxAudioUrl (2026-08-13, storystudio-dialogue-sfx-url-integration-
+            // request.md) — StoryStudio's pre-vetted SFX-library match, optional
+            // per-frame same as sfxPrompt above. Same unguarded `.$` crash risk
+            // in BuildSceneResult if left undefined on a frame that omits it.
+            NormalizeSceneSfxAudioUrl: {
+              Type: 'Choice',
+              Choices: [{ Variable: '$.sfxAudioUrl', IsPresent: true, Next: 'NormalizeSceneSfxVolume' }],
+              Default: 'SetSceneSfxAudioUrlDefault',
+            },
+            SetSceneSfxAudioUrlDefault: {
+              Type: 'Pass',
+              Result: '',
+              ResultPath: '$.sfxAudioUrl',
+              Next: 'NormalizeSceneSfxVolume',
+            },
+            // sfxVolume (2026-08-13, same request doc §4) — optional per-frame
+            // linear gain applied to the SFX track in QMMixSceneSfx(FromUrl)
+            // (merge.ts's ffmpeg `volume=` filter, same convention as dialogue-
+            // mix's ambienceVolume). Defaults to 1 (no-op) so omitting it
+            // reproduces today's unscaled SFX level exactly.
+            NormalizeSceneSfxVolume: {
+              Type: 'Choice',
+              Choices: [{ Variable: '$.sfxVolume', IsPresent: true, Next: 'BuildSceneResult' }],
+              Default: 'SetSceneSfxVolumeDefault',
+            },
+            SetSceneSfxVolumeDefault: {
+              Type: 'Pass',
+              Result: 1,
+              ResultPath: '$.sfxVolume',
               Next: 'BuildSceneResult',
             },
             BuildSceneResult: {
               Type: 'Pass',
-              Comment: 'imageUrl/imagePrompt/videoPrompt/sfxPrompt carried through (not just videoUrl/duration) so a later QA/rework pass can re-evaluate and regenerate this scene without a separate lookup — safe to add: reconcile-segment-timing.ts spreads unknown fields through untouched, and dialogue-basic-qa-agent\'s reworkItems spreads **frame too, so sfxPrompt survives a rework round trip unchanged. referenceImageUrl deliberately NOT carried — RouteSceneImageGen only reads it behind an IsPresent guard, meaning it is not guaranteed present on every frame; an unguarded `.$` reference here would risk a States.Runtime crash across the whole scenes branch for every project, not just reworked ones. Rework falls back to a fresh T2I regen when the original scene used I2I.',
+              Comment: 'imageUrl/imagePrompt/videoPrompt/sfxPrompt/sfxAudioUrl/sfxVolume/referenceImageUrl carried through (not just videoUrl/duration) so a later QA/rework pass can re-evaluate and regenerate this scene without a separate lookup — safe to add: reconcile-segment-timing.ts spreads unknown fields through untouched, and dialogue-basic-qa-agent\'s reworkItems spreads **frame too, so these survive a rework round trip unchanged. referenceImageUrl (2026-08-13) is now guard-normalized the same way as sfxPrompt/sfxAudioUrl above (NormalizeSceneReferenceImageUrl), so it\'s safe to reference here unguarded — RouteSceneReworkImageGen uses it to pick i2i vs t2i for rework, mirroring RouteSceneImageGen\'s original-generation logic.',
               Parameters: {
                 'frameId.$': '$.frameId',
                 'frameNumber.$': '$.frameNumber',
@@ -4385,6 +4436,9 @@ function dialogueBasicScenesBranch(qmGenerateArn: string): object {
                 'imagePrompt.$': '$.imagePrompt',
                 'videoPrompt.$': '$.videoPrompt',
                 'sfxPrompt.$': '$.sfxPrompt',
+                'sfxAudioUrl.$': '$.sfxAudioUrl',
+                'referenceImageUrl.$': '$.referenceImageUrl',
+                'sfxVolume.$': '$.sfxVolume',
               },
               End: true,
             },
@@ -4798,15 +4852,49 @@ function buildDialogueBasicQmNewDefinition(
           TimeoutSeconds: 180,
           Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
           Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkError', Next: 'ReworkSceneFailed' }],
-          Next: 'QMReworkImageT2I',
+          Next: 'RouteSceneReworkImageGen',
+        },
+        RouteSceneReworkImageGen: {
+          Type: 'Choice',
+          Comment: 'Character reference present -> i2i rework (preserve the identity anchor); else t2i rework — mirrors RouteSceneImageGen\'s original-generation logic (2026-08-13, per user: rework was always regenerating unanchored via T2I even for scenes originally anchored on a reference image, risking character-consistency drift).',
+          Choices: [{
+            And: [
+              { Variable: '$.referenceImageUrl', IsPresent: true },
+              { Variable: '$.referenceImageUrl', IsString: true },
+              { Not: { Variable: '$.referenceImageUrl', StringEquals: '' } },
+            ],
+            Next: 'QMReworkImageI2I',
+          }],
+          Default: 'QMReworkImageT2I',
+        },
+        QMReworkImageI2I: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Regenerate this scene\'s still image via QM, anchored on the original character referenceImageUrl (image.dialogueBasic.i2i: self-hosted Qwen-Image-Edit -> KIE google/nano-banana-edit fallback) — same ladder QMGenerateSceneImageI2I uses for the original generation, so a rework attempt on an I2I-anchored scene keeps the same identity anchor instead of drifting via an unanchored T2I regen. jobType:\'batch\' (see QMReworkImageT2I\'s note) so a cold self-hosted qwen-image-edit pod is waited out rather than routing straight to KIE.',
+          Parameters: {
+            assetType: 'image', tier: 'dialogueBasic', operation: 'i2i', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'prompt.$': '$.reworkPromptResult.imagePrompt',
+            'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+            'initImageUrls.$': 'States.Array($.referenceImageUrl)',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+            'requestId.$': "States.Format('{}-rework{}-{}-img', $.frameId, $.reworkAttempt, $$.Execution.Name)",
+          },
+          ResultPath: '$.imageResult',
+          TimeoutSeconds: 920,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.reworkError', Next: 'ReworkSceneFailed' }],
+          Next: 'QMReworkVideo',
         },
         QMReworkImageT2I: {
           Type: 'Task',
           Resource: qmGenerateArn,
-          Comment: 'Regenerate this scene\'s still image via QM. jobType:\'realtime\' (not \'batch\', unlike the original scene generation) so rework leads with the external fallback rung (KIE qwen/image-edit) instead of waiting on a cold self-hosted RunPod pod — product decision 2026-08-10. Always T2I: referenceImageUrl isn\'t carried through BuildSceneResult (see its own comment above), so a scene originally generated via I2I regenerates as a fresh T2I here.',
+          Comment: 'Regenerate this scene\'s still image via QM (no character reference on this frame — see RouteSceneReworkImageGen). jobType:\'batch\' (2026-08-13, reversing the earlier 2026-08-10 \'realtime\' decision) — router.ts leads batch jobs with the internal rung (self-hosted qwen-image-gen) unconditionally, waiting out a cold RunPod start rather than routing straight to the KIE google/nano-banana fallback the way \'realtime\' does when that endpoint has 0 in-flight jobs. Root-caused 2026-08-13: a real rework burst hit exactly that cold-endpoint case, landed on KIE, and got permanently stuck — KIE\'s webhook signature check (webhook.ts) rejects every callback, and kie.ts\'s poll() fallback hits the wrong endpoint too, so there was no recovery path. KIE remains the fallback rung if qwen-image-gen itself fails; QM_GENERATE_DEADLINE_MS (850s) comfortably covers a cold start (~2.5-4min per executor.ts) plus generation.',
           Parameters: {
             assetType: 'image', tier: 'dialogueBasic', operation: 't2i', product: 'dialogue',
-            queue: 'background', jobType: 'realtime',
+            queue: 'background', jobType: 'batch',
             'prompt.$': '$.reworkPromptResult.imagePrompt',
             'aspectRatio.$': '$$.Execution.Input.aspectRatio',
             'projectId.$': '$$.Execution.Input.projectId',
@@ -4844,7 +4932,7 @@ function buildDialogueBasicQmNewDefinition(
         },
         BuildReworkedSceneResult: {
           Type: 'Pass',
-          Comment: 'sfxPrompt (2026-08-12) carried through unchanged from the original scene — rework only touches image/video, never the SFX moment, and reworkItems always has it present (spread from BuildSceneResult\'s already-normalized field), so no IsPresent guard needed here unlike the scenes branch.',
+          Comment: 'sfxPrompt/sfxAudioUrl/sfxVolume/referenceImageUrl (2026-08-12/13) carried through unchanged from the original scene — rework only touches image/video, never the SFX moment, and reworkItems always has these present (spread from BuildSceneResult\'s already-normalized fields), so no IsPresent guard needed here unlike the scenes branch.',
           Parameters: {
             'frameId.$': '$.frameId',
             'frameNumber.$': '$.frameNumber',
@@ -4856,6 +4944,9 @@ function buildDialogueBasicQmNewDefinition(
             'imagePrompt.$': '$.reworkPromptResult.imagePrompt',
             'videoPrompt.$': '$.reworkPromptResult.videoPrompt',
             'sfxPrompt.$': '$.sfxPrompt',
+            'sfxAudioUrl.$': '$.sfxAudioUrl',
+            'sfxVolume.$': '$.sfxVolume',
+            'referenceImageUrl.$': '$.referenceImageUrl',
           },
           End: true,
         },
@@ -4873,6 +4964,9 @@ function buildDialogueBasicQmNewDefinition(
             'imagePrompt.$': '$.imagePrompt',
             'videoPrompt.$': '$.videoPrompt',
             'sfxPrompt.$': '$.sfxPrompt',
+            'sfxAudioUrl.$': '$.sfxAudioUrl',
+            'sfxVolume.$': '$.sfxVolume',
+            'referenceImageUrl.$': '$.referenceImageUrl',
           },
           End: true,
         },
@@ -4973,6 +5067,59 @@ function buildDialogueBasicQmNewDefinition(
       States: {
         RouteSceneSfx: {
           Type: 'Choice',
+          Comment: 'sfxAudioUrl (2026-08-13, storystudio-dialogue-sfx-url-integration-request.md §3) — StoryStudio\'s pre-vetted SFX-library match — takes priority over sfxPrompt-driven ACE-Step generation when present. Falls back to the sfxPrompt branch on an empty/absent URL, or (via QMMixSceneSfxFromUrl\'s Catch below) on an unreachable one.',
+          Choices: [
+            {
+              And: [
+                { Variable: '$.sfxAudioUrl', IsPresent: true },
+                { Variable: '$.sfxAudioUrl', IsString: true },
+                { Not: { Variable: '$.sfxAudioUrl', StringEquals: '' } },
+              ],
+              Next: 'AdoptSceneSfxAudioUrl',
+            },
+            {
+              And: [
+                { Variable: '$.sfxPrompt', IsPresent: true },
+                { Variable: '$.sfxPrompt', IsString: true },
+                { Not: { Variable: '$.sfxPrompt', StringEquals: '' } },
+              ],
+              Next: 'QMGenerateSceneSfx',
+            },
+          ],
+          Default: 'PassthroughScene',
+        },
+        AdoptSceneSfxAudioUrl: {
+          Type: 'Pass',
+          Comment: 'Library SFX match found — skip QMGenerateSceneSfx/ACE-Step entirely and go straight to mixing exactly as a generated clip would (merge.ts already downloads whatever audioUrl it\'s given, generated or not).',
+          Parameters: { 'cdnUrl.$': '$.sfxAudioUrl' },
+          ResultPath: '$.sfxResult',
+          Next: 'QMMixSceneSfxFromUrl',
+        },
+        QMMixSceneSfxFromUrl: {
+          Type: 'Task',
+          Resource: qmGenerateArn,
+          Comment: 'Mix the library SFX asset onto this scene\'s own clip (video.dialogueBasic.merge -> qm-merge Lambda, handlers/merge.ts). Same shape as QMMixSceneSfx below, kept as a separate state so a download/mix failure here can fall back to sfxPrompt-driven generation (RouteSceneSfxFallback) instead of passing the scene through untouched.',
+          Parameters: {
+            assetType: 'video', tier: 'dialogueBasic', operation: 'merge', product: 'dialogue',
+            queue: 'background', jobType: 'batch',
+            'initImageUrls.$': 'States.Array($.videoUrl)',
+            'audioUrl.$': '$.sfxResult.cdnUrl',
+            mixMode: 'additive',
+            'durationS.$': '$.duration',
+            'sfxVolume.$': '$.sfxVolume',
+            'projectId.$': '$$.Execution.Input.projectId',
+            'frameId.$': '$.frameId',
+            'userId.$': '$$.Execution.Input.userId',
+          },
+          ResultPath: '$.sfxMixResult',
+          TimeoutSeconds: 300,
+          Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.sfxUrlMixError', Next: 'RouteSceneSfxFallback' }],
+          Next: 'SetSceneAfterSfx',
+        },
+        RouteSceneSfxFallback: {
+          Type: 'Choice',
+          Comment: 'sfxAudioUrl was present but unreachable/failed to mix — fall back to sfxPrompt-driven ACE-Step generation, same as if the URL had been absent (storystudio-dialogue-sfx-url-integration-request.md §3).',
           Choices: [{
             And: [
               { Variable: '$.sfxPrompt', IsPresent: true },
@@ -5018,6 +5165,7 @@ function buildDialogueBasicQmNewDefinition(
             'audioUrl.$': '$.sfxResult.cdnUrl',
             mixMode: 'additive',
             'durationS.$': '$.duration',
+            'sfxVolume.$': '$.sfxVolume',
             'projectId.$': '$$.Execution.Input.projectId',
             'frameId.$': '$.frameId',
             'userId.$': '$$.Execution.Input.userId',

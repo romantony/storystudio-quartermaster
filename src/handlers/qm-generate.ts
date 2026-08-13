@@ -55,6 +55,9 @@ interface QMGenerateEvent {
   leftAudioUrl?: string;
   rightAudioUrl?: string;
   mixMode?: 'replace' | 'additive';
+  // lambdamerge only — linear gain applied to audioUrl before mux/mix, see
+  // CanonicalJobParams.sfxVolume (types.ts) for the full contract.
+  sfxVolume?: number;
   // BGM only: the project's frames, used to compute the generated track's
   // length (sum of frame durations) — ASL has no native array-sum function,
   // and by the time BGM would otherwise run near finalize, the pipeline has
@@ -185,6 +188,7 @@ export const handler = async (event: QMGenerateEvent): Promise<QMGenerateResult>
       leftAudioUrl: event.leftAudioUrl,
       rightAudioUrl: event.rightAudioUrl,
       mixMode: event.mixMode,
+      sfxVolume: event.sfxVolume,
     },
     s3Target,
     projectId: event.projectId,

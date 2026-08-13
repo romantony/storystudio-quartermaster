@@ -122,6 +122,15 @@ export interface CanonicalJobParams {
   // handoff.md §8, "Common tail"). Every other merge caller omits this and
   // gets the existing replace behavior unchanged.
   mixMode?: 'replace' | 'additive';
+  // lambdamerge (video.*.merge) only — linear gain applied to audioUrl before
+  // it's muxed/mixed in, same 0-1-ish convention as dialogue-mix's
+  // ambienceVolume. Added for StoryStudio's SFX-library integration
+  // (sfxAudioUrl replacing ACE-Step generation for a matched frame) so a
+  // per-frame/per-project mix-level override is possible instead of using
+  // the SFX clip at whatever amplitude it was authored/generated at —
+  // storystudio-dialogue-sfx-url-integration-request.md §4. Undefined = no
+  // gain change, same as every merge caller that predates this field.
+  sfxVolume?: number;
 }
 
 export interface CanonicalJob {

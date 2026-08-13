@@ -33,6 +33,7 @@ export const lambdamerge: Adapter = {
         audioUrl: job.audioUrl,
         ...(job.params.durationS !== undefined ? { durationS: job.params.durationS } : {}),
         ...(job.params.mixMode === 'additive' ? { mixMode: 'additive' as const } : {}),
+        ...(job.params.sfxVolume !== undefined ? { sfxVolume: job.params.sfxVolume } : {}),
         outputKey,
       },
     };

@@ -57,6 +57,13 @@ interface MergeEvent {
    * layering a spot SFX over a shot that already carries dialogue/narration
    * audio (storystudio-dialogue-qm-sfn-handoff.md §8). */
   mixMode?: 'replace' | 'additive';
+  /** Linear gain applied to audioUrl before it's muxed/mixed in (matches
+   * dialogue-mix's ambienceVolume convention — 1 = no change). Added for
+   * StoryStudio's SFX-library integration (sfxAudioUrl bypassing ACE-Step
+   * generation) so a per-frame/per-project SFX level override is possible —
+   * storystudio-dialogue-sfx-url-integration-request.md §4. Undefined = no
+   * gain filter applied, same ffmpeg output as before this field existed. */
+  sfxVolume?: number;
   outputKey: string;
 }
 
@@ -76,6 +83,14 @@ export const handler = async (event: MergeEvent): Promise<MergeResult> => {
 
     const videoDuration = getDuration(videoPath);
 
+    // sfxVolume, when present, prepends a gain stage on the audioUrl input
+    // (stream 1:a) before whichever branch below consumes it — a no-op
+    // (`[1:a]volume=1[sfxin]`) is functionally identical to referencing
+    // `1:a` directly, but only bother inserting the stage when a caller
+    // actually asked for a non-default level.
+    const sfxLabel = event.sfxVolume !== undefined ? 'sfxin' : '1:a';
+    const gainStage = event.sfxVolume !== undefined ? `[1:a]volume=${event.sfxVolume}[${sfxLabel}];` : '';
+
     let filter: string;
     let target: number;
     if (event.mixMode === 'additive' && hasAudioStream(videoPath)) {
@@ -85,7 +100,7 @@ export const handler = async (event: MergeEvent): Promise<MergeResult> => {
       // (same amix gotcha as the dialogue-mix ECS task's ambience-bed mix).
       // The video's own audio duration is canonical; the SFX clip is
       // typically much shorter and just plays under it.
-      filter = '[0:a][1:a]amix=inputs=2:duration=first:normalize=0[aout]';
+      filter = `${gainStage}[0:a][${sfxLabel}]amix=inputs=2:duration=first:normalize=0[aout]`;
       target = videoDuration;
     } else {
       const audioProbe = run(['-i', audioPath, '-f', 'null', '-']);
@@ -100,7 +115,7 @@ export const handler = async (event: MergeEvent): Promise<MergeResult> => {
       // the trim case (audio already >= target, where the padding is simply
       // never reached before the cutoff).
       const padLenSamples = sampleRate * 60;
-      filter = `[1:a]apad=pad_len=${padLenSamples}[aout]`;
+      filter = `${gainStage}[${sfxLabel}]apad=pad_len=${padLenSamples}[aout]`;
     }
 
     const { status, stderr } = run([

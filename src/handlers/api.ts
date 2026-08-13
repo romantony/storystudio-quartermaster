@@ -213,6 +213,7 @@ const canonicalJobSchema = z.object({
     leftAudioUrl: z.string().optional(),
     rightAudioUrl: z.string().optional(),
     mixMode: z.enum(['replace', 'additive']).optional(),
+    sfxVolume: z.number().optional(),
   }).default({}),
   s3Target: z.string(),
   manifestRef: z.string().optional(),
