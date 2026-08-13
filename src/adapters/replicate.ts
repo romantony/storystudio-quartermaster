@@ -6,6 +6,20 @@ import type {
 const REP = 'https://api.replicate.com/v1';
 const env = (k: string) => process.env[k] ?? '';
 
+// wan-2.2-i2v-fast has a hard num_frames floor of 81 (Replicate's own docs:
+// "81 frames give the best results", max 121) — hitting a target duration
+// below 81/16=5.06s means varying frames_per_second (range 5-30), not
+// num_frames. Locked decision 2026-08-13 (per user): keep num_frames fixed
+// at the documented best-quality 81 rather than varying it; this pipeline's
+// Wan2 target durations ({3,4,5,6,7}s, matching the self-hosted Wan2 legal
+// set) all land inside fps's wider range. Was previously hardcoded to a
+// fixed frames_per_second: 16 regardless of job.params.durationS, silently
+// generating a ~5.06s clip no matter what duration was actually requested.
+function wanFramesPerSecond(durationS: number | undefined): number {
+  if (!durationS || durationS <= 0) return 16;
+  return Math.min(30, Math.max(5, Math.round(81 / durationS)));
+}
+
 function normalizeOutput(output: unknown): string[] | undefined {
   if (!output) return undefined;
   if (Array.isArray(output)) return output.filter(Boolean) as string[];
@@ -76,7 +90,7 @@ export const replicate: Adapter = {
         last_image: job.initImageUrls?.[1],
         num_frames: 81,
         resolution: '480p',
-        frames_per_second: 16,
+        frames_per_second: wanFramesPerSecond(job.params.durationS),
         go_fast: true,
       };
     } else if (rung.model.includes('seedance')) {
