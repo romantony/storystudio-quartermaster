@@ -101,16 +101,28 @@ export const kie: Adapter = {
       return { done: urls.length > 0, outputUrls: urls };
     }
 
-    // Market task poll (Get Task Details)
-    resp = await fetch(`${KIE}/v1/jobs?taskId=${encodeURIComponent(taskRef)}`, { headers });
+    // Market task poll (Get Task Details). Root-caused 2026-08-13, alongside
+    // the webhook signature fix (webhook.ts): this hit `${KIE}/v1/jobs` (a
+    // 404 — no such endpoint) instead of `v1/jobs/recordInfo`, and even once
+    // pointed at the right URL, `data.status`/`data.resultUrls` don't exist
+    // on KIE's real response — per https://docs.kie.ai/market/common/get-
+    // task-detail the field is `data.state` (one of waiting/queuing/
+    // generating/success/fail) and results live in `data.resultJson`, a
+    // JSON-encoded STRING that itself needs parsing to reach `resultUrls`.
+    // This poll() path is currently unused by any live rung (kie is
+    // webhook-only, supportsWebhook:true), but a webhook miss has no other
+    // recovery path, so it needs to actually work.
+    resp = await fetch(`${KIE}/v1/jobs/recordInfo?taskId=${encodeURIComponent(taskRef)}`, { headers });
     const json = (await resp.json()) as Record<string, unknown>;
     if (json.code !== 200) return { done: false };
 
     const data = json.data as Record<string, unknown>;
-    const status = String(data?.status ?? '').toLowerCase();
-    if (status === 'failed' || status === 'error') return { done: true, failed: true };
+    const state = String(data?.state ?? '').toLowerCase();
+    if (state === 'fail') return { done: true, failed: true };
+    if (state !== 'success') return { done: false };
 
-    const resultUrls = (data?.resultUrls ?? data?.result_urls ?? []) as string[];
+    const resultJson = data?.resultJson ? JSON.parse(data.resultJson as string) as Record<string, unknown> : {};
+    const resultUrls = (resultJson.resultUrls ?? []) as string[];
     if (resultUrls.length > 0) return { done: true, outputUrls: resultUrls };
     return { done: false };
   },
@@ -126,8 +138,21 @@ export const kie: Adapter = {
       return { taskRef, outputUrls: sunoData.map(s => s.audioUrl as string).filter(Boolean) };
     }
 
-    const resultUrls = (d.resultUrls ?? []) as string[];
-    const failed = p.code !== 200;
+    // Market model webhook (nano-banana/nano-banana-edit/seedance/etc, same
+    // v1/jobs/createTask family as recordInfo's poll response above) —
+    // resultJson is a JSON-encoded STRING, not a direct array (docs.kie.ai/
+    // market/common/get-task-detail's "Text-to-Image Model Callback"
+    // example). Root-caused 2026-08-13 alongside poll()'s identical bug.
+    const resultJson = d.resultJson ? JSON.parse(d.resultJson as string) as Record<string, unknown> : undefined;
+    const resultUrls = (resultJson?.resultUrls ?? d.resultUrls ?? []) as string[];
+    // p.code !== 200 only means the CALLBACK DELIVERY itself was malformed —
+    // a genuinely failed generation still delivers code:200 with
+    // data.state:'fail' (failCode/failMsg populated). The old `p.code !== 200`
+    // check never caught a real KIE generation failure, so it never
+    // triggered webhook.ts's dispatchExecutor failover to the next rung —
+    // the job just sat mislabeled until a downstream consumer choked on a
+    // missing assetKey instead.
+    const failed = p.code !== 200 || String(d.state ?? '').toLowerCase() === 'fail';
     return { taskRef, outputUrls: resultUrls, failed };
   },
 

@@ -184,13 +184,30 @@ async function verifySignature(
     }
 
     if (provider === 'kie') {
+      // Root-caused 2026-08-13: this previously checked a header KIE never
+      // sends (x-kie-signature/x-signature) against an HMAC of the raw body
+      // — KIE actually signs `X-Webhook-Signature` (base64, no prefix) as
+      // HMAC-SHA256 over `{taskId}.{timestampSeconds}` (timestamp from its
+      // own X-Webhook-Timestamp header), body NOT included — per
+      // https://docs.kie.ai/common-api/webhook-verification. The old code's
+      // sig was always '', so every real KIE webhook (confirmed 100% over
+      // the prior 7 days of logs) failed timingSafeEqual's length check and
+      // got silently swallowed by this function's outer catch, permanently
+      // stranding any job whose completion depended on this callback.
       const secretArn = process.env.KIE_WEBHOOK_SECRET_ARN ?? '';
       if (!secretArn) return true;
       const secret = await getSecret(secretArn);
-      const sig = headers['x-kie-signature'] ?? headers['x-signature'] ?? '';
-      const expected = createHmac('sha256', secret).update(body).digest('hex');
-      const sigHex = sig.startsWith('sha256=') ? sig.slice(7) : sig;
-      return timingSafeEqual(Buffer.from(sigHex, 'hex'), Buffer.from(expected, 'hex'));
+      const sig = headers['x-webhook-signature'] ?? '';
+      const timestamp = headers['x-webhook-timestamp'] ?? '';
+      if (!sig || !timestamp) return false;
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      const data = (parsed.data ?? parsed) as Record<string, unknown>;
+      const taskId = String(data.taskId ?? '');
+      if (!taskId) return false;
+      const expected = createHmac('sha256', secret).update(`${taskId}.${timestamp}`).digest('base64');
+      const sigBuf = Buffer.from(sig, 'base64');
+      const expectedBuf = Buffer.from(expected, 'base64');
+      return sigBuf.length === expectedBuf.length && timingSafeEqual(sigBuf, expectedBuf);
     }
 
     if (provider === 'runpod') {
