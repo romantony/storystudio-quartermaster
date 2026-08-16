@@ -78,6 +78,15 @@ describe('projectAssetLoad — dialogue-premium (shotCounts-aware)', () => {
     expect(load.perEndpoint[BGM_S2T]).toBe(3);
     expect(load.supported).toBe(true);
   });
+
+  it('folds narration shots into Wan2 (silent visual) and TTS (1 narrator call each), same as an action + a mono turn', () => {
+    const load = projectAssetLoad('dialogue-premium', 300, { total: 26, monologue: 14, dialogue: 2, action: 8, narration: 2 });
+    expect(load.perEndpoint[WAN2_I2V]).toBe(8 + 2);              // action + narration, both render a Wan2 clip
+    expect(load.perEndpoint[QWEN_IMAGE_EDIT]).toBe(26);          // every shot (incl. narration) gets an image
+    expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(14 + 2 * 2 + 2); // mono 1 turn + dialogue 2 turns + narration 1 call each
+    expect(load.perEndpoint[BGM_S2T]).toBe(3);
+    expect(load.supported).toBe(true);
+  });
 });
 
 describe('projectAssetLoad — unknown type', () => {

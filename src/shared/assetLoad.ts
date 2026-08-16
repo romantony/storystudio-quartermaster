@@ -50,6 +50,10 @@ export interface ShotCounts {
   monologue: number;
   dialogue: number;
   action: number;
+  /** New 2026-08-16 (narration addendum) — narrator-voiced VO over a silent
+   * Wan2 visual. Optional for backward compat with callers not yet sending
+   * it (defaults to 0 in fromShotCounts below). */
+  narration?: number;
 }
 
 interface LoadSpec {
@@ -117,14 +121,16 @@ const LOAD_SPECS: Record<string, LoadSpec> = {
   // to fix). Every shot gets one image (mostly i2i — coverage singles anchor
   // on a character reference, §7.10.2) and roughly one TTS turn-pair;
   // monologue/dialogue lip-sync itself is RunComfy (external, no counterKey).
+  // `narration` shots (2026-08-16 addendum) render a Wan2 clip identically to
+  // `action` plus exactly one narrator TTS call (no lip-sync, so no RunComfy).
   'dialogue-premium': {
     tier: 'premium',
     perFrame: { [WAN2_I2V]: 1, [QWEN_IMAGE_EDIT]: 1, [FLUX_TTS_S2T]: 2 },
     perProject: { [BGM_S2T]: 3 }, // SRT + project BGM + a representative ambience-bed call
     fromShotCounts: (shotCounts) => ({
-      [WAN2_I2V]: shotCounts.action,
+      [WAN2_I2V]: shotCounts.action + (shotCounts.narration ?? 0),
       [QWEN_IMAGE_EDIT]: shotCounts.total,
-      [FLUX_TTS_S2T]: shotCounts.monologue + shotCounts.dialogue * 2, // 1 turn (mono) / 2 turns (dialogue)
+      [FLUX_TTS_S2T]: shotCounts.monologue + shotCounts.dialogue * 2 + (shotCounts.narration ?? 0), // 1 turn (mono/narration) / 2 turns (dialogue)
     }),
   },
 };
