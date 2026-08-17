@@ -62,6 +62,7 @@ const webhookStack = new WebhookStack(app, 'QMWebhookStack', {
   kieWebhookSecretArn: ctx('KIE_WEBHOOK_SECRET_ARN'),
   replicateWebhookSecretArn: ctx('REPLICATE_WEBHOOK_SECRET_ARN'),
   executorFunction: apiStack.executorFunction,
+  externalAssetBucket: apiStack.externalAssetBucket,
 });
 webhookStack.addDependency(dbStack);
 webhookStack.addDependency(apiStack);

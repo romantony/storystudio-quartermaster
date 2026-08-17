@@ -9,6 +9,7 @@ import { releaseSimple } from '../gate/dynamo-gate';
 // internal rung's completion/cost/baseline accounting identical to the
 // inline-poll path in executor.ts.
 import { complete, loadJob, recordBaseline } from './executor';
+import { persistIfExternal } from '../shared/persistExternalAsset';
 import type {
   LambdaFunctionUrlEvent,
   LambdaFunctionUrlResponse,
@@ -110,7 +111,22 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
         console.warn('[webhook] executor re-dispatch failed', e));
       console.info('[webhook] provider failed → failover', provider, taskRef);
     } else {
-      const assetKey = outputUrls?.[0];
+      // External providers' (replicate/runcomfy/kie) delivery URLs are
+      // ephemeral and expire — re-host onto QM's own storage now, while the
+      // link is still fresh, before this job is ever marked COMPLETE. See
+      // persistExternalAsset.ts's header for why this throws rather than
+      // falling back to the (soon-to-be-dead) original URL: this file's own
+      // top-level catch (below) already handles that correctly — the job
+      // just never gets marked COMPLETE and times out normally, same
+      // graceful degrade as any other real generation failure.
+      const rawAssetKey = outputUrls?.[0];
+      const assetKey = rawAssetKey
+        ? await persistIfExternal(
+          rawAssetKey,
+          { provider: map.provider ?? provider, endpointId: map.endpointId, model: '', lane: 'rest', routingMode: 'direct' },
+          map.jobId,
+        )
+        : undefined;
       // A webhookCompletion internal rung (RunPod, endpointId set) reuses
       // executor.ts's own complete()/recordBaseline() so cost/baseline
       // accounting matches the inline-poll path exactly — the plain

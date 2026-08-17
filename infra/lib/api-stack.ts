@@ -43,6 +43,12 @@ export class ApiStack extends Stack {
   public readonly apiFunction: nodejs.NodejsFunction;
   public readonly executorFunction: nodejs.NodejsFunction;
   public readonly distribution: cloudfront.Distribution;
+  /** Public/permanent storage for re-hosted external-provider assets
+   * (persistExternalAsset.ts) — reuses the same bucket QM-merge already
+   * writes finished media to, exposed here so WebhookStack (a separate
+   * stack, where external providers' webhook completions actually land)
+   * can grant itself write access too. */
+  public readonly externalAssetBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
@@ -141,6 +147,16 @@ export class ApiStack extends Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ACLS,
       removalPolicy: RemovalPolicy.RETAIN,
     });
+    this.externalAssetBucket = mergeOutputBucket;
+    // 2026-08-17: persistExternalAsset.ts re-hosts external providers'
+    // ephemeral delivery URLs (replicate.delivery/RunComfy/KIE — see that
+    // file's header) onto this bucket before a job is ever marked COMPLETE.
+    // Reached from executor.ts's own sync-completion path (this function)
+    // directly, so it needs the grant/env var here too — WebhookStack (the
+    // other call site, for async provider callbacks) grants itself
+    // separately via the externalAssetBucket reference exported above.
+    mergeOutputBucket.grantPut(this.executorFunction);
+    this.executorFunction.addEnvironment('EXTERNAL_ASSET_BUCKET', mergeOutputBucket.bucketName);
 
     const mergeFunction = new nodejs.NodejsFunction(this, 'MergeFunction', {
       functionName: 'QM-merge',

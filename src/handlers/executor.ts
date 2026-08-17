@@ -9,6 +9,7 @@ import { acquireSimple, releaseSimple } from '../gate/dynamo-gate';
 import { isInternalRung, rungKey, selectRungOrder } from './router';
 import { endpointWorkers } from '../shared/fleet';
 import { gpuCostUsd, gpuTypeForRung } from '../shared/gpuPricing';
+import { persistIfExternal } from '../shared/persistExternalAsset';
 import type {
   Adapter, CircuitConfig, JobItem, ProviderConfig, ProviderTaskItem, Queue, Rung,
 } from '../types';
@@ -170,9 +171,12 @@ export const handler = async (event: ExecutorEvent, context: LambdaContext = {})
         const raw = await submit(adapter, job, rung, callbackUrl);
         const result = adapter.parseSubmit(raw);
 
-        // Sync completion (provider returned URLs immediately).
+        // Sync completion (provider returned URLs immediately). External
+        // rungs' URLs are ephemeral (see persistExternalAsset.ts) — re-host
+        // before this job is ever marked COMPLETE. No-op for internal rungs.
         if (result.outputUrls?.length) {
-          await complete(job, result.outputUrls[0], rung.fb, result.durationS, result.text, rung, result.executionTimeMs);
+          const assetUrl = await persistIfExternal(result.outputUrls[0], rung, job.jobId);
+          await complete(job, assetUrl, rung.fb, result.durationS, result.text, rung, result.executionTimeMs);
           await recordBaseline(rung, job, Date.now() - rungStart);
           await releaseSimple(counterKey, leaseId);
           if (internal) await dispatchNextForEndpoint(counterKey, depth).catch(() => {});
