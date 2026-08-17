@@ -6303,20 +6303,37 @@ function dialoguePremiumShotMap(opts: {
     // confirmed live). Fix: an `ItemSelector` builds each child's actual
     // input explicitly — the raw shot item nested under `shot`, plus the
     // handful of parent-level fields the iterator body actually needs
-    // pulled to the child's root — and every reference below is rewritten
-    // to match: bare shot fields (`$.shotId` etc.) get a `.shot.` prefix,
-    // `$$.Execution.Input.X` becomes plain `$.X`. Computed/intermediate
-    // fields the iterator sets on ITSELF as it runs (imageResult,
-    // turnResult, shotVideoUrl, the various *Error fields, etc.) are
-    // untouched — those live in the child's own working state regardless of
-    // the parent/child boundary, so `$.imageResult` stays exactly
-    // `$.imageResult`. The two field lists below are the complete, exact set
-    // actually referenced in iteratorBody (verified by grepping this
-    // function's own source for every `$$.Execution.Input.*` and bare
-    // `$.<word>` token) — if a future edit adds a new top-level or shot
-    // field reference to iteratorBody, it must be added to one of these
-    // sets too, or the S3/distributed branch will silently read that field as null.
-    const EXEC_INPUT_FIELDS = new Set(['aspectRatio', 'projectId', 'textOverlayEnabled', 'userId', 'voiceBank']);
+    // pulled to the child's root.
+    //
+    // 2026-08-17, FOURTH live-execution finding (a real project, not a
+    // synthetic test — real cost): `$$.Execution.Input.X` for these
+    // parent-level fields must be left COMPLETELY UNREWRITTEN, not converted
+    // to plain `$.X`. `$$.Execution.Input` is an IMMUTABLE snapshot of the
+    // child execution's own starting input (exactly what ItemSelector
+    // produced) — valid for that child's ENTIRE lifetime regardless of how
+    // many times a Pass state replaces the working `$`. An earlier version
+    // of this fix converted `$$.Execution.Input.projectId` to plain
+    // `$.projectId`, which put it at the mercy of the exact same "SetXAsIs"
+    // whole-state-replace Pass states that were ALREADY known to wipe
+    // shotId/sfxPrompt/etc (see the fix two blocks up) — QMGenerateShotSfx
+    // crashed on `$.projectId` after SetActionVideoAsIs ran, on a real
+    // customer project. Bare shot fields (`$.shotId` etc, below) DO need the
+    // `.shot.` treatment, because unlike the exec-level fields they're
+    // sometimes genuinely optional (sfxPrompt/tailBeatSeconds/textManifest)
+    // and need a MUTABLE default written into them (NormalizeShotSfxPrompt
+    // et al, which write into `$`, not `$$.Execution.Input` — you can't
+    // mutate the latter) — so those still flow through the working state and
+    // still need the TAIL_STATES-aware treatment below. Computed/
+    // intermediate fields the iterator sets on ITSELF as it runs
+    // (imageResult, turnResult, shotVideoUrl, the various *Error fields,
+    // etc.) are untouched either way — those live in the child's own working
+    // state regardless of the parent/child boundary, so `$.imageResult`
+    // stays exactly `$.imageResult`. The SHOT_FIELDS list is the complete,
+    // exact set actually referenced in iteratorBody (verified by grepping
+    // this function's own source for every bare `$.<word>` token) — if a
+    // future edit adds a new shot field reference to iteratorBody, it must
+    // be added here too, or the S3/distributed branch will silently read
+    // that field as null.
     const SHOT_FIELDS = new Set([
       'shotId', 'shotNumber', 'kind', 'imagePrompt', 'imageModel', 'referenceImageUrl',
       'videoPrompt', 'durationSeconds', 'dialogueLines', 'narrationText',
@@ -6343,12 +6360,8 @@ function dialoguePremiumShotMap(opts: {
     ]);
     const FLATTENED_IN_TAIL = new Set(['shotId', 'shotNumber', 'sfxPrompt', 'tailBeatSeconds', 'textManifest']);
     const rewritePathTokens = (s: string, shotFields: Set<string>): string => s.replace(
-      /\$\$\.Execution\.Input\.(\w+)|\$\.(\w+)/g,
-      (match: string, execField?: string, shotField?: string) => {
-        if (execField !== undefined) return EXEC_INPUT_FIELDS.has(execField) ? `$.${execField}` : match;
-        if (shotField !== undefined) return shotFields.has(shotField) ? `$.shot.${shotField}` : match;
-        return match;
-      },
+      /\$\.(\w+)/g,
+      (match: string, shotField: string) => (shotFields.has(shotField) ? `$.shot.${shotField}` : match),
     );
     const rewriteForDistributed = (node: unknown, shotFields: Set<string>): unknown => {
       if (Array.isArray(node)) return node.map((n) => rewriteForDistributed(n, shotFields));
@@ -6562,6 +6575,36 @@ function buildDialoguePremiumQmNewDefinition(opts: {
   // RouteBGM/SkipBgm/QMGenerateBGM/BgmGenerationFailed all still Next to the
   // inherited 'NormalizeFourLang' -> ... -> 'DropFrameData' chain, untouched
   // (same reasoning as Dialogue Basic's builder above).
+
+  // 2026-08-17 fix, found live on the first real non-fourLang execution ever
+  // to get this far (163/163 shots + all ambience beds + BGM succeeded,
+  // crashed one state later): DropFrameData's allowlist references
+  // `$.localizedAssets` unconditionally, same as generateShorts/shortsOptions
+  // above it (both already guarded by Normalize*/Set*Default pairs) — but
+  // localizedAssets had no such guard. In dialogue-basic/other tiers this is
+  // safe because their own SetNoLocalizedAssets (inherited from the shared
+  // template, defaults to `{}`) runs BEFORE their DropFrameData. Dialogue
+  // Premium's flow is ordered the other way — DropFrameData here runs BEFORE
+  // ConcatenateShots/BuildMergedVoiceResult/SetNoLocalizedAssets (see
+  // SetNoLocalizedAssets.Next = 'MixAmbienceBeds' below) — so that guarantee
+  // never actually holds by the time this DropFrameData runs. Mirrors the
+  // exact same Normalize/Default pattern as NormalizeShortsOptionsField
+  // immediately above.
+  def.States.NormalizeShortsOptionsField.Choices[0].Next = 'NormalizeLocalizedAssets';
+  def.States.SetShortsOptionsFieldDefault.Next = 'NormalizeLocalizedAssets';
+  def.States.NormalizeLocalizedAssets = {
+    Type: 'Choice',
+    Comment: 'Guarantee $.localizedAssets is a real value before DropFrameData\'s Parameters allowlist would otherwise silently drop it if fourLang processing never ran (the common case — no real fourLang branch is wired for this tier yet, so this is currently always the path taken).',
+    Choices: [{ Variable: '$.localizedAssets', IsPresent: true, Next: 'DropFrameData' }],
+    Default: 'SetLocalizedAssetsDefaultBeforeDrop',
+  };
+  def.States.SetLocalizedAssetsDefaultBeforeDrop = {
+    Type: 'Pass',
+    Comment: 'Matches SetNoLocalizedAssets\' own {} shape below (StoryStudio\'s existing consumer expects {} not [] for a non-fourLang project) — a distinct state since SetNoLocalizedAssets itself runs later in this tier\'s flow (after concat) and can\'t serve both positions.',
+    Result: {},
+    ResultPath: '$.localizedAssets',
+    Next: 'DropFrameData',
+  };
 
   def.States.DropFrameData = {
     Type: 'Pass',
