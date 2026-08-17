@@ -217,17 +217,22 @@ export const PROJECT_FLEET: Record<string, ProjectFleetPlan> = {
     gateMax: 8, // "<= 8" — same starting point as narration-premium
   },
   // Dialogue Premium: image per shot (mostly i2i — coverage singles anchor on
-  // a character reference, §7.10.2), Wan2 only for `action` shots (NOT
-  // derivable from duration — see assetLoad.ts's shotCounts-aware estimate),
-  // per-turn TTS on flux-tts-s2t, monologue/dialogue lip-sync on RunComfy
-  // (external, not pre-warmed here — same reasoning as dialogue-basic),
-  // project-level SRT+BGM+ambience beds on bgm-s2t. Wan2 still gates
-  // admission even though its share of shots is now the minority (§1) —
-  // it remains the slowest per-job endpoint this tier touches.
+  // a character reference, §7.10.2), per-turn TTS on flux-tts-s2t,
+  // monologue/dialogue lip-sync on RunComfy (external, not pre-warmed here —
+  // same reasoning as dialogue-basic), project-level SRT+BGM+ambience beds on
+  // bgm-s2t. 2026-08-17: action/narration-kind video (Wan2 i2v) moved off the
+  // self-hosted RunPod pod onto Replicate's hosted wan-2.2-i2v-fast
+  // (background.json's video.dialoguePremium.i2v, quality-driven product
+  // decision — same reasoning already proven for video.dialogueRework.i2v) —
+  // no counterKey/pre-warm for it anymore, this tier no longer touches
+  // WAN2_I2V at all. Gate moved to qwen-image-edit instead (every shot needs
+  // one, mostly i2i) — real pod count is 4 workers (see QWEN_FLEET above),
+  // gateMax kept conservatively under that pending real dialogue-premium
+  // traffic under the new routing.
   'dialogue-premium': {
-    endpoints: [QWEN_IMAGE_EDIT, QWEN_IMAGE_GEN, WAN2_I2V, FLUX_TTS_S2T, BGM_S2T],
-    gateEndpoint: WAN2_I2V,
-    gateMax: 8,
+    endpoints: [QWEN_IMAGE_EDIT, QWEN_IMAGE_GEN, FLUX_TTS_S2T, BGM_S2T],
+    gateEndpoint: QWEN_IMAGE_EDIT,
+    gateMax: 3,
   },
 };
 

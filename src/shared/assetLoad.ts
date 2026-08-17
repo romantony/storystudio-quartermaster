@@ -111,24 +111,25 @@ const LOAD_SPECS: Record<string, LoadSpec> = {
     perFrame: { [WAN2_I2V]: 1, [QWEN_IMAGE_GEN]: 1 },
     perProject: { [QWEN_IMAGE_GEN]: 1, [FLUX_TTS_S2T]: 2, [BGM_S2T]: 2 },
   },
-  // Dialogue Premium: Wan2 demand is NOT derivable from duration (§2) — a
-  // dialogue-dense film may be 80% monologue/dialogue shots (RunComfy, not
-  // RunPod) and only 20% action (Wan2). fromShotCounts computes the accurate
-  // per-endpoint estimate when the caller supplies shotCounts (§7.2); perFrame
-  // below is only the fallback used when a caller has no shotCounts yet
-  // (duration/5, same proportion as narration-premium — an overestimate for
-  // a dialogue-heavy film, which is exactly the inaccuracy shotCounts exists
-  // to fix). Every shot gets one image (mostly i2i — coverage singles anchor
-  // on a character reference, §7.10.2) and roughly one TTS turn-pair;
-  // monologue/dialogue lip-sync itself is RunComfy (external, no counterKey).
-  // `narration` shots (2026-08-16 addendum) render a Wan2 clip identically to
-  // `action` plus exactly one narrator TTS call (no lip-sync, so no RunComfy).
+  // Dialogue Premium: every shot gets one image (mostly i2i — coverage
+  // singles anchor on a character reference, §7.10.2) and roughly one TTS
+  // turn-pair; monologue/dialogue lip-sync itself is RunComfy (external, no
+  // counterKey). fromShotCounts computes the accurate per-endpoint estimate
+  // when the caller supplies shotCounts (§7.2); perFrame below is only the
+  // fallback used when a caller has no shotCounts yet.
+  // action/narration shots' video (Wan2 i2v) has NO counterKey here — 2026-08-17
+  // product decision routed video.dialoguePremium.i2v straight to Replicate's
+  // hosted wan-2.2-i2v-fast (background.json), not the self-hosted RunPod pod,
+  // same quality reasoning already proven for video.dialogueRework.i2v. So
+  // unlike dialogue-basic's scenes (still self-hosted, WAN2_I2V counted below),
+  // Dialogue Premium's Wan2 demand is off the RunPod-fleet capacity model
+  // entirely — counting it here would make admission needlessly conservative
+  // against a pod this tier no longer uses at all.
   'dialogue-premium': {
     tier: 'premium',
-    perFrame: { [WAN2_I2V]: 1, [QWEN_IMAGE_EDIT]: 1, [FLUX_TTS_S2T]: 2 },
+    perFrame: { [QWEN_IMAGE_EDIT]: 1, [FLUX_TTS_S2T]: 2 },
     perProject: { [BGM_S2T]: 3 }, // SRT + project BGM + a representative ambience-bed call
     fromShotCounts: (shotCounts) => ({
-      [WAN2_I2V]: shotCounts.action + (shotCounts.narration ?? 0),
       [QWEN_IMAGE_EDIT]: shotCounts.total,
       [FLUX_TTS_S2T]: shotCounts.monologue + shotCounts.dialogue * 2 + (shotCounts.narration ?? 0), // 1 turn (mono/narration) / 2 turns (dialogue)
     }),

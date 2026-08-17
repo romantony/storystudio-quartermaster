@@ -261,18 +261,19 @@ describe('handleAdmission — dialogue-basic/dialogue-premium', () => {
       .find(item => typeof item.pk === 'string' && item.pk.startsWith('RESERVATION#'));
     expect(reservationWrite).toBeDefined();
     const perEndpointJobs = reservationWrite!.perEndpointJobs as Record<string, number>;
-    // frameCount(300) would be 60 — if shotCounts hadn't flowed through, Wan2
-    // demand would badly overstate a dialogue-dense film's real needs (§2).
-    expect(perEndpointJobs['runpod:wan2-i2v']).toBe(20);
+    // 2026-08-17: video.dialoguePremium.i2v routes to Replicate now (quality
+    // decision), so Wan2 demand is off the RunPod-fleet capacity model
+    // entirely for this tier — no runpod:wan2-i2v entry should appear at all.
+    expect(perEndpointJobs['runpod:wan2-i2v']).toBeUndefined();
     expect(perEndpointJobs['runpod:qwen-image-edit']).toBe(68);
   });
 
-  it('defers dialogue-premium when the wan2-i2v backlog exceeds its gate, same as narration-premium', async () => {
-    const wan2Jobs = Array.from({ length: 9 }, (_, i) => ({
+  it('defers dialogue-premium when the qwen-image-edit backlog exceeds its gate (2026-08-17: gate moved off wan2-i2v, which this tier no longer touches)', async () => {
+    const editJobs = Array.from({ length: 4 }, (_, i) => ({
       lane: 'video', status: 'QUEUED', requestId: `dp${i}`, jobId: `dp${i}`,
-      assetType: 'video', tier: 'dialoguePremium', operation: 'i2v', queue: 'background',
+      assetType: 'image', tier: 'dialoguePremium', operation: 'i2i', queue: 'background',
     }));
-    mockScenario({ inflight: {}, workersMax: {}, baselines: {}, queuedJobs: wan2Jobs });
+    mockScenario({ inflight: {}, workersMax: {}, baselines: {}, queuedJobs: editJobs });
     const res = await handleAdmission(evt({
       requestId: 'r-dialogue-premium-busy', projectType: 'dialogue-premium', tier: 'premium', durationSeconds: 100,
       shotCounts: { total: 30, monologue: 20, dialogue: 2, action: 8 },

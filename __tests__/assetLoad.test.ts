@@ -60,28 +60,28 @@ describe('projectAssetLoad — dialogue-basic (duration-derived, no shotCounts c
 describe('projectAssetLoad — dialogue-premium (shotCounts-aware)', () => {
   it('falls back to duration-derived perFrame when no shotCounts supplied', () => {
     const load = projectAssetLoad('dialogue-premium', 100); // 20 frames
-    expect(load.perEndpoint[WAN2_I2V]).toBe(20);
+    expect(load.perEndpoint[WAN2_I2V]).toBeUndefined(); // 2026-08-17: video.dialoguePremium.i2v routes to Replicate, off the RunPod fleet model
     expect(load.perEndpoint[QWEN_IMAGE_EDIT]).toBe(20);
     expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(20 * 2); // perFrame only — the fixed +3 lands on BGM_S2T, not this endpoint
     expect(load.perEndpoint[BGM_S2T]).toBe(3);
     expect(load.tier).toBe('premium');
   });
 
-  it('uses shotCounts instead of duration when supplied — Wan2 = action shots only, not duration/5', () => {
+  it('uses shotCounts instead of duration when supplied — Wan2 stays off the RunPod fleet model (Replicate-routed)', () => {
     // A dialogue-dense film: long duration but very few action shots — the
     // whole point of shotCounts (handoff doc §2): duration-derived estimate
-    // would badly overstate Wan2 demand here.
+    // would badly overstate demand on endpoints this tier still uses.
     const load = projectAssetLoad('dialogue-premium', 300, { total: 68, monologue: 45, dialogue: 3, action: 20 });
-    expect(load.perEndpoint[WAN2_I2V]).toBe(20);           // action shots only, NOT frameCount(300)=60
+    expect(load.perEndpoint[WAN2_I2V]).toBeUndefined();
     expect(load.perEndpoint[QWEN_IMAGE_EDIT]).toBe(68);    // every shot gets an image
     expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(45 + 3 * 2); // mono 1 turn + dialogue 2 turns (fromShotCounts REPLACES perFrame; perProject's +3 still lands on BGM_S2T)
     expect(load.perEndpoint[BGM_S2T]).toBe(3);
     expect(load.supported).toBe(true);
   });
 
-  it('folds narration shots into Wan2 (silent visual) and TTS (1 narrator call each), same as an action + a mono turn', () => {
+  it('folds narration shots into TTS (1 narrator call each), same as a mono turn; video stays off Wan2 fleet capacity', () => {
     const load = projectAssetLoad('dialogue-premium', 300, { total: 26, monologue: 14, dialogue: 2, action: 8, narration: 2 });
-    expect(load.perEndpoint[WAN2_I2V]).toBe(8 + 2);              // action + narration, both render a Wan2 clip
+    expect(load.perEndpoint[WAN2_I2V]).toBeUndefined();
     expect(load.perEndpoint[QWEN_IMAGE_EDIT]).toBe(26);          // every shot (incl. narration) gets an image
     expect(load.perEndpoint[FLUX_TTS_S2T]).toBe(14 + 2 * 2 + 2); // mono 1 turn + dialogue 2 turns + narration 1 call each
     expect(load.perEndpoint[BGM_S2T]).toBe(3);

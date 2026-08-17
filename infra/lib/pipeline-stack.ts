@@ -484,12 +484,16 @@ export class PipelineStack extends Stack {
       memorySize: 256,
       bundling: { minify: true, sourceMap: false, externalModules: [] },
     });
+    removeSilenceBucket.grantRead(buildAmbienceBedSpecsFn);
     buildAmbienceBedSpecsFn.addPermission('E2ESfnInvoke', {
       principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
       action: 'lambda:InvokeFunction',
     });
 
-    // QM-fetch-shots-manifest — Dialogue Premium only (§7.2's shotsManifestUrl fallback).
+    // QM-fetch-shots-manifest — Dialogue Premium only (§7.2's shotsManifestUrl
+    // fallback). Mirrors the fetched manifest into removeSilenceBucket
+    // (2026-08-16 — see handler's own header comment) so the shot Map can
+    // read it via S3 ItemReader instead of carrying it through state.
     const fetchShotsManifestFn = new nodejs.NodejsFunction(this, 'FetchShotsManifestFunction', {
       functionName: 'QM-fetch-shots-manifest',
       entry: path.join(__dirname, '../../src/handlers/fetch-shots-manifest.ts'),
@@ -498,7 +502,11 @@ export class PipelineStack extends Stack {
       timeout: Duration.seconds(60),
       memorySize: 256,
       bundling: { minify: true, sourceMap: false, externalModules: [] },
+      environment: {
+        OUTPUT_BUCKET: removeSilenceBucket.bucketName,
+      },
     });
+    removeSilenceBucket.grantPut(fetchShotsManifestFn);
     fetchShotsManifestFn.addPermission('E2ESfnInvoke', {
       principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
       action: 'lambda:InvokeFunction',
@@ -721,6 +729,42 @@ export class PipelineStack extends Stack {
     });
 
     new CfnOutput(this, 'DialoguePremiumQMNewStateMachineArn', { value: dialoguePremiumQmNewStateMachine.attrArn });
+
+    // Distributed Map (GenerateShotsFromS3, dialoguePremiumShotMap's
+    // itemSource:'s3' branch) requires its OWN execution role to hold
+    // self-referential child-execution permissions — confirmed live
+    // 2026-08-17 (first attempt used Mode:'INLINE', which AWS rejects at
+    // RUNTIME for any state with ItemReader: "ItemReader, ItemBatcher and
+    // ResultWriter fields are not supported for INLINE maps" — not caught by
+    // cdk synth/deploy, only a real execution surfaces it). Unlike every
+    // other grant in this file (all resource-side, via fn.addPermission —
+    // deliberately avoiding any edit to E2E-StepFunction-Role's own
+    // hand-managed policy, since it's imported/managed outside this stack),
+    // Step Functions has no resource-based-policy equivalent for
+    // child-execution permissions, so this is the one deliberate exception:
+    // a new, distinctly-named inline policy attached ADDITIVELY (CDK creates
+    // its own AWS::IAM::Policy resource here — the two hand-managed inline
+    // policies, E2E-StepFunction-Permissions + ECSRunTaskForShortsAnalyze,
+    // are untouched) to the shared role, scoped as narrowly as possible to
+    // just this one state machine's own executions, never a wildcard across
+    // pipelines.
+    sfnRole.attachInlinePolicy(new iam.Policy(this, 'DialoguePremiumDistributedMapPolicy', {
+      statements: [
+        new iam.PolicyStatement({
+          actions: ['states:StartExecution'],
+          resources: ['arn:aws:states:us-east-1:929075264324:stateMachine:E2E-VideoGenerationPipeline-Dialogue-Premium-QM-New'],
+        }),
+        new iam.PolicyStatement({
+          actions: ['states:DescribeExecution', 'states:StopExecution', 'states:RedriveExecution'],
+          resources: ['arn:aws:states:us-east-1:929075264324:execution:E2E-VideoGenerationPipeline-Dialogue-Premium-QM-New*'],
+        }),
+        new iam.PolicyStatement({
+          actions: ['iam:PassRole'],
+          resources: ['arn:aws:iam::929075264324:role/E2E-StepFunction-Role'],
+          conditions: { StringEquals: { 'iam:PassedToService': 'states.amazonaws.com' } },
+        }),
+      ],
+    }));
   }
 }
 
@@ -5547,15 +5591,21 @@ function buildDialogueBasicQmNewDefinition(
 function dialoguePremiumShotMap(opts: {
   qmGenerateArn: string; remotionOverlayArn: string; buildTurnTracksArn: string;
   trimClipArn: string; appendTailBeatArn: string;
+  /** Default 'inline': today's shape, shots already sitting in `$.shots`.
+   * 's3': 2026-08-16 fix for films whose shots manifest is too large for
+   * Step Functions' 256KB state ceiling (a real 132-shot/565KB project hit
+   * this live) — shots are read directly off S3 via a Distributed Map
+   * ItemReader (`Mode:'INLINE'`, iterations still run in this execution,
+   * only the ITEM SOURCE moves off in-state) instead of `ItemsPath`, so the
+   * full array never has to land in execution state at all. Same Iterator
+   * body either way — only the item-source wrapper differs. */
+  itemSource?: 's3';
 }): object {
-  const { qmGenerateArn, remotionOverlayArn, buildTurnTracksArn, trimClipArn, appendTailBeatArn } = opts;
-  return {
-    Type: 'Map',
-    Comment: 'Per-shot via Quartermaster gateway + RunComfy InfiniteTalk (Dialogue Premium). MaxConcurrency=12, lower than Basic\'s 15 — a "dialogue" shot fans out into 2 TTS calls plus one RunComfy job, so 12 concurrent shots is materially more load than 12 concurrent frames (§8.1).',
-    ItemsPath: '$.shots',
-    MaxConcurrency: 12,
-    ResultPath: '$.shotResults',
-    Iterator: {
+  const {
+    qmGenerateArn, remotionOverlayArn, buildTurnTracksArn, trimClipArn, appendTailBeatArn,
+    itemSource,
+  } = opts;
+  const iteratorBody = {
       StartAt: 'CheckShotImageCache',
       States: {
         CheckShotImageCache: {
@@ -5582,7 +5632,7 @@ function dialoguePremiumShotMap(opts: {
           Type: 'Pass',
           Parameters: { 'cdnUrl.$': '$.imageCacheResult.cdnUrl' },
           ResultPath: '$.imageResult',
-          Next: 'RouteShotKind',
+          Next: 'NormalizeShotSfxPrompt',
         },
         RouteShotImageGen: {
           Type: 'Choice',
@@ -5644,8 +5694,48 @@ function dialoguePremiumShotMap(opts: {
           },
           ResultPath: null,
           TimeoutSeconds: 10,
-          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.metaStoreError', Next: 'RouteShotKind' }],
-          Next: 'RouteShotKind',
+          Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.metaStoreError', Next: 'NormalizeShotSfxPrompt' }],
+          Next: 'NormalizeShotSfxPrompt',
+        },
+
+        // ── normalize optional per-shot fields (2026-08-17 fix) ──────────
+        // sfxPrompt/tailBeatSeconds/textManifest are all genuinely optional
+        // on a shot (most shots have none — §7.3/§7.7). RouteShotSfx/
+        // RouteTailBeat/RouteShotTextOverlay below tolerate that fine (a
+        // Choice's Variable check just falls to Default when the path is
+        // absent — no error). But the "SetXAsIs"-family Pass states further
+        // down need to explicitly carry these fields forward (see their own
+        // comments), and Parameters — unlike Choice Variable — throws
+        // States.Runtime on a missing path. So, exactly mirroring dialogue-
+        // basic's proven live pattern (GenerateScenes' NormalizeSceneSfxPrompt
+        // / SetSceneSfxPromptDefault / etc., storystudio-dialogue-qm-sfn-
+        // handoff.md's sibling pipeline), normalize each optional field to a
+        // default ONCE here, before any generation happens, so every later
+        // reference to $.sfxPrompt/$.tailBeatSeconds/$.textManifest is always
+        // safe.
+        NormalizeShotSfxPrompt: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.sfxPrompt', IsPresent: true, Next: 'NormalizeShotTailBeatSeconds' }],
+          Default: 'SetShotSfxPromptDefault',
+        },
+        SetShotSfxPromptDefault: {
+          Type: 'Pass', Result: '', ResultPath: '$.sfxPrompt', Next: 'NormalizeShotTailBeatSeconds',
+        },
+        NormalizeShotTailBeatSeconds: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.tailBeatSeconds', IsPresent: true, Next: 'NormalizeShotTextManifest' }],
+          Default: 'SetShotTailBeatSecondsDefault',
+        },
+        SetShotTailBeatSecondsDefault: {
+          Type: 'Pass', Result: 0, ResultPath: '$.tailBeatSeconds', Next: 'NormalizeShotTextManifest',
+        },
+        NormalizeShotTextManifest: {
+          Type: 'Choice',
+          Choices: [{ Variable: '$.textManifest', IsPresent: true, Next: 'RouteShotKind' }],
+          Default: 'SetShotTextManifestDefault',
+        },
+        SetShotTextManifestDefault: {
+          Type: 'Pass', Result: '', ResultPath: '$.textManifest', Next: 'RouteShotKind',
         },
 
         RouteShotKind: {
@@ -5695,9 +5785,29 @@ function dialoguePremiumShotMap(opts: {
           }],
           Default: 'SetActionVideoAsIs',
         },
+        // 2026-08-17 fix: this Pass state's Parameters, with no ResultPath,
+        // defaults to ResultPath:'$' — REPLACING the whole working state
+        // with just its own Parameters output, not merging. Confirmed live
+        // (first real 132-shot execution): every one of these "SetXAsIs"-
+        // family states was silently wiping shotId/shotNumber/sfxPrompt/
+        // tailBeatSeconds/textManifest, which RouteShotSfx/RouteTailBeat/
+        // RouteShotTextOverlay/BuildShotVideo further down still need —
+        // BuildShotVideo's own `$.shotId` reference was crashing 100% of
+        // real shots with States.Runtime. Fix (mirrors dialogue-basic's
+        // GenerateScenes→BuildSceneResult, the proven working reference
+        // pattern for this exact problem): every field still needed by the
+        // shared tail must be explicitly carried forward here, same as
+        // dialogue-basic's SetPersonaFromResult/BuildSceneResult already do.
+        // sfxPrompt/tailBeatSeconds/textManifest are guaranteed present by
+        // this point (NormalizeShotSfxPrompt et al, above) so referencing
+        // them here is always safe, never a missing-path crash.
         SetActionVideoAsIs: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.actionVideoResult.cdnUrl', 'shotDurationSeconds.$': '$.actionVideoResult.durationS' },
+          Parameters: {
+            'shotVideoUrl.$': '$.actionVideoResult.cdnUrl', 'shotDurationSeconds.$': '$.actionVideoResult.durationS',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'RouteShotSfx',
         },
         QMGenerateShotNarrationTTS: {
@@ -5739,7 +5849,11 @@ function dialoguePremiumShotMap(opts: {
         },
         SetActionVideoWithNarration: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.narrationMergeResult.cdnUrl', 'shotDurationSeconds.$': '$.narrationMergeResult.durationS' },
+          Parameters: {
+            'shotVideoUrl.$': '$.narrationMergeResult.cdnUrl', 'shotDurationSeconds.$': '$.narrationMergeResult.durationS',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'RouteShotSfx',
         },
 
@@ -5807,7 +5921,11 @@ function dialoguePremiumShotMap(opts: {
         },
         SetNarrationVideoWithNarration: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.narrationMergeResult.cdnUrl', 'shotDurationSeconds.$': '$.narrationMergeResult.durationS' },
+          Parameters: {
+            'shotVideoUrl.$': '$.narrationMergeResult.cdnUrl', 'shotDurationSeconds.$': '$.narrationMergeResult.durationS',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'RouteShotSfx',
         },
 
@@ -5865,7 +5983,11 @@ function dialoguePremiumShotMap(opts: {
         },
         SetMonologueVideoAsIs: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.talkingHeadResult.cdnUrl', 'shotDurationSeconds.$': '$.monologueTtsResult.durationS' },
+          Parameters: {
+            'shotVideoUrl.$': '$.talkingHeadResult.cdnUrl', 'shotDurationSeconds.$': '$.monologueTtsResult.durationS',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'RouteShotSfx',
         },
 
@@ -5967,7 +6089,11 @@ function dialoguePremiumShotMap(opts: {
         },
         SetDialogueVideoTrimmed: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.trimResult.cdnUrl', 'shotDurationSeconds.$': '$.trimResult.durationS' },
+          Parameters: {
+            'shotVideoUrl.$': '$.trimResult.cdnUrl', 'shotDurationSeconds.$': '$.trimResult.durationS',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'RouteShotSfx',
         },
 
@@ -6025,7 +6151,11 @@ function dialoguePremiumShotMap(opts: {
         },
         SetVideoAfterSfx: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.sfxMixResult.cdnUrl', 'shotDurationSeconds.$': '$.sfxMixResult.durationS' },
+          Parameters: {
+            'shotVideoUrl.$': '$.sfxMixResult.cdnUrl', 'shotDurationSeconds.$': '$.sfxMixResult.durationS',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'RouteTailBeat',
         },
         RouteTailBeat: {
@@ -6058,7 +6188,11 @@ function dialoguePremiumShotMap(opts: {
         },
         SetVideoAfterTailBeat: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.tailBeatResult.cdnUrl', 'shotDurationSeconds.$': '$.tailBeatResult.durationS' },
+          Parameters: {
+            'shotVideoUrl.$': '$.tailBeatResult.cdnUrl', 'shotDurationSeconds.$': '$.tailBeatResult.durationS',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'RouteShotTextOverlay',
         },
         RouteShotTextOverlay: {
@@ -6093,7 +6227,12 @@ function dialoguePremiumShotMap(opts: {
         },
         ApplyShotTextOverlay: {
           Type: 'Pass',
-          Parameters: { 'shotVideoUrl.$': '$.overlayResult.overlayRenderedUrl' },
+          Comment: 'Same fix as the "SetXAsIs" family above — this one was the worst case: it didn\'t even carry shotDurationSeconds forward (only shotVideoUrl), so BuildShotVideo\'s actualDurationSeconds would have been undefined too, not just shotId/shotNumber.',
+          Parameters: {
+            'shotVideoUrl.$': '$.overlayResult.overlayRenderedUrl', 'shotDurationSeconds.$': '$.shotDurationSeconds',
+            'shotId.$': '$.shotId', 'shotNumber.$': '$.shotNumber',
+            'sfxPrompt.$': '$.sfxPrompt', 'tailBeatSeconds.$': '$.tailBeatSeconds', 'textManifest.$': '$.textManifest',
+          },
           Next: 'BuildShotVideo',
         },
         BuildShotVideo: {
@@ -6115,9 +6254,156 @@ function dialoguePremiumShotMap(opts: {
           End: true,
         },
       },
-    },
+  };
+
+  const base = {
+    Type: 'Map',
+    Comment: 'Per-shot via Quartermaster gateway + RunComfy InfiniteTalk (Dialogue Premium). MaxConcurrency=12, lower than Basic\'s 15 — a "dialogue" shot fans out into 2 TTS calls plus one RunComfy job, so 12 concurrent shots is materially more load than 12 concurrent frames (§8.1).',
+    MaxConcurrency: 12,
+    ResultPath: '$.shotResults',
     Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
-    Next: 'GenerateAmbienceBedSpecs',
+    Next: itemSource === 's3' ? 'GenerateAmbienceBedSpecsFromS3' : 'GenerateAmbienceBedSpecs',
+  };
+
+  if (itemSource === 's3') {
+    // AWS's deploy-time changeset validation (NOT caught by local `cdk synth`
+    // — found this the hard way) requires state names to be unique across
+    // the ENTIRE state machine once a Map becomes a Distributed Map
+    // (triggered by ItemReader's presence), unlike a standard Map's Iterator,
+    // which is its own independent naming scope. Since this reuses the exact
+    // same iteratorBody as the untouched inline Map (GenerateShots), every
+    // state name here collides with that Map's — so give this variant's
+    // states a distinct suffix and rewrite every internal Next/Default/
+    // Choices[].Next reference to match. Cross-boundary references (e.g. the
+    // Map-level Catch's 'HandleFailure', outside iteratorBody) are untouched
+    // since they're not in the rename map.
+    const renameMap = Object.fromEntries(
+      Object.keys(iteratorBody.States).map((name) => [name, `${name}S3`]),
+    );
+    const renameRefs = (node: unknown): unknown => {
+      if (Array.isArray(node)) return node.map(renameRefs);
+      if (node && typeof node === 'object') {
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+          out[k] = (k === 'Next' || k === 'Default') && typeof v === 'string' && renameMap[v]
+            ? renameMap[v]
+            : renameRefs(v);
+        }
+        return out;
+      }
+      return node;
+    };
+    // 2026-08-17, second live-execution finding: a Distributed Map's
+    // ItemProcessor states run as their OWN CHILD EXECUTION, each with its
+    // OWN `$$.Execution.Input` — NOT the parent pipeline's original
+    // top-level input. Every `$$.Execution.Input.X` reference in
+    // iteratorBody (written for the inline/standard-Map case, where
+    // iterations share the parent's execution context) breaks here
+    // ("$$.Execution.Input.projectId could not be found in the input",
+    // confirmed live). Fix: an `ItemSelector` builds each child's actual
+    // input explicitly — the raw shot item nested under `shot`, plus the
+    // handful of parent-level fields the iterator body actually needs
+    // pulled to the child's root — and every reference below is rewritten
+    // to match: bare shot fields (`$.shotId` etc.) get a `.shot.` prefix,
+    // `$$.Execution.Input.X` becomes plain `$.X`. Computed/intermediate
+    // fields the iterator sets on ITSELF as it runs (imageResult,
+    // turnResult, shotVideoUrl, the various *Error fields, etc.) are
+    // untouched — those live in the child's own working state regardless of
+    // the parent/child boundary, so `$.imageResult` stays exactly
+    // `$.imageResult`. The two field lists below are the complete, exact set
+    // actually referenced in iteratorBody (verified by grepping this
+    // function's own source for every `$$.Execution.Input.*` and bare
+    // `$.<word>` token) — if a future edit adds a new top-level or shot
+    // field reference to iteratorBody, it must be added to one of these
+    // sets too, or the S3/distributed branch will silently read that field as null.
+    const EXEC_INPUT_FIELDS = new Set(['aspectRatio', 'projectId', 'textOverlayEnabled', 'userId', 'voiceBank']);
+    const SHOT_FIELDS = new Set([
+      'shotId', 'shotNumber', 'kind', 'imagePrompt', 'imageModel', 'referenceImageUrl',
+      'videoPrompt', 'durationSeconds', 'dialogueLines', 'narrationText',
+      'narratorVoiceCloneArtifactUrl', 'sfxPrompt', 'tailBeatSeconds', 'textManifest',
+    ]);
+    // 2026-08-17, third live-execution-adjacent finding (caught by inspecting
+    // synth output before deploying, not another real-execution round trip):
+    // shotId/sfxPrompt/tailBeatSeconds/textManifest/shotNumber mean TWO
+    // different things depending on where in the flow a reference sits.
+    // Before the "SetXAsIs"-family Pass states (the fix two blocks up), they
+    // ARE the original shot's own fields (`.shot.` prefix correct). AFTER
+    // one of those states runs, the fix explicitly re-flattens them to
+    // top-level copies (`'shotId.$': '$.shot.shotId'` writing out a bare
+    // `shotId` key) — so every state in the shared tail from RouteShotSfx
+    // onward reads the FLAT copy, not the original nested shot object, and
+    // must NOT get the `.shot.` treatment for these 5 field names, even
+    // though the field names are identical. A single stateless token rewrite
+    // can't tell these apart, so the whitelist is applied per-state instead.
+    const TAIL_STATES = new Set([
+      'RouteShotSfx', 'QMGenerateShotSfx', 'QMMixShotSfx', 'SetVideoAfterSfx',
+      'RouteTailBeat', 'QMAppendTailBeat', 'SetVideoAfterTailBeat',
+      'RouteShotTextOverlay', 'RenderShotTextOverlay', 'ApplyShotTextOverlay',
+      'BuildShotVideo',
+    ]);
+    const FLATTENED_IN_TAIL = new Set(['shotId', 'shotNumber', 'sfxPrompt', 'tailBeatSeconds', 'textManifest']);
+    const rewritePathTokens = (s: string, shotFields: Set<string>): string => s.replace(
+      /\$\$\.Execution\.Input\.(\w+)|\$\.(\w+)/g,
+      (match: string, execField?: string, shotField?: string) => {
+        if (execField !== undefined) return EXEC_INPUT_FIELDS.has(execField) ? `$.${execField}` : match;
+        if (shotField !== undefined) return shotFields.has(shotField) ? `$.shot.${shotField}` : match;
+        return match;
+      },
+    );
+    const rewriteForDistributed = (node: unknown, shotFields: Set<string>): unknown => {
+      if (Array.isArray(node)) return node.map((n) => rewriteForDistributed(n, shotFields));
+      if (node && typeof node === 'object') {
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+          out[k] = (k === 'Variable' || k === 'ResultPath' || k.endsWith('.$')) && typeof v === 'string'
+            ? rewritePathTokens(v, shotFields)
+            : rewriteForDistributed(v, shotFields);
+        }
+        return out;
+      }
+      return node;
+    };
+
+    const renamedStates = Object.fromEntries(
+      Object.entries(iteratorBody.States).map(([name, state]) => {
+        const shotFields = TAIL_STATES.has(name)
+          ? new Set([...SHOT_FIELDS].filter((f) => !FLATTENED_IN_TAIL.has(f)))
+          : SHOT_FIELDS;
+        return [renameMap[name], rewriteForDistributed(renameRefs(state), shotFields)];
+      }),
+    );
+
+    return {
+      ...base,
+      Comment: `${base.Comment} Items read via S3 ItemReader (Distributed Map) from the manifest FetchShotsManifest mirrored there — 2026-08-16 fix, see fetch-shots-manifest.ts's header comment. State names suffixed 'S3' — Distributed Map requires state-machine-wide-unique names, unlike a standard Map's Iterator. Mode:'DISTRIBUTED' — confirmed live 2026-08-17 that AWS rejects ItemReader on Mode:'INLINE' at RUNTIME ("ItemReader, ItemBatcher and ResultWriter fields are not supported for INLINE maps" — not caught by cdk synth/deploy, only a real execution surfaces it), so each shot iteration runs as its own child execution of this state machine; requires states:StartExecution/DescribeExecution/StopExecution + iam:PassRole granted directly on E2E-StepFunction-Role (see the inline policy added after this stack's state machines, DialoguePremiumDistributedMapPolicy) — the one deliberate exception to this codebase's usual resource-side-grant-only convention for that shared/externally-managed role, because Distributed Map's self-child-execution permissions have no resource-policy equivalent. ItemSelector + shot./exec-field rewrite added same day (second live finding): child executions don't inherit the parent's $$.Execution.Input.`,
+      ItemReader: {
+        Resource: 'arn:aws:states:::s3:getObject',
+        ReaderConfig: { InputType: 'JSON' },
+        Parameters: {
+          'Bucket.$': '$.manifestLocation.bucket',
+          'Key.$': '$.manifestLocation.key',
+        },
+      },
+      ItemSelector: {
+        'shot.$': '$$.Map.Item.Value',
+        'aspectRatio.$': '$$.Execution.Input.aspectRatio',
+        'projectId.$': '$$.Execution.Input.projectId',
+        'textOverlayEnabled.$': '$$.Execution.Input.textOverlayEnabled',
+        'userId.$': '$$.Execution.Input.userId',
+        'voiceBank.$': '$$.Execution.Input.voiceBank',
+      },
+      ItemProcessor: {
+        ProcessorConfig: { Mode: 'DISTRIBUTED', ExecutionType: 'STANDARD' },
+        StartAt: renameMap[iteratorBody.StartAt],
+        States: renamedStates,
+      },
+    };
+  }
+
+  return {
+    ...base,
+    ItemsPath: '$.shots',
+    Iterator: iteratorBody,
   };
 }
 
@@ -6158,24 +6444,23 @@ function buildDialoguePremiumQmNewDefinition(opts: {
   def.States.FetchShotsManifest = {
     Type: 'Task',
     Resource: fetchShotsManifestArn,
-    Comment: 'Plain HTTPS GET + JSON parse — shotsManifestUrl is an R2 URL, not AWS S3, so the SFN\'s native aws-sdk:s3:getObject integration can\'t fetch it directly.',
-    Parameters: { 'shotsManifestUrl.$': '$.shotsManifestUrl' },
-    ResultPath: '$.manifestResult',
+    Comment: '2026-08-16: fetches shotsManifestUrl (R2, plain HTTPS GET) and mirrors it into S3 itself — returns only {bucket,key}, never the shots array, so this task\'s own output never risks the 256KB ceiling the array blew past live on a real 132-shot/565KB project (see fetch-shots-manifest.ts header). Downstream reads shots directly off S3 (RouteGenerateShots\' S3 branch) instead of via $.shots.',
+    Parameters: { 'shotsManifestUrl.$': '$.shotsManifestUrl', 'projectId.$': '$.projectId', 'jobId.$': '$.jobId' },
+    ResultPath: '$.manifestLocation',
     TimeoutSeconds: 60,
     Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
     Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
-    Next: 'SetShotsFromManifest',
-  };
-  def.States.SetShotsFromManifest = {
-    Type: 'Pass',
-    Comment: 'InputPath+ResultPath (no Parameters) copies just the array to $.shots without disturbing the rest of the state.',
-    InputPath: '$.manifestResult.shots',
-    ResultPath: '$.shots',
     Next: 'UpdateStatusGeneratingImages',
   };
 
-  def.States.UpdateStatusGeneratingImages.Next = 'GenerateShots';
-  def.States.UpdateStatusGeneratingImages.Catch[0].Next = 'GenerateShots';
+  def.States.UpdateStatusGeneratingImages.Next = 'RouteGenerateShots';
+  def.States.UpdateStatusGeneratingImages.Catch[0].Next = 'RouteGenerateShots';
+  def.States.RouteGenerateShots = {
+    Type: 'Choice',
+    Comment: 'Same fork RouteShotsSource made earlier, re-checked here since UpdateStatusGeneratingImages is shared by both branches (inline shots vs FetchShotsManifest\'s S3 mirror, 2026-08-16 fix).',
+    Choices: [{ Variable: '$.shots', IsPresent: true, Next: 'GenerateShots' }],
+    Default: 'GenerateShotsFromS3',
+  };
   delete def.States.GenerateImages;
 
   // Same reasoning as buildDialogueBasicQmNewDefinition above: delete the
@@ -6193,12 +6478,27 @@ function buildDialoguePremiumQmNewDefinition(opts: {
   def.States.GenerateShots = dialoguePremiumShotMap({
     qmGenerateArn, remotionOverlayArn, buildTurnTracksArn, trimClipArn, appendTailBeatArn,
   });
+  def.States.GenerateShotsFromS3 = dialoguePremiumShotMap({
+    qmGenerateArn, remotionOverlayArn, buildTurnTracksArn, trimClipArn, appendTailBeatArn,
+    itemSource: 's3',
+  });
 
   def.States.GenerateAmbienceBedSpecs = {
     Type: 'Task',
     Resource: buildAmbienceBedSpecsArn,
     Comment: 'Group shots by sceneNumber into one ambience-bed spec per scene (§7.7) — pure grouping/summing, no ffmpeg; ASL has no group-by/dedup to do this in-line.',
     Parameters: { 'shots.$': '$.shots', 'shotResults.$': '$.shotResults' },
+    ResultPath: '$.ambienceBedSpecsResult',
+    TimeoutSeconds: 60,
+    Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
+    Next: 'GenerateAmbienceBeds',
+  };
+  def.States.GenerateAmbienceBedSpecsFromS3 = {
+    Type: 'Task',
+    Resource: buildAmbienceBedSpecsArn,
+    Comment: '2026-08-16 S3-manifest-path sibling of GenerateAmbienceBedSpecs — passes manifestLocation instead of the full shots array (build-ambience-bed-specs.ts reads shots from S3 itself when shots is absent), same reasoning as GenerateShotsFromS3\'s ItemReader: the full array must never land in execution state for a large film.',
+    Parameters: { 'manifestLocation.$': '$.manifestLocation', 'shotResults.$': '$.shotResults' },
     ResultPath: '$.ambienceBedSpecsResult',
     TimeoutSeconds: 60,
     Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.TooManyRequestsException', 'Lambda.SdkClientException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2.0 }],
