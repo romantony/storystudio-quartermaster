@@ -1,0 +1,17 @@
+{
+  "input": {
+    "mode": "shorts",
+    "project_id": "testproj001",
+    "video_url": "https://cdn-v2.ai-storystudio.com/REPLACE/with/concat.mp4",
+    "num_shorts": 2,
+    "render_style": "BLUR_FILL",
+    "captions": true,
+    "srt_source": "endpoint",
+    "bgm_url": null,
+    "bgm_prompt": null,
+    "bgm_volume": 0.18,
+    "slides": true,
+    "project_title": "Test Project",
+    "language": "en"
+  }
+}

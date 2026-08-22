@@ -89,6 +89,9 @@ const pipelineStack = new PipelineStack(app, 'QMPipelineStack', {
   gatewayKeySecretArn: ctx('GATEWAY_STATIC_KEY_ARN'),
   qmApiDomain: apiStack.distribution.distributionDomainName,
   runpodKeySecretArn: ctx('RUNPOD_API_KEY_ARN'),
+  anthropicKeySecretArn: ctx('ANTHROPIC_API_KEY_ARN'),
+  r2AccessKeyIdSecretArn: ctx('R2_ACCESS_KEY_ID_SECRET_ARN'),
+  r2SecretAccessKeySecretArn: ctx('R2_SECRET_ACCESS_KEY_SECRET_ARN'),
 });
 pipelineStack.addDependency(apiStack);
 

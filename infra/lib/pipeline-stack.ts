@@ -11,14 +11,26 @@ import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as codebuild from 'aws-cdk-lib/aws-codebuild';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as path from 'path';
 
 interface PipelineStackProps extends StackProps {
   gatewayKeySecretArn: string;
   /** CloudFront domain of the Quartermaster API distribution (no https://) */
   qmApiDomain: string;
-  /** Secret ARN holding the RunPod API key, used by the shorts-longform trigger */
+  /** Secret ARN holding the RunPod API key — used by the qm-shorts-longform
+   * ECS task's cross-endpoint transcribe/bgm calls (unrelated to how the
+   * task itself is invoked, which no longer touches RunPod at all). */
   runpodKeySecretArn: string;
+  /** Secret ARN holding the Anthropic API key (qm-shorts-longform's AI
+   * highlight selection, segments_source:"ai") — same secret ApiStack
+   * already references via ANTHROPIC_API_KEY_ARN context. */
+  anthropicKeySecretArn: string;
+  /** Secret ARNs holding Cloudflare R2 credentials (qm-shorts-longform's
+   * uploads) — previously only ever configured in the RunPod endpoint's own
+   * dashboard, never AWS infra; this is their first use inside QM's stack. */
+  r2AccessKeyIdSecretArn: string;
+  r2SecretAccessKeySecretArn: string;
 }
 
 export class PipelineStack extends Stack {
@@ -107,12 +119,14 @@ export class PipelineStack extends Stack {
       action: 'lambda:InvokeFunction',
     });
 
-    // ── QM-shorts-trigger Lambda (SFN → shorts-longform RunPod endpoint) ─────
-    // Fire-and-forget: POSTs the finished concat video (+ SRT + BGM) to the
-    // shorts-longform RunPod worker's async /run, then returns immediately —
-    // completion is reported by RunPod's webhook straight to Convex. Replaces
-    // the legacy TriggerShortsFromLongForm→E2E-start-shorts/10-Lambda-SFN path
-    // (see ~/longtoshort/RUNPOD-SHORTS-WORKER.md + STORYSTUDIO-INTEGRATION.md).
+    // ── QM-shorts-trigger Lambda (SFN → qm-shorts-longform ECS task payload) ──
+    // Pure data transform, no network calls: builds the job input the
+    // qm-shorts-longform Fargate task expects (+ a webhook URL it POSTs its
+    // own completion to — see infra/docker/shorts-longform/handler.py).
+    // Used to POST straight to the shorts-longform RunPod endpoint's async
+    // /run; RunPod's serverless platform isn't in the loop anymore (moved to
+    // QM-owned ECS — see ShortsLongform* resources below), so this Lambda no
+    // longer needs the RunPod API key at all.
     const shortsTriggerFn = new nodejs.NodejsFunction(this, 'ShortsTriggerFunction', {
       functionName: 'QM-shorts-trigger',
       entry: path.join(__dirname, '../../src/handlers/shorts-trigger.ts'),
@@ -121,15 +135,7 @@ export class PipelineStack extends Stack {
       timeout: Duration.seconds(30),
       memorySize: 256,
       bundling: { minify: true, sourceMap: false, externalModules: [] },
-      environment: {
-        RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
-        SHORTS_ENDPOINT_ID: 'u3bvq5juben8ri',
-      },
     });
-    shortsTriggerFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: [props.runpodKeySecretArn],
-    }));
     shortsTriggerFn.addPermission('E2ESfnInvoke', {
       principal: new iam.ArnPrincipal('arn:aws:iam::929075264324:role/E2E-StepFunction-Role'),
       action: 'lambda:InvokeFunction',
@@ -596,6 +602,145 @@ export class PipelineStack extends Stack {
       },
     });
 
+    // ── shorts-longform ECS Fargate task (replaces the RunPod GPU serverless
+    // endpoint — see 2026-08-22 GPU-dependency-removal session: NVENC/CUDA
+    // were never required, both already fall back to libx264/lanczos on a
+    // GPU-less host, verified live by building+running the CPU-only image).
+    // Source of truth is now infra/docker/shorts-longform (built via
+    // CodeBuild -> ECR, same pattern as qm-concat-and-trim/qm-dialogue-mix)
+    // rather than longtoshort's own GH Actions -> Docker Hub CI.
+    const shortsLongformRepo = new ecr.Repository(this, 'ShortsLongformRepo', {
+      repositoryName: 'qm-shorts-longform',
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    const shortsLongformBuildContext = new s3assets.Asset(this, 'ShortsLongformBuildContext', {
+      path: path.join(__dirname, '../docker/shorts-longform'),
+    });
+
+    const shortsLongformBuildProject = new codebuild.Project(this, 'ShortsLongformBuildProject', {
+      projectName: 'qm-shorts-longform-build',
+      source: codebuild.Source.s3({
+        bucket: shortsLongformBuildContext.bucket,
+        path: shortsLongformBuildContext.s3ObjectKey,
+      }),
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+        privileged: true,
+      },
+      environmentVariables: {
+        REPOSITORY_URI: { value: shortsLongformRepo.repositoryUri },
+        AWS_ACCOUNT_ID: { value: this.account },
+        AWS_DEFAULT_REGION: { value: this.region },
+      },
+      buildSpec: codebuild.BuildSpec.fromSourceFilename('buildspec.yml'),
+    });
+    shortsLongformRepo.grantPullPush(shortsLongformBuildProject);
+
+    // Dedicated task role — reads its job payload back from S3
+    // (PAYLOAD_S3_KEY, same 8192-byte ContainerOverrides workaround
+    // concat-and-trim uses). No other AWS access needed: R2 uploads go
+    // through explicit Cloudflare credentials (env secrets below), not IAM.
+    const shortsLongformTaskRole = new iam.Role(this, 'ShortsLongformTaskRole', {
+      roleName: 'qm-shorts-longform-task-role',
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+    });
+    removeSilenceBucket.grantRead(shortsLongformTaskRole);
+
+    // Dedicated (not shared/immutable) execution role — unlike concat-and-
+    // trim/dialogue-mix, this task needs secretsmanager:GetSecretValue at
+    // container-start to inject R2/Anthropic/RunPod credentials as env vars,
+    // which the shared `ecsTaskExecutionRole` (imported immutable elsewhere
+    // in this file) can't be granted without touching a role used outside
+    // this stack.
+    const shortsLongformExecutionRole = new iam.Role(this, 'ShortsLongformExecutionRole', {
+      roleName: 'qm-shorts-longform-execution-role',
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy')],
+    });
+    // R2 credentials and the Anthropic key previously lived only in the
+    // RunPod endpoint's own dashboard config, outside AWS entirely — this is
+    // their first use inside QM's own infra (props threaded via CDK context,
+    // same convention as runpodKeySecretArn/gatewayKeySecretArn — see
+    // bin/app.ts's ctx() calls for this stack. R2_ACCESS_KEY_ID_SECRET_ARN/
+    // R2_SECRET_ACCESS_KEY_SECRET_ARN must be passed at deploy time or these
+    // resolve to a non-existent placeholder ARN — same class of gotcha as
+    // the documented WEBHOOK_BASE_URL one).
+    const shortsR2AccessKeySecret = secretsmanager.Secret.fromSecretCompleteArn(
+      this, 'ShortsR2AccessKeySecret', props.r2AccessKeyIdSecretArn,
+    );
+    const shortsR2SecretKeySecret = secretsmanager.Secret.fromSecretCompleteArn(
+      this, 'ShortsR2SecretKeySecret', props.r2SecretAccessKeySecretArn,
+    );
+    const shortsAnthropicSecret = secretsmanager.Secret.fromSecretCompleteArn(
+      this, 'ShortsAnthropicSecret', props.anthropicKeySecretArn,
+    );
+    const shortsRunpodSecret = secretsmanager.Secret.fromSecretCompleteArn(
+      this, 'ShortsRunpodSecret', props.runpodKeySecretArn,
+    );
+
+    const shortsLongformSg = new ec2.SecurityGroup(this, 'ShortsLongformSg', {
+      vpc: concatTrimVpc,
+      description: 'QM shorts-longform Fargate task - outbound only',
+      allowAllOutbound: true,
+    });
+
+    const shortsLongformCluster = new ecs.Cluster(this, 'ShortsLongformCluster', {
+      clusterName: 'qm-shorts-longform',
+      vpc: concatTrimVpc,
+    });
+
+    const shortsLongformLogGroup = new logs.LogGroup(this, 'ShortsLongformLogGroup', {
+      logGroupName: '/qm/shorts-longform',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    // Sizing: moderate CPU-bound ffmpeg work (libx264 main encode + slide
+    // concat + BGM mix per short, sequential, 3-5 shorts/job typically) —
+    // same order of magnitude as dialogue-mix, well below concat-and-trim's
+    // up-to-69-frame case. Tune from real measurements once live.
+    const shortsLongformTaskDef = new ecs.FargateTaskDefinition(this, 'ShortsLongformTaskDef', {
+      family: 'qm-shorts-longform',
+      cpu: 4096,
+      memoryLimitMiB: 16384,
+      ephemeralStorageGiB: 30,
+      taskRole: shortsLongformTaskRole,
+      executionRole: shortsLongformExecutionRole,
+    });
+    shortsLongformTaskDef.addContainer('shorts-longform', {
+      containerName: 'shorts-longform',
+      image: ecs.ContainerImage.fromEcrRepository(shortsLongformRepo, 'latest'),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'shorts-longform', logGroup: shortsLongformLogGroup }),
+      environment: {
+        PAYLOAD_BUCKET: removeSilenceBucket.bucketName,
+        R2_ENDPOINT: 'https://620baa808df08b1a30d448989365f7dd.r2.cloudflarestorage.com',
+        R2_BUCKET: 'e2e-storystudio',
+        R2_PUBLIC_BASE: 'https://storyaistudio.app',
+        // Flux-TTS-S2T RunPod endpoint — unrelated to this migration, still
+        // called out to directly for transcribe/bgm modes.
+        SRT_ENDPOINT_ID: 'rnqxi6c0mlq517',
+        BGM_ENDPOINT_ID: 'rnqxi6c0mlq517',
+      },
+      secrets: {
+        R2_ACCESS_KEY_ID: ecs.Secret.fromSecretsManager(shortsR2AccessKeySecret),
+        R2_SECRET_ACCESS_KEY: ecs.Secret.fromSecretsManager(shortsR2SecretKeySecret),
+        ANTHROPIC_API_KEY: ecs.Secret.fromSecretsManager(shortsAnthropicSecret),
+        RUNPOD_API_KEY: ecs.Secret.fromSecretsManager(shortsRunpodSecret),
+      },
+    });
+
+    const shortsEcsConfig: ShortsEcsConfig = {
+      triggerArn: shortsTriggerFn.functionArn,
+      clusterArn: shortsLongformCluster.clusterArn,
+      taskDefinitionArn: shortsLongformTaskDef.taskDefinitionArn,
+      containerName: 'shorts-longform',
+      subnetIds: concatTrimSubnetIds,
+      securityGroupId: shortsLongformSg.securityGroupId,
+      outputBucket: removeSilenceBucket.bucketName,
+      uploadPayloadArn: uploadPayloadFn.functionArn,
+    };
+
     // ── State machine definition ─────────────────────────────────────────────
     const brokerArn = brokerFn.functionArn;
 
@@ -650,7 +795,7 @@ export class PipelineStack extends Stack {
       uploadPayloadArn: uploadPayloadFn.functionArn,
     };
 
-    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn, concatTrimEcsConfig);
+    const qmNewDefinition = buildQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsEcsConfig, remotionOverlayFn.functionArn, removeSilenceFn.functionArn, concatTrimEcsConfig);
 
     const qmNewStateMachine = new sfn.CfnStateMachine(this, 'QMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Basic-QM-New',
@@ -667,7 +812,7 @@ export class PipelineStack extends Stack {
     // (Qwen voice-design) → Wan2 i2v → merge, all through the Quartermaster
     // gateway. Finalize is Premium-flavored (1080p upscale), mirroring
     // buildPremiumDefinition's FinalizeVideoPremium exactly.
-    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn, removeSilenceFn.functionArn, concatTrimEcsConfig);
+    const narrationPremiumQmNewDefinition = buildNarrationPremiumQmNewDefinition(qmGenerateFn.functionArn, brokerArn, shortsEcsConfig, remotionOverlayFn.functionArn, removeSilenceFn.functionArn, concatTrimEcsConfig);
 
     const narrationPremiumQmNewStateMachine = new sfn.CfnStateMachine(this, 'NarrationPremiumQMNewPipeline', {
       stateMachineName: 'E2E-VideoGenerationPipeline-Narration-Premium-QM-New',
@@ -691,7 +836,7 @@ export class PipelineStack extends Stack {
     };
 
     const dialogueBasicQmNewDefinition = buildDialogueBasicQmNewDefinition(
-      qmGenerateFn.functionArn, brokerArn, shortsTriggerFn.functionArn, remotionOverlayFn.functionArn,
+      qmGenerateFn.functionArn, brokerArn, shortsEcsConfig, remotionOverlayFn.functionArn,
       concatTrimEcsConfig, dialogueMixEcsConfig, reconcileSegmentTimingFn.functionArn,
     );
 
@@ -709,7 +854,7 @@ export class PipelineStack extends Stack {
     const dialoguePremiumQmNewDefinition = buildDialoguePremiumQmNewDefinition({
       qmGenerateArn: qmGenerateFn.functionArn,
       brokerArn,
-      shortsTriggerArn: shortsTriggerFn.functionArn,
+      shortsEcs: shortsEcsConfig,
       remotionOverlayArn: remotionOverlayFn.functionArn,
       concatTrimEcs: concatTrimEcsConfig,
       dialogueMixEcs: dialogueMixEcsConfig,
@@ -777,7 +922,7 @@ export class PipelineStack extends Stack {
 // that Map, replacing it removes every broker reference — the cloned brokerArn
 // never survives into the QM-new definition.
 // ---------------------------------------------------------------------------
-function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string, concatTrimEcs: ConcatTrimEcsConfig): object {
+function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsEcs: ShortsEcsConfig, remotionOverlayArn: string, removeSilenceArn: string, concatTrimEcs: ConcatTrimEcsConfig): object {
   const def = JSON.parse(JSON.stringify(buildDefinition(brokerArn))) as {
     Comment: string;
     States: Record<string, any>;
@@ -976,7 +1121,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
     }],
     Default: 'ConcatenateVideos',
   };
-  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, concatTrimEcs, 'basic', shortsTriggerArn));
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, concatTrimEcs, 'basic', shortsEcs));
   def.States.BuildMergedVoiceResult.Next = 'SetNoLocalizedAssets';
   def.States.SetNoLocalizedAssets = {
     Type: 'Pass',
@@ -1083,7 +1228,7 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
   // (mergedVoiceResult), before Fargate finalize — finalize's upscale/BGM/
   // caption burn only affects the long-form output, not the shorts.
   def.States.PrepareFinalizeBasic.Next = 'NormalizeShortsOptions';
-  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoBasic'));
+  Object.assign(def.States, shortsTriggerStates(shortsEcs, 'FinalizeVideoBasic'));
 
   return def;
 }
@@ -1099,17 +1244,28 @@ function buildQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTr
  * never worth failing the main long-form project over.
  *
  * NormalizeShortsOptions/SetShortsOptionsDefault guarantee `$.shortsOptions`
- * is always present before TriggerShortsFromLongForm's Parameters allowlist
+ * is always present before BuildShortsPayload's Parameters allowlist
  * references it via `.$` — same gotcha as fourLang/voiceGender (see
  * NormalizeFourLang above): a direct `'shortsOptions.$': '$.shortsOptions'`
  * throws at runtime if the caller omitted the key entirely, which is the
  * common case (it's optional).
+ *
+ * BuildShortsPayload/UploadShortsPayload/TriggerShortsEcsTask replace the
+ * single RunPod-`/run`-POSTing TriggerShortsFromLongForm Lambda task: the
+ * Lambda now only builds the job input (+ webhook URL), a second Lambda
+ * uploads it to S3 (ecs:runTask's ContainerOverrides has an 8192-byte limit
+ * a caller's ``shortsOptions`` — e.g. many explicit ``segments[]`` — could
+ * exceed, same workaround concat-and-trim already uses), and `ecs:runTask`
+ * (not `.sync`) fires the qm-shorts-longform Fargate task and returns
+ * immediately without waiting for it — preserving the original fire-and-
+ * forget semantics (the task POSTs its own completion webhook to Convex;
+ * see infra/docker/shorts-longform/handler.py's main()/_post_webhook()).
  */
-function shortsTriggerStates(shortsTriggerArn: string, finalizeStateName: string): Record<string, unknown> {
+function shortsTriggerStates(shortsEcs: ShortsEcsConfig, finalizeStateName: string): Record<string, unknown> {
   return {
     NormalizeShortsOptions: {
       Type: 'Choice',
-      Comment: 'Guarantee $.shortsOptions is a real object before TriggerShortsFromLongForm\'s Parameters allowlist would otherwise throw if the caller omitted the key entirely.',
+      Comment: 'Guarantee $.shortsOptions is a real object before BuildShortsPayload\'s Parameters allowlist would otherwise throw if the caller omitted the key entirely.',
       Choices: [{ Variable: '$.shortsOptions', IsPresent: true, Next: 'CheckGenerateShorts' }],
       Default: 'SetShortsOptionsDefault',
     },
@@ -1122,14 +1278,14 @@ function shortsTriggerStates(shortsTriggerArn: string, finalizeStateName: string
           { Variable: '$.generateShorts', IsPresent: true },
           { Variable: '$.generateShorts', BooleanEquals: true },
         ],
-        Next: 'TriggerShortsFromLongForm',
+        Next: 'BuildShortsPayload',
       }],
       Default: finalizeStateName,
     },
-    TriggerShortsFromLongForm: {
+    BuildShortsPayload: {
       Type: 'Task',
-      Resource: shortsTriggerArn,
-      Comment: 'Fire-and-forget: POST the concat video + SRT + BGM (+ caller shortsOptions passthrough) to the shorts-longform RunPod endpoint (u3bvq5juben8ri) /run; completion reported via webhook straight to Convex. Failure is non-fatal.',
+      Resource: shortsEcs.triggerArn,
+      Comment: 'Build the qm-shorts-longform task\'s job input (+ webhook URL) — pure data transform, no network call.',
       Parameters: {
         'projectId.$': '$.projectId',
         'jobId.$': '$.jobId',
@@ -1139,6 +1295,51 @@ function shortsTriggerStates(shortsTriggerArn: string, finalizeStateName: string
         language: 'en',
         'convexEndpoint.$': '$.convexEndpoint',
         'shortsOptions.$': '$.shortsOptions',
+      },
+      ResultPath: '$.shortsPayload',
+      TimeoutSeconds: 30,
+      Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Shorts trigger failure is non-fatal — always proceed to finalize', ResultPath: '$.shortsError', Next: finalizeStateName }],
+      Next: 'UploadShortsPayload',
+    },
+    UploadShortsPayload: {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::lambda:invoke',
+      Comment: 'ecs:runTask\'s ContainerOverrides has a hard 8192-byte limit — a caller-supplied shortsOptions (e.g. many explicit segments[]) could exceed it inlined. Upload to S3 here and pass only the short key across that boundary (same pattern concat-and-trim uses).',
+      Parameters: {
+        FunctionName: shortsEcs.uploadPayloadArn,
+        Payload: {
+          'key.$': "States.Format('projects/{}/payloads/shorts.json', $.projectId)",
+          'body.$': 'States.JsonToString($.shortsPayload)',
+        },
+      },
+      ResultSelector: { 'key.$': '$.Payload.key' },
+      ResultPath: '$.shortsPayloadUpload',
+      TimeoutSeconds: 60,
+      Retry: [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+      Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Shorts trigger failure is non-fatal — always proceed to finalize', ResultPath: '$.shortsError', Next: finalizeStateName }],
+      Next: 'TriggerShortsEcsTask',
+    },
+    TriggerShortsEcsTask: {
+      Type: 'Task',
+      Resource: 'arn:aws:states:::ecs:runTask',
+      Comment: 'Fire-and-forget: launches the qm-shorts-longform Fargate task and returns immediately (NOT ecs:runTask.sync) — the task POSTs its own completion webhook straight to Convex once done. Failure is non-fatal.',
+      Parameters: {
+        Cluster: shortsEcs.clusterArn,
+        TaskDefinition: shortsEcs.taskDefinitionArn,
+        LaunchType: 'FARGATE',
+        NetworkConfiguration: {
+          AwsvpcConfiguration: {
+            Subnets: shortsEcs.subnetIds,
+            SecurityGroups: [shortsEcs.securityGroupId],
+            AssignPublicIp: 'ENABLED',
+          },
+        },
+        Overrides: {
+          ContainerOverrides: [{
+            Name: shortsEcs.containerName,
+            Environment: [{ Name: 'PAYLOAD_S3_KEY', 'Value.$': '$.shortsPayloadUpload.key' }],
+          }],
+        },
       },
       ResultPath: '$.shortsExecution',
       TimeoutSeconds: 30,
@@ -2668,6 +2869,22 @@ interface ConcatTrimEcsConfig {
   uploadPayloadArn: string;
 }
 
+/** qm-shorts-longform ECS task (replaces the shorts-longform RunPod
+ * serverless endpoint — see 2026-08-22 GPU-removal/ECS-migration session).
+ * `triggerArn` is the QM-shorts-trigger Lambda that builds the task's job
+ * input (pure data transform, no network call); `uploadPayloadArn` is the
+ * same generic S3-payload-upload Lambda concat-and-trim uses. */
+interface ShortsEcsConfig {
+  triggerArn: string;
+  clusterArn: string;
+  taskDefinitionArn: string;
+  containerName: string;
+  subnetIds: string[];
+  securityGroupId: string;
+  outputBucket: string;
+  uploadPayloadArn: string;
+}
+
 /** Replaces concatFourLangBranch + removeSilenceFourLangBranch (both
  * deleted) — what used to be two separate Lambda hops through S3/R2 for the
  * same file (external E2E-video-concat-premium Lambda, then QM-remove-silence
@@ -2807,13 +3024,15 @@ function concatAndTrimFourLangBranch(
 function finalizeLocalizedBranch(
   qmGenerateArn: string, fieldKey: string, langCode: string, transcribeIndex: number,
   mode: 'basic' | 'premium' = 'basic', targetResolution: string | undefined = undefined, timeoutSeconds = 3600,
-  shortsTriggerArn: string = '',
+  shortsEcs: ShortsEcsConfig | undefined = undefined,
 ): { StartAt: string; States: Record<string, unknown> } {
   const check = `CheckOmitted${fieldKey}`;
   const omitted = `Omitted${fieldKey}`;
   const prepare = `PrepareFinalize${fieldKey}`;
   const routeShorts = `RouteShorts${fieldKey}`;
-  const triggerShorts = `TriggerShortsFourLang${fieldKey}`;
+  const buildShortsPayload = `BuildShortsPayloadFourLang${fieldKey}`;
+  const uploadShortsPayload = `UploadShortsPayloadFourLang${fieldKey}`;
+  const triggerShorts = `TriggerShortsEcsTaskFourLang${fieldKey}`;
   const finalize = `FinalizeVideo${fieldKey}`;
   const finalizeFailed = `FinalizeFailed${fieldKey}`;
   const buildAsset = `BuildLocalizedAsset${fieldKey}`;
@@ -2849,19 +3068,19 @@ function finalizeLocalizedBranch(
           'convexEndpoint.$': '$.convexEndpoint',
         },
         ResultPath: taskInputPath,
-        Next: shortsTriggerArn ? routeShorts : finalize,
+        Next: shortsEcs ? routeShorts : finalize,
       },
-      ...(shortsTriggerArn ? {
+      ...(shortsEcs ? {
         [routeShorts]: {
           Type: 'Choice',
           Comment: `Fire ${langCode}'s own long-to-shorts job when the project asked for shorts — mirrors CheckGenerateShorts, just per-language.`,
-          Choices: [{ Variable: '$.generateShorts', BooleanEquals: true, Next: triggerShorts }],
+          Choices: [{ Variable: '$.generateShorts', BooleanEquals: true, Next: buildShortsPayload }],
           Default: finalize,
         },
-        [triggerShorts]: {
+        [buildShortsPayload]: {
           Type: 'Task',
-          Resource: shortsTriggerArn,
-          Comment: `Fire-and-forget long-to-shorts trigger for ${langCode}, sourced from this language's own pre-finalize concat video/SRT (same precedent as English's own trigger using its pre-finalize concat video, not the finalized master). projectId/jobId are language-suffixed — the shorts worker's R2 keys and Convex webhook correlation are otherwise global/unsuffixed and would collide across 4 parallel per-language triggers for the same project.`,
+          Resource: shortsEcs.triggerArn,
+          Comment: `Build ${langCode}'s own long-to-shorts job input, sourced from this language's own pre-finalize concat video/SRT (same precedent as English's own trigger using its pre-finalize concat video, not the finalized master). projectId/jobId are language-suffixed — the shorts worker's R2 keys and Convex webhook correlation are otherwise global/unsuffixed and would collide across 4 parallel per-language triggers for the same project.`,
           Parameters: {
             'projectId.$': `States.Format('{}-${fieldKey}', $.projectId)`,
             'jobId.$': `States.Format('{}-${fieldKey}', $.jobId)`,
@@ -2871,6 +3090,51 @@ function finalizeLocalizedBranch(
             language: langCode,
             'convexEndpoint.$': '$.convexEndpoint',
             'shortsOptions.$': '$.shortsOptions',
+          },
+          ResultPath: `$.shortsPayload${fieldKey}`,
+          TimeoutSeconds: 30,
+          Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Shorts trigger failure is non-fatal — always proceed to finalize.', ResultPath: `$.shortsError${fieldKey}`, Next: finalize }],
+          Next: uploadShortsPayload,
+        },
+        [uploadShortsPayload]: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::lambda:invoke',
+          Comment: `Upload ${langCode}'s shorts job payload to S3 (own key, per fieldKey — avoids collisions across the parallel per-language branches) — same 8192-byte ContainerOverrides workaround as the English trigger.`,
+          Parameters: {
+            FunctionName: shortsEcs.uploadPayloadArn,
+            Payload: {
+              'key.$': `States.Format('projects/{}/payloads/shorts-${fieldKey}.json', $.projectId)`,
+              'body.$': `States.JsonToString($.shortsPayload${fieldKey})`,
+            },
+          },
+          ResultSelector: { 'key.$': '$.Payload.key' },
+          ResultPath: `$.shortsPayloadUpload${fieldKey}`,
+          TimeoutSeconds: 60,
+          Retry: [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+          Catch: [{ ErrorEquals: ['States.ALL'], Comment: 'Shorts trigger failure is non-fatal — always proceed to finalize.', ResultPath: `$.shortsError${fieldKey}`, Next: finalize }],
+          Next: triggerShorts,
+        },
+        [triggerShorts]: {
+          Type: 'Task',
+          Resource: 'arn:aws:states:::ecs:runTask',
+          Comment: `Fire-and-forget: launches the qm-shorts-longform Fargate task for ${langCode} and returns immediately (NOT ecs:runTask.sync) — the task POSTs its own completion webhook straight to Convex once done.`,
+          Parameters: {
+            Cluster: shortsEcs.clusterArn,
+            TaskDefinition: shortsEcs.taskDefinitionArn,
+            LaunchType: 'FARGATE',
+            NetworkConfiguration: {
+              AwsvpcConfiguration: {
+                Subnets: shortsEcs.subnetIds,
+                SecurityGroups: [shortsEcs.securityGroupId],
+                AssignPublicIp: 'ENABLED',
+              },
+            },
+            Overrides: {
+              ContainerOverrides: [{
+                Name: shortsEcs.containerName,
+                Environment: [{ Name: 'PAYLOAD_S3_KEY', 'Value.$': `$.shortsPayloadUpload${fieldKey}.key` }],
+              }],
+            },
           },
           ResultPath: `$.shortsExecution${fieldKey}`,
           TimeoutSeconds: 30,
@@ -2935,7 +3199,7 @@ function finalizeLocalizedBranch(
  * via SetNoLocalizedAssets instead.
  */
 function fourLangConcatFinalizeStates(
-  qmGenerateArn: string, concatTrimEcs: ConcatTrimEcsConfig, mode: 'basic' | 'premium' = 'basic', shortsTriggerArn: string = '',
+  qmGenerateArn: string, concatTrimEcs: ConcatTrimEcsConfig, mode: 'basic' | 'premium' = 'basic', shortsEcs: ShortsEcsConfig | undefined = undefined,
 ): Record<string, unknown> {
   const targetResolution = mode === 'premium' ? '1080p' : undefined;
   const finalizeTimeoutSeconds = mode === 'premium' ? 5400 : 3600;
@@ -3064,9 +3328,9 @@ function fourLangConcatFinalizeStates(
       Type: 'Parallel',
       Comment: 'es/pt-BR/hi finalize fan-out — English is deliberately NOT a branch here (see BuildMergedVoiceResultFourLangEn). Output array (order: es, pt-BR, hi) becomes $.localizedAssets directly, matching the doc\'s array-of-{language,...} shape.',
       Branches: [
-        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 1, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
-        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 2, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
-        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 3, mode, targetResolution, finalizeTimeoutSeconds, shortsTriggerArn),
+        finalizeLocalizedBranch(qmGenerateArn, 'es', 'es', 1, mode, targetResolution, finalizeTimeoutSeconds, shortsEcs),
+        finalizeLocalizedBranch(qmGenerateArn, 'ptBr', 'pt-BR', 2, mode, targetResolution, finalizeTimeoutSeconds, shortsEcs),
+        finalizeLocalizedBranch(qmGenerateArn, 'hi', 'hi', 3, mode, targetResolution, finalizeTimeoutSeconds, shortsEcs),
       ],
       ResultPath: '$.localizedAssets',
       Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.error', Next: 'HandleFailure' }],
@@ -3407,8 +3671,8 @@ function qmPremiumFourLangFrameAssetsMap(qmGenerateArn: string, remotionOverlayA
 // the finalize section is Premium-flavored (1080p upscale), matching
 // buildPremiumDefinition's FinalizeVideoPremium exactly.
 // ---------------------------------------------------------------------------
-function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string, removeSilenceArn: string, concatTrimEcs: ConcatTrimEcsConfig): object {
-  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, removeSilenceArn, concatTrimEcs))) as {
+function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: string, shortsEcs: ShortsEcsConfig, remotionOverlayArn: string, removeSilenceArn: string, concatTrimEcs: ConcatTrimEcsConfig): object {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsEcs, remotionOverlayArn, removeSilenceArn, concatTrimEcs))) as {
     Comment: string;
     States: Record<string, any>;
   };
@@ -3440,7 +3704,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   // branch on $.fourLang — so they're left as-is, not deleted.
   def.States.GenerateImagesFourLang = qmPremiumFourLangFrameAssetsMap(qmGenerateArn, remotionOverlayArn);
   def.States.GenerateImagesFourLang.Next = 'RouteBGM';
-  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, concatTrimEcs, 'premium', shortsTriggerArn));
+  Object.assign(def.States, fourLangConcatFinalizeStates(qmGenerateArn, concatTrimEcs, 'premium', shortsEcs));
 
   // No whole-script localizationStates() call for Premium anymore: once the
   // per-frame fourLang path above is wired in, RouteFrameGeneration/
@@ -3536,7 +3800,7 @@ function buildNarrationPremiumQmNewDefinition(qmGenerateArn: string, brokerArn: 
   // The clone above inherited buildQmNewDefinition's CheckGenerateShorts/
   // TriggerShortsFromLongForm pointed at FinalizeVideoBasic (now deleted) —
   // retarget both at FinalizeVideoPremium.
-  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoPremium'));
+  Object.assign(def.States, shortsTriggerStates(shortsEcs, 'FinalizeVideoPremium'));
 
   return def;
 }
@@ -4652,10 +4916,10 @@ function overrideDialogueValidateInput(
 }
 
 function buildDialogueBasicQmNewDefinition(
-  qmGenerateArn: string, brokerArn: string, shortsTriggerArn: string, remotionOverlayArn: string,
+  qmGenerateArn: string, brokerArn: string, shortsEcs: ShortsEcsConfig, remotionOverlayArn: string,
   concatTrimEcs: ConcatTrimEcsConfig, dialogueMixEcs: DialogueMixEcsConfig, reconcileSegmentTimingArn: string,
 ): object {
-  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, '', concatTrimEcs))) as {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsEcs, remotionOverlayArn, '', concatTrimEcs))) as {
     Comment: string;
     States: Record<string, any>;
   };
@@ -5569,7 +5833,7 @@ function buildDialogueBasicQmNewDefinition(
   };
   delete def.States.FinalizeVideoBasic;
 
-  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoDialogueBasic'));
+  Object.assign(def.States, shortsTriggerStates(shortsEcs, 'FinalizeVideoDialogueBasic'));
 
   return def;
 }
@@ -6421,17 +6685,17 @@ function dialoguePremiumShotMap(opts: {
 }
 
 function buildDialoguePremiumQmNewDefinition(opts: {
-  qmGenerateArn: string; brokerArn: string; shortsTriggerArn: string; remotionOverlayArn: string;
+  qmGenerateArn: string; brokerArn: string; shortsEcs: ShortsEcsConfig; remotionOverlayArn: string;
   concatTrimEcs: ConcatTrimEcsConfig; dialogueMixEcs: DialogueMixEcsConfig;
   buildTurnTracksArn: string; trimClipArn: string; appendTailBeatArn: string;
   buildAmbienceBedSpecsArn: string; fetchShotsManifestArn: string;
 }): object {
   const {
-    qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, concatTrimEcs, dialogueMixEcs,
+    qmGenerateArn, brokerArn, shortsEcs, remotionOverlayArn, concatTrimEcs, dialogueMixEcs,
     buildTurnTracksArn, trimClipArn, appendTailBeatArn, buildAmbienceBedSpecsArn, fetchShotsManifestArn,
   } = opts;
 
-  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsTriggerArn, remotionOverlayArn, '', concatTrimEcs))) as {
+  const def = JSON.parse(JSON.stringify(buildQmNewDefinition(qmGenerateArn, brokerArn, shortsEcs, remotionOverlayArn, '', concatTrimEcs))) as {
     Comment: string;
     States: Record<string, any>;
   };
@@ -6822,7 +7086,7 @@ function buildDialoguePremiumQmNewDefinition(opts: {
   };
   delete def.States.FinalizeVideoBasic;
 
-  Object.assign(def.States, shortsTriggerStates(shortsTriggerArn, 'FinalizeVideoDialoguePremium'));
+  Object.assign(def.States, shortsTriggerStates(shortsEcs, 'FinalizeVideoDialoguePremium'));
 
   return def;
 }
