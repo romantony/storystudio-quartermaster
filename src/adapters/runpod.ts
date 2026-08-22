@@ -331,6 +331,32 @@ function buildRunpodInput(job: CanonicalJob, rung: Rung): Record<string, unknown
         ...attribution,
       };
     }
+    case 'multitalk': {
+      // MeiGen-MultiTalk (~/multitalk repo, endpoint mt6vmstwzw0evp) —
+      // primary rung for Dialogue Premium monologue (single audioUrl) or
+      // dialogue (leftAudioUrl+rightAudioUrl, same fields RunComfy's
+      // fast/multi rung uses) shots; RunComfy InfiniteTalk is the fallback
+      // when this rung fails or is unavailable. audio_type distinguishes
+      // the two: "para" (single speaker) vs "add" (two-speaker sequential
+      // turn-taking). One patched model serves both shapes (no
+      // InfiniteTalk-style checkpoint swap). Max video generation duration
+      // is 15s/clip (the worker's own MULTITALK_LOCAL_MAX_DURATION_S env
+      // var) — long narrator/spokesperson segments stay on the legacy
+      // /infinitetalk route below, not this rung.
+      const left = p.leftAudioUrl;
+      const right = p.rightAudioUrl;
+      const audio = right ? { person1: left, person2: right } : { person1: job.audioUrl ?? left };
+      return {
+        image: job.initImageUrls?.[0],
+        prompt: job.prompt ?? '',
+        audio,
+        audio_type: right ? 'add' : 'para',
+        resolution: rung.fixed?.resolution ?? '480p',
+        duration_s: Math.min(15, Math.max(1, Math.round(p.durationS ?? 5))),
+        sample_steps: 4,
+        ...attribution,
+      };
+    }
     default:
       // Fallback: pass the prompt through untouched.
       return { prompt: job.prompt, ...attribution };

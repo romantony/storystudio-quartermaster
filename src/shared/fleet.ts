@@ -70,6 +70,7 @@ export const QWEN_IMAGE_GEN = 'runpod:qwen-image-gen';
 export const QWEN_IMAGE_EDIT = 'runpod:qwen-image-edit';
 export const WAN2_I2V = 'runpod:wan2-i2v';
 export const BGM_S2T = 'runpod:bgm-s2t';
+export const MULTITALK = 'runpod:multitalk';
 
 export interface FleetEndpoint {
   counterKey: string;
@@ -129,6 +130,17 @@ export const FLEET: FleetEndpoint[] = [
   // 0/4 running, 4 idle — unchanged). Shares the flux2-TTS-S2T-Bgm network
   // volume with flux-tts-s2t (each endpoint loads only its own models).
   { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 4 },
+  // MeiGen-MultiTalk (~/multitalk repo) — primary rung for Dialogue Premium
+  // monologue/dialogue video-gen (video.dialoguePremium.monologue/.dialogue
+  // in background.json); RunComfy InfiniteTalk is the fallback when this
+  // rung fails or is unavailable. Already deployed on the RunPod dashboard
+  // at 2 workers (part of this file's top-comment "39/40 Workers deployed"
+  // count, previously unrouted through QM) — not autoscaled by
+  // provisioner.ts, a fixed small pool. Max video generation duration is
+  // 15s/clip by the worker's own MULTITALK_LOCAL_MAX_DURATION_S; NOT a
+  // substitute for the legacy /infinitetalk route's long
+  // narrator/spokesperson segments (adapters/runpod.ts).
+  { counterKey: MULTITALK,       endpointId: 'mt6vmstwzw0evp', workers: 2 },
 ];
 
 export const ACCOUNT_CAP = Number(process.env.RUNPOD_ACCOUNT_CAP ?? 40);
