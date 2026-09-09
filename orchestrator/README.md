@@ -49,10 +49,19 @@ Tests run from the repo root under the shared jest config:
 npm test -- orchestrator
 ```
 
-## M0 exit criteria
+## M0 exit criteria — met
 
-- [x] migration set is well-formed and reversible — every `up` has a matching `down`
-      (`migrations.test.ts`). The live `migrate up` → `migrate down` on a scratch
-      Postgres is still a **manual step**: no local DB in the build environment.
-- [x] `/v1/health` reports pg reachable (200) / unreachable (503)
+- [x] migrations apply and roll back cleanly — verified on the VPS 2026-09-09
+      against Postgres 16: `up` applies `001`–`005`, `down` reverts `005`, `up`
+      re-applies it. `migrations.test.ts` guards reversibility structurally in CI.
+- [x] `/v1/health` reports pg reachable (200 `{"pg":{"ok":true}}`) / unreachable (503)
 - [x] `fleet-registry.ts` divergence is a test failure
+
+## Deploy (VPS)
+
+Dedicated Bluehost NVMe8 box, `orchestrator.ai-storystudio.com` → 129.121.78.38.
+`/opt/qm-orchestrator/` holds `docker-compose.yml` (postgres:16 `db` + `orchestrator`
+built from `./repo/orchestrator`) and `.env`. Deploy = `git -C repo pull &&
+docker compose build orchestrator && docker compose run --rm orchestrator node
+dist/db/migrate.js up && docker compose up -d orchestrator`. Migrations are an
+explicit step, never automatic on boot.
