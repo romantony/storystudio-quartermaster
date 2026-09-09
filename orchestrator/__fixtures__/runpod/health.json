@@ -1,0 +1,16 @@
+{
+  "workers": {
+    "ready": 25,
+    "running": 18,
+    "idle": 7,
+    "throttled": 0,
+    "initializing": 0
+  },
+  "jobs": {
+    "completed": 402,
+    "failed": 3,
+    "inProgress": 18,
+    "inQueue": 271,
+    "retried": 5
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "sync-def456-e165se4r3eo5hp",
+  "status": "COMPLETED",
+  "delayTime": 812,
+  "executionTime": 11840,
+  "output": {
+    "image_url": "https://cdn.example/proj_8812/f_001.png",
+    "gen_time_s": 2.1
+  }
+}

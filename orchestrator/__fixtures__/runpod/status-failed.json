@@ -1,0 +1,7 @@
+{
+  "id": "sync-ghi789-nd7wloyvj09xwy",
+  "status": "FAILED",
+  "delayTime": 1503,
+  "executionTime": 4210,
+  "error": "duration_s must be one of [3, 4, 5, 6, 7]"
+}
