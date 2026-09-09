@@ -948,16 +948,23 @@ before breadth** — steps 1→3 end to end teaches more than thirteen half-buil
 - **Done:** a written non-expired lease makes `runProvisioner` skip the endpoint entirely.
   Orchestrator-side lease *writer* (fleet agent) lands with M3.
 
-### M1 — Two new endpoints *(parallel track, long lead time)* — **in progress**
-- [x] `media` container: ffmpeg + NVENC + Real-ESRGAN, ops merge/concat/upscale/caption/bgm_overlay
-      — `orchestrator/containers/media/`. Pure argv-builder tests (12) + a GPU-less ffmpeg smoke
-      (libx264/lanczos) both green. `MEDIA_VIDEO_ENCODER` makes NVENC↔libx264 one switch (§16 q3).
-- [ ] Deploy the `media` image + run §12.3's probe (`orchestrator/containers/media/probe.md`) —
-      NVENC, Real-ESRGAN Vulkan, per-op VRAM. Needs a real endpoint.
-- [~] `remotion` container — **deferred for M1** (§16 q3): step 7 stays on the existing Remotion
-      Lambda (`src/handlers/remotion-overlay.ts`), the one remaining AWS touch in the background path.
-- **Done when:** each `media` op completes one real job and writes to R2 (object storage = Cloudflare R2).
-- **Risk:** longest-lead item, and steps 6–12 all depend on it.
+### M1 — the two new endpoints *(revised: reuse, don't build)* — **in progress**
+The `media` "container" was going to be new ffmpeg code — until `flux4B-Wan2-storystudio`
+(the `flux-tts-s2t` / `bgm-s2t` codebase) turned out to already implement `merge`, `concat`,
+`upscale`, `caption`, `mix_bgm` **and** `postprod`, on R2, in production. A reimplementation
+(commit `059a4ad`) was reverted. So M1 is now a deploy + a contract, not a build.
+- [x] Contract pinned — `orchestrator/containers/media.md` (the 5 modes' input/output, the
+      caption-re-runs-Whisper consequence, why `postprod` is unused, the concat-no-normalize gap).
+- [ ] Deploy `flux4B-Wan2-storystudio` with `ENDPOINT_ROLE=all` as the `media` endpoint;
+      register its `endpointId` in `fleet-registry.ts` (with M2).
+- [ ] Measure `gen_time_s` + `executionTime` + peak VRAM per mode on a real cohort's assets
+      → feeds spec §8 rate card and §16 q4 (GPU class for this role).
+- [~] `remotion` — **deferred for M1** (§16 q3): step 7 stays on the existing Remotion Lambda
+      (`src/handlers/remotion-overlay.ts`), the one remaining AWS touch in the background path.
+- **Decision taken:** caption = Whisper-regenerated from the concatenated video (does not consume
+      step 9's SRT). Step 9 keeps only if a standalone pre-concat `.srt` deliverable is wanted —
+      else the planner may drop it (M2).
+- **Done when:** each of the 5 modes completes one real job for a cohort and writes to R2.
 
 ### M2 — Plan and generate, shadow fleet
 - [ ] Planner: spec §9.1 validation, job graph, step plan, affinity collapse

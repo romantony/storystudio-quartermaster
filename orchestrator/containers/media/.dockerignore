@@ -1,6 +1,0 @@
-test/
-probe.md
-README.md
-**/__pycache__/
-*.pyc
-.pytest_cache/
