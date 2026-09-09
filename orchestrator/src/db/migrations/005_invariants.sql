@@ -12,7 +12,8 @@ CREATE UNIQUE INDEX steps_one_live_per_cohort ON steps (cohort_id)
   WHERE status IN ('scaling', 'ready', 'running', 'generated', 'gating', 'draining');
 
 -- §2.2's queue-behind rule: at most one running cohort, account-wide.
-CREATE UNIQUE INDEX cohorts_one_running ON cohorts ((status = 'running'))
+-- Unique on `status` among rows where status='running' ⇒ at most one such row.
+CREATE UNIQUE INDEX cohorts_one_running ON cohorts (status)
   WHERE status = 'running';
 
 -- Rework caps (§12.2) — a runaway cohort consumes the window.
@@ -43,8 +44,10 @@ CREATE FUNCTION verify_invariants()
          format('project %s job %s', j.project_id, j.id)
     FROM jobs j
     JOIN projects p ON p.id = j.project_id
+    JOIN (SELECT cohort_id, max(seq) AS leaf_seq FROM steps GROUP BY cohort_id) lf
+      ON lf.cohort_id = j.cohort_id
    WHERE p.status = 'completed'
-     AND j.step_seq = (SELECT max(step_seq) FROM steps WHERE cohort_id = j.cohort_id)
+     AND j.step_seq = lf.leaf_seq
      AND (j.output ->> 'url' IS NULL OR j.quality_status = 'fail');
 $$;
 
