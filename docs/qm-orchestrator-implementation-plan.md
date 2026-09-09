@@ -948,12 +948,16 @@ before breadth** — steps 1→3 end to end teaches more than thirteen half-buil
 - **Done:** a written non-expired lease makes `runProvisioner` skip the endpoint entirely.
   Orchestrator-side lease *writer* (fleet agent) lands with M3.
 
-### M1 — Two new endpoints *(parallel track, long lead time)*
-- [ ] `media` container: ffmpeg + NVENC, SR model, handlers for merge/concat/upscale/caption/bgm
-- [ ] `remotion` container: headless Chrome + the overlay renderer
-- [ ] Run §12.3's probe
-- **Done when:** each handler completes one real job and writes to object storage.
-- **Risk:** longest-lead item, and steps 6–12 all depend on it. Start it on day one.
+### M1 — Two new endpoints *(parallel track, long lead time)* — **in progress**
+- [x] `media` container: ffmpeg + NVENC + Real-ESRGAN, ops merge/concat/upscale/caption/bgm_overlay
+      — `orchestrator/containers/media/`. Pure argv-builder tests (12) + a GPU-less ffmpeg smoke
+      (libx264/lanczos) both green. `MEDIA_VIDEO_ENCODER` makes NVENC↔libx264 one switch (§16 q3).
+- [ ] Deploy the `media` image + run §12.3's probe (`orchestrator/containers/media/probe.md`) —
+      NVENC, Real-ESRGAN Vulkan, per-op VRAM. Needs a real endpoint.
+- [~] `remotion` container — **deferred for M1** (§16 q3): step 7 stays on the existing Remotion
+      Lambda (`src/handlers/remotion-overlay.ts`), the one remaining AWS touch in the background path.
+- **Done when:** each `media` op completes one real job and writes to R2 (object storage = Cloudflare R2).
+- **Risk:** longest-lead item, and steps 6–12 all depend on it.
 
 ### M2 — Plan and generate, shadow fleet
 - [ ] Planner: spec §9.1 validation, job graph, step plan, affinity collapse
