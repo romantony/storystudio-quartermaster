@@ -5,7 +5,7 @@ import { CatalogResolver } from '../catalog/resolver';
 import { getInflight } from '../gate/dynamo-gate';
 import { getReservedWorkersByEndpoint } from '../gate/reservation-gate';
 import { isInternalRung } from './router';
-import type { JobItem, ProvisionShadowItem, Queue, RunPodEndpointItem } from '../types';
+import type { EndpointLeaseItem, JobItem, ProvisionShadowItem, Queue, RunPodEndpointItem } from '../types';
 
 const TABLE = process.env.TABLE_NAME ?? 'quartermaster-jobs';
 // Shared account-wide worker cap. Raised 30→40 (2026-08-04): confirmed
@@ -137,16 +137,33 @@ function planFor(
  * mode — records the scale decision it *would* make without touching RunPod.
  */
 export async function runProvisioner(): Promise<Plan[]> {
-  const [queued, reservedWorkers] = await Promise.all([
+  const [queued, reservedWorkers, leases] = await Promise.all([
     gatherQueuedByEndpoint(),
     getReservedWorkersByEndpoint(),
+    readEndpointLeases(),
   ]);
   const now = Date.now();
+
+  // 0. Endpoints the background orchestrator currently holds a live lease on are
+  //    not ours to size this tick (impl plan §5.3): skip planning, PATCHing, and
+  //    cap-counting them entirely. The lease always carries an expiry, so a
+  //    crashed orchestrator returns the endpoint to demand-driven sizing on its
+  //    own — an expired lease is treated as absent.
+  const leasedWorkers = new Map<string, number>();
+  for (const [counterKey, lease] of Object.entries(leases)) {
+    if (lease.expiresAt > now) leasedWorkers.set(counterKey, lease.workers);
+  }
 
   // 1. Raw demand + a first-pass desired workersMax per endpoint, for the
   //    account-cap-pooled group.
   const plans: Plan[] = [];
   for (const ep of ENDPOINTS) {
+    if (leasedWorkers.has(ep.counterKey)) {
+      const l = leases[ep.counterKey];
+      console.info('[provisioner] skipping leased endpoint', ep.counterKey,
+        `held by ${l.cohortId}#${l.stepSeq} for ${l.workers}w until ${new Date(l.expiresAt).toISOString()}`);
+      continue;
+    }
     const inflight = await getInflight(ep.counterKey);
     const demand: Demand = { inflight, queued: queued[ep.counterKey] ?? 0, reserved: reservedWorkers[ep.counterKey] ?? 0 };
     const state = await readEndpoint(ep.counterKey, ep.endpointId);
@@ -154,8 +171,11 @@ export async function runProvisioner(): Promise<Plan[]> {
   }
 
   // 2. Rebalance to respect the shared account cap (sum of workersMax ≤ cap),
-  //    proportional to each endpoint's demand share (organic + reserved).
-  rebalanceUnderCap(plans);
+  //    proportional to each endpoint's demand share (organic + reserved). The
+  //    cap the live path may rebalance under is reduced by whatever the
+  //    orchestrator holds under lease (§5.2: 40 − 25 = 15).
+  const leasedTotal = [...leasedWorkers.values()].reduce((a, w) => a + w, 0);
+  rebalanceUnderCap(plans, ACCOUNT_CAP - leasedTotal);
 
   // 2b. Standalone endpoints (own dedicated GPU, see STANDALONE_ENDPOINTS) get
   //     the same demand/cooldown lifecycle but are never subject to the cap
@@ -201,6 +221,12 @@ export async function runProvisioner(): Promise<Plan[]> {
  */
 export async function prewarmEndpoints(neededWorkers: Record<string, number>): Promise<void> {
   const now = Date.now();
+  // NOTE (impl plan §5.3): an endpoint lease is checked in the 2-min sweeper
+  // (runProvisioner), not on this per-grant hot path. The narrow race — a grant
+  // pre-warming an endpoint the background orchestrator holds under lease at a
+  // *lower* count — self-corrects: the orchestrator's fleet agent re-asserts its
+  // target every tick, and QM_LIVE_RESERVE_WORKERS (§16 q8) leaves headroom for
+  // it. Revisit if that reserve proves too tight in practice.
   for (const [counterKey, workers] of Object.entries(neededWorkers)) {
     const ep = ENDPOINTS.find(e => e.counterKey === counterKey)
       ?? STANDALONE_ENDPOINTS.find(e => e.counterKey === counterKey);
@@ -241,10 +267,14 @@ function demandWeight(p: Plan): number {
   return p.demand.inflight + p.demand.queued + p.demand.reserved * JOBS_PER_WORKER;
 }
 
-/** Clamp total workersMax across endpoints to ACCOUNT_CAP, demand-weighted. */
-function rebalanceUnderCap(plans: Plan[]): void {
+/**
+ * Clamp total workersMax across endpoints to `cap`, demand-weighted. `cap`
+ * defaults to the full ACCOUNT_CAP but is passed reduced by any workers the
+ * background orchestrator holds under an endpoint lease (§5.3).
+ */
+function rebalanceUnderCap(plans: Plan[], cap: number = ACCOUNT_CAP): void {
   const sum = plans.reduce((a, p) => a + p.toMax, 0);
-  if (sum <= ACCOUNT_CAP) return;
+  if (sum <= cap) return;
 
   const totalDemand = plans.reduce((a, p) => a + demandWeight(p), 0);
   let allocated = 0;
@@ -252,14 +282,14 @@ function rebalanceUnderCap(plans: Plan[]): void {
     const d = demandWeight(p);
     // At least 1 for any endpoint with demand; otherwise proportional share.
     const share = totalDemand > 0
-      ? Math.max(d > 0 ? 1 : 0, Math.floor((d / totalDemand) * ACCOUNT_CAP))
-      : Math.floor(ACCOUNT_CAP / plans.length);
+      ? Math.max(d > 0 ? 1 : 0, Math.floor((d / totalDemand) * cap))
+      : Math.floor(cap / plans.length);
     p.toMax = Math.min(p.toMax, Math.max(share, d > 0 ? 1 : 0));
     allocated += p.toMax;
     if (p.toMax < p.toMin) p.toMin = p.toMax; // keep min ≤ max
   }
   // Hand any leftover headroom to the hungriest endpoint.
-  let leftover = ACCOUNT_CAP - allocated;
+  let leftover = cap - allocated;
   if (leftover > 0) {
     const sorted = [...plans].sort((a, b) => demandWeight(b) - demandWeight(a));
     for (const p of sorted) {
@@ -324,6 +354,34 @@ function jobCounterKey(job: JobItem): string | undefined {
   const resolver = CatalogResolver.forQueue((job.queue ?? 'background') as Queue);
   const ladder = resolver.getLadder(job.assetType, job.tier, job.operation);
   return ladder.find(isInternalRung)?.counterKey;
+}
+
+// ─── Background-orchestrator endpoint leases (impl plan §5.3) ─────────────────
+
+/**
+ * Read the background orchestrator's active endpoint leases — one Query on
+ * pk='ENDPOINTLEASE'. Returns counterKey → lease; the caller filters on expiry
+ * itself (a lease whose `expiresAt` has passed is treated as absent, so a dead
+ * orchestrator cannot hold the live path at reduced capacity). Exported for the
+ * provisioner tests.
+ */
+export async function readEndpointLeases(): Promise<Record<string, EndpointLeaseItem>> {
+  const out: Record<string, EndpointLeaseItem> = {};
+  let lastKey: Record<string, unknown> | undefined;
+  do {
+    const res = await db.send(new QueryCommand({
+      TableName: TABLE,
+      KeyConditionExpression: 'pk = :pk',
+      ExpressionAttributeValues: marshall({ ':pk': 'ENDPOINTLEASE' }),
+      ExclusiveStartKey: lastKey ? marshall(lastKey) : undefined,
+    }));
+    for (const raw of res.Items ?? []) {
+      const lease = unmarshall(raw) as EndpointLeaseItem;
+      if (lease.sk) out[lease.sk] = lease;
+    }
+    lastKey = res.LastEvaluatedKey ? unmarshall(res.LastEvaluatedKey) : undefined;
+  } while (lastKey);
+  return out;
 }
 
 // ─── Endpoint state + shadow audit ───────────────────────────────────────────

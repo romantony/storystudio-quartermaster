@@ -23,6 +23,7 @@ interface Scenario {
   inflight?: Record<string, number>;       // counterKey -> inflight
   activeReservations?: unknown[];          // plain ReservationItem-shaped objects
   endpointState?: Record<string, { workersMin: number; workersMax: number }>;
+  leases?: Array<Record<string, unknown>>; // EndpointLeaseItem-shaped objects (pk='ENDPOINTLEASE')
 }
 
 function mockScenario(s: Scenario) {
@@ -33,6 +34,13 @@ function mockScenario(s: Scenario) {
       if (cmd.input.IndexName === 'queue-index') return { Items: [] }; // no queued jobs
       if (cmd.input.IndexName === 'reservation-status-index') {
         return { Items: (s.activeReservations ?? []).map(r => marshall(r as Record<string, unknown>)) };
+      }
+      // readEndpointLeases(): main-table Query on pk='ENDPOINTLEASE'
+      if (!cmd.input.IndexName && cmd.input.KeyConditionExpression === 'pk = :pk') {
+        const vals = unmarshall(cmd.input.ExpressionAttributeValues);
+        if (vals[':pk'] === 'ENDPOINTLEASE') {
+          return { Items: (s.leases ?? []).map(l => marshall(l)) };
+        }
       }
       return { Items: [] };
     }
@@ -143,6 +151,65 @@ describe('runProvisioner — reservation-aware demand (WS-C2)', () => {
     expect(flux.toMax).toBeGreaterThan(0);          // not starved to zero
     expect(flux.toMin).toBe(1);                      // still pre-warmed
     expect(qwenGen.toMax).toBeGreaterThan(flux.toMax); // heavier organic demand still wins more share
+  });
+});
+
+describe('runProvisioner — background orchestrator endpoint leases (impl plan §5.3)', () => {
+  const lease = (counterKey: string, workers: number, expiresAt: number) => ({
+    pk: 'ENDPOINTLEASE', sk: counterKey, holder: 'orchestrator',
+    cohortId: 'win_2026_09_01_18', stepSeq: 3, workers, expiresAt, updatedAt: Date.now(),
+  });
+
+  it('skips a live-leased endpoint entirely — no plan, no PATCH, no cap-count', async () => {
+    // Heavy organic demand on wan2-i2v that would normally pull it to 25 — but
+    // the background orchestrator holds it, so the provisioner must not touch it.
+    mockScenario({
+      inflight: { 'runpod:wan2-i2v': 200 },
+      leases: [lease('runpod:wan2-i2v', 25, Date.now() + 30 * 60_000)],
+    });
+
+    const plans = await runProvisioner();
+
+    expect(plans.some(p => p.counterKey === 'runpod:wan2-i2v')).toBe(false);
+    // the rest of the pool is still planned normally
+    expect(plans.some(p => p.counterKey === 'runpod:flux-tts-s2t')).toBe(true);
+    // nothing was written or PATCHed for the leased endpoint
+    const wroteWan2 = sendMock.mock.calls
+      .filter(c => (c[0] as any).constructor.name === 'PutItemCommand')
+      .some(c => {
+        const item = unmarshall((c[0] as any).input.Item);
+        return item.sk === 'runpod:wan2-i2v' || item.counterKey === 'runpod:wan2-i2v';
+      });
+    expect(wroteWan2).toBe(false);
+  });
+
+  it('ignores an expired lease — the endpoint is sized from demand as usual', async () => {
+    mockScenario({ inflight: {}, leases: [lease('runpod:wan2-i2v', 25, Date.now() - 60_000)] });
+
+    const plans = await runProvisioner();
+
+    const wan2 = plans.find(p => p.counterKey === 'runpod:wan2-i2v');
+    expect(wan2).toBeDefined();
+    expect(wan2!.toMax).toBe(10); // its normal idle baseline, untouched by the stale lease
+  });
+
+  it('rebalances the live path under a cap reduced by the leased workers', async () => {
+    // wan2-i2v leased at 25 → the four remaining pooled endpoints must fit in
+    // 40 − 25 = 15. Heavy organic demand on all four so rebalanceUnderCap fires.
+    mockScenario({
+      inflight: {
+        'runpod:flux-tts-s2t': 200, 'runpod:qwen-image-gen': 200,
+        'runpod:qwen-image-edit': 200, 'runpod:bgm-s2t': 200,
+      },
+      leases: [lease('runpod:wan2-i2v', 25, Date.now() + 30 * 60_000)],
+    });
+
+    const plans = await runProvisioner();
+
+    expect(plans.some(p => p.counterKey === 'runpod:wan2-i2v')).toBe(false);
+    const pooledTotal = plans.reduce((a, p) => a + p.toMax, 0);
+    expect(pooledTotal).toBeLessThanOrEqual(15); // ACCOUNT_CAP(40) − leased(25)
+    expect(pooledTotal).toBeGreaterThan(0);
   });
 });
 
