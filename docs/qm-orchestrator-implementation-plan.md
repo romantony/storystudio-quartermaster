@@ -620,11 +620,19 @@ Emits the spec §9.6 shape. Three parts of it are load-bearing rather than decor
 ```sql
 -- a project is 'completed' ONLY if this returns zero rows
 SELECT j.id FROM jobs j
+JOIN (SELECT cohort_id, max(seq) AS leaf_seq FROM steps GROUP BY cohort_id) lf
+  ON lf.cohort_id = j.cohort_id
 WHERE j.project_id = $1
-  AND j.step_seq = (SELECT max(step_seq) FROM steps WHERE cohort_id = j.cohort_id)  -- leaf
+  AND j.step_seq = lf.leaf_seq                        -- leaf: steps.seq, not step_seq
   AND (j.output->>'url' IS NULL OR j.quality_status = 'fail');
 -- anything else is 'partial', with errors[] populated
 ```
+
+> The leaf-step column on `steps` is `seq`, not `step_seq` (`step_seq` is on
+> `jobs`). Written as `(SELECT max(step_seq) FROM steps …)` Postgres resolves
+> `step_seq` to the outer `jobs` row and rejects it — "aggregate functions are
+> not allowed in WHERE". The `GROUP BY` join above is the working form (and is
+> what `005_invariants.sql`'s `verify_invariants()` uses).
 
 **Shorts close by construction.** "Shorts complete" is defined as *manifest read and clip URLs
 recorded in `assets.shorts[]`*, not as "the render job returned 200". That closes the still-open
@@ -923,20 +931,22 @@ and the warm-up figure rises ~$1.51 a cohort. Half a day; it validates §6.2's a
 Each milestone is independently shippable and independently reversible. **The vertical slice comes
 before breadth** — steps 1→3 end to end teaches more than thirteen half-built steps.
 
-### M0 — Foundations *(no RunPod contact)*
-- [ ] `orchestrator/` workspace, config, pg pool, migrations `001`–`004`
-- [ ] `fleet-registry.ts` generated from `fleet.ts`; a test that fails if they diverge
-- [ ] `runpod/client.ts` with retry/backoff/timeouts; **recorded fixtures, no live calls**
-- [ ] Fastify server, `/v1/health`, structured logging
-- **Done when:** migrations apply and roll back cleanly; `/v1/health` reports pg reachable.
+### M0 — Foundations *(no RunPod contact)* — **DONE 2026-09-09**
+- [x] `orchestrator/` workspace, config, pg pool, migrations `001`–`005` (`005` = §4.5 invariants)
+- [x] `fleet-registry.ts` generated from `fleet.ts`; a test that fails if they diverge
+- [x] `runpod/client.ts` with retry/backoff/timeouts; **recorded fixtures, no live calls**
+- [x] Fastify server, `/v1/health`, structured logging
+- **Done:** migrations apply + roll back cleanly on the VPS's Postgres 16; `/v1/health` → 200.
+  Deployed at `orchestrator.ai-storystudio.com` (compose: db + orchestrator + caddy). Commits
+  `ab7f402`, `8e735ba`, `eec0f23`. Runbook: `docs/qm-orchestrator-vps-access.md`.
 
-### M0.5 — The live-path lease *(AWS side; ~40 lines; blocks M3)*
-- [ ] `EndpointLeaseItem` in `src/types.ts`; lease read + skip in `runProvisioner()`
-- [ ] Leased workers subtracted from `ACCOUNT_CAP` in `rebalanceUnderCap`
-- [ ] Three tests in `__tests__/provisioner.test.ts` (§5.3)
-- **Done when:** a written lease demonstrably makes the provisioner skip that endpoint.
-- **Ship this early.** It is harmless while no lease exists, and it is the prerequisite for every
-  live scale-up that follows.
+### M0.5 — The live-path lease *(AWS side; blocks M3)* — **DONE 2026-09-09** (`d138d71`)
+- [x] `EndpointLeaseItem` in `src/types.ts`; `readEndpointLeases()` + skip in `runProvisioner()`
+- [x] Leased workers subtracted from `ACCOUNT_CAP` — `rebalanceUnderCap(plans, cap)` called as
+      `ACCOUNT_CAP - sum(leased)`
+- [x] Three tests in `__tests__/provisioner.test.ts` (§5.3); suite 6 → 9, green
+- **Done:** a written non-expired lease makes `runProvisioner` skip the endpoint entirely.
+  Orchestrator-side lease *writer* (fleet agent) lands with M3.
 
 ### M1 — Two new endpoints *(parallel track, long lead time)*
 - [ ] `media` container: ffmpeg + NVENC, SR model, handlers for merge/concat/upscale/caption/bgm
