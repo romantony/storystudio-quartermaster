@@ -86,20 +86,24 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
 
   await updateStepStatus(pool, cohortId, step.seq, 'scaling');
 
-  // workersMin stays 0 — only the ceiling (workersMax) moves. Forcing
-  // workersMin up would keep `step.workers` GPUs permanently active for the
-  // whole allocation, not just available up to it; RunPod's own QUEUE_DELAY
-  // scaler provisions real workers against workersMax as jobs are actually
-  // submitted. Confirmed this is the right lever by hand throughout M2's
-  // real acceptance run and the postprod-lite redeploy (2026-09-10) — every
-  // manual scale-up in both used workersMax only, workersMin never left 0.
+  // workersMin == workersMax == target: ACTIVE workers, not a flex floor
+  // (impl plan §6.3). Raising workersMin is what actually commands RunPod to
+  // provision workers proactively; raising workersMax alone only lifts a
+  // ceiling that RunPod's QUEUE_DELAY scaler won't act on until jobs are
+  // already queued — and nothing queues until this function returns and
+  // steps.status flips to 'ready'. That gap is exactly the chicken-and-egg
+  // stall M2's real acceptance run hit on its first two attempts (a human
+  // manually raising workersMax only, with no queued jobs, produced no
+  // scale-up). A prior version of this function tried workersMin: 0 based on
+  // that manual workaround — reverted: it would reproduce the same stall
+  // with nobody there to unstick it once M3 runs unattended.
   if (cfg.fleetLive) {
-    await runpod.patchWorkers(step.endpointId, { workersMin: 0, workersMax: step.workers });
+    await runpod.patchWorkers(step.endpointId, { workersMin: step.workers, workersMax: step.workers });
     log().info({ endpointId: step.endpointId, workers: step.workers }, 'fleet: patched workers (live)');
   } else {
     log().info(
       { endpointId: step.endpointId, workers: step.workers },
-      `fleet: SHADOW — would PATCH ${step.endpointId} max -> ${step.workers} (min stays 0)`,
+      `fleet: SHADOW — would PATCH ${step.endpointId} min/max -> ${step.workers}`,
     );
   }
 

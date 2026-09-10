@@ -1046,18 +1046,18 @@ rejected as too risky.
 - [ ] Flip `ORCH_FLEET_LIVE=true` on one endpoint, one step
 - [ ] Warm/drain verification polls, cap assertion, stall handling
 - [ ] Watchdog deployed **first**, alerting, before the first live scale-up
-- **Decided and already fixed in code, ahead of M3**: `agents/fleet.ts`'s `allocate()`
-  originally PATCHed `workersMin` up to `step.workers` alongside `workersMax` — meaning
-  once live, a step's full worker count would be forced permanently active for the whole
-  allocation, not just available as a ceiling. Corrected: `allocate()` now always sends
-  `workersMin: 0`, only `workersMax` moves to `step.workers`. This matches every manual
-  scale observed to actually work this session (M2's real acceptance run and the
-  `postprod-lite` redeploy both scaled via `workersMax` alone, `workersMin` always 0) —
-  RunPod's own `QUEUE_DELAY` scaler provisions real workers against the `workersMax`
-  ceiling as jobs are actually submitted, so there's no need (and real added cost) to
-  force a floor. `release()` was already correct (`0`/`0`). No test asserted the old
-  behavior — the fix is a plain two-line diff, 52/56 orchestrator tests still green
-  (4 skipped need a live DB).
+- **Settled ahead of M3, after a same-day back-and-forth worth recording**: `agents/fleet.ts`'s
+  `allocate()` briefly had `workersMin` changed to always stay `0` (reasoning: every manual
+  scale during M2's real acceptance run and the `postprod-lite` redeploy used `workersMax`
+  alone). **Reverted** — that manual pattern only worked *because a human was watching and
+  could nudge a stalled scale-up*. Re-reading this spec's own §6.3 (above) makes the
+  original design's reasoning explicit: raising `workersMin` is what actually *commands*
+  RunPod to provision workers proactively; raising `workersMax` alone only lifts a ceiling
+  that the `QUEUE_DELAY` scaler won't act on until jobs are already queued — and nothing
+  queues until `allocate()` returns and `steps.status` flips to `ready`. That gap is exactly
+  the chicken-and-egg stall M2 hit on its first two attempts. `allocate()` now correctly
+  matches §6.3: `workersMin == workersMax == step.workers`. 52/56 orchestrator tests green
+  (4 skipped need a live DB) with the reverted version.
 - **Done when:** a step scales 0→25→0 with both polls verified, and the watchdog stays silent.
 
 ### M4 — Quality gates
