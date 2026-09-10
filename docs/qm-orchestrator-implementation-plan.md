@@ -1043,22 +1043,51 @@ rejected as too risky.
   — still applies once the real run happens.
 
 ### M3 — Live fleet control
-- [ ] Flip `ORCH_FLEET_LIVE=true` on one endpoint, one step
-- [ ] Warm/drain verification polls, cap assertion, stall handling
-- [ ] Watchdog deployed **first**, alerting, before the first live scale-up
-- **Settled ahead of M3, after a same-day back-and-forth worth recording**: `agents/fleet.ts`'s
-  `allocate()` briefly had `workersMin` changed to always stay `0` (reasoning: every manual
-  scale during M2's real acceptance run and the `postprod-lite` redeploy used `workersMax`
-  alone). **Reverted** — that manual pattern only worked *because a human was watching and
-  could nudge a stalled scale-up*. Re-reading this spec's own §6.3 (above) makes the
-  original design's reasoning explicit: raising `workersMin` is what actually *commands*
-  RunPod to provision workers proactively; raising `workersMax` alone only lifts a ceiling
-  that the `QUEUE_DELAY` scaler won't act on until jobs are already queued — and nothing
-  queues until `allocate()` returns and `steps.status` flips to `ready`. That gap is exactly
-  the chicken-and-egg stall M2 hit on its first two attempts. `allocate()` now correctly
-  matches §6.3: `workersMin == workersMax == step.workers`. 52/56 orchestrator tests green
-  (4 skipped need a live DB) with the reverted version.
-- **Done when:** a step scales 0→25→0 with both polls verified, and the watchdog stays silent.
+- [x] Watchdog deployed **first**, alerting, before the first live scale-up — **DONE
+      2026-09-10**. `endpoint_state` (already in `001_init.sql`, unwired until now) is the
+      Postgres-only claim `watchdog.ts` checks against RunPod's real worker counts —
+      MCP-originated traffic never touches the AWS Lambda live-path provisioner/DynamoDB at
+      all, confirmed this session, so §5.3/§6.9's DynamoDB lease design was unnecessary.
+      Scoped to only `STEP_CATALOG`'s endpoints, not the full `FLEET` — an unscoped first
+      deploy immediately false-positived on `multitalk` (a deliberate standing pool) and
+      `bgm-s2t` (a still-warm worker from an unrelated direct RunPod call), both legitimate
+      non-orchestrator traffic on shared endpoints.
+- [x] Flip `ORCH_FLEET_LIVE=true` on one endpoint, one step — **attempted live 2026-09-10,
+      found a real flaw, fixed, re-verification pending.** First attempt used the spec's
+      literal `workersMin == workersMax == target` design (directly above, historically):
+      raised 5 real workers on `qwen-image-gen`, which is genuinely different from — and
+      better than — the earlier manual `workersMax`-only pattern (RunPod visibly provisioned
+      5 workers in parallel, confirmed via `running: 5`, instead of never provisioning
+      anything absent queued demand). But those 5 workers never reported `ready` within the
+      8-minute `warmTimeoutMs` and the step stalled — **billing 5 active workers for 8+
+      minutes with zero job throughput**, since job submission was gated behind full
+      readiness that never arrived. Manually drained to stop the bleed.
+- **The actual fix, not a fourth flip-flop on `workersMin`**: the real problem was gating
+  job submission on worker readiness at all. `generator.ts`'s `submitOne()` just POSTs
+  `/run`, which RunPod queues regardless of current real worker count — its own
+  `QUEUE_DELAY` scaler reacts to actually-queued jobs, exactly how every manual `/run` call
+  this session (`postprod-lite`, `BGM-S2T`) worked reliably. So: **`workersMin` never
+  leaves 0, anywhere.** `allocate()` now only raises `workersMax`, does a single cheap
+  reachability probe (not a poll) plus the existing cap assertion, and hands off
+  immediately — no blocking wait. `generator.ts`'s `runStep()` now owns cold-start-stall
+  detection instead, non-blockingly, inside its existing loop: if no real `ready` worker
+  has been observed and no job has reached terminal within `warmTimeoutMs`, it throws a new
+  `GeneratorStallError('warm_timeout', ...)` — restoring the same protection the old
+  blocking poll gave, without ever billing for it, since `workersMin` stayed 0 the whole
+  time waiting. `warmAt` moved with it: now set on the first observed `ready > 0` inside
+  the generator's loop, not by `allocate()` (which no longer observes real readiness at
+  all). Validated (Plan agent stress-test + implementation) 2026-09-10: `PatchWorkersBody
+  .workersMin` made optional (prerequisite type fix), 69/78 orchestrator tests green (9
+  skipped need a live DB) including new `fleet.test.ts`/`generator.test.ts` coverage that
+  didn't exist before this incident. **Re-running the real live acceptance test against
+  this fix is still pending** — see `docs/qm-orchestrator-session-2026-09-10-m2.md`'s
+  successor doc once written.
+- [ ] Warm/drain verification polls, cap assertion, stall handling — cap assertion and
+      drain verification unchanged from M2; warm verification redesigned per above, not yet
+      re-proven live.
+- **Done when:** a step scales 0→N→0 unattended, real workers ramp in response to queued
+  jobs (not blocked on it), and the watchdog stays silent throughout. Not yet met — pending
+  the re-run.
 
 ### M4 — Quality gates
 - [ ] Evaluator wrappers, `jobs_ungated` queue, verdict writes

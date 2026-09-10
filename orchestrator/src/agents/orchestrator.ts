@@ -15,7 +15,7 @@ import { listSteps } from '../db/repo/steps';
 import { getCohort, setCurrentStep } from '../db/repo/cohorts';
 import { catalogEntry } from '../steps/catalog';
 import { allocate, release, type FleetDeps } from './fleet';
-import { runStep, type GeneratorDeps } from './generator';
+import { runStep, GeneratorStallError, type GeneratorDeps } from './generator';
 
 export interface DriverDeps {
   pool: Pool;
@@ -59,7 +59,11 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
     try {
       await runStep(generatorDeps, cohortId, catalog, dbStep.workersTarget);
     } catch (err) {
-      log().error({ cohortId, seq: dbStep.seq, err }, 'driver: generator failed, stopping cohort');
+      const stalled = err instanceof GeneratorStallError;
+      log().error(
+        { cohortId, seq: dbStep.seq, err },
+        stalled ? 'driver: generator stalled, stopping cohort' : 'driver: generator failed, stopping cohort',
+      );
       return;
     }
 

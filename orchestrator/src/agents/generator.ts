@@ -29,11 +29,28 @@ import { runpodOutUrl } from '../runpod/output';
 export interface GeneratorDeps {
   pool: Pool;
   runpod: RunpodClient;
-  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs'>;
+  // warmTimeoutMs: fleet.ts's allocate() no longer polls for readiness (M3
+  // fix, 2026-09-10) — runStep()'s own non-blocking cold-start check owns
+  // that timeout now, reusing the same config value.
+  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs'>;
   /** Base URL this process is reachable at (e.g. https://orchestrator.ai-storystudio.com),
    * used to build each job's per-job webhook callback URL. */
   publicBaseUrl: string;
   webhookSecret: string;
+}
+
+export type GeneratorStallReason = 'warm_timeout';
+
+/** Mirrors FleetStallError's shape — runStep()'s own stall, now that
+ * allocate() no longer blocks on real worker readiness. */
+export class GeneratorStallError extends Error {
+  constructor(
+    readonly reason: GeneratorStallReason,
+    readonly detail?: Record<string, unknown>,
+  ) {
+    super(`generator stalled: ${reason}${detail ? ' ' + JSON.stringify(detail) : ''}`);
+    this.name = 'GeneratorStallError';
+  }
 }
 
 /** Resolves a job's step-dependency outputs into the shape steps/builders
@@ -160,21 +177,29 @@ export async function reconcileTick(deps: GeneratorDeps, cohortId: string, step:
 }
 
 /**
- * Runs one step to completion: claims + submits work up to the verified
+ * Runs one step to completion: claims + submits work up to the target
  * worker count, waits for webhooks/reconcile to bring every job to a
- * terminal state. `verifiedWorkers` comes from the fleet controller's
- * already-verified health check — never a config value (impl plan §6.4).
+ * terminal state. `targetWorkers` is the planned/configured worker count
+ * for this step (`steps.workers_target`) — as of the M3 fix (2026-09-10)
+ * this is no longer a fleet-verified real count (allocate() doesn't poll
+ * for readiness anymore); it's the ceiling RunPod's own QUEUE_DELAY
+ * autoscaler is expected to grow real capacity into as jobs actually land
+ * against it. submitOne() just POSTs /run, which RunPod queues regardless
+ * of current real worker count — that's the whole mechanism this relies on.
  */
-export async function runStep(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, verifiedWorkers: number): Promise<void> {
+export async function runStep(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, targetWorkers: number): Promise<void> {
   await updateStepStatus(deps.pool, cohortId, step.seq, 'running', { startedAt: new Date() });
-  log().info({ stepSeq: step.seq, verifiedWorkers }, 'generator: step running');
+  log().info({ stepSeq: step.seq, targetWorkers }, 'generator: step running');
+
+  const loopStartedAt = Date.now();
+  let warmedAt: Date | null = null;
 
   for (;;) {
     const { total, terminal } = await stepJobCounts(deps.pool, cohortId, step.seq);
     if (terminal >= total) break;
 
     const inFlight = (await listInFlight(deps.pool, cohortId, step.seq)).length;
-    const room = Math.max(0, verifiedWorkers - inFlight);
+    const room = Math.max(0, targetWorkers - inFlight);
     if (room > 0) {
       const batch = await claimBatchReadOnly(deps.pool, cohortId, step.seq, room);
       for (const job of batch) {
@@ -187,6 +212,49 @@ export async function runStep(deps: GeneratorDeps, cohortId: string, step: Catal
     // actively generating, not just at allocation — watchdog.ts's orphan
     // grace window is measured from this timestamp.
     await touchObserved(deps.pool, step.endpointId);
+
+    // Non-blocking cold-start check — only probes until this step has
+    // observed a real ready worker; a no-op for the rest of the step once
+    // warm. Restores the protection allocate()'s removed blocking poll used
+    // to provide, without its billing cost: workersMin stays 0 throughout,
+    // so a stuck cold start here costs nothing while waiting, unlike the
+    // 2026-09-10 incident where 5 active workers billed for the full
+    // warmTimeoutMs with zero job throughput.
+    if (!warmedAt) {
+      try {
+        const h = await deps.runpod.health(step.endpointId);
+        const ready = h.workers.ready ?? 0;
+        if (ready > 0) {
+          warmedAt = new Date();
+          await updateStepStatus(deps.pool, cohortId, step.seq, 'running', { warmAt: warmedAt });
+          log().info({ stepSeq: step.seq, endpointId: step.endpointId }, 'generator: endpoint observed warm');
+        } else if (Date.now() - loopStartedAt > deps.cfg.warmTimeoutMs && terminal === 0) {
+          // terminal===0, not a fraction/total check: the moment ANY job in
+          // this step reaches complete/failed, forward progress happened,
+          // so "the endpoint never came up" stops being the right diagnosis
+          // even if ready is still reading 0 for some unrelated reason.
+          // This also sidesteps a real, pre-existing, separate bug rather
+          // than masking it: a job whose upstream dependency FAILED (not
+          // completed) never decrements deps_remaining (db/repo/jobs.ts —
+          // no rework path until M4), so it can sit stuck forever. Don't
+          // "fix" this condition into checking total/terminal ratios; that
+          // would reintroduce a false stall on a healthy endpoint whenever
+          // any single frame's dependency chain is broken.
+          await updateStepStatus(deps.pool, cohortId, step.seq, 'stalled');
+          throw new GeneratorStallError('warm_timeout', {
+            endpointId: step.endpointId,
+            stepSeq: step.seq,
+            elapsedMs: Date.now() - loopStartedAt,
+            total,
+            terminal,
+          });
+        }
+      } catch (err) {
+        if (err instanceof GeneratorStallError) throw err;
+        log().warn({ stepSeq: step.seq, err }, 'generator: warm-check health probe failed, will retry next tick');
+      }
+    }
+
     await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, deps.cfg.reconcileIntervalMs)));
   }
 

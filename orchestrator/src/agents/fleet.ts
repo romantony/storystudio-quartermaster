@@ -4,10 +4,11 @@
  * __tests__/fleet-import-boundary.test.ts, not just this comment.
  *
  * Shadow mode (`cfg.fleetLive === false`, the default): does everything
- * except the two `patchWorkers` calls, logging what it would have sent.
- * Health verification and cap assertion happen for real regardless — M2's
- * acceptance run hand-scales one endpoint's real worker count so this real
- * verification has something real to observe (see the M2 plan's decision 5).
+ * except the two `patchWorkers` calls, logging what it would have sent. A
+ * single reachability probe (not a poll-until-ready loop — see allocate())
+ * and the cap assertion happen for real regardless — M2's acceptance run
+ * hand-scales one endpoint's real worker count so this real verification
+ * has something real to observe (see the M2 plan's decision 5).
  *
  * M0.5's original design called for a DynamoDB lease written here, read by
  * the AWS Lambda live-path provisioner. M3 confirmed that's unnecessary:
@@ -26,7 +27,7 @@ import { log } from '../telemetry/log';
 import { updateStepStatus } from '../db/repo/steps';
 import { upsertHeld, clearHeld } from '../db/repo/endpoint-state';
 
-export type StallReason = 'warm_timeout' | 'cap_breach' | 'drain_timeout';
+export type StallReason = 'unreachable' | 'cap_breach' | 'drain_timeout';
 
 export class FleetStallError extends Error {
   constructor(
@@ -41,7 +42,9 @@ export class FleetStallError extends Error {
 export interface FleetDeps {
   pool: Pool;
   runpod: RunpodClient;
-  cfg: Pick<Config, 'fleetLive' | 'warmTimeoutMs' | 'drainTimeoutMs' | 'accountCap' | 'liveReserveWorkers'>;
+  // warmTimeoutMs moved to generator.ts's GeneratorDeps — allocate() no
+  // longer polls for readiness, so it has no use for it here.
+  cfg: Pick<Config, 'fleetLive' | 'drainTimeoutMs' | 'accountCap' | 'liveReserveWorkers'>;
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -61,10 +64,11 @@ async function pollUntil(
 }
 
 /**
- * Reads every other endpoint's currently-configured `workersMax` from
- * RunPod directly — impl plan §6.3 step 4: raising to N while others hold
- * workers does not error, it caps silently. This is the real read that
- * catches that before it happens invisibly.
+ * Reads every other endpoint's real, currently-observed worker draw from
+ * RunPod directly (not their configured `workersMax` — see the note on
+ * `ready + running` below) — impl plan §6.3 step 4: raising to N while
+ * others hold workers does not error, it caps silently. This is the real
+ * read that catches that before it happens invisibly.
  */
 async function sumWorkersMaxExcept(deps: FleetDeps, endpointId: string, others: string[]): Promise<number> {
   let sum = 0;
@@ -89,52 +93,55 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
 
   await updateStepStatus(pool, cohortId, step.seq, 'scaling');
 
-  // workersMin == workersMax == target: ACTIVE workers, not a flex floor
-  // (impl plan §6.3). Raising workersMin is what actually commands RunPod to
-  // provision workers proactively; raising workersMax alone only lifts a
-  // ceiling that RunPod's QUEUE_DELAY scaler won't act on until jobs are
-  // already queued — and nothing queues until this function returns and
-  // steps.status flips to 'ready'. That gap is exactly the chicken-and-egg
-  // stall M2's real acceptance run hit on its first two attempts (a human
-  // manually raising workersMax only, with no queued jobs, produced no
-  // scale-up). A prior version of this function tried workersMin: 0 based on
-  // that manual workaround — reverted: it would reproduce the same stall
-  // with nobody there to unstick it once M3 runs unattended.
+  // Only workersMax ever moves. workersMin stays 0, always, everywhere in
+  // this codebase. A real live test (2026-09-10) found the opposite design
+  // (workersMin == workersMax == target, "active workers") can get stuck
+  // mid-cold-start indefinitely while billing the whole time — 5 real
+  // workers ran for the full 8-minute warmTimeoutMs and never reported
+  // ready, with zero job throughput. RunPod's own QUEUE_DELAY scaler grows
+  // real capacity in response to actually-queued jobs, not to a raised
+  // ceiling alone and not reliably to a raised floor either — every manual
+  // /run submission this session against a workersMin=0 endpoint (postprod-
+  // lite, BGM-S2T) scaled up and completed reliably. So allocate() no longer
+  // waits for real readiness before handing off — it raises the ceiling,
+  // does a cheap reachability check, and lets the generator start
+  // submitting immediately; generator.ts's runStep() owns cold-start-stall
+  // detection now, non-blockingly, without the billing cost (see its
+  // GeneratorStallError).
   if (cfg.fleetLive) {
-    await runpod.patchWorkers(step.endpointId, { workersMin: step.workers, workersMax: step.workers });
-    log().info({ endpointId: step.endpointId, workers: step.workers }, 'fleet: patched workers (live)');
+    await runpod.patchWorkers(step.endpointId, { workersMax: step.workers });
+    log().info({ endpointId: step.endpointId, workers: step.workers }, 'fleet: patched workersMax (live)');
   } else {
     log().info(
       { endpointId: step.endpointId, workers: step.workers },
-      `fleet: SHADOW — would PATCH ${step.endpointId} min/max -> ${step.workers}`,
+      `fleet: SHADOW — would PATCH ${step.endpointId} workersMax -> ${step.workers} (workersMin stays 0)`,
     );
   }
 
-  // Record the claim BEFORE the warm-up poll, not after — cold start can
-  // take up to warmTimeoutMs (8 min default), and watchdog.ts ticks every
-  // 60s. Writing this only on success would leave a window where real
-  // RunPod workers are visibly ramping up but endpoint_state shows no
-  // claim, which watchdog would misread as an orphan mid-scale-up.
+  // Record the claim right after the PATCH, before anything else — a real
+  // worker could start appearing the moment RunPod sees the raised ceiling
+  // and a job lands in its queue; watchdog.ts must never see that without a
+  // matching claim on record.
   await upsertHeld(pool, step.endpointId, {
     cohortId,
     stepSeq: step.seq,
     workersMax: step.workers,
-    workersMin: step.workers,
+    workersMin: 0,
     workersReady: 0,
   });
 
-  let lastReady = 0;
-  const ready = await pollUntil(
-    async () => {
-      const h = await runpod.health(step.endpointId);
-      lastReady = h.workers.ready ?? 0;
-      return lastReady >= step.workers;
-    },
-    { everyMs: 5_000, timeoutMs: cfg.warmTimeoutMs },
-  );
-  if (!ready) {
+  // One cheap reachability probe, NOT a poll-until-ready loop — catches a
+  // typo'd/deleted endpointId immediately rather than minutes into
+  // generation. Must not gate on ready/running counts; that's exactly what
+  // this function is no longer allowed to wait on.
+  try {
+    await runpod.health(step.endpointId);
+  } catch (err) {
     await updateStepStatus(pool, cohortId, step.seq, 'stalled');
-    throw new FleetStallError('warm_timeout', { endpointId: step.endpointId, target: step.workers });
+    throw new FleetStallError('unreachable', {
+      endpointId: step.endpointId,
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 
   const otherEndpointIds = FLEET.map((e) => e.endpointId).filter((id) => id !== step.endpointId);
@@ -144,17 +151,8 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
     throw new FleetStallError('cap_breach', { others, accountCap: cfg.accountCap, requested: step.workers });
   }
 
-  // Refresh with the confirmed-ready count and a fresh observed_at.
-  await upsertHeld(pool, step.endpointId, {
-    cohortId,
-    stepSeq: step.seq,
-    workersMax: step.workers,
-    workersMin: step.workers,
-    workersReady: lastReady,
-  });
-
-  await updateStepStatus(pool, cohortId, step.seq, 'ready', { warmAt: new Date() });
-  log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step ready');
+  await updateStepStatus(pool, cohortId, step.seq, 'ready');
+  log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step ready (ceiling raised, generator may submit)');
 }
 
 export async function release(deps: FleetDeps, cohortId: string, step: CatalogEntry): Promise<void> {

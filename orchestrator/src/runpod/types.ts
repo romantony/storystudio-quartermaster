@@ -40,7 +40,11 @@ export interface HealthResponse {
 }
 
 export interface PatchWorkersBody {
-  workersMin: number;
+  // Optional: agents/fleet.ts's allocate() only ever raises workersMax now
+  // (M3 fix, 2026-09-10 — see docs/qm-orchestrator-implementation-plan.md).
+  // workersMin should never leave 0 anywhere in this codebase; release()
+  // and watchdog.ts's autodrain path still pass it explicitly as 0.
+  workersMin?: number;
   workersMax: number;
 }
 
