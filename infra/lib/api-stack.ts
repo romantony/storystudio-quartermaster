@@ -16,7 +16,6 @@ interface ApiStackProps extends StackProps {
   gatewayKeySecretArn: string;
   jwtSecretArn: string;
   adminPasswordHashSecretArn: string;
-  modeslabKeySecretArn: string;
   replicateKeySecretArn: string;
   kieKeySecretArn: string;
   runpodKeySecretArn: string;
@@ -54,7 +53,6 @@ export class ApiStack extends Stack {
     super(scope, id, props);
 
     const providerSecretArns = [
-      props.modeslabKeySecretArn,
       props.replicateKeySecretArn,
       props.kieKeySecretArn,
       props.runpodKeySecretArn,
@@ -62,7 +60,6 @@ export class ApiStack extends Stack {
       props.runcomfyKeySecretArn,
     ];
     const providerSecretEnv = {
-      MODELSLAB_API_KEY_ARN: props.modeslabKeySecretArn,
       REPLICATE_API_TOKEN_ARN: props.replicateKeySecretArn,
       KIE_AI_API_KEY_ARN: props.kieKeySecretArn,
       RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
@@ -191,7 +188,6 @@ export class ApiStack extends Stack {
         GATEWAY_STATIC_KEY_ARN: props.gatewayKeySecretArn,
         JWT_SECRET_ARN: props.jwtSecretArn,
         ADMIN_PASSWORD_HASH_ARN: props.adminPasswordHashSecretArn,
-        MODELSLAB_API_KEY_ARN: props.modeslabKeySecretArn,
         REPLICATE_API_TOKEN_ARN: props.replicateKeySecretArn,
         KIE_AI_API_KEY_ARN: props.kieKeySecretArn,
         RUNPOD_API_KEY_ARN: props.runpodKeySecretArn,
@@ -216,7 +212,6 @@ export class ApiStack extends Stack {
         props.gatewayKeySecretArn,
         props.jwtSecretArn,
         props.adminPasswordHashSecretArn,
-        props.modeslabKeySecretArn,
         props.replicateKeySecretArn,
         props.kieKeySecretArn,
         props.runpodKeySecretArn,
@@ -249,18 +244,15 @@ export class ApiStack extends Stack {
     });
 
     // CloudWatch alarms
-    new cloudwatch.Alarm(this, 'HighInflightAlarm', {
-      alarmName: 'quartermaster-high-inflight',
-      metric: new cloudwatch.Metric({
-        namespace: 'Quartermaster',
-        metricName: 'modelslab_inflight',
-        statistic: 'Maximum',
-        period: Duration.minutes(5),
-      }),
-      threshold: 12,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-    });
+    //
+    // NOTE: a `HighInflightAlarm` used to live here, watching
+    // `Quartermaster/modelslab_inflight` against a threshold of 12. Nothing in
+    // the codebase has ever called PutMetricData, so that metric was never
+    // emitted and the alarm sat in INSUFFICIENT_DATA for its whole life.
+    // Removed rather than left as false assurance. The lane semaphore's
+    // ceiling (SAFE_LIMIT=15, dynamo-gate.ts) is therefore UNMONITORED — to
+    // restore real coverage, emit the counter's total_inflight from the
+    // sweeper and re-add an alarm against that.
 
     new cloudwatch.Alarm(this, 'HighDeadRateAlarm', {
       alarmName: 'quartermaster-high-dead-rate',

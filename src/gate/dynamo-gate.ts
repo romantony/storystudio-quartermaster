@@ -43,7 +43,7 @@ const counterPk = (counterKey: string) => `COUNTER#${counterKey}`;
 
 /**
  * Acquire one slot from a single-counter semaphore keyed by `counterKey`
- * (e.g. "runpod:flux-tts-s2t"). Unlike the modelslab gate below there is no
+ * (e.g. "runpod:flux-tts-s2t"). Unlike the lane gate below there is no
  * video/rest floor — just a flat `inflight < limit` ceiling per endpoint pool.
  *
  * Used to (a) gate concurrent generations against a RunPod endpoint and
@@ -147,7 +147,15 @@ export async function getInflight(counterKey: string): Promise<number> {
 // ─── Acquire ─────────────────────────────────────────────────────────────────
 
 /**
- * Try to atomically acquire one slot from the semaphore.
+ * Try to atomically acquire one slot from the GLOBAL video/rest lane semaphore.
+ *
+ * NOTE ON THE `COUNTER#modelslab` KEY: the pk is vestigial branding from when
+ * ModelsLab was the sole provider (decommissioned 2026-07-02). This semaphore is
+ * NOT provider-specific and is very much live — it is the fleet-wide SAFE_LIMIT=15
+ * ceiling the StoryStudio Step Functions pipeline holds across its image (rest
+ * lane) and video (video lane) Map iterations via POST /acquire + /release.
+ * Do not delete it as "dead ModelsLab code"; renaming the pk needs a sequenced
+ * live migration of the counter values, not a find-and-replace.
  *
  * Uses DynamoDB conditional UpdateItem to enforce the 8/7 video/rest floor
  * (§17.4 / §21.2). ConditionalCheckFailedException means pool full → not granted.
@@ -614,7 +622,7 @@ export async function reclaimExpiredLeases(): Promise<{ reclaimed: number }> {
           ExpressionAttributeValues: marshall({ ':neg': -1, ':zero': 0 }),
         })).catch(() => { /* already at 0, that's fine */ });
       } else {
-        // modelslab video/rest floor lease.
+        // Global video/rest floor lease (the lane semaphore).
         const lane: Lane = (item.lane === 'video' ? 'video' : 'rest');
         const field = lane === 'video' ? 'video_inflight' : 'rest_inflight';
         await client.send(new UpdateItemCommand({

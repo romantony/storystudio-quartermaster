@@ -5,7 +5,8 @@
   "workspaces": [
     "admin",
     "sdk/typescript",
-    "infra"
+    "infra",
+    "orchestrator"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -41,3 +41,10 @@ cdk.context.json
 .DS_Store
 *.log
 coverage/
+
+# local-only credentials — never commit
+docs/*-login.txt
+docs/*-credentials*
+*.pem
+*_rsa
+*_ed25519

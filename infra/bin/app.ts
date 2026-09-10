@@ -38,7 +38,6 @@ const apiStack = new ApiStack(app, 'QMApiStack', {
   gatewayKeySecretArn: ctx('GATEWAY_STATIC_KEY_ARN'),
   jwtSecretArn: ctx('JWT_SECRET_ARN'),
   adminPasswordHashSecretArn: ctx('ADMIN_PASSWORD_HASH_ARN'),
-  modeslabKeySecretArn: ctx('MODELSLAB_API_KEY_ARN'),
   replicateKeySecretArn: ctx('REPLICATE_API_TOKEN_ARN'),
   kieKeySecretArn: ctx('KIE_AI_API_KEY_ARN'),
   runpodKeySecretArn: ctx('RUNPOD_API_KEY_ARN'),

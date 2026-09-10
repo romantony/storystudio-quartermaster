@@ -229,6 +229,11 @@ export interface JobItem {
 
 // ─── Semaphore Item ───────────────────────────────────────────────────────────
 
+/**
+ * The global video/rest lane semaphore. The `COUNTER#modelslab` pk is vestigial
+ * branding from the decommissioned ModelsLab provider — the counter itself is
+ * provider-agnostic and live (see acquire() in gate/dynamo-gate.ts).
+ */
 export interface SemaphoreItem {
   pk: 'COUNTER#modelslab';
   sk: 'SEMAPHORE';
@@ -247,7 +252,7 @@ export interface LeaseItem {
   leaseExpiry: number;
   acquiredAt: number;
   // Set for RunPod-style single-counter leases (COUNTER#runpod:*). When absent,
-  // the lease belongs to the modelslab video/rest floor semaphore.
+  // the lease belongs to the global video/rest floor lane semaphore.
   counterKey?: string;
   // Unix epoch seconds for DynamoDB TTL auto-delete — fixed, generous window from
   // creation (not tied to leaseExpiry/heartbeat), purely a backstop so leases the
@@ -439,6 +444,29 @@ export interface ProvisionShadowItem {
   inflight: number;
   reserved: number;       // worker-units committed by active admission-gate reservations (§WS-C2)
   timestamp: number;
+}
+
+/**
+ * A background-orchestrator claim on a RunPod endpoint for the duration of one
+ * cohort step (background path — see docs/qm-orchestrator-implementation-plan.md
+ * §5.3). While a non-expired lease exists, `runProvisioner` does NOT plan,
+ * PATCH, or cap-count that endpoint — it is not the live path's to size.
+ *
+ * `expiresAt` is ALWAYS set and never further out than ~6h, so a crashed
+ * orchestrator returns the endpoint to demand-driven sizing on its own. Written
+ * by the orchestrator's fleet agent to the shared jobs table (pk='ENDPOINTLEASE',
+ * sk=counterKey); read here every sweeper tick.
+ */
+export interface EndpointLeaseItem {
+  pk: 'ENDPOINTLEASE';
+  sk: string;              // counterKey, e.g. "runpod:wan2-i2v"
+  holder: 'orchestrator';
+  cohortId: string;
+  stepSeq: number;
+  workers: number;         // worker count the orchestrator is holding on this endpoint
+  expiresAt: number;       // epoch ms — self-heal deadline; always set, <= now + 6h
+  updatedAt: number;
+  ttl?: number;            // Unix epoch seconds for DynamoDB TTL auto-delete (backstop past expiresAt)
 }
 
 // ─── Broker API shapes ────────────────────────────────────────────────────────

@@ -7098,7 +7098,7 @@ function buildDefinition(brokerArn: string): object {
   const acquireImageSlot = {
     Type: 'Task',
     Resource: brokerArn,
-    Comment: 'Acquire a rest-lane slot from Quartermaster before calling ModelsLab/Replicate',
+    Comment: 'Acquire a rest-lane slot from the Quartermaster lane semaphore before generating',
     Parameters: {
       action: 'acquire',
       lane: 'rest',
@@ -7272,7 +7272,7 @@ function buildDefinition(brokerArn: string): object {
             GenerateImage: {
               Type: 'Task',
               Resource: 'arn:aws:lambda:us-east-1:929075264324:function:image-basic-generator',
-              Comment: 'Generate single frame image via ModelsLab Flux Klein (slot held by Quartermaster)',
+              Comment: 'Generate single frame image via image-basic-generator; provider resolved by the QM ladder (slot held by Quartermaster)',
               Parameters: {
                 'prompt.$': '$.imagePrompt',
                 'aspectRatio.$': '$$.Execution.Input.aspectRatio',
@@ -7824,7 +7824,7 @@ function buildPremiumDefinition(brokerArn: string): object {
         Type: 'Parallel',
         Comment: 'Run hook generation and per-frame generation (TTS+Image+I2V) in parallel',
         Branches: [
-          // Branch 1: Hook generation — unchanged (uses Replicate, not ModelsLab)
+          // Branch 1: Hook generation — unchanged (goes direct to Replicate, ungated by QM)
           {
             StartAt: 'GenerateHook',
             States: {
@@ -8003,7 +8003,7 @@ function buildPremiumDefinition(brokerArn: string): object {
                     GenerateImage: {
                       Type: 'Task',
                       Resource: 'arn:aws:lambda:us-east-1:929075264324:function:image-basic-generator',
-                      Comment: 'Generate frame image via ModelsLab Flux Klein. Slot held by Quartermaster rest lane.',
+                      Comment: 'Generate frame image via image-basic-generator; provider resolved by the QM ladder. Slot held by Quartermaster rest lane.',
                       Parameters: {
                         'prompt.$': '$.imagePrompt',
                         'aspectRatio.$': '$$.Execution.Input.aspectRatio',
@@ -8125,7 +8125,7 @@ function buildPremiumDefinition(brokerArn: string): object {
                     GenerateI2V: {
                       Type: 'Task',
                       Resource: 'arn:aws:lambda:us-east-1:929075264324:function:video-i2v-generator',
-                      Comment: 'Generate I2V video via ModelsLab Wan 2.2. Slot held by Quartermaster video lane.',
+                      Comment: 'Generate I2V video via video-i2v-generator; provider resolved by the QM ladder. Slot held by Quartermaster video lane.',
                       Parameters: {
                         'imageUrl.$': '$.imageUrl',
                         'prompt.$': '$.narrationText',

@@ -50,7 +50,9 @@ export class DatabaseStack extends Stack {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
-    // Seed COUNTER#modelslab — semaphore item with zero inflight counters.
+    // Seed COUNTER#modelslab — the GLOBAL video/rest lane semaphore, with zero
+    // inflight counters. The pk name is vestigial ModelsLab branding; the counter
+    // is provider-agnostic and live (see acquire() in src/gate/dynamo-gate.ts).
     // DynamoDB TTL cannot decrement counters itself, so the sweeper still does the
     // real-time reclaim; the `ttl` set on LeaseItem (dynamo-gate.ts) is only a
     // backstop so leases the sweeper already marked `deleted` don't pile up forever.
