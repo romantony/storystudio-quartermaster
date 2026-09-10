@@ -15,6 +15,8 @@ export const ADAPTERS: Record<string, Adapter> = {
   runpod,
   lambda: lambdamerge,
   runcomfy,
-  // modelslab decommissioned (2026-07-02) — no longer in any catalog ladder.
+  // modelslab decommissioned (2026-07-02); adapter + secret wiring deleted 2026-08-31.
+  // (The COUNTER#modelslab semaphore in gate/dynamo-gate.ts is unrelated — it is the
+  // live, provider-agnostic video/rest lane gate and must not be removed.)
   // google, openai — added when those direct-provider routes are needed
 };

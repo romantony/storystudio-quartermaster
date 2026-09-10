@@ -229,6 +229,11 @@ export interface JobItem {
 
 // ─── Semaphore Item ───────────────────────────────────────────────────────────
 
+/**
+ * The global video/rest lane semaphore. The `COUNTER#modelslab` pk is vestigial
+ * branding from the decommissioned ModelsLab provider — the counter itself is
+ * provider-agnostic and live (see acquire() in gate/dynamo-gate.ts).
+ */
 export interface SemaphoreItem {
   pk: 'COUNTER#modelslab';
   sk: 'SEMAPHORE';
@@ -247,7 +252,7 @@ export interface LeaseItem {
   leaseExpiry: number;
   acquiredAt: number;
   // Set for RunPod-style single-counter leases (COUNTER#runpod:*). When absent,
-  // the lease belongs to the modelslab video/rest floor semaphore.
+  // the lease belongs to the global video/rest floor lane semaphore.
   counterKey?: string;
   // Unix epoch seconds for DynamoDB TTL auto-delete — fixed, generous window from
   // creation (not tied to leaseExpiry/heartbeat), purely a backstop so leases the
