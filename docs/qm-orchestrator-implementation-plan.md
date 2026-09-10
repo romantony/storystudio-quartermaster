@@ -948,23 +948,59 @@ before breadth** — steps 1→3 end to end teaches more than thirteen half-buil
 - **Done:** a written non-expired lease makes `runProvisioner` skip the endpoint entirely.
   Orchestrator-side lease *writer* (fleet agent) lands with M3.
 
-### M1 — the two new endpoints *(revised: reuse, don't build)* — **in progress**
+### M1 — the media assembly endpoint *(revised twice: reuse became build-new)* — **DONE 2026-09-10**
 The `media` "container" was going to be new ffmpeg code — until `flux4B-Wan2-storystudio`
 (the `flux-tts-s2t` / `bgm-s2t` codebase) turned out to already implement `merge`, `concat`,
 `upscale`, `caption`, `mix_bgm` **and** `postprod`, on R2, in production. A reimplementation
-(commit `059a4ad`) was reverted. So M1 is now a deploy + a contract, not a build.
+(commit `059a4ad`) was reverted in favor of reuse. **That reuse plan also hit a real
+blocker**: the account's only live endpoint on that codebase (`rnqxi6c0mlq517`,
+`Flux-TTS-ANIM`) turned out to be running a separate minimal `story-studio-tts` image
+(only `tts`/`voice_clone_prompt` — confirmed via the RunPod REST API), not the full pod2
+image `ENDPOINT_ROLE=all` assumed. Repointing that live production TTS endpoint was
+rejected as too risky.
 - [x] Contract pinned — `orchestrator/containers/media.md` (the 5 modes' input/output, the
       caption-re-runs-Whisper consequence, why `postprod` is unused, the concat-no-normalize gap).
-- [ ] Deploy `flux4B-Wan2-storystudio` with `ENDPOINT_ROLE=all` as the `media` endpoint;
-      register its `endpointId` in `fleet-registry.ts` (with M2).
-- [ ] Measure `gen_time_s` + `executionTime` + peak VRAM per mode on a real cohort's assets
-      → feeds spec §8 rate card and §16 q4 (GPU class for this role).
+- [x] **Final approach: a fourth image**, `flux4B-Wan2-storystudio`'s new `postprod-lite/`
+      subfolder — reuses the pod2 handler's `merge`/`concat`/`upscale`/`caption`/`mix_bgm`/
+      `animate` functions **verbatim**, adds a ported `remove_silence` (from quartermaster's
+      own validated `infra/docker/concat-and-trim/index.ts` tuning) and a standalone
+      `transcribe` mode, extends `mix_bgm` with optional `sfx_urls`. **No network volume** —
+      Real-ESRGAN + Whisper large-v3-turbo baked into the image at build time, since this
+      endpoint never touches FLUX/Kokoro/Qwen-TTS/ACE-Step/SFX. Deployed as endpoint
+      `n6252hm01qz0xh` ("PostProd-Lite"), template `ud534tgyb1`, A40,
+      `workersMin=0`/`workersMax=2`/`workersStandby=2`. `endpointId` recorded in
+      `fleet-registry.ts` with M2.
+- [x] **All 8 modes measured against real assets, twice** — first the synthetic smoke test
+      (a 25.2s TTS clip + a 4s Ken Burns clip, 2026-09-10), then a real 18-frame/90s
+      narration-basic project's actual output (2026-09-10, same day, after M2's acceptance
+      run produced real assets to assemble). Zero failures across both. Full per-mode timing:
+      `orchestrator/containers/media.md` and
+      `docs/qm-orchestrator-postprod-pipeline-and-caption-drift-2026-09-10.md`.
+- [x] **Real bug found, fixed, and redeployed the same day**: `caption`'s blind Whisper pass
+      truncates near a clip's tail once audio exceeds Whisper's ~30s chunking threshold
+      (confirmed directly — a clip's last ~3.4s of real narration had no caption at all;
+      reordering steps to preserve pause-anchors was tested and made it *worse*, not
+      better — see the postprod-pipeline doc for the full root-cause chain). Fixed by
+      wiring `caption` to accept an optional `chunks` input (same shape `transcribe`
+      already returns), letting a caller with ground-truth text+timing skip Whisper
+      entirely. Committed + pushed `96cb548`, redeployed, and **verified live** against
+      the real endpoint (a real gotcha found here: `workersStandby` keeps workers
+      permanently warm, so a plain `docker push` does not reach them — redeploying an
+      endpoint with a standby pool needs a `workersMax` drain-to-0-then-restore to force a
+      fresh image pull).
 - [~] `remotion` — **deferred for M1** (§16 q3): step 7 stays on the existing Remotion Lambda
       (`src/handlers/remotion-overlay.ts`), the one remaining AWS touch in the background path.
-- **Decision taken:** caption = Whisper-regenerated from the concatenated video (does not consume
-      step 9's SRT). Step 9 keeps only if a standalone pre-concat `.srt` deliverable is wanted —
-      else the planner may drop it (M2).
-- **Done when:** each of the 5 modes completes one real job for a cohort and writes to R2.
+- **Decision taken:** caption = Whisper-regenerated from the concatenated video by default
+      (does not consume step 9's SRT), but a caller with known text+timing can now pass
+      `chunks` to skip that. Step 9 keeps only if a standalone pre-concat `.srt` deliverable
+      is wanted — else the planner may drop it (M2).
+- **Not done**: peak-VRAM instrumentation (deferred both passes); `merge`'s `-shortest` mux
+      will silently drop trailing audio if a caller's `audio_url` is ever longer than
+      `video_url` — not guarded, not yet exercised (every real frame so far had audio
+      shorter than its video clip).
+- **Done when:** each mode completes one real job for a cohort and writes to R2. **Met** —
+      twice over, including a full real project assembled start to finish into one
+      finished, captioned, BGM-scored video.
 
 ### M2 — Plan and generate, shadow fleet — **code complete 2026-09-10, real acceptance run pending**
 - [x] Planner: §9.1 validation (zod `.strict()`), job graph, step plan, affinity collapse
@@ -1010,6 +1046,18 @@ The `media` "container" was going to be new ffmpeg code — until `flux4B-Wan2-s
 - [ ] Flip `ORCH_FLEET_LIVE=true` on one endpoint, one step
 - [ ] Warm/drain verification polls, cap assertion, stall handling
 - [ ] Watchdog deployed **first**, alerting, before the first live scale-up
+- **Decided and already fixed in code, ahead of M3**: `agents/fleet.ts`'s `allocate()`
+  originally PATCHed `workersMin` up to `step.workers` alongside `workersMax` — meaning
+  once live, a step's full worker count would be forced permanently active for the whole
+  allocation, not just available as a ceiling. Corrected: `allocate()` now always sends
+  `workersMin: 0`, only `workersMax` moves to `step.workers`. This matches every manual
+  scale observed to actually work this session (M2's real acceptance run and the
+  `postprod-lite` redeploy both scaled via `workersMax` alone, `workersMin` always 0) —
+  RunPod's own `QUEUE_DELAY` scaler provisions real workers against the `workersMax`
+  ceiling as jobs are actually submitted, so there's no need (and real added cost) to
+  force a floor. `release()` was already correct (`0`/`0`). No test asserted the old
+  behavior — the fix is a plain two-line diff, 52/56 orchestrator tests still green
+  (4 skipped need a live DB).
 - **Done when:** a step scales 0→25→0 with both polls verified, and the watchdog stays silent.
 
 ### M4 — Quality gates

@@ -86,13 +86,20 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
 
   await updateStepStatus(pool, cohortId, step.seq, 'scaling');
 
+  // workersMin stays 0 — only the ceiling (workersMax) moves. Forcing
+  // workersMin up would keep `step.workers` GPUs permanently active for the
+  // whole allocation, not just available up to it; RunPod's own QUEUE_DELAY
+  // scaler provisions real workers against workersMax as jobs are actually
+  // submitted. Confirmed this is the right lever by hand throughout M2's
+  // real acceptance run and the postprod-lite redeploy (2026-09-10) — every
+  // manual scale-up in both used workersMax only, workersMin never left 0.
   if (cfg.fleetLive) {
-    await runpod.patchWorkers(step.endpointId, { workersMin: step.workers, workersMax: step.workers });
+    await runpod.patchWorkers(step.endpointId, { workersMin: 0, workersMax: step.workers });
     log().info({ endpointId: step.endpointId, workers: step.workers }, 'fleet: patched workers (live)');
   } else {
     log().info(
       { endpointId: step.endpointId, workers: step.workers },
-      `fleet: SHADOW — would PATCH ${step.endpointId} min/max -> ${step.workers}`,
+      `fleet: SHADOW — would PATCH ${step.endpointId} max -> ${step.workers} (min stays 0)`,
     );
   }
 
