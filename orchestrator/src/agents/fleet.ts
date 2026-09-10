@@ -26,8 +26,9 @@ import { FLEET } from '../fleet-registry';
 import { log } from '../telemetry/log';
 import { updateStepStatus } from '../db/repo/steps';
 import { upsertHeld, clearHeld } from '../db/repo/endpoint-state';
+import { countUngated, countInFlightForGatedStep } from '../db/repo/quality';
 
-export type StallReason = 'unreachable' | 'cap_breach' | 'drain_timeout';
+export type StallReason = 'unreachable' | 'cap_breach' | 'drain_timeout' | 'ungated_on_drain';
 
 export class FleetStallError extends Error {
   constructor(
@@ -157,6 +158,28 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
 
 export async function release(deps: FleetDeps, cohortId: string, step: CatalogEntry): Promise<void> {
   const { pool, runpod, cfg } = deps;
+
+  // §6.5: "jobs_ungated must return empty before the fleet controller is
+  // allowed to drain" — the ONLY coupling between the quality agent and
+  // this module. Only meaningful for a gated step (step.gate set) — an
+  // ungated step's completed jobs never get a quality_status written at
+  // all, so countUngated would find them "ungated" forever; that's correct
+  // for gated steps (nothing SHOULD write quality_status until a gate
+  // evaluates it) and meaningless noise for ungated ones. In the normal
+  // gated path this never fires — the driver already awaits gateStep()
+  // before calling release() — this is defense-in-depth against a driver
+  // bug, same spirit as the cap assertion below. An ungated drain is worse
+  // than the drain-timeout stall already below it: that one is a cost bug
+  // ($19/window billing), this one is a correctness bug (a caller receives
+  // an unevaluated or mid-rework asset as final).
+  if (step.gate === 'image' || step.gate === 'motion') {
+    const ungated = await countUngated(pool, cohortId, step.seq);
+    const inFlight = await countInFlightForGatedStep(pool, cohortId, step.seq);
+    if (ungated > 0 || inFlight > 0) {
+      await updateStepStatus(pool, cohortId, step.seq, 'stalled');
+      throw new FleetStallError('ungated_on_drain', { endpointId: step.endpointId, cohortId, seq: step.seq, ungated, inFlight });
+    }
+  }
 
   await updateStepStatus(pool, cohortId, step.seq, 'draining');
 

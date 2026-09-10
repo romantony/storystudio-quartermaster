@@ -43,7 +43,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     seq: 1,
     name: 'image',
     endpointId: endpointFor('runpod:qwen-image-gen'),
-    gate: null, // M2 runs gate-free; §6.5's image gate lands M4
+    gate: 'image', // §6.5's image gate — M4
     dependsOn: [],
     builder: buildImageInput,
   },
@@ -59,7 +59,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     seq: 3,
     name: 'animation',
     endpointId: endpointFor('runpod:wan2-i2v'),
-    gate: null, // §6.5's motion gate lands M4
+    gate: 'motion', // §6.5's motion gate — M4
     dependsOn: [1],
     builder: buildI2vInput,
   },

@@ -147,3 +147,57 @@ describe('agents/fleet.ts release() — unchanged behavior', () => {
     expect(JSON.parse(patchCall![1].body as string)).toEqual({ workersMin: 0, workersMax: 0 });
   });
 });
+
+describe('agents/fleet.ts release() — M4 drain precondition', () => {
+  const GATED_STEP: CatalogEntry & { workers: number } = { ...STEP, seq: 1, gate: 'image' };
+
+  function poolWithCounts(ungated: number, inFlight: number) {
+    return {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes("status = 'complete' AND quality_status IS NULL")) return { rows: [{ count: String(ungated) }] };
+        if (sql.includes("status IN ('planned', 'submitted')")) return { rows: [{ count: String(inFlight) }] };
+        return { rows: [] };
+      }),
+    } as unknown as FleetDeps['pool'];
+  }
+
+  it('throws FleetStallError("ungated_on_drain") and never PATCHes when jobs are still ungated', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, { workers: { ready: 0, running: 0 } }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: FleetDeps = { pool: poolWithCounts(2, 0), runpod, cfg: FLEET_CFG };
+
+    await expect(release(deps, 'win_test', GATED_STEP)).rejects.toMatchObject({ reason: 'ungated_on_drain' });
+    const patchCall = (fetchImpl.mock.calls as unknown as [string, RequestInit][]).find(([url]) => url.includes('/rest.runpod.io/'));
+    expect(patchCall).toBeUndefined();
+  });
+
+  it('throws when jobs are still in flight (planned/submitted), even with zero ungated', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, { workers: { ready: 0, running: 0 } }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: FleetDeps = { pool: poolWithCounts(0, 1), runpod, cfg: FLEET_CFG };
+
+    await expect(release(deps, 'win_test', GATED_STEP)).rejects.toMatchObject({ reason: 'ungated_on_drain' });
+  });
+
+  it('proceeds normally (PATCHes to drain) when ungated=0 and inFlight=0 on a gated step', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, { workers: { ready: 0, running: 0 } }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: FleetDeps = { pool: poolWithCounts(0, 0), runpod, cfg: FLEET_CFG };
+
+    await release(deps, 'win_test', GATED_STEP);
+
+    const patchCall = (fetchImpl.mock.calls as unknown as [string, RequestInit][]).find(([url]) => url.includes('/rest.runpod.io/'));
+    expect(patchCall).toBeDefined();
+  });
+
+  it('never even queries the ungated counts for an ungated step (gate: null)', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, { workers: { ready: 0, running: 0 } }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const pool = poolWithCounts(99, 99); // would throw if this step's release() checked it
+    const deps: FleetDeps = { pool, runpod, cfg: FLEET_CFG };
+
+    await release(deps, 'win_test', STEP); // STEP has gate: null
+    const patchCall = (fetchImpl.mock.calls as unknown as [string, RequestInit][]).find(([url]) => url.includes('/rest.runpod.io/'));
+    expect(patchCall).toBeDefined(); // proceeded to drain, ignoring the poisoned counts
+  });
+});

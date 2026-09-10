@@ -1090,11 +1090,61 @@ rejected as too risky.
   the re-run.
 
 ### M4 — Quality gates
-- [ ] Evaluator wrappers, `jobs_ungated` queue, verdict writes
-- [ ] Image gate, then motion gate; rework path with the attempts cap
-- [ ] Drain gated on the quality agent, not the generator
+- [x] Evaluator wrappers, `jobs_ungated` queue, verdict writes — **DONE 2026-09-10.**
+      `agents/quality.ts`'s `gateStep()` runs CONCURRENTLY with `generator.ts`'s
+      `runStep()` (Promise.all, not allSettled — see below), not strictly after it —
+      this is what "gates assets as they land" means. Zero changes needed to
+      `generator.ts`: a rework verdict resets a job's `status` from `'complete'` back to
+      `'planned'`, which naturally reopens `runStep()`'s own `terminal >= target` loop-
+      exit condition and lets its existing claim query pick the row back up. Evaluator
+      rubric/prompts/weights/thresholds ported verbatim from the AWS-side
+      `dialogue-basic-qa-agent`'s `image_evaluator.py`/`video_evaluator.py`/
+      `llm_client.py`/`config.py` (Replicate-hosted `google/gemini-2.5-flash`, fallback
+      `google/gemini-3-pro`) — same VLM, no new credential (`REPLICATE_API_TOKEN`
+      already in Secrets Manager). New migration `007_quality_verdict_asset.sql` (two
+      real gaps the existing schema didn't cover: `quality_verdicts` had no column for
+      the asset URL evaluated, and none for the image gate's numeric score, which the
+      motion gate's image-quality pre-gate needs).
+- [x] Image gate (step 1), then motion gate (step 3); rework path with the attempts
+      cap — **DONE.** Both reworks are same-endpoint prompt corrections (append the
+      VLM's issue summary) — no rung ladder exists in this codebase yet (that's the
+      Wan 2.2 CFG sweep, §16 q1, itself gated on this gate existing first), so
+      `persistIfExternal()` is correctly out of scope. At `quality_attempts` exhausted:
+      `quality_status='fail'`, `jobs.status` stays `'complete'` (the asset genuinely
+      generated; the content is what's rejected) — confirmed against
+      `005_invariants.sql`'s `completed_project_with_ungated_leaf`, which only checks
+      `quality_status`, not `status`. Assembly gate (step 12) deferred wholesale — no
+      catalog entry exists for it until M5, and its failure action is different anyway
+      (flag partial, no automatic rework). Rule promotion (§6.6) also deferred — every
+      verdict already writes `quality_verdicts.rule_candidate` regardless, so no data
+      is lost.
+- [x] Drain gated on the quality agent, not the generator — **DONE.** `fleet.ts`'s
+      `release()` gained a precondition (for gated steps only — an ungated step's
+      completed jobs never get a `quality_status` at all, so the check would be
+      meaningless noise there): throws `FleetStallError('ungated_on_drain', ...)` if
+      `jobs_ungated` isn't empty or a rework is still in flight. Defense-in-depth — the
+      driver already awaits `gateStep()` before calling `release()`, so this should
+      never fire in the normal path.
+- **A real bug found by the driver's own new test, not just added coverage**:
+  the first implementation used `Promise.allSettled([runStep(...), gateStep(...)])` to
+  run them concurrently — but `allSettled` waits for BOTH to settle even after one
+  rejects. A test asserting "a `runStep()` stall still stops the cohort even if
+  `gateStep()` never resolves" hung for the full 5s jest timeout, proving it: a stuck
+  `gateStep()` would have blocked the cohort from ever reporting a real `runStep()`
+  stall. Fixed to `Promise.all` (rejects as soon as either does), with a documented,
+  accepted limitation: the promise that didn't cause the rejection may keep running in
+  the background after the driver returns — `gateStep()` has no cancellation mechanism
+  yet, acceptable since the cohort is already being abandoned on error at that point.
+- 116/116 orchestrator tests green (9 integration tests skipped without a live DB, run
+  separately against a real throwaway Postgres — migration `007` applies/rolls back/
+  reapplies cleanly). New test files: `rubric.test.ts` (pure), `quality-replicate.test.ts`
+  (mocked-fetch), `quality.test.ts` (jest.mock'd repo layer), `orchestrator.test.ts` (the
+  driver had no direct test before M4), plus additions to `fleet.test.ts` for the drain
+  precondition.
 - **Done when:** a deliberately bad prompt is caught, reworked on the warm endpoint, and passes —
-  with no second warm-up in the allocation log.
+  with no second warm-up in the allocation log. **Not yet proven live** — built and
+  tested locally/against a real throwaway Postgres, but not yet deployed or run against
+  real RunPod + Replicate infra.
 
 ### M5 — The full thirteen
 - [ ] Steps 4–13, one payload builder at a time, each with its test

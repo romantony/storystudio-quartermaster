@@ -79,6 +79,37 @@ const ConfigSchema = z.object({
   watchdogAutodrain: bool(false), // alert-only until proven false-positive-free (§16 q10)
   orphanGraceMs: numeric(600_000).pipe(z.number().int().positive()),
   watchdogAlertWebhookUrl: z.string().url().optional(), // unset = log-only, no-op
+
+  // ── quality gates (impl plan §6.5 / M4) ───────────────────────────────
+  // Replicate-hosted VLM, ported from the AWS-side dialogue-basic-qa-agent
+  // (image_evaluator.py/video_evaluator.py/llm_client.py/config.py) — same
+  // model, same thresholds, same weights, just called directly instead of
+  // through that Lambda. No new credential: REPLICATE_API_TOKEN already
+  // exists in AWS Secrets Manager (quartermaster/replicate-api-token) and
+  // this is the same env var name the Python config.py already uses.
+  replicateApiToken: z.string().optional(),
+  replicateApiBase: z.string().url().default('https://api.replicate.com/v1'),
+  replicateVisionModel: z.string().default('google/gemini-2.5-flash'),
+  replicateVisionModelFallback: z.string().default('google/gemini-3-pro'),
+  replicatePollIntervalMs: numeric(3_000).pipe(z.number().int().positive()),
+  replicateMaxPollAttempts: numeric(80).pipe(z.number().int().positive()), // ~4min max, matches the Python original
+  replicateTimeoutMs: numeric(120_000).pipe(z.number().int().positive()),
+  // Replicate's prediction response has no reliable per-call cost field —
+  // same situation WORKER_RATE_USD_S already solved for RunPod. A clearly-
+  // labeled estimate, not a measurement (telemetry/ledger.ts's own
+  // precedent: "an estimate labelled measured that is actually a guess is
+  // worse than no estimate").
+  qualityVlmCostUsd: numeric(0.002).pipe(z.number().nonnegative()),
+  qualityImagePassThreshold: numeric(8.0).pipe(z.number()),
+  qualityImageReviewThreshold: numeric(7.0).pipe(z.number()),
+  qualityVideoGateThreshold: numeric(7.5).pipe(z.number()),
+  qualityVideoPassThreshold: numeric(5.0).pipe(z.number()),
+  // Equal to qualityVideoPassThreshold by design, not an oversight — ported
+  // verbatim from config.py's QA_VIDEO_REVIEW_THRESHOLD comment: the video
+  // evaluator checks PASS before REWORK, so a REVIEW threshold above PASS
+  // would never fire; this collapses the REWORK tier deliberately rather
+  // than leaving it dead code above an unreachable band.
+  qualityVideoReviewThreshold: numeric(5.0).pipe(z.number()),
 });
 
 export type Config = Readonly<z.infer<typeof ConfigSchema>>;
@@ -114,6 +145,19 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   watchdogAutodrain: 'WATCHDOG_AUTODRAIN',
   orphanGraceMs: 'ORPHAN_GRACE_MS',
   watchdogAlertWebhookUrl: 'WATCHDOG_ALERT_WEBHOOK_URL',
+  replicateApiToken: 'REPLICATE_API_TOKEN',
+  replicateApiBase: 'REPLICATE_API_BASE',
+  replicateVisionModel: 'REPLICATE_VISION_MODEL',
+  replicateVisionModelFallback: 'REPLICATE_VISION_MODEL_FALLBACK',
+  replicatePollIntervalMs: 'REPLICATE_POLL_INTERVAL_MS',
+  replicateMaxPollAttempts: 'REPLICATE_MAX_POLL_ATTEMPTS',
+  replicateTimeoutMs: 'REPLICATE_TIMEOUT_MS',
+  qualityVlmCostUsd: 'QUALITY_VLM_COST_USD',
+  qualityImagePassThreshold: 'QA_IMAGE_PASS_THRESHOLD',
+  qualityImageReviewThreshold: 'QA_IMAGE_REVIEW_THRESHOLD',
+  qualityVideoGateThreshold: 'QA_VIDEO_GATE_THRESHOLD',
+  qualityVideoPassThreshold: 'QA_VIDEO_PASS_THRESHOLD',
+  qualityVideoReviewThreshold: 'QA_VIDEO_REVIEW_THRESHOLD',
 };
 
 /**

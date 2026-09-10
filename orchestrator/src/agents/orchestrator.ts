@@ -1,11 +1,21 @@
 /**
  * The driver (impl plan §2's repo layout: "agents/orchestrator.ts — the
- * driver: step sequencing, drain gating, cohort lifecycle"). Scoped narrowly
- * for M2 (see the M2 plan's decision 3): sequences a cohort's catalogued
- * steps in order — allocate, run, release-if-drainAfter, next — with no
- * gating phase, because agents/quality.ts does not exist yet (lands M4).
- * Full §8.2 state machine (generated -> gating -> draining) is not
- * implemented; M2 goes straight from generated to draining/complete.
+ * driver: step sequencing, drain gating, cohort lifecycle"). Sequences a
+ * cohort's catalogued steps in order — allocate, run (+ gate, concurrently,
+ * if the step is gated), release-if-drainAfter, next.
+ *
+ * M4: when a step is gated (catalog.gate set), runStep() and gateStep() run
+ * CONCURRENTLY via Promise.all (not allSettled — allSettled waits for BOTH
+ * to settle even after one rejects, which a real test caught hanging
+ * forever on a still-running gateStep() after runStep() had already
+ * stalled; Promise.all rejects as soon as either does) — this is what the
+ * spec means by gating assets "as they land" and reworking "while the
+ * endpoint is still warm". See agents/quality.ts's header comment for why
+ * this needs zero changes to generator.ts. §8.2's
+ * `generated -> gating -> draining` hop is deliberately collapsed:
+ * gateStep() writes 'generated'->'gating' at its own start, and the
+ * existing 'draining' write already at the top of fleet.ts's release() is
+ * what closes it out — no separate write here.
  */
 import type { Pool } from 'pg';
 import type { Config } from '../config';
@@ -16,6 +26,7 @@ import { getCohort, setCurrentStep } from '../db/repo/cohorts';
 import { catalogEntry } from '../steps/catalog';
 import { allocate, release, type FleetDeps } from './fleet';
 import { runStep, GeneratorStallError, type GeneratorDeps } from './generator';
+import { gateStep, type QualityDeps } from './quality';
 
 export interface DriverDeps {
   pool: Pool;
@@ -38,6 +49,19 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
     publicBaseUrl: deps.publicBaseUrl,
     webhookSecret: deps.cfg.webhookSecret,
   };
+  const qualityDeps: QualityDeps = {
+    pool: deps.pool,
+    replicate: {
+      apiToken: deps.cfg.replicateApiToken,
+      apiBase: deps.cfg.replicateApiBase,
+      visionModel: deps.cfg.replicateVisionModel,
+      visionModelFallback: deps.cfg.replicateVisionModelFallback,
+      pollIntervalMs: deps.cfg.replicatePollIntervalMs,
+      maxPollAttempts: deps.cfg.replicateMaxPollAttempts,
+      timeoutMs: deps.cfg.replicateTimeoutMs,
+    },
+    cfg: deps.cfg,
+  };
 
   const dbSteps = await listSteps(deps.pool, cohortId);
   const runnable = dbSteps
@@ -56,19 +80,38 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
       return;
     }
 
+    const runStepPromise = runStep(generatorDeps, cohortId, catalog, dbStep.workersTarget);
+    const gateStepPromise = catalog.gate ? gateStep(qualityDeps, cohortId, catalog, dbStep.workersTarget) : undefined;
+    // A no-op catch on each promise individually, BEFORE the Promise.all
+    // below — otherwise the one that doesn't win the race below still has
+    // its rejection observed asynchronously later (by the try/catch), so
+    // this isn't strictly needed for the current single-await shape, but
+    // keeps the invariant explicit as this function's shape evolves.
+    runStepPromise.catch(() => undefined);
+    gateStepPromise?.catch(() => undefined);
+
     try {
-      await runStep(generatorDeps, cohortId, catalog, dbStep.workersTarget);
+      // Promise.all, NOT allSettled: rejects as soon as EITHER promise
+      // does, so a runStep() stall stops the cohort immediately rather
+      // than waiting for a possibly still-running gateStep() to also
+      // finish first (allSettled's actual behavior — verified by a real
+      // test that hung for gateStep() never resolving until this was
+      // fixed). Known, accepted limitation: the promise that didn't cause
+      // the rejection may still be running in the background after this
+      // function returns — gateStep()'s loop has no cancellation
+      // mechanism yet. Acceptable for now: the cohort is already being
+      // abandoned on error, and gateStep()'s own loop naturally winds down
+      // once its jobs_ungated query empties out.
+      await (gateStepPromise ? Promise.all([runStepPromise, gateStepPromise]) : runStepPromise);
     } catch (err) {
       const stalled = err instanceof GeneratorStallError;
       log().error(
         { cohortId, seq: dbStep.seq, err },
-        stalled ? 'driver: generator stalled, stopping cohort' : 'driver: generator failed, stopping cohort',
+        stalled ? 'driver: generator stalled, stopping cohort' : 'driver: step failed, stopping cohort',
       );
       return;
     }
 
-    // No quality agent yet (M4) — generated jobs go straight to drain
-    // eligibility. §8.2's `gating` state is skipped entirely for now.
     if (dbStep.drainAfter) {
       try {
         await release(fleetDeps, cohortId, catalog);
