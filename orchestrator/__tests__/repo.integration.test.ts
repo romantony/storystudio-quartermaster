@@ -13,6 +13,7 @@ import { ensureCohort, windowBounds } from '../src/db/repo/cohorts';
 import { insertProject, getProject } from '../src/db/repo/projects';
 import { insertSteps, listSteps, dependentSteps } from '../src/db/repo/steps';
 import { insertJobs, claimNextBatch, markSubmitted, markTerminal, stepJobCounts } from '../src/db/repo/jobs';
+import { upsertHeld, touchObserved, clearHeld, getState } from '../src/db/repo/endpoint-state';
 
 const DB_URL = process.env.DATABASE_URL;
 const maybeDescribe = DB_URL ? describe : describe.skip;
@@ -197,5 +198,77 @@ maybeDescribe('db repo layer (integration)', () => {
 
     const counts81 = await stepJobCounts(pool, cohort.id, seqImage);
     expect(counts81).toEqual({ total: 1, terminal: 1 });
+  });
+});
+
+maybeDescribe('db repo layer — endpoint_state (integration, M3)', () => {
+  let pool: Pool;
+
+  beforeAll(() => {
+    pool = new Pool({ connectionString: DB_URL });
+  });
+
+  afterAll(async () => {
+    await pool.end();
+  });
+
+  function uniqueEndpointId(): string {
+    return `test-endpoint-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  it('upsertHeld -> getState round-trips the claim', async () => {
+    const endpointId = uniqueEndpointId();
+    await upsertHeld(pool, endpointId, { cohortId: 'win_test', stepSeq: 3, workersMax: 10, workersMin: 10, workersReady: 0 });
+
+    const state = await getState(pool, endpointId);
+    expect(state).toBeDefined();
+    expect(state?.heldByCohort).toBe('win_test');
+    expect(state?.heldByStep).toBe(3);
+    expect(state?.workersMax).toBe(10);
+    expect(state?.workersReady).toBe(0);
+  });
+
+  it('a second upsertHeld call overwrites the row (ON CONFLICT), not a duplicate', async () => {
+    const endpointId = uniqueEndpointId();
+    await upsertHeld(pool, endpointId, { cohortId: 'win_a', stepSeq: 1, workersMax: 5, workersMin: 5, workersReady: 0 });
+    await upsertHeld(pool, endpointId, { cohortId: 'win_a', stepSeq: 1, workersMax: 5, workersMin: 5, workersReady: 5 });
+
+    const state = await getState(pool, endpointId);
+    expect(state?.workersReady).toBe(5);
+  });
+
+  it('touchObserved bumps observed_at without touching the held fields', async () => {
+    const endpointId = uniqueEndpointId();
+    await upsertHeld(pool, endpointId, { cohortId: 'win_b', stepSeq: 7, workersMax: 25, workersMin: 25, workersReady: 25 });
+    const before = await getState(pool, endpointId);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await touchObserved(pool, endpointId);
+    const after = await getState(pool, endpointId);
+
+    expect(after?.observedAt.getTime()).toBeGreaterThan(before!.observedAt.getTime());
+    expect(after?.heldByStep).toBe(7);
+    expect(after?.heldByCohort).toBe('win_b');
+  });
+
+  it('clearHeld nulls the held fields and zeroes worker counts', async () => {
+    const endpointId = uniqueEndpointId();
+    await upsertHeld(pool, endpointId, { cohortId: 'win_c', stepSeq: 2, workersMax: 8, workersMin: 8, workersReady: 8 });
+
+    await clearHeld(pool, endpointId);
+    const state = await getState(pool, endpointId);
+
+    expect(state?.heldByCohort).toBeNull();
+    expect(state?.heldByStep).toBeNull();
+    expect(state?.workersMax).toBe(0);
+    expect(state?.workersMin).toBe(0);
+    expect(state?.workersReady).toBe(0);
+  });
+
+  it('clearHeld on an endpoint with no prior row still leaves it in a clean, unheld state', async () => {
+    const endpointId = uniqueEndpointId();
+    await clearHeld(pool, endpointId);
+    const state = await getState(pool, endpointId);
+    expect(state?.heldByStep).toBeNull();
   });
 });

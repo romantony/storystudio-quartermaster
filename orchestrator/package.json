@@ -8,6 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
+    "dev:watchdog": "ts-node src/watchdog.ts",
+    "start:watchdog": "node dist/watchdog.js",
     "gen:fleet": "ts-node --transpileOnly scripts/gen-fleet-registry.ts",
     "migrate": "ts-node src/db/migrate.ts up",
     "migrate:down": "ts-node src/db/migrate.ts down",

@@ -23,6 +23,7 @@ import { log } from '../telemetry/log';
 import { claimNextBatch, markSubmitted, markTerminal, listInFlight, stepJobCounts, listStale, type JobRow } from '../db/repo/jobs';
 import { updateStepStatus, incrementStepCounters } from '../db/repo/steps';
 import { recordJobCost } from '../db/repo/costs';
+import { touchObserved } from '../db/repo/endpoint-state';
 import { runpodOutUrl } from '../runpod/output';
 
 export interface GeneratorDeps {
@@ -182,6 +183,10 @@ export async function runStep(deps: GeneratorDeps, cohortId: string, step: Catal
     }
 
     await reconcileTick(deps, cohortId, step);
+    // Keep endpoint_state.observed_at fresh for the whole time this step is
+    // actively generating, not just at allocation — watchdog.ts's orphan
+    // grace window is measured from this timestamp.
+    await touchObserved(deps.pool, step.endpointId);
     await new Promise((resolve) => setTimeout(resolve, Math.min(5_000, deps.cfg.reconcileIntervalMs)));
   }
 

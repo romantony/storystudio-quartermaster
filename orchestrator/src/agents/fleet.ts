@@ -9,11 +9,13 @@
  * acceptance run hand-scales one endpoint's real worker count so this real
  * verification has something real to observe (see the M2 plan's decision 5).
  *
- * NOT YET WIRED: §6.3's lease-write-first step. Impl plan §13 M0.5 is
- * explicit that "the orchestrator-side lease writer (fleet agent) lands with
- * M3" — the AWS-side lease READER already ships (M0.5, `d138d71`), but
- * nothing on this side writes to it yet. Harmless for M2: shadow mode never
- * actually scales anything the live path could contest.
+ * M0.5's original design called for a DynamoDB lease written here, read by
+ * the AWS Lambda live-path provisioner. M3 confirmed that's unnecessary:
+ * MCP-originated traffic (this orchestrator's entire load) never touches
+ * that Lambda, so there's no cross-system datastore to coordinate through.
+ * `endpoint_state` (already in `001_init.sql`, unwired until now) is the
+ * Postgres-only stand-in — legible only to this orchestrator's own
+ * watchdog (`watchdog.ts`), not to anything on the AWS side.
  */
 import type { Pool } from 'pg';
 import type { Config } from '../config';
@@ -22,6 +24,7 @@ import type { CatalogEntry } from '../steps/catalog';
 import { FLEET } from '../fleet-registry';
 import { log } from '../telemetry/log';
 import { updateStepStatus } from '../db/repo/steps';
+import { upsertHeld, clearHeld } from '../db/repo/endpoint-state';
 
 export type StallReason = 'warm_timeout' | 'cap_breach' | 'drain_timeout';
 
@@ -107,10 +110,25 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
     );
   }
 
+  // Record the claim BEFORE the warm-up poll, not after — cold start can
+  // take up to warmTimeoutMs (8 min default), and watchdog.ts ticks every
+  // 60s. Writing this only on success would leave a window where real
+  // RunPod workers are visibly ramping up but endpoint_state shows no
+  // claim, which watchdog would misread as an orphan mid-scale-up.
+  await upsertHeld(pool, step.endpointId, {
+    cohortId,
+    stepSeq: step.seq,
+    workersMax: step.workers,
+    workersMin: step.workers,
+    workersReady: 0,
+  });
+
+  let lastReady = 0;
   const ready = await pollUntil(
     async () => {
       const h = await runpod.health(step.endpointId);
-      return (h.workers.ready ?? 0) >= step.workers;
+      lastReady = h.workers.ready ?? 0;
+      return lastReady >= step.workers;
     },
     { everyMs: 5_000, timeoutMs: cfg.warmTimeoutMs },
   );
@@ -125,6 +143,15 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
     await updateStepStatus(pool, cohortId, step.seq, 'stalled');
     throw new FleetStallError('cap_breach', { others, accountCap: cfg.accountCap, requested: step.workers });
   }
+
+  // Refresh with the confirmed-ready count and a fresh observed_at.
+  await upsertHeld(pool, step.endpointId, {
+    cohortId,
+    stepSeq: step.seq,
+    workersMax: step.workers,
+    workersMin: step.workers,
+    workersReady: lastReady,
+  });
 
   await updateStepStatus(pool, cohortId, step.seq, 'ready', { warmAt: new Date() });
   log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step ready');
@@ -152,11 +179,15 @@ export async function release(deps: FleetDeps, cohortId: string, step: CatalogEn
   if (!drained) {
     await updateStepStatus(pool, cohortId, step.seq, 'stalled');
     // §6.3: "ALERT LOUDLY — this one costs $19/window." A stuck drain leaves
-    // an endpoint billing with nothing in front of it.
+    // an endpoint billing with nothing in front of it. Deliberately NOT
+    // clearing endpoint_state here — the claim staying present with a
+    // recent observed_at is correct: real workers genuinely are still this
+    // step's responsibility, not an orphan of some other cause.
     log().error({ endpointId: step.endpointId, cohortId, seq: step.seq }, 'fleet: DRAIN TIMEOUT — endpoint may still be billing active workers');
     throw new FleetStallError('drain_timeout', { endpointId: step.endpointId });
   }
 
+  await clearHeld(pool, step.endpointId);
   await updateStepStatus(pool, cohortId, step.seq, 'complete', { finishedAt: new Date() });
   log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step drained and complete');
 }

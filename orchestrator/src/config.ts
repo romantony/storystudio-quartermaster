@@ -67,6 +67,18 @@ const ConfigSchema = z.object({
   maxAttempts: numeric(2).pipe(z.number().int().positive()),
   qualityGates: z.enum(['full', 'sampled', 'image-only', 'off']).default('full'),
   workerRateUsdS: numeric(0.00021).pipe(z.number().positive()),
+
+  // ── watchdog (impl plan §6.9 / M3) ────────────────────────────────────
+  // Runs as its own process (watchdog.ts), own pg.Pool, own RunpodClient —
+  // deliberately not sharing this config object's constructed instances, so
+  // it survives the main orchestrator process's death, which is the entire
+  // point. No DynamoDB/AWS SDK here: MCP-originated traffic never touches
+  // the AWS Lambda live-path provisioner, so endpoint_state (Postgres,
+  // already in 001_init.sql) is the only source of truth it needs.
+  watchdogIntervalMs: numeric(60_000).pipe(z.number().int().positive()),
+  watchdogAutodrain: bool(false), // alert-only until proven false-positive-free (§16 q10)
+  orphanGraceMs: numeric(600_000).pipe(z.number().int().positive()),
+  watchdogAlertWebhookUrl: z.string().url().optional(), // unset = log-only, no-op
 });
 
 export type Config = Readonly<z.infer<typeof ConfigSchema>>;
@@ -98,6 +110,10 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   maxAttempts: 'ORCH_MAX_ATTEMPTS',
   qualityGates: 'ORCH_QUALITY_GATES',
   workerRateUsdS: 'WORKER_RATE_USD_S',
+  watchdogIntervalMs: 'WATCHDOG_INTERVAL_MS',
+  watchdogAutodrain: 'WATCHDOG_AUTODRAIN',
+  orphanGraceMs: 'ORPHAN_GRACE_MS',
+  watchdogAlertWebhookUrl: 'WATCHDOG_ALERT_WEBHOOK_URL',
 };
 
 /**
