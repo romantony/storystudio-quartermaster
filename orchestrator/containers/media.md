@@ -28,8 +28,22 @@ differences from the pod2 handler:
   and a standalone `transcribe` mode; `mix_bgm` gained optional `sfx_urls`.
 
 Full contract: `flux4B-Wan2-storystudio/Flux-klien-4b/postprod-lite/API.md`.
-Not yet deployed as of this doc's edit — CI build + RunPod endpoint creation
-are the next steps.
+
+**DEPLOYED and measured 2026-09-10.** Endpoint `n6252hm01qz0xh` ("PostProd-Lite"),
+template `ud534tgyb1`, image `romantony/story-studio-postprod-lite:latest`,
+GPU NVIDIA A40, `workersMin=0`/`workersMax=2`, no network volume. CI build
+took 32m30s (cold GHA cache + baking in Whisper). All 8 modes live-tested
+against real assets and verified — see the measurement table below.
+
+**Account was at its 40-worker RunPod quota ceiling** (exactly 40/40 across
+all endpoints, unrelated systems included — 3D pipeline: Trellis2 4 +
+Blender-headless 2 + Hunyuan-3D 2 + 3d-rigging-skintokens 3; QM/StoryStudio:
+Wan2 8 + Flux-TTS-ANIM 6 + BGM-S2T 4 + qwen-image-gen 4 + qwen-image-edit 4;
+multitalk 3). Freed capacity by shrinking **multitalk 3→1** (user's call) to
+give PostProd-Lite its 2 workers — confirmed multitalk still healthy after.
+**This quota ceiling is a real constraint on [[qm-orchestrator-open-decisions]]
+item 7 (cohort size cap)** — there is no headroom left in the account today
+without either a RunPod quota increase or shrinking another endpoint further.
 
 ## Deploy
 
@@ -99,9 +113,25 @@ Full field tables: `flux4B-Wan2-storystudio/Flux-klien-4b/postprod-lite/API.md`.
 - **`upscale` skips** when the source is already ≥ `target_height`, returning
   the original URL with `upscale: "skipped_source_hires"`.
 
-## Measurement (feeds spec §8 and §16 q4)
+## Measurement (feeds spec §8 and §16 q4) — DONE 2026-09-10
 
-On a real cohort's assets, one job per mode, record `gen_time_s` + RunPod
-`executionTime` + peak VRAM (the SR model is the outlier). That rebuilds the §8
-rate card for steps 6/8/10/11/12 and sizes the GPU for this role (NVENC + the
-SRVGG model's working set).
+One real job per mode against real assets (a 25.2s TTS-narrated clip + a
+4s Ken Burns clip, both from an earlier pod2 pipeline test). `delayTime` mixes
+queue-wait (6 jobs fired at once against 2 workers) and cold-start — not a
+clean per-mode cold-start number except the very first call. Peak VRAM not
+instrumented this pass (worth adding to the handler's response next time).
+
+| mode | gen_time_s | executionTime | delayTime | notes |
+|---|---|---|---|---|
+| transcribe | 3.9 | 6.3s | 171.4s | first-ever call on this endpoint — full image pull, this is the real one-time cold-start cost |
+| upscale (video, 1080p) | 32.6 | 32.9s | 6.3s | Real-ESRGAN is genuinely the slow one, confirms the doc's own prediction |
+| concat (2 clips) | 9.4 | 11.1s | 13.2s | |
+| merge | 2.2 | 2.3s | 24.8s | |
+| caption | 10.2 | 10.4s | 27.6s | includes its own internal Whisper pass |
+| remove_silence | 6.7 | 6.9s | 37.3s | 8 silence segments cut from 25.2s → 22.3s on real TTS narration |
+| animate | 3.0 | 3.1s | 37.6s | |
+| mix_bgm | 2.5 | 2.7s | 1.1s | warm worker by this point, no queue wait — the clean number |
+
+All outputs verified as genuinely valid media (ffprobe'd the caption output:
+h264 1024x576 + aac, 25.2s, matches input) — not just clean-looking API
+responses.
