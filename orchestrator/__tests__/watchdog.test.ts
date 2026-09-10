@@ -8,8 +8,9 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { RunpodClient } from '../src/runpod/client';
-import { checkOnce } from '../src/watchdog';
+import { checkOnce, watchedEndpoints } from '../src/watchdog';
 import type { FleetEndpoint } from '../src/fleet-registry';
+import { STEP_CATALOG } from '../src/steps/catalog';
 
 const fixture = (name: string) =>
   JSON.parse(readFileSync(join(__dirname, '..', '__fixtures__', 'runpod', name), 'utf8'));
@@ -134,5 +135,26 @@ describe('watchdog checkOnce', () => {
     const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
     const patchCall = calls.find(([url]) => url.includes('/rest.runpod.io/'));
     expect(patchCall).toBeUndefined();
+  });
+});
+
+describe('watchedEndpoints', () => {
+  const MULTITALK: FleetEndpoint = { counterKey: 'runpod:multitalk', endpointId: 'mt6vmstwzw0evp', workers: 2 };
+  const BGM: FleetEndpoint = { counterKey: 'runpod:bgm-s2t', endpointId: '6apg6j7suzuezw', workers: 4 };
+
+  it('excludes FLEET endpoints no catalogued step uses — a real false-positive found live 2026-09-10', () => {
+    const fleet = [ENDPOINT, MULTITALK, BGM];
+    const watched = watchedEndpoints(fleet);
+    expect(watched.map((e) => e.endpointId)).not.toContain(MULTITALK.endpointId);
+    expect(watched.map((e) => e.endpointId)).not.toContain(BGM.endpointId);
+  });
+
+  it('includes every FLEET endpoint a catalogued step references', () => {
+    const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId));
+    const fleet = [ENDPOINT, MULTITALK, BGM, ...[...cataloguedIds].map((id) => ({ counterKey: id, endpointId: id, workers: 1 }))];
+    const watched = watchedEndpoints(fleet);
+    for (const id of cataloguedIds) {
+      expect(watched.map((e) => e.endpointId)).toContain(id);
+    }
   });
 });

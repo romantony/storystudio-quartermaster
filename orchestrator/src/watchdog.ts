@@ -23,13 +23,31 @@
  * live-path provisioner, so there's nothing on that side to coordinate with
  * — endpoint_state (Postgres, this orchestrator's own database) is the only
  * source of truth this needs.
+ *
+ * Watches only CATALOGUED endpoints (steps/catalog.ts), not the full FLEET
+ * registry. Real testing on 2026-09-10 found the full-FLEET version
+ * immediately false-positived on `multitalk` (a deliberate standing pool,
+ * never touched by allocate()/release()) and `bgm-s2t` (a still-warm worker
+ * from a direct RunPod call made outside the orchestrator entirely, for
+ * BGM generation). Both are legitimate — "real workers, no orchestrator
+ * claim" only means something for an endpoint the orchestrator actually
+ * scales. Every endpoint in STEP_CATALOG is also FLEET-listed today, but
+ * this is deliberately derived from the catalog, not hand-filtered from
+ * FLEET, so it stays correct as M5 adds more catalogued steps.
  */
 import { loadConfig } from './config';
 import { closePool, initPool, getPool } from './db/pool';
 import { createLogger, setLogger, log } from './telemetry/log';
 import { RunpodClient } from './runpod/client';
 import { FLEET, type FleetEndpoint } from './fleet-registry';
+import { STEP_CATALOG } from './steps/catalog';
 import { getState } from './db/repo/endpoint-state';
+
+/** Unique FleetEndpoints for every endpoint a catalogued step actually uses. */
+export function watchedEndpoints(fleet: readonly FleetEndpoint[] = FLEET): FleetEndpoint[] {
+  const catalogued = new Set(STEP_CATALOG.map((s) => s.endpointId));
+  return fleet.filter((e) => catalogued.has(e.endpointId));
+}
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
@@ -56,7 +74,7 @@ export async function checkOnce(
   runpod: RunpodClient,
   pool: ReturnType<typeof getPool>,
   cfg: { orphanGraceMs: number; watchdogAutodrain: boolean; watchdogAlertWebhookUrl?: string },
-  endpoints: readonly FleetEndpoint[] = FLEET,
+  endpoints: readonly FleetEndpoint[] = watchedEndpoints(),
 ): Promise<void> {
   for (const endpoint of endpoints) {
     let realWorkers = 0;
@@ -92,8 +110,14 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   const logger = createLogger(cfg);
   setLogger(logger);
+  const watched = watchedEndpoints();
   logger.info(
-    { intervalMs: cfg.watchdogIntervalMs, autodrain: cfg.watchdogAutodrain, orphanGraceMs: cfg.orphanGraceMs },
+    {
+      intervalMs: cfg.watchdogIntervalMs,
+      autodrain: cfg.watchdogAutodrain,
+      orphanGraceMs: cfg.orphanGraceMs,
+      watching: watched.map((e) => e.endpointId),
+    },
     'watchdog starting',
   );
 
