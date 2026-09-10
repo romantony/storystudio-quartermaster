@@ -2,6 +2,30 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## Next session (2026-09-11) — QM Orchestrator live acceptance tests
+
+Both M3 and M4 are code-complete, tested (116/116 orchestrator tests), deployed to the
+VPS, and confirmed healthy — but neither has been proven against real RunPod/Replicate
+infra since their latest fix. Two separate, deliberate live tests, in this order:
+
+- **M3 re-verification**: the `workersMax`-only redesign (fixed the 2026-09-10 billing
+  incident — 5 workers billed 8+ min with zero throughput under the old
+  `workersMin==workersMax` design) was deployed but never re-run live after the fix.
+  Flip `ORCH_FLEET_LIVE=true`, submit a small real project, confirm it scales
+  0→N→0 **unattended** (no manual RunPod PATCHing), watchdog stays silent throughout.
+  See `docs/qm-orchestrator-implementation-plan.md` §13 M3 and the M3 fix commits
+  (`cded23e`, `4a83892`) for exactly what changed.
+- **M4 live acceptance**: submit a project with a deliberately bad image prompt, confirm
+  the image gate (Replicate/Gemini VLM) catches it, reworks it on the still-warm
+  `qwen-image-gen` endpoint (check the allocation log shows no second warm-up), and it
+  eventually passes or exhausts cleanly at the 2-attempt cap. This is the first real
+  Replicate spend — small, but real. See §13 M4 in the same doc.
+- Clean up each test's cohort/project row afterward the same way earlier ones needed
+  (`UPDATE cohorts SET status=...` — M6 doesn't auto-close cohorts yet, a known gap
+  documented in `docs/qm-orchestrator-agent-flow.md`).
+- After both pass: M5 ("the full thirteen" — steps 4–13, result assembler, Convex
+  callback) is the next milestone per §13's build order.
+
 ## Queued
 
 - **EC2 cleanup — terminate 2 stopped doc-finalize instances** (blocked on: orchestrator VPS migration for batch jobs — see `docs/qm-orchestrator-session-2026-09-{09,10}.md` — must finish first; this is explicitly sequenced after that, not concurrent)
