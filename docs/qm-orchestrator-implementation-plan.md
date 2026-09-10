@@ -989,13 +989,20 @@ The `media` "container" was going to be new ffmpeg code — until `flux4B-Wan2-s
       `windowId` used the raw current hour instead of rounding to the window's 00/06/12/18
       opening hour, and `ensureCohort` raised a raw Postgres constraint error (instead of a
       clear typed one) when a different cohort was still `running` — both fixed.
-- [ ] **Hand-scale one endpoint manually; run steps 1→2→3 only, one real project, no gates** —
-      not yet done. Needs: deploy to the VPS, set `ORCH_PUBLIC_BASE_URL` (new required config,
-      didn't exist before M2), a human manually set one endpoint's real worker count to match
-      the small number the test plan will carry, then `POST /v1/requests`.
+- [x] **Hand-scale one endpoint manually; run steps 1→2→3 only, one real project, no gates —
+      DONE 2026-09-10.** Deployed to the VPS, added `ORCH_PUBLIC_BASE_URL`/`RUNPOD_API_KEY` to
+      `.env`/`docker-compose.yml` (neither existed before). Real 18-frame/90s narration-basic
+      project: **54/54 jobs complete, zero failures**, image 5m24s/18, tts 2m52s/18, animation
+      15m20s/18. Required manual, sequential (not parallel) worker-count PATCHes in sync with
+      the driver's own step transitions — `workersMin=0` shared endpoints don't self-provision
+      before any job is queued (a real chicken-and-egg with `allocate()`'s verify-before-submit
+      model), and shadow mode's `release()` drain-verification hangs on real leftover workers
+      unless scaled down by hand. See `docs/qm-orchestrator-session-2026-09-10-m2.md` for full
+      timing data and whether `allocate()` should self-nudge `workersMin` before M3.
 - **Done when:** a real project's frames complete image + tts + i2v, with `job_costs` populated
-  from real `execution_ms`/`delay_ms`, having never scaled a worker programmatically. Not yet
-  verified against real infra — see `docs/qm-orchestrator-session-2026-09-10-m2.md`.
+  from real `execution_ms`/`delay_ms`, having never scaled a worker programmatically. **Met**
+  (the fleet controller itself never scaled anything — a human did, exactly as designed for
+  shadow mode) — see `docs/qm-orchestrator-session-2026-09-10-m2.md`.
 - **This milestone is where finding C is retired.** Read the shadow log line by line before M3
   — still applies once the real run happens.
 
