@@ -73,7 +73,7 @@ function mockScenario(s: Scenario) {
     }
 
     if (name === 'QueryCommand') {
-      if (cmd.input.IndexName === 'queue-index') {
+      if (cmd.input.IndexName === 'queue-status-index') {
         const lane = valuesOf(cmd)[':lane'];
         const jobs = (s.queuedJobs ?? []).filter(j => j.lane === lane);
         return { Items: jobs.map(j => marshall(j, { removeUndefinedValues: true })) };

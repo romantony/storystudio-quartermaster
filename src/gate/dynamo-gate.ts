@@ -332,11 +332,10 @@ export async function pullNext(releasedLane: Lane): Promise<string | null> {
 async function queryOldestQueued(lane: Lane): Promise<JobItem | null> {
   const result = await client.send(new QueryCommand({
     TableName: TABLE,
-    IndexName: 'queue-index',
+    IndexName: 'queue-status-index',
     KeyConditionExpression: '#lane = :lane',
-    FilterExpression: '#status = :queued',
-    ExpressionAttributeNames: { '#lane': 'lane', '#status': 'status' },
-    ExpressionAttributeValues: marshall({ ':lane': lane, ':queued': 'QUEUED' }),
+    ExpressionAttributeNames: { '#lane': 'queueLane' },
+    ExpressionAttributeValues: marshall({ ':lane': lane }),
     ScanIndexForward: true,   // ascending enqueueSeq = FIFO
     Limit: 5,                 // check a few in case dependsOn blocks the first
   }));
@@ -408,7 +407,7 @@ async function inlineAdmit(job: JobItem, lane: Lane): Promise<boolean> {
           Update: {
             TableName: TABLE,
             Key: marshall({ pk: job.pk, sk: job.sk }),
-            UpdateExpression: 'SET #status = :proc, leaseId = :lid, leaseExpiry = :exp, updatedAt = :now',
+            UpdateExpression: 'SET #status = :proc, leaseId = :lid, leaseExpiry = :exp, leaseLane = :ln, updatedAt = :now REMOVE queueLane',
             ConditionExpression: '#status = :queued',
             ExpressionAttributeNames: { '#status': 'status' },
             ExpressionAttributeValues: marshall({
@@ -416,6 +415,7 @@ async function inlineAdmit(job: JobItem, lane: Lane): Promise<boolean> {
               ':queued': 'QUEUED',
               ':lid': leaseId,
               ':exp': leaseExpiry,
+              ':ln': lane,
               ':now': now,
             }),
           },
@@ -445,20 +445,21 @@ export async function reclaimExpired(): Promise<{
   let reclaimed = 0, requeued = 0, dead = 0;
 
   for (const lane of ['video', 'rest'] as Lane[]) {
-    // Scan queue-index for PROCESSING items — DynamoDB doesn't index by status,
-    // so we scan with a filter. At our scale (≤15 PROCESSING items) this is cheap.
+    // Query the sparse lease-reclaim-index (leaseLane+leaseExpiry, set only
+    // while a job holds an inline-admitted PROCESSING lease) instead of paging
+    // through queue-index's entire lane history — that Query had no sort-key
+    // bound, so it read every job ever indexed under this lane just to filter
+    // client-side for the handful (if any) of expired leases.
     let lastKey: Record<string, unknown> | undefined;
 
     do {
       const result = await client.send(new QueryCommand({
         TableName: TABLE,
-        IndexName: 'queue-index',
-        KeyConditionExpression: '#lane = :lane',
-        FilterExpression: '#status = :proc AND leaseExpiry < :now',
-        ExpressionAttributeNames: { '#lane': 'lane', '#status': 'status' },
+        IndexName: 'lease-reclaim-index',
+        KeyConditionExpression: '#lane = :lane AND leaseExpiry < :now',
+        ExpressionAttributeNames: { '#lane': 'leaseLane' },
         ExpressionAttributeValues: marshall({
           ':lane': lane,
-          ':proc': 'PROCESSING',
           ':now': now,
         }),
         ExclusiveStartKey: lastKey ? marshall(lastKey) : undefined,
@@ -485,12 +486,18 @@ export async function reclaimExpired(): Promise<{
         await client.send(new UpdateItemCommand({
           TableName: TABLE,
           Key: marshall({ pk: job.pk, sk: job.sk }),
-          UpdateExpression: 'SET #status = :s, attempts = :a, updatedAt = :now REMOVE leaseId, leaseExpiry',
+          // Re-enter queue-status-index (queueLane) when requeued so the next
+          // dispatch pass finds it; always drop the released lease-reclaim-index
+          // key (leaseLane) whether requeued or marked DEAD.
+          UpdateExpression: 'SET #status = :s, attempts = :a, updatedAt = :now'
+            + (newStatus === 'QUEUED' ? ', queueLane = :ql' : '')
+            + ' REMOVE leaseId, leaseExpiry, leaseLane',
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: marshall({
             ':s': newStatus,
             ':a': newAttempts,
             ':now': now,
+            ...(newStatus === 'QUEUED' ? { ':ql': lane } : {}),
           }),
         }));
 

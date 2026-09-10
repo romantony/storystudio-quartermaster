@@ -31,7 +31,7 @@ function mockScenario(s: Scenario) {
     const name = cmdName(cmd);
 
     if (name === 'QueryCommand') {
-      if (cmd.input.IndexName === 'queue-index') return { Items: [] }; // no queued jobs
+      if (cmd.input.IndexName === 'queue-status-index') return { Items: [] }; // no queued jobs
       if (cmd.input.IndexName === 'reservation-status-index') {
         return { Items: (s.activeReservations ?? []).map(r => marshall(r as Record<string, unknown>)) };
       }

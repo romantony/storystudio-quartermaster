@@ -171,7 +171,15 @@ export interface JobItem {
   status: JobStatus;
   lane: Lane;
   priority: Priority;
-  enqueueSeq: string;   // epoch_ms#jobId — sort key for queue-index GSI
+  enqueueSeq: string;   // epoch_ms#jobId — sort key for queue-index/queue-status-index GSIs
+  // Sparse-index key for queue-status-index: mirrors `lane` (never 'none')
+  // while status is QUEUED, absent otherwise. Present only during the window
+  // a job is actually waiting to be dispatched.
+  queueLane?: Lane;
+  // Sparse-index key for lease-reclaim-index: mirrors `lane`, set alongside
+  // leaseId/leaseExpiry by inlineAdmit() while this job holds a modelslab
+  // admission lease, removed the moment that lease is released.
+  leaseLane?: Lane;
   provider?: string;
   model?: string;
   endpoint?: string;

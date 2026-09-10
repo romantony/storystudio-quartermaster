@@ -260,6 +260,7 @@ async function handleIngest(evt: LambdaFunctionUrlEvent): Promise<LambdaFunction
     sk: `JOB#${jobId}`,
     status: 'QUEUED',
     lane,
+    queueLane: lane !== 'none' ? lane : undefined,
     priority,
     enqueueSeq: `${now}#${jobId}`,
     provider: undefined,
@@ -341,11 +342,11 @@ async function redispatchQueuedCanonical(): Promise<number> {
     do {
       const res = await db.send(new QueryCommand({
         TableName: TABLE,
-        IndexName: 'queue-index',
+        IndexName: 'queue-status-index',
         KeyConditionExpression: '#lane = :lane',
-        FilterExpression: '#status = :q AND attribute_exists(assetType)',
-        ExpressionAttributeNames: { '#lane': 'lane', '#status': 'status' },
-        ExpressionAttributeValues: marshall({ ':lane': lane, ':q': 'QUEUED' }),
+        FilterExpression: 'attribute_exists(assetType)',
+        ExpressionAttributeNames: { '#lane': 'queueLane' },
+        ExpressionAttributeValues: marshall({ ':lane': lane }),
         ExclusiveStartKey: lastKey ? marshall(lastKey) : undefined,
       }));
       for (const raw of res.Items ?? []) {

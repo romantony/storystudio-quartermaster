@@ -350,12 +350,12 @@ async function dispatchNextForEndpoint(counterKey: string, depth: number): Promi
   for (const lane of ['video', 'rest']) {
     const res = await db.send(new QueryCommand({
       TableName: TABLE,
-      IndexName: 'queue-index',
+      IndexName: 'queue-status-index',
       KeyConditionExpression: '#lane = :lane',
-      FilterExpression: '#status = :q AND attribute_exists(assetType)',
-      ExpressionAttributeNames: { '#lane': 'lane', '#status': 'status' },
-      ExpressionAttributeValues: marshall({ ':lane': lane, ':q': 'QUEUED' }),
-    })); // queue-index sorts by enqueueSeq → oldest first
+      FilterExpression: 'attribute_exists(assetType)',
+      ExpressionAttributeNames: { '#lane': 'queueLane' },
+      ExpressionAttributeValues: marshall({ ':lane': lane }),
+    })); // queue-status-index sorts by enqueueSeq → oldest first
     for (const raw of res.Items ?? []) {
       const j = unmarshall(raw) as JobItem;
       if (jobCounterKey(j) === counterKey) {
@@ -381,7 +381,7 @@ async function claimJob(job: JobItem): Promise<boolean> {
     await db.send(new UpdateItemCommand({
       TableName: TABLE,
       Key: marshall({ pk: job.pk, sk: job.sk }),
-      UpdateExpression: 'SET #s = :p, updatedAt = :now',
+      UpdateExpression: 'SET #s = :p, updatedAt = :now REMOVE queueLane',
       ConditionExpression: '#s = :q',
       ExpressionAttributeNames: { '#s': 'status' },
       ExpressionAttributeValues: marshall({ ':p': 'PROCESSING', ':q': 'QUEUED', ':now': Date.now() }),
@@ -402,9 +402,13 @@ async function requeueForCapacity(job: JobItem): Promise<void> {
   await db.send(new UpdateItemCommand({
     TableName: TABLE,
     Key: marshall({ pk: job.pk, sk: job.sk }),
-    UpdateExpression: 'SET #s = :q, updatedAt = :now, capacityWaits = if_not_exists(capacityWaits, :zero) + :one',
+    UpdateExpression: 'SET #s = :q, updatedAt = :now, capacityWaits = if_not_exists(capacityWaits, :zero) + :one'
+      + (job.lane !== 'none' ? ', queueLane = :ql' : ''),
     ExpressionAttributeNames: { '#s': 'status' },
-    ExpressionAttributeValues: marshall({ ':q': 'QUEUED', ':now': Date.now(), ':zero': 0, ':one': 1 }),
+    ExpressionAttributeValues: marshall({
+      ':q': 'QUEUED', ':now': Date.now(), ':zero': 0, ':one': 1,
+      ...(job.lane !== 'none' ? { ':ql': job.lane } : {}),
+    }),
   }));
   console.info('[executor] re-queued for capacity (internal endpoint full)', job.jobId,
     `capacityWaits=${(job.capacityWaits ?? 0) + 1}`);
@@ -443,7 +447,13 @@ export async function complete(
   await db.send(new UpdateItemCommand({
     TableName: TABLE,
     Key: marshall({ pk: job.pk, sk: job.sk }),
-    UpdateExpression: `SET ${sets.join(', ')}`,
+    // REMOVE queueLane/leaseId/leaseExpiry/leaseLane defensively — claimJob()
+    // already strips queueLane on the normal QUEUED→PROCESSING path, and
+    // reclaimExpired() strips the lease fields when it times one out, but
+    // complete() is also reachable via webhook.ts for jobs admitted through
+    // inlineAdmit()'s own transaction, so this must not assume either of those
+    // ran. Removing an already-absent attribute is a no-op.
+    UpdateExpression: `SET ${sets.join(', ')} REMOVE queueLane, leaseId, leaseExpiry, leaseLane`,
     ExpressionAttributeNames: { '#s': 'status' },
     ExpressionAttributeValues: marshall(values),
   }));
@@ -521,7 +531,7 @@ async function markFailed(job: JobItem, reason: string): Promise<void> {
   await db.send(new UpdateItemCommand({
     TableName: TABLE,
     Key: marshall({ pk: job.pk, sk: job.sk }),
-    UpdateExpression: 'SET #s = :s, errorReason = :r, updatedAt = :now',
+    UpdateExpression: 'SET #s = :s, errorReason = :r, updatedAt = :now REMOVE queueLane, leaseId, leaseExpiry, leaseLane',
     ExpressionAttributeNames: { '#s': 'status' },
     ExpressionAttributeValues: marshall({ ':s': 'FAILED', ':r': reason, ':now': Date.now() }),
   }));

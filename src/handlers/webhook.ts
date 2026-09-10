@@ -165,7 +165,8 @@ export const handler = async (evt: LambdaFunctionUrlEvent): Promise<LambdaFuncti
           UpdateExpression: 'SET #status = :s, updatedAt = :now'
             + (assetKey ? ', assetKey = :ak' : '')
             + (durationS !== undefined ? ', durationS = :d' : '')
-            + (text !== undefined ? ', resultText = :rt' : ''),
+            + (text !== undefined ? ', resultText = :rt' : '')
+            + ' REMOVE queueLane, leaseId, leaseExpiry, leaseLane',
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: marshall({
             ':s': 'COMPLETE',

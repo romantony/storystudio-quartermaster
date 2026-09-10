@@ -326,11 +326,10 @@ export async function gatherQueuedDetailed(): Promise<{
     do {
       const res = await db.send(new QueryCommand({
         TableName: TABLE,
-        IndexName: 'queue-index',
+        IndexName: 'queue-status-index',
         KeyConditionExpression: '#lane = :lane',
-        FilterExpression: '#status = :q',
-        ExpressionAttributeNames: { '#lane': 'lane', '#status': 'status' },
-        ExpressionAttributeValues: marshall({ ':lane': lane, ':q': 'QUEUED' }),
+        ExpressionAttributeNames: { '#lane': 'queueLane' },
+        ExpressionAttributeValues: marshall({ ':lane': lane }),
         ExclusiveStartKey: lastKey ? marshall(lastKey) : undefined,
       }));
       for (const raw of res.Items ?? []) {
