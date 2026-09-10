@@ -966,14 +966,38 @@ The `media` "container" was going to be new ffmpeg code — until `flux4B-Wan2-s
       else the planner may drop it (M2).
 - **Done when:** each of the 5 modes completes one real job for a cohort and writes to R2.
 
-### M2 — Plan and generate, shadow fleet
-- [ ] Planner: spec §9.1 validation, job graph, step plan, affinity collapse
-- [ ] Generator: submit loop, in-flight limiter, webhook receiver, reconciler
-- [ ] Fleet controller with `ORCH_FLEET_LIVE=false` — logs every PATCH it would make
-- [ ] Hand-scale one endpoint manually; run **steps 1→2→3 only**, one project, no gates
-- **Done when:** 69 frames of image + tts + i2v complete, with `job_costs` populated, having never
-  scaled a worker programmatically.
-- **This milestone is where finding C is retired.** Read the shadow log line by line before M3.
+### M2 — Plan and generate, shadow fleet — **code complete 2026-09-10, real acceptance run pending**
+- [x] Planner: §9.1 validation (zod `.strict()`), job graph, step plan, affinity collapse
+      (`agents/planner.ts`). Plans only catalogued steps (1-3 for now — `steps/catalog.ts`);
+      resolves the full spec step-set so widening to 4-13 in M5 needs no change here.
+- [x] Generator: submit loop, in-flight limiter (= verified worker count, not config),
+      synchronous-completion handling, webhook receiver (`http/routes/webhooks.ts`),
+      reconcile-tick fallback (`agents/generator.ts`)
+- [x] Fleet controller with `ORCH_FLEET_LIVE=false` — logs every PATCH it would make
+      (`agents/fleet.ts`); real health verification + cap assertion regardless. Lease-write
+      (§6.3 step 1) intentionally NOT wired — M0.5 already flagged that as landing with M3.
+- [x] New migration `006_step_deps.sql` — `001`'s schema never persisted §9.3's `dependsOn`;
+      applies/rolls back cleanly.
+- [x] `db/repo/{cohorts,projects,steps,jobs,costs}.ts`, `steps/builders/{image,tts,i2v}.ts`
+      (ported from `src/adapters/runpod.ts`'s `t2i`/`tts`/`i2v` cases), `agents/orchestrator.ts`
+      (the minimal driver — no gating phase yet, `agents/quality.ts` doesn't exist until M4),
+      `http/routes/{requests,admin}.ts`, `telemetry/ledger.ts` (`estimateBasis: "default"` only
+      — `step_baselines` isn't written until there's a real measured cohort).
+- [x] 56 tests green (36 pure-unit + 4 repo-layer integration against a real throwaway Postgres
+      + the pre-existing suite), incl. a structural test that only `agents/fleet.ts` calls
+      `patchWorkers`. The integration tests caught two real bugs before they shipped:
+      `windowId` used the raw current hour instead of rounding to the window's 00/06/12/18
+      opening hour, and `ensureCohort` raised a raw Postgres constraint error (instead of a
+      clear typed one) when a different cohort was still `running` — both fixed.
+- [ ] **Hand-scale one endpoint manually; run steps 1→2→3 only, one real project, no gates** —
+      not yet done. Needs: deploy to the VPS, set `ORCH_PUBLIC_BASE_URL` (new required config,
+      didn't exist before M2), a human manually set one endpoint's real worker count to match
+      the small number the test plan will carry, then `POST /v1/requests`.
+- **Done when:** a real project's frames complete image + tts + i2v, with `job_costs` populated
+  from real `execution_ms`/`delay_ms`, having never scaled a worker programmatically. Not yet
+  verified against real infra — see `docs/qm-orchestrator-session-2026-09-10-m2.md`.
+- **This milestone is where finding C is retired.** Read the shadow log line by line before M3
+  — still applies once the real run happens.
 
 ### M3 — Live fleet control
 - [ ] Flip `ORCH_FLEET_LIVE=true` on one endpoint, one step

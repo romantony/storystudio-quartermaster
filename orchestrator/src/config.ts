@@ -38,6 +38,12 @@ const ConfigSchema = z.object({
   // ── ingress auth ───────────────────────────────────────────────────────
   ingestToken: z.string().min(1, 'ORCH_INGEST_TOKEN is required'),
   webhookSecret: z.string().min(1, 'ORCH_WEBHOOK_SECRET is required'),
+  // Spec §11: "hostname stability is now a correctness requirement, not a
+  // convenience" — every submitted job's webhook URL is built from this. No
+  // default; a wrong or missing value breaks every callback for the cohort
+  // that started while it was wrong, silently (the generator's reconcile
+  // tick is the only thing that would eventually notice).
+  publicBaseUrl: z.string().url('ORCH_PUBLIC_BASE_URL is required, e.g. https://orchestrator.ai-storystudio.com'),
 
   // ── RunPod ─────────────────────────────────────────────────────────────
   // Optional in M0 — no milestone before M2 makes a RunPod call, and M0's
@@ -74,6 +80,7 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   pgStatementTimeoutMs: 'PG_STATEMENT_TIMEOUT_MS',
   ingestToken: 'ORCH_INGEST_TOKEN',
   webhookSecret: 'ORCH_WEBHOOK_SECRET',
+  publicBaseUrl: 'ORCH_PUBLIC_BASE_URL',
   runpodApiKey: 'RUNPOD_API_KEY',
   runpodApiBase: 'RUNPOD_API_BASE',
   runpodRestBase: 'RUNPOD_REST_BASE',

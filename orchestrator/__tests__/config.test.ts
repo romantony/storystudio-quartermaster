@@ -4,6 +4,7 @@ const MINIMAL = {
   DATABASE_URL: 'postgres://u:p@localhost:5432/qm_orch',
   ORCH_INGEST_TOKEN: 'ingest-tok',
   ORCH_WEBHOOK_SECRET: 'wh-secret',
+  ORCH_PUBLIC_BASE_URL: 'https://orchestrator.ai-storystudio.com',
 };
 
 describe('loadConfig', () => {
