@@ -1216,9 +1216,29 @@ rejected as too risky.
   driver had no direct test before M4), plus additions to `fleet.test.ts` for the drain
   precondition.
 - **Done when:** a deliberately bad prompt is caught, reworked on the warm endpoint, and passes —
-  with no second warm-up in the allocation log. **Not yet proven live** — built and
-  tested locally/against a real throwaway Postgres, but not yet deployed or run against
-  real RunPod + Replicate infra.
+  with no second warm-up in the allocation log. **Attempted live 2026-09-11, inconclusive —
+  blocked by an external dependency, not a pipeline bug.** Real findings from the attempt:
+  - The **image gate passed a deliberately hard prompt (specific legible sign text) on the
+    first try, 10/10, zero issues** — validates the pass path works correctly, but a harder
+    trigger (e.g. exact multi-entity counting/ordering, historically more reliable than text
+    rendering against `qwen-image-gen`) is needed to actually exercise the rework path.
+  - The **motion gate never resolved**: Replicate's account has **under $5 in credit**,
+    which drops the rate limit hard enough (6 req/min, burst of 1) that both the primary
+    (`google/gemini-2.5-flash`) and fallback (`google/gemini-3-pro`) vision calls 429 every
+    attempt — confirmed by replaying the exact call manually. `agents/quality.ts`'s
+    infra-failure retry (deliberately uncapped, unlike the 2-attempt content-rework cap —
+    see §6.5) then spun forever, and since `runStep()` had already exited, nothing was
+    refreshing `endpoint_state` for the still-warm `wan2-i2v` pool, so the newly-enabled
+    `WATCHDOG_AUTODRAIN` was minutes from force-draining it out from under the stuck gate.
+    Manually drained and the cohort marked failed before that fired. Two real gaps this
+    surfaces for later, not fixed today: (1) no cap/backoff distinction between "infra is
+    down" and "will recover," so a persistent outage spins forever instead of eventually
+    stalling the step the way a content-rework exhaustion does; (2) the gate's retry loop
+    and the watchdog's ownership model don't coordinate — the gate still legitimately needs
+    the endpoint while autodrain doesn't know that.
+  - Per this doc's own principle (§1, and the pipeline flow spec compared 2026-09-11):
+    external billing/outage issues are explicitly out of scope for the pipeline to
+    self-correct — Replicate credit needs topping up before a real M4 re-attempt.
 
 ### M5 — The full thirteen
 - [ ] Steps 4–5 (lip-sync, bgm_sfx), one payload builder at a time — bulk/stage-major via the

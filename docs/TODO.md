@@ -17,11 +17,19 @@ infra since their latest fix. Two separate, deliberate live tests, in this order
   backoff. Third attempt (cohort `win_2026_09_11_12`) passed clean: all 3 steps scaled
   0→N→0 unattended, zero watchdog alerts. Commits `e681651`, `56110c0`. See the
   2026-09-11 memory entries for the full incident writeup.
-- **M4 live acceptance**: submit a project with a deliberately bad image prompt, confirm
-  the image gate (Replicate/Gemini VLM) catches it, reworks it on the still-warm
-  `qwen-image-gen` endpoint (check the allocation log shows no second warm-up), and it
-  eventually passes or exhausts cleanly at the 2-attempt cap. This is the first real
-  Replicate spend — small, but real. See §13 M4 in the same doc.
+- **M4 live acceptance — attempted 2026-09-11, inconclusive, retry blocked on external
+  billing.** Image gate passed a hard prompt cleanly (10/10, first try) — validates the
+  pass path, but didn't exercise rework (need a harder trigger next time, e.g. exact
+  multi-entity counting/ordering rather than legible text — `qwen-image-gen` handled the
+  text prompt fine). Motion gate never resolved: **Replicate account has under $5 credit**,
+  which 429s both vision models on every attempt — confirmed by replaying the call
+  manually, not a code bug. Manually drained `wan2-i2v` and closed out the cohort before
+  the newly-enabled `WATCHDOG_AUTODRAIN` would have force-drained it mid-gate. **Top up
+  Replicate credit before re-attempting.** Two real orchestrator gaps surfaced, not yet
+  fixed: the quality gate's infra-failure retry has no cap (spins forever on a persistent
+  outage, unlike the 2-attempt content-rework cap), and it doesn't coordinate with the
+  watchdog's endpoint-ownership model. See §13 M4 in the implementation plan doc for the
+  full writeup.
 - Clean up each test's cohort/project row afterward the same way earlier ones needed
   (`UPDATE cohorts SET status=...` — M6 doesn't auto-close cohorts yet, a known gap
   documented in `docs/qm-orchestrator-agent-flow.md`).
