@@ -157,4 +157,14 @@ describe('watchedEndpoints', () => {
       expect(watched.map((e) => e.endpointId)).toContain(id);
     }
   });
+
+  it('watches a catalogued endpoint even when FLEET has no entry for it at all (2026-09-11: postprod-lite, orchestrator-only, never shared with the AWS live path)', () => {
+    const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId));
+    // Deliberately empty/unrelated FLEET — the old fleet.filter(...) implementation
+    // would have watched nothing at all in this case, silently.
+    const watched = watchedEndpoints([MULTITALK, BGM]);
+    for (const id of cataloguedIds) {
+      expect(watched.map((e) => e.endpointId)).toContain(id);
+    }
+  });
 });

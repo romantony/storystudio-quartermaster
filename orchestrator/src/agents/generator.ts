@@ -212,9 +212,17 @@ export function webhookToken(secret: string, jobId: number): string {
   return createHmac('sha256', secret).update(String(jobId)).digest('hex').slice(0, 32);
 }
 
-/** §6.4's reconcile tick — the fallback for a missed/delayed webhook. */
-export async function reconcileTick(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, baselineSec = 60): Promise<void> {
-  const stale = await listStale(deps.pool, cohortId, step.seq, new Date(Date.now() - baselineSec * 1000));
+/** §6.4's reconcile tick — the fallback for a missed/delayed webhook.
+ * Optional projectId scopes this to one project's rows only — see
+ * runStep()'s doc comment for why. */
+export async function reconcileTick(
+  deps: GeneratorDeps,
+  cohortId: string,
+  step: CatalogEntry,
+  baselineSec = 60,
+  projectId?: string,
+): Promise<void> {
+  const stale = await listStale(deps.pool, cohortId, step.seq, new Date(Date.now() - baselineSec * 1000), projectId);
   for (const job of stale) {
     if (!job.runpodJobId) continue;
     try {
@@ -260,28 +268,41 @@ export async function reconcileTick(deps: GeneratorDeps, cohortId: string, step:
  * autoscaler is expected to grow real capacity into as jobs actually land
  * against it. submitOne() just POSTs /run, which RunPod queues regardless
  * of current real worker count — that's the whole mechanism this relies on.
+ *
+ * `projectId` (M5 phase 1, 2026-09-11): when provided, every claim/read
+ * this loop does is additionally scoped to that one project's jobs for this
+ * step — the reuse point that lets agents/assembler.ts drive an
+ * assembly step one project at a time without duplicating this whole
+ * crash-safe claim/submit/reconcile loop. Undefined (the default) preserves
+ * the exact cohort-wide behavior steps 1-5 already rely on.
  */
-export async function runStep(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, targetWorkers: number): Promise<void> {
+export async function runStep(
+  deps: GeneratorDeps,
+  cohortId: string,
+  step: CatalogEntry,
+  targetWorkers: number,
+  projectId?: string,
+): Promise<void> {
   await updateStepStatus(deps.pool, cohortId, step.seq, 'running', { startedAt: new Date() });
-  log().info({ stepSeq: step.seq, targetWorkers }, 'generator: step running');
+  log().info({ stepSeq: step.seq, targetWorkers, projectId }, 'generator: step running');
 
   const loopStartedAt = Date.now();
   let warmedAt: Date | null = null;
 
   for (;;) {
-    const { total, terminal } = await stepJobCounts(deps.pool, cohortId, step.seq);
+    const { total, terminal } = await stepJobCounts(deps.pool, cohortId, step.seq, projectId);
     if (terminal >= total) break;
 
-    const inFlight = (await listInFlight(deps.pool, cohortId, step.seq)).length;
+    const inFlight = (await listInFlight(deps.pool, cohortId, step.seq, projectId)).length;
     const room = Math.max(0, targetWorkers - inFlight);
     if (room > 0) {
-      const batch = await claimBatchReadOnly(deps.pool, cohortId, step.seq, room);
+      const batch = await claimBatchReadOnly(deps.pool, cohortId, step.seq, room, projectId);
       for (const job of batch) {
         await submitOne(deps, cohortId, step, job);
       }
     }
 
-    await reconcileTick(deps, cohortId, step);
+    await reconcileTick(deps, cohortId, step, 60, projectId);
     // Keep endpoint_state.observed_at fresh for the whole time this step is
     // actively generating, not just at allocation — watchdog.ts's orphan
     // grace window is measured from this timestamp.
@@ -339,11 +360,11 @@ export async function runStep(deps: GeneratorDeps, cohortId: string, step: Catal
 /** Unlocked read of candidate jobs — submitOne() does the real FOR UPDATE
  * SKIP LOCKED claim per-job right before submitting, so this is just "what
  * to try next," not the crash-safety boundary. */
-async function claimBatchReadOnly(pool: Pool, cohortId: string, stepSeq: number, limit: number): Promise<JobRow[]> {
+async function claimBatchReadOnly(pool: Pool, cohortId: string, stepSeq: number, limit: number, projectId?: string): Promise<JobRow[]> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const rows = await claimNextBatch(client, cohortId, stepSeq, limit);
+    const rows = await claimNextBatch(client, cohortId, stepSeq, limit, projectId);
     await client.query('ROLLBACK'); // release the locks immediately; submitOne reclaims per-job
     return rows;
   } finally {

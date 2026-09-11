@@ -49,6 +49,7 @@ const STEP: CatalogEntry & { workers: number } = {
   endpointId: 'e165se4r3eo5hp', // real qwen-image-gen id, matches FLEET
   gate: null,
   dependsOn: [],
+  scope: 'bulk',
   builder: (() => ({})) as CatalogEntry['builder'],
   workers: 5,
 };

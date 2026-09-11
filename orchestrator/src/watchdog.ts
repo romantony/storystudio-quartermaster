@@ -31,9 +31,17 @@
  * from a direct RunPod call made outside the orchestrator entirely, for
  * BGM generation). Both are legitimate — "real workers, no orchestrator
  * claim" only means something for an endpoint the orchestrator actually
- * scales. Every endpoint in STEP_CATALOG is also FLEET-listed today, but
- * this is deliberately derived from the catalog, not hand-filtered from
- * FLEET, so it stays correct as M5 adds more catalogued steps.
+ * scales.
+ *
+ * True catalog membership, not FLEET-filtered (fixed 2026-09-11, M5 phase
+ * 1): every endpoint in STEP_CATALOG WAS also FLEET-listed through M4, so
+ * `fleet.filter(e => catalogued.has(...))` happened to watch everything
+ * catalogued — but `postprod-lite` (step 6+) is orchestrator-only, never
+ * shared with the AWS live path, so it has no FLEET entry at all and that
+ * filter would have silently watched nothing for it, reopening the exact
+ * orphaned-worker failure class (see the 2026-09-11 memory writeup) with
+ * zero coverage on the new endpoint. Now built directly from the catalog's
+ * unique endpoint ids, enriched with FLEET's metadata where it exists.
  */
 import { loadConfig } from './config';
 import { closePool, initPool, getPool } from './db/pool';
@@ -43,10 +51,15 @@ import { FLEET, type FleetEndpoint } from './fleet-registry';
 import { STEP_CATALOG } from './steps/catalog';
 import { getState } from './db/repo/endpoint-state';
 
-/** Unique FleetEndpoints for every endpoint a catalogued step actually uses. */
+/** Unique FleetEndpoints for every endpoint a catalogued step actually uses —
+ * built from the catalog itself, not filtered from FLEET (see this file's
+ * header comment for why that distinction matters). */
 export function watchedEndpoints(fleet: readonly FleetEndpoint[] = FLEET): FleetEndpoint[] {
-  const catalogued = new Set(STEP_CATALOG.map((s) => s.endpointId));
-  return fleet.filter((e) => catalogued.has(e.endpointId));
+  const fleetById = new Map(fleet.map((e) => [e.endpointId, e] as const));
+  const uniqueIds = [...new Set(STEP_CATALOG.map((s) => s.endpointId))];
+  return uniqueIds.map(
+    (endpointId) => fleetById.get(endpointId) ?? { endpointId, counterKey: `orchestrator-only:${endpointId}`, workers: 0 },
+  );
 }
 
 async function sleep(ms: number): Promise<void> {

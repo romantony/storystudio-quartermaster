@@ -107,15 +107,17 @@ export async function claimNextBatch(
   cohortId: string,
   stepSeq: number,
   limit: number,
+  projectId?: string,
 ): Promise<JobRow[]> {
   if (limit <= 0) return [];
   const { rows } = await client.query(
     `SELECT ${JOB_COLUMNS} FROM jobs
       WHERE cohort_id = $1 AND step_seq = $2 AND status = 'planned' AND deps_remaining = 0
+        ${projectId !== undefined ? 'AND project_id = $4' : ''}
       ORDER BY seq
       LIMIT $3
       FOR UPDATE SKIP LOCKED`,
-    [cohortId, stepSeq, limit],
+    projectId !== undefined ? [cohortId, stepSeq, limit, projectId] : [cohortId, stepSeq, limit],
   );
   return rows.map(toJob);
 }
@@ -137,10 +139,11 @@ export async function getJobByRunpodId(db: Queryable, runpodJobId: string): Prom
   return rows[0] ? toJob(rows[0]) : undefined;
 }
 
-export async function listInFlight(db: Queryable, cohortId: string, stepSeq: number): Promise<JobRow[]> {
+export async function listInFlight(db: Queryable, cohortId: string, stepSeq: number, projectId?: string): Promise<JobRow[]> {
   const { rows } = await db.query(
-    `SELECT ${JOB_COLUMNS} FROM jobs WHERE cohort_id = $1 AND step_seq = $2 AND status = 'submitted'`,
-    [cohortId, stepSeq],
+    `SELECT ${JOB_COLUMNS} FROM jobs WHERE cohort_id = $1 AND step_seq = $2 AND status = 'submitted'
+       ${projectId !== undefined ? 'AND project_id = $3' : ''}`,
+    projectId !== undefined ? [cohortId, stepSeq, projectId] : [cohortId, stepSeq],
   );
   return rows.map(toJob);
 }
@@ -149,12 +152,14 @@ export async function stepJobCounts(
   db: Queryable,
   cohortId: string,
   stepSeq: number,
+  projectId?: string,
 ): Promise<{ total: number; terminal: number }> {
   const { rows } = await db.query<{ total: string; terminal: string }>(
     `SELECT count(*) AS total,
             count(*) FILTER (WHERE status IN ('complete', 'failed')) AS terminal
-       FROM jobs WHERE cohort_id = $1 AND step_seq = $2`,
-    [cohortId, stepSeq],
+       FROM jobs WHERE cohort_id = $1 AND step_seq = $2
+         ${projectId !== undefined ? 'AND project_id = $3' : ''}`,
+    projectId !== undefined ? [cohortId, stepSeq, projectId] : [cohortId, stepSeq],
   );
   return { total: Number(rows[0].total), terminal: Number(rows[0].terminal) };
 }
@@ -206,12 +211,26 @@ export async function listStale(
   cohortId: string,
   stepSeq: number,
   olderThan: Date,
+  projectId?: string,
 ): Promise<JobRow[]> {
   const { rows } = await db.query(
     `SELECT ${JOB_COLUMNS} FROM jobs
       WHERE cohort_id = $1 AND step_seq = $2 AND status = 'submitted' AND submitted_at < $3
-        AND runpod_job_id IS NOT NULL`,
-    [cohortId, stepSeq, olderThan],
+        AND runpod_job_id IS NOT NULL
+        ${projectId !== undefined ? 'AND project_id = $4' : ''}`,
+    projectId !== undefined ? [cohortId, stepSeq, olderThan, projectId] : [cohortId, stepSeq, olderThan],
   );
   return rows.map(toJob);
+}
+
+/** Which projects actually have work planned for this step, in project
+ * insertion order — agents/assembler.ts's per-project loop (M5 phase 1)
+ * uses this instead of "every project in the cohort" so a project that
+ * somehow has no tail work planned is silently skipped, not stalled on. */
+export async function listProjectIdsForStep(db: Queryable, cohortId: string, stepSeq: number): Promise<string[]> {
+  const { rows } = await db.query<{ project_id: string }>(
+    `SELECT DISTINCT project_id FROM jobs WHERE cohort_id = $1 AND step_seq = $2 ORDER BY project_id`,
+    [cohortId, stepSeq],
+  );
+  return rows.map((r) => r.project_id);
 }

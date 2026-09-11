@@ -25,6 +25,7 @@ const IMAGE_STEP: CatalogEntry = {
   endpointId: 'e165se4r3eo5hp',
   gate: 'image',
   dependsOn: [],
+  scope: 'bulk',
   builder: (() => ({})) as CatalogEntry['builder'],
 };
 
@@ -34,6 +35,7 @@ const MOTION_STEP: CatalogEntry = {
   endpointId: 'nd7wloyvj09xwy',
   gate: 'motion',
   dependsOn: [1],
+  scope: 'bulk',
   builder: (() => ({})) as CatalogEntry['builder'],
 };
 

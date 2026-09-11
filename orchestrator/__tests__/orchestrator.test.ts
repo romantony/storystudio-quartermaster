@@ -14,6 +14,7 @@ import * as cohortsRepo from '../src/db/repo/cohorts';
 import * as fleetAgent from '../src/agents/fleet';
 import * as generatorAgent from '../src/agents/generator';
 import * as qualityAgent from '../src/agents/quality';
+import * as assemblerAgent from '../src/agents/assembler';
 
 jest.mock('../src/db/repo/steps');
 jest.mock('../src/db/repo/cohorts');
@@ -25,6 +26,10 @@ jest.mock('../src/agents/generator', () => ({
 jest.mock('../src/agents/quality', () => ({
   ...jest.requireActual('../src/agents/quality'),
   gateStep: jest.fn(),
+}));
+jest.mock('../src/agents/assembler', () => ({
+  ...jest.requireActual('../src/agents/assembler'),
+  runAssembler: jest.fn(),
 }));
 
 function dbStep(seq: number, workersTarget = 5, drainAfter = true) {
@@ -78,6 +83,7 @@ beforeEach(() => {
   (fleetAgent.allocate as jest.Mock).mockResolvedValue(undefined);
   (fleetAgent.release as jest.Mock).mockResolvedValue(undefined);
   (fleetAgent.emergencyDrain as jest.Mock).mockResolvedValue(undefined);
+  (assemblerAgent.runAssembler as jest.Mock).mockResolvedValue(undefined);
 });
 
 describe('driveCohort() — gating concurrency', () => {
@@ -164,5 +170,41 @@ describe('driveCohort() — error handling', () => {
     await driveCohort(BASE_DEPS, 'win_test');
 
     expect(fleetAgent.emergencyDrain).toHaveBeenCalledWith(expect.anything(), 'rnqxi6c0mlq517');
+  });
+});
+
+describe('driveCohort() — assembler dispatch fork (M5 phase 1, 2026-09-11)', () => {
+  it('does not call the assembler at all when only bulk-scope steps are planned', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2)]); // seq 2 (tts) is scope: 'bulk'
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(assemblerAgent.runAssembler).not.toHaveBeenCalled();
+  });
+
+  it('calls the assembler once, after every bulk step finishes, when a project-scope step is planned', async () => {
+    // seq 2 (tts, bulk) + seq 6 (merge, project) — both real catalog entries.
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2), dbStep(6)]);
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(assemblerAgent.runAssembler).toHaveBeenCalledTimes(1);
+    // Called after seq 2's own runStep()/release() — the bulk loop entirely
+    // skips seq 6 (driveCohort()'s `runnable` filters to scope: 'bulk'),
+    // so runStep() itself must never see it.
+    expect(generatorAgent.runStep).toHaveBeenCalledTimes(1);
+    expect(generatorAgent.runStep).toHaveBeenCalledWith(expect.anything(), 'win_test', expect.objectContaining({ seq: 2 }), 5);
+  });
+
+  it('emergency-drains the tail endpoint and stops the cohort when the assembler fails', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(6)]);
+    (assemblerAgent.runAssembler as jest.Mock).mockRejectedValue(new Error('postprod-lite down'));
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    // Real catalog entry for seq 6 — postprod-lite, not a synthetic dbStep() id.
+    expect(fleetAgent.emergencyDrain).toHaveBeenCalledWith(expect.anything(), 'n6252hm01qz0xh');
   });
 });

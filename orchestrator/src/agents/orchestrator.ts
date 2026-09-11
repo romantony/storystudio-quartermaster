@@ -27,6 +27,7 @@ import { catalogEntry } from '../steps/catalog';
 import { allocate, release, emergencyDrain, type FleetDeps } from './fleet';
 import { runStep, GeneratorStallError, type GeneratorDeps } from './generator';
 import { gateStep, type QualityDeps } from './quality';
+import { runAssembler, type AssemblerDeps } from './assembler';
 
 export interface DriverDeps {
   pool: Pool;
@@ -64,10 +65,15 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
   };
 
   const dbSteps = await listSteps(deps.pool, cohortId);
-  const runnable = dbSteps
+  const catalogued = dbSteps
     .map((s) => ({ dbStep: s, catalog: catalogEntry(s.seq) }))
     .filter((x): x is { dbStep: (typeof dbSteps)[number]; catalog: NonNullable<ReturnType<typeof catalogEntry>> } => x.catalog !== undefined)
     .sort((a, b) => a.dbStep.seq - b.dbStep.seq);
+  // Bulk (1-5) drives here, stage-major, exactly as before M5. Project-scope
+  // (6+) is handed off to the assembler once, after every bulk step is
+  // done — see steps/catalog.ts's header comment for why the split exists.
+  const runnable = catalogued.filter((x) => x.catalog.scope === 'bulk');
+  const tailPlanned = catalogued.some((x) => x.catalog.scope === 'project');
 
   for (const { dbStep, catalog } of runnable) {
     await setCurrentStep(deps.pool, cohortId, dbStep.seq);
@@ -135,6 +141,27 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
       }
     } else {
       log().info({ cohortId, seq: dbStep.seq }, 'driver: drainAfter=false, keeping endpoint warm for next step');
+    }
+  }
+
+  if (tailPlanned) {
+    const assemblerDeps: AssemblerDeps = {
+      pool: deps.pool,
+      runpod: deps.runpod,
+      cfg: deps.cfg,
+      publicBaseUrl: deps.publicBaseUrl,
+    };
+    try {
+      await runAssembler(assemblerDeps, cohortId);
+    } catch (err) {
+      log().error({ cohortId, err }, 'driver: assembler failed, stopping cohort (stalled)');
+      // Same discipline as the bulk-step failure paths above: the
+      // assembler's own allocate() may have already raised the tail pool
+      // before whatever failed. First project-scope step's endpoint is the
+      // one it allocated (see assembler.ts's runAssembler()).
+      const firstTailStep = catalogued.find((x) => x.catalog.scope === 'project')?.catalog;
+      if (firstTailStep) await emergencyDrain(fleetDeps, firstTailStep.endpointId);
+      return;
     }
   }
 

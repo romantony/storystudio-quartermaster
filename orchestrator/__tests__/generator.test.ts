@@ -57,6 +57,7 @@ const STEP: CatalogEntry = {
   endpointId: 'e165se4r3eo5hp',
   gate: null,
   dependsOn: [],
+  scope: 'bulk',
   builder: (() => ({})) as CatalogEntry['builder'],
 };
 
@@ -201,5 +202,44 @@ describe('agents/generator.ts submitOne() — ENDPOINT_PAUSED retry (2026-09-11 
     const err = await runStep(deps, 'win_test', STEP, 5).catch((e) => e);
     expect(err).toBeInstanceOf(Error);
     expect(err.status).toBe(409);
+  });
+});
+
+describe('agents/generator.ts runStep() — optional projectId scoping (M5 phase 1, 2026-09-11)', () => {
+  it('threads projectId through every claim/read call when provided, for agents/assembler.ts to drive one project at a time', async () => {
+    (jobsRepo.stepJobCounts as jest.Mock)
+      .mockResolvedValueOnce({ total: 1, terminal: 0 }) // one real loop iteration first...
+      .mockResolvedValue({ total: 1, terminal: 1 }); // ...then finishes
+    const fetchImpl = jest.fn(async () => fakeRes(200, { workers: { ready: 1, running: 0 } }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: GeneratorDeps = {
+      pool: fakePool(),
+      runpod,
+      cfg: FAST_CFG,
+      publicBaseUrl: 'https://vps.example',
+      webhookSecret: 'secret',
+    };
+
+    await runStep(deps, 'win_test', STEP, 5, 'proj_abc');
+
+    expect(jobsRepo.stepJobCounts).toHaveBeenCalledWith(expect.anything(), 'win_test', STEP.seq, 'proj_abc');
+    expect(jobsRepo.listInFlight).toHaveBeenCalledWith(expect.anything(), 'win_test', STEP.seq, 'proj_abc');
+  });
+
+  it('omits projectId entirely (undefined) when not provided — preserves the exact cohort-wide behavior steps 1-5 rely on', async () => {
+    (jobsRepo.stepJobCounts as jest.Mock).mockResolvedValue({ total: 1, terminal: 1 });
+    const fetchImpl = jest.fn(async () => fakeRes(200, { workers: { ready: 1, running: 0 } }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: GeneratorDeps = {
+      pool: fakePool(),
+      runpod,
+      cfg: FAST_CFG,
+      publicBaseUrl: 'https://vps.example',
+      webhookSecret: 'secret',
+    };
+
+    await runStep(deps, 'win_test', STEP, 5);
+
+    expect(jobsRepo.stepJobCounts).toHaveBeenCalledWith(expect.anything(), 'win_test', STEP.seq, undefined);
   });
 });
