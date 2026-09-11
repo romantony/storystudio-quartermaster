@@ -15,7 +15,7 @@
 import { createHmac } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import type { Config } from '../config';
-import type { RunpodClient } from '../runpod/client';
+import { backoffMs, type RunpodClient } from '../runpod/client';
 import { isTerminal, RunpodError, type RunResponse } from '../runpod/types';
 import type { CatalogEntry } from '../steps/catalog';
 import type { FrameJobInput, ResolvedDeps } from '../steps/builders/types';
@@ -56,9 +56,17 @@ export interface GeneratorDeps {
  * race rather than just containing its blast radius: a few seconds of
  * cheap, no-worker-billed retrying (workersMin stays 0 the whole time) is
  * enough for RunPod to catch up to a PATCH it already accepted.
+ *
+ * The unpause latency isn't fixed. The first re-verification of this exact
+ * fix (same day) found `qwen-image-gen` needed zero retries but
+ * `flux-tts-s2t` was still paused after 5 attempts at a flat 3s (~15s
+ * total) — different endpoints/node pools evidently settle at different
+ * speeds. Reuses runpod/client.ts's own `backoffMs` (full jitter, capped
+ * 20s/attempt) instead of a flat delay, and raises the budget to 8
+ * attempts — worst case a bit over a minute of cheap polling (no workers
+ * billed while waiting), typically much less.
  */
-const ENDPOINT_PAUSED_MAX_ATTEMPTS = 5;
-const ENDPOINT_PAUSED_RETRY_DELAY_MS = 3_000;
+const ENDPOINT_PAUSED_MAX_ATTEMPTS = 8;
 
 function isEndpointPausedRace(err: unknown): boolean {
   return (
@@ -88,7 +96,7 @@ async function runWithPausedRetry(
         { jobId, endpointId, attempt: tries + 1, maxAttempts: ENDPOINT_PAUSED_MAX_ATTEMPTS },
         'generator: endpoint still paused right after workersMax PATCH (fleet.ts allocate() race), retrying submission',
       );
-      await sleepImpl(ENDPOINT_PAUSED_RETRY_DELAY_MS);
+      await sleepImpl(backoffMs(tries));
     }
   }
 }
