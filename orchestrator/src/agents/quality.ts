@@ -169,7 +169,7 @@ async function gateOneJob(deps: QualityDeps, cohortId: string, gate: 'image' | '
       return;
     }
   } else {
-    const imageScore = await latestImageScoreForFrame(deps.pool, cohortId, job.frameId ?? '');
+    const imageScore = await latestImageScoreForFrame(deps.pool, cohortId, job.projectId, job.frameId ?? '');
     if (imageScore == null) {
       log().warn({ jobId: job.id, frameId: job.frameId }, 'quality: motion gate has no image score for this frame yet, will retry next tick');
       return;

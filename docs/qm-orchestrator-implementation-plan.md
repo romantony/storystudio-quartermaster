@@ -607,6 +607,11 @@ stops producing them. Prior art and the data model to copy: `storyframe_qa_agent
 
 ### 6.7 Result assembler — `result/assemble.ts`, `result/callback.ts`
 
+**Scope note (2026-09-11):** this module only checks completion and delivers the callback — it
+assumes steps 6–13's actual assembly work already happened. Driving that work per-project is
+§6.10's job, added later in this doc; §6.10 calls into this module once a project's whole tail is
+terminal, it does not duplicate it.
+
 Emits the spec §9.6 shape. Three parts of it are load-bearing rather than decorative:
 
 - `steps[]` — per-step totals, `warmMs`, `runMs`. Without it a caller cannot see that a cohort ran
@@ -679,6 +684,56 @@ every 60s:
 It is twenty lines and it is the only check that survives the process it is checking. Give it its
 own systemd unit, its own restart policy, and its own alert channel. It reads RunPod and the
 database; it never writes the database.
+
+### 6.10 Project assembler agent — `agents/assembler.ts` *(new, decided 2026-09-11, M5 scope)*
+
+**Why this is a separate agent, not a mode of `agents/generator.ts`.** §6.4's generator is
+correct exactly because it treats every job as independent of every other project's jobs —
+that's what lets it submit bulk across the whole cohort at once. Steps 6–13 break that
+independence: they read and combine outputs that belong to one specific project, and running
+them bulk-per-stage the way 1–5 run risks a caller receiving a video assembled from another
+project's assets, or (more subtly) just forces artificial waves — wait for every project's step 6
+before any project can start step 8 — with no benefit, since the endpoint they share
+(`postprod-lite`, `n6252hm01qz0xh`, §M1) is one warm pool either way. Driving it per-project
+instead costs nothing and removes the risk.
+
+**What it does**, once a project's generation-phase jobs (steps 1–5, filtered to whichever are
+catalogued/requested) are all terminal for that project:
+
+```
+for each project whose generation steps are all terminal (§6.7's per-project check, reused):
+  for step in [6, 8, 9, 10, 11, 12, 13] intersected with this project's plan, in order:
+    submit that project's job(s) for this step to postprod-lite (or remotion/long2shorts
+    for 7/13) sequentially — this project's own merge output feeds its own concat input,
+    etc., never another project's
+    record request/response/status to `jobs`, same as §6.4
+  once every planned tail step is terminal for this project -> hand off to §6.7's
+  result assembler (completion check + Convex callback) for THIS project
+```
+
+No separate worker-pool lifecycle here — `postprod-lite` is a `workersMin=0`/`workersMax=2`/
+`workersStandby=2` pool (M1) that the fleet controller allocates/releases *once* for the whole
+cohort's tail (the "tail collapse" §13 M5 already calls out), not per project and not per step.
+This agent only owns **submission ordering and per-project sequencing** against that
+already-warm pool — it does not call `agents/fleet.ts` per project.
+
+**Orchestrator dispatch change this needs (§6's driver, `agents/orchestrator.ts`).**
+`driveCohort()` today only knows one mode: sequence catalogued steps stage-major across the
+whole cohort. It needs a fork after the last bulk generation step: keep driving 1–5 bulk as now,
+then for the tail, hand off per-project to this agent instead of continuing the same stage-major
+loop. Exact shape (parallel per-project, or one-project-at-a-time against the 2-worker pool) is
+an M5 implementation decision, not yet made.
+
+**A real, currently-latent bug this surfaces:** `agents/generator.ts`'s `resolveDeps()` (used to
+resolve `dependsOn`, e.g. step 3 reading step 1's output) queries
+`WHERE cohort_id = $1 AND frame_id = $2 AND step_seq = $3` — **no `project_id` filter**. Harmless
+today only because M2 has no real multi-project cohorts yet. The moment two projects sharing a
+cohort use the same `frame_id` (e.g. both start numbering frames `f1`, `f2`, …, which is the
+likely default), this silently resolves to *whichever* project's row the query happens to return
+first — exactly the cross-project contamination this section exists to prevent, except already
+possible today in the generation phase, not just a risk for the new tail agent. **Must be fixed
+(add `project_id` to that query and to `jobs`'s dependency lookups generally) before M6 enables
+real multi-project cohorts** — see §16 q12.
 
 ---
 
@@ -803,6 +858,19 @@ inside one process.
 | 13 shorts | long2shorts | `/run` | `src/handlers/shorts-trigger.ts` | raw `shortsOptions` passthrough; caller keys win except `project_id`/`video_url` |
 
 Each builder is `(job: Job, step: StepPlan) => Record<string, unknown>`. No I/O, no DB, no clock.
+
+**Generation vs. assembly — two different scopes, confirmed with Roman 2026-09-11.** Steps
+1–5 (image, tts, i2v, lip-sync, bgm_sfx) are **asset-type-scoped**: each job needs only its own
+prompt/reference, nothing from any other project sharing the cohort. Bulk/stage-major execution
+across every project in the window (§6.4's model, already built and M3-verified) is correct for
+these, not a shortcut.
+
+Steps 6–13 (merge, remotion overlay, concat, subtitles, upscale, burn-caption, overlay-bgm,
+shorts) are **inherently project-scoped** — you cannot merge project A's audio with project B's
+video, concat project A's frames with project B's, etc. These must run **one project's full tail
+chain at a time**, not bulk-per-stage across the cohort the way 1–5 do. §6.10 is the agent that
+owns this; see its header for why it has to be a separate module rather than a mode of §6.4's
+generator.
 
 ---
 
@@ -1082,12 +1150,18 @@ rejected as too risky.
   didn't exist before this incident. **Re-running the real live acceptance test against
   this fix is still pending** — see `docs/qm-orchestrator-session-2026-09-10-m2.md`'s
   successor doc once written.
-- [ ] Warm/drain verification polls, cap assertion, stall handling — cap assertion and
-      drain verification unchanged from M2; warm verification redesigned per above, not yet
+- [x] Warm/drain verification polls, cap assertion, stall handling — **DONE 2026-09-11.**
+      cap assertion and drain verification unchanged from M2; warm verification (per above)
       re-proven live.
 - **Done when:** a step scales 0→N→0 unattended, real workers ramp in response to queued
-  jobs (not blocked on it), and the watchdog stays silent throughout. Not yet met — pending
-  the re-run.
+  jobs (not blocked on it), and the watchdog stays silent throughout. **Met 2026-09-11**,
+  on the third attempt same day — see
+  `docs/qm-orchestrator-m3-orphan-incident-and-live-verify-20260911.md` (or the
+  2026-09-11 memory entry) for the two real failures found and fixed along the way
+  (orphaned-worker incident; ENDPOINT_PAUSED retry budget too short for
+  `flux-tts-s2t`). Final run: cohort `win_2026_09_11_12`, all 3 steps (image/tts/
+  animation) scaled 0→N→0 on their own endpoints, zero watchdog alerts, no manual
+  RunPod intervention.
 
 ### M4 — Quality gates
 - [x] Evaluator wrappers, `jobs_ungated` queue, verdict writes — **DONE 2026-09-10.**
@@ -1147,9 +1221,19 @@ rejected as too risky.
   real RunPod + Replicate infra.
 
 ### M5 — The full thirteen
-- [ ] Steps 4–13, one payload builder at a time, each with its test
-- [ ] Tail collapse verified: steps 8/10/11/12 show **one** `allocation_costs` row
-- [ ] Result assembler, shorts manifest read-back, Convex callback with retries
+- [ ] Steps 4–5 (lip-sync, bgm_sfx), one payload builder at a time — bulk/stage-major via the
+      existing §6.4 generator, same pattern as 1–3, no new agent needed
+- [ ] **§6.10 Project assembler agent** — new module, drives steps 6–13 **per-project**, not
+      bulk (§9's generation-vs-assembly split, decided 2026-09-11). Includes the
+      `driveCohort()` dispatch fork described in §6.10.
+- [ ] **Fix `resolveDeps()`'s missing `project_id` filter** (§6.10, §16 q12) before any
+      multi-project-cohort testing of this milestone — otherwise a shared `frame_id` across
+      two projects in one cohort can silently resolve to the wrong project's asset
+- [ ] Tail collapse verified: steps 8/10/11/12 show **one** `allocation_costs` row (the fleet
+      controller allocates `postprod-lite` once for the whole cohort's tail, not per project —
+      the assembler agent only orders submissions against it, see §6.10)
+- [ ] Result assembler, shorts manifest read-back, Convex callback with retries (§6.7, called
+      by §6.10 once a project's tail is terminal)
 - **Done when:** one project runs 1→13 and Convex receives a spec §9.6 result with
   `status: completed`.
 
@@ -1253,7 +1337,14 @@ Two of the spec's seven block a *choice*; none block the *start*. Where each lan
 |---|---|---|
 | 8 | **`QM_LIVE_RESERVE_WORKERS`** — how many of the 40 the live path may hold while a background step is live | Start at **8** (§5.2's arithmetic). It is a config value; tune it against real live-path traffic during the background window, which is by design the quietest part of the day |
 | 9 | **Does the lease belong in DynamoDB or somewhere neutral?** | DynamoDB. The provisioner already reads that table every tick; a second datastore in the live path's hot loop is a worse trade than a slightly odd home for the row |
-| 10 | **Auto-drain on orphan detection, or alert only?** | Alert only, first. Flip `WATCHDOG_AUTODRAIN=true` once the alert has fired a few times and proved it has no false positives — an auto-drain on a false positive kills a live cohort's step |
+| 10 | **Auto-drain on orphan detection, or alert only?** | ~~Alert only, first.~~ **Resolved 2026-09-11: `WATCHDOG_AUTODRAIN=true`, flipped live.** A real 2h16m orphaned-worker incident that day (5 workers on `qwen-image-gen`, zero false positives since the earlier FLEET-scoping fix) satisfied the "fired a few times, no false positives" bar. See the 2026-09-11 orchestrator memory entries |
+
+**New, from the 2026-09-11 generation-vs-assembly conversation — decide before/during M5:**
+
+| # | Question | Recommendation |
+|---|---|---|
+| 11 | **Should steps 6–13 run bulk-per-stage (like 1–5) or per-project?** | **Resolved: per-project**, via a new §6.10 agent, not a mode of §6.4's generator. Confirmed directly with Roman — assembly steps combine one project's own outputs and must not interleave across projects; bulk-per-stage would either risk cross-project contamination or force pointless synchronization waves for no benefit, since the tail endpoint (`postprod-lite`) is one warm pool regardless of submission order |
+| 12 | **`resolveDeps()` has no `project_id` filter** — is this a real bug or dead code? | **Real, must fix before M6.** Confirmed in `agents/generator.ts`: `WHERE cohort_id = $1 AND frame_id = $2 AND step_seq = $3` with no project scoping. Silently resolves to the wrong project's asset the moment two projects in one cohort share a `frame_id` (likely, since per-project frame numbering probably starts at `f1` for every project). Currently masked only because M2 has no real multi-project cohorts. Fix: add `project_id` to this query and audit `jobs` repo for the same gap elsewhere before M6 testing begins |
 
 ---
 

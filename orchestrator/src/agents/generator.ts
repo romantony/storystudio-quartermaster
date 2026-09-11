@@ -117,12 +117,22 @@ export class GeneratorStallError extends Error {
 
 /** Resolves a job's step-dependency outputs into the shape steps/builders
  * expect, by reading the completed same-frame job in each dependsOn step. */
-async function resolveDeps(client: PoolClient, cohortId: string, frameId: string, dependsOn: number[]): Promise<ResolvedDeps> {
+/**
+ * project_id is required, not just cohort_id — frame_id is caller-assigned
+ * (Story Studio's own per-project scene numbering, e.g. "f1", "f2", ...) and
+ * has no global-uniqueness guarantee. A real cross-project cohort would
+ * otherwise let this resolve to a DIFFERENT project's same-numbered frame's
+ * output — silently wrong, not an error. Found 2026-09-11 while designing
+ * the M5 assembler agent's per-project scoping (docs/
+ * qm-orchestrator-implementation-plan.md §6.10, §16 q12); dormant until now
+ * only because M2 has no real multi-project cohorts yet.
+ */
+async function resolveDeps(client: PoolClient, cohortId: string, projectId: string, frameId: string, dependsOn: number[]): Promise<ResolvedDeps> {
   const resolved: ResolvedDeps = {};
   for (const seq of dependsOn) {
     const { rows } = await client.query<{ output: unknown }>(
-      `SELECT output FROM jobs WHERE cohort_id = $1 AND frame_id = $2 AND step_seq = $3 AND status = 'complete'`,
-      [cohortId, frameId, seq],
+      `SELECT output FROM jobs WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq = $4 AND status = 'complete'`,
+      [cohortId, projectId, frameId, seq],
     );
     const url = rows[0] ? runpodOutUrl(rows[0].output) : undefined;
     resolved[seq] = url ? { url } : undefined;
@@ -146,7 +156,7 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
     }
 
     const frameInput = job.input as FrameJobInput;
-    const resolvedDeps = job.frameId ? await resolveDeps(client, cohortId, job.frameId, step.dependsOn) : {};
+    const resolvedDeps = job.frameId ? await resolveDeps(client, cohortId, job.projectId, job.frameId, step.dependsOn) : {};
     const payload = step.builder({
       job: frameInput,
       resolvedDeps,

@@ -96,16 +96,20 @@ async function recordVerdict(client: PoolClient, v: VerdictWrite): Promise<void>
  * join back through jobs, not by job_id (the image job and the motion job
  * for one frame are different rows). Returns null if no image verdict
  * exists yet for this frame (shouldn't happen given steps run sequentially
- * and step 3 depends on step 1, but handled defensively, not assumed). */
-export async function latestImageScoreForFrame(db: Queryable, cohortId: string, frameId: string): Promise<number | null> {
+ * and step 3 depends on step 1, but handled defensively, not assumed).
+ * project_id is required alongside frame_id — same 2026-09-11 finding as
+ * generator.ts's resolveDeps(): frame_id alone is not globally unique, so
+ * without it this could return another project's same-numbered frame's
+ * image score into this frame's motion-gate evaluation. */
+export async function latestImageScoreForFrame(db: Queryable, cohortId: string, projectId: string, frameId: string): Promise<number | null> {
   const { rows } = await db.query<{ weighted_score: string | null }>(
     `SELECT qv.weighted_score
        FROM quality_verdicts qv
        JOIN jobs j ON j.id = qv.job_id
-      WHERE j.cohort_id = $1 AND j.frame_id = $2 AND qv.gate = 'image'
+      WHERE j.cohort_id = $1 AND j.project_id = $2 AND j.frame_id = $3 AND qv.gate = 'image'
       ORDER BY qv.created_at DESC
       LIMIT 1`,
-    [cohortId, frameId],
+    [cohortId, projectId, frameId],
   );
   return rows[0]?.weighted_score != null ? Number(rows[0].weighted_score) : null;
 }

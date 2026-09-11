@@ -8,13 +8,15 @@ Both M3 and M4 are code-complete, tested (116/116 orchestrator tests), deployed 
 VPS, and confirmed healthy — but neither has been proven against real RunPod/Replicate
 infra since their latest fix. Two separate, deliberate live tests, in this order:
 
-- **M3 re-verification**: the `workersMax`-only redesign (fixed the 2026-09-10 billing
-  incident — 5 workers billed 8+ min with zero throughput under the old
-  `workersMin==workersMax` design) was deployed but never re-run live after the fix.
-  Flip `ORCH_FLEET_LIVE=true`, submit a small real project, confirm it scales
-  0→N→0 **unattended** (no manual RunPod PATCHing), watchdog stays silent throughout.
-  See `docs/qm-orchestrator-implementation-plan.md` §13 M3 and the M3 fix commits
-  (`cded23e`, `4a83892`) for exactly what changed.
+- **M3 re-verification — DONE 2026-09-11.** The very first unattended attempt (before
+  today's deliberate test even started) hit a real incident: 5 orphaned `qwen-image-gen`
+  workers billed for 2h16m because the driver never compensated a step failure right
+  after a `workersMax` PATCH. Fixed (retry the `ENDPOINT_PAUSED` race, `emergencyDrain()`
+  on any driver failure path, `WATCHDOG_AUTODRAIN=true`), then the retry budget itself
+  turned out too short for `flux-tts-s2t` on the next attempt — widened to jittered
+  backoff. Third attempt (cohort `win_2026_09_11_12`) passed clean: all 3 steps scaled
+  0→N→0 unattended, zero watchdog alerts. Commits `e681651`, `56110c0`. See the
+  2026-09-11 memory entries for the full incident writeup.
 - **M4 live acceptance**: submit a project with a deliberately bad image prompt, confirm
   the image gate (Replicate/Gemini VLM) catches it, reworks it on the still-warm
   `qwen-image-gen` endpoint (check the allocation log shows no second warm-up), and it

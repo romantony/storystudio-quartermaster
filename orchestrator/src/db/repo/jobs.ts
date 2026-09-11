@@ -184,10 +184,16 @@ export async function markTerminal(
   if (outcome.status === 'complete' && job.frameId) {
     const dependents = await dependentSteps(client, job.cohortId, job.stepSeq);
     if (dependents.length > 0) {
+      // project_id required, not just cohort_id + frame_id — frame_id alone
+      // is not globally unique (see generator.ts's resolveDeps() comment,
+      // same 2026-09-11 finding). Without it, completing project A's frame
+      // "f1" step would also decrement project B's same-numbered frame's
+      // deps_remaining, letting a job go 'ready' with a dependency that
+      // never actually ran in its own project.
       await client.query(
         `UPDATE jobs SET deps_remaining = GREATEST(deps_remaining - 1, 0)
-           WHERE cohort_id = $1 AND frame_id = $2 AND step_seq = ANY($3)`,
-        [job.cohortId, job.frameId, dependents],
+           WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq = ANY($4)`,
+        [job.cohortId, job.projectId, job.frameId, dependents],
       );
     }
   }
