@@ -156,6 +156,34 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
   log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step ready (ceiling raised, generator may submit)');
 }
 
+/**
+ * Best-effort backstop used only by the driver's failure path
+ * (orchestrator.ts) — a bare `workersMax:0` PATCH with none of release()'s
+ * gating (no ungated-quality check, no poll-until-confirmed-drained wait).
+ * Real incident, 2026-09-11: allocate() PATCHed workersMax up, then the
+ * very next call (submitOne's /run) failed on a transient RunPod race
+ * (see generator.ts's ENDPOINT_PAUSED retry — that closes the race itself;
+ * this is what stops the bleed on whatever failure gets through anyway).
+ * The driver logged the failure and returned without ever compensating,
+ * leaving the just-raised workers to bill unmanaged for 2+ hours until a
+ * human found and manually drained them. Never throws — a failure here is
+ * logged and swallowed so it cannot mask the original error that triggered
+ * it; WATCHDOG_AUTODRAIN is the remaining backstop if this PATCH itself
+ * fails or the orchestrator process dies before reaching it.
+ */
+export async function emergencyDrain(deps: FleetDeps, endpointId: string): Promise<void> {
+  if (!deps.cfg.fleetLive) return;
+  try {
+    await deps.runpod.patchWorkers(endpointId, { workersMin: 0, workersMax: 0 });
+    log().error({ endpointId }, 'fleet: EMERGENCY DRAIN — step failed after allocate(), PATCHing workersMax -> 0 to stop billing');
+  } catch (err) {
+    log().error(
+      { endpointId, err },
+      'fleet: emergency drain PATCH itself failed — endpoint may still be billing; WATCHDOG_AUTODRAIN is the remaining backstop',
+    );
+  }
+}
+
 export async function release(deps: FleetDeps, cohortId: string, step: CatalogEntry): Promise<void> {
   const { pool, runpod, cfg } = deps;
 

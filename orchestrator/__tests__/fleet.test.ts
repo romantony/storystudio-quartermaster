@@ -9,7 +9,7 @@
  * Postgres or RunPod needed.
  */
 import { RunpodClient } from '../src/runpod/client';
-import { allocate, release, FleetStallError, type FleetDeps } from '../src/agents/fleet';
+import { allocate, release, emergencyDrain, FleetStallError, type FleetDeps } from '../src/agents/fleet';
 import type { CatalogEntry } from '../src/steps/catalog';
 
 const CFG = {
@@ -199,5 +199,37 @@ describe('agents/fleet.ts release() — M4 drain precondition', () => {
     await release(deps, 'win_test', STEP); // STEP has gate: null
     const patchCall = (fetchImpl.mock.calls as unknown as [string, RequestInit][]).find(([url]) => url.includes('/rest.runpod.io/'));
     expect(patchCall).toBeDefined(); // proceeded to drain, ignoring the poisoned counts
+  });
+});
+
+describe('agents/fleet.ts emergencyDrain() — driver failure-path backstop (2026-09-11 incident)', () => {
+  it('PATCHes workersMax:0 with no gating and no drain-confirmation wait', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, {}));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: FleetDeps = { pool: fakePool(), runpod, cfg: FLEET_CFG };
+
+    await emergencyDrain(deps, 'e165se4r3eo5hp');
+
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toContain('/rest.runpod.io/');
+    expect(JSON.parse(init.body as string)).toEqual({ workersMin: 0, workersMax: 0 });
+  });
+
+  it('never throws, even when the PATCH itself fails — must not mask the original driver error', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(500, { error: 'boom' }));
+    const runpod = new RunpodClient({ ...CFG, runpodMaxRetries: 0 }, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: FleetDeps = { pool: fakePool(), runpod, cfg: FLEET_CFG };
+
+    await expect(emergencyDrain(deps, 'e165se4r3eo5hp')).resolves.toBeUndefined();
+  });
+
+  it('is a no-op in shadow mode (fleetLive: false) — no PATCH sent', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, {}));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: FleetDeps = { pool: fakePool(), runpod, cfg: { ...FLEET_CFG, fleetLive: false } };
+
+    await emergencyDrain(deps, 'e165se4r3eo5hp');
+
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

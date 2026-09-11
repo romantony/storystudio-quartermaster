@@ -24,7 +24,7 @@ import { log } from '../telemetry/log';
 import { listSteps } from '../db/repo/steps';
 import { getCohort, setCurrentStep } from '../db/repo/cohorts';
 import { catalogEntry } from '../steps/catalog';
-import { allocate, release, type FleetDeps } from './fleet';
+import { allocate, release, emergencyDrain, type FleetDeps } from './fleet';
 import { runStep, GeneratorStallError, type GeneratorDeps } from './generator';
 import { gateStep, type QualityDeps } from './quality';
 
@@ -77,6 +77,10 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
       await allocate(fleetDeps, cohortId, { ...catalog, workers: dbStep.workersTarget });
     } catch (err) {
       log().error({ cohortId, seq: dbStep.seq, err }, 'driver: allocate failed, stopping cohort (stalled)');
+      // allocate() PATCHes workersMax up before its own failure modes
+      // (unreachable, cap_breach) can fire — those raised workers must not
+      // be left behind just because the step never got past allocation.
+      await emergencyDrain(fleetDeps, catalog.endpointId);
       return;
     }
 
@@ -109,6 +113,11 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
         { cohortId, seq: dbStep.seq, err },
         stalled ? 'driver: generator stalled, stopping cohort' : 'driver: step failed, stopping cohort',
       );
+      // The real 2026-09-11 incident: this path used to just return, leaving
+      // the workers allocate() had already raised for this step orphaned —
+      // billing, unclaimed, for 2+ hours until a human noticed the
+      // watchdog's alert-only log lines and drained manually.
+      await emergencyDrain(fleetDeps, catalog.endpointId);
       return;
     }
 
@@ -117,6 +126,11 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
         await release(fleetDeps, cohortId, catalog);
       } catch (err) {
         log().error({ cohortId, seq: dbStep.seq, err }, 'driver: release failed, stopping cohort (stalled)');
+        // release()'s own drain PATCH may not have gone out at all (e.g. it
+        // threw before reaching the PATCH) or may have gone out but timed
+        // out waiting for confirmation — either way, resend it. Idempotent:
+        // harmless if release() already succeeded in PATCHing to 0.
+        await emergencyDrain(fleetDeps, catalog.endpointId);
         return;
       }
     } else {

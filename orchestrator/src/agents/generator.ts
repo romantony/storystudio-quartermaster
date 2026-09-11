@@ -16,7 +16,7 @@ import { createHmac } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import type { Config } from '../config';
 import type { RunpodClient } from '../runpod/client';
-import { isTerminal } from '../runpod/types';
+import { isTerminal, RunpodError, type RunResponse } from '../runpod/types';
 import type { CatalogEntry } from '../steps/catalog';
 import type { FrameJobInput, ResolvedDeps } from '../steps/builders/types';
 import { log } from '../telemetry/log';
@@ -37,6 +37,60 @@ export interface GeneratorDeps {
    * used to build each job's per-job webhook callback URL. */
   publicBaseUrl: string;
   webhookSecret: string;
+  /** Injectable for tests so the ENDPOINT_PAUSED retry backoff does not
+   * actually wait. Defaults to a real setTimeout-based sleep. */
+  sleepImpl?: (ms: number) => Promise<void>;
+}
+
+/**
+ * allocate()'s workersMax PATCH (fleet.ts) and RunPod actually lifting the
+ * pause are two different moments — a real incident on 2026-09-11 found a
+ * step's very first submitOne() landing in the gap: RunPod returned
+ * `409 ENDPOINT_PAUSED` even though the PATCH had already been sent and
+ * accepted. The driver treated that single 409 as a fatal step failure and
+ * abandoned the cohort, leaving the (by-then-actually-raised) workers
+ * orphaned for over two hours with the watchdog only alerting, never
+ * draining (WATCHDOG_AUTODRAIN was off — see orchestrator.ts's
+ * emergencyDrain() and this repo's docs/qm-orchestrator-session-2026-09-11
+ * write-up for the rest of that incident). This retry closes the actual
+ * race rather than just containing its blast radius: a few seconds of
+ * cheap, no-worker-billed retrying (workersMin stays 0 the whole time) is
+ * enough for RunPod to catch up to a PATCH it already accepted.
+ */
+const ENDPOINT_PAUSED_MAX_ATTEMPTS = 5;
+const ENDPOINT_PAUSED_RETRY_DELAY_MS = 3_000;
+
+function isEndpointPausedRace(err: unknown): boolean {
+  return (
+    err instanceof RunpodError &&
+    err.status === 409 &&
+    (err.body as { code?: string } | undefined)?.code === 'ENDPOINT_PAUSED'
+  );
+}
+
+async function defaultSleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runWithPausedRetry(
+  deps: GeneratorDeps,
+  jobId: number,
+  endpointId: string,
+  attempt: () => Promise<RunResponse>,
+): Promise<RunResponse> {
+  const sleepImpl = deps.sleepImpl ?? defaultSleep;
+  for (let tries = 0; ; tries += 1) {
+    try {
+      return await attempt();
+    } catch (err) {
+      if (!isEndpointPausedRace(err) || tries >= ENDPOINT_PAUSED_MAX_ATTEMPTS) throw err;
+      log().warn(
+        { jobId, endpointId, attempt: tries + 1, maxAttempts: ENDPOINT_PAUSED_MAX_ATTEMPTS },
+        'generator: endpoint still paused right after workersMax PATCH (fleet.ts allocate() race), retrying submission',
+      );
+      await sleepImpl(ENDPOINT_PAUSED_RETRY_DELAY_MS);
+    }
+  }
 }
 
 export type GeneratorStallReason = 'warm_timeout';
@@ -95,7 +149,9 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
     const jobToken = webhookToken(deps.webhookSecret, job.id);
     const webhookUrl = `${deps.publicBaseUrl}/v1/webhooks/runpod/${jobToken}`;
 
-    const res = await deps.runpod.run(step.endpointId, payload, webhookUrl);
+    const res = await runWithPausedRetry(deps, job.id, step.endpointId, () =>
+      deps.runpod.run(step.endpointId, payload, webhookUrl),
+    );
 
     if (res.status === 'COMPLETED') {
       // Synchronous completion — a warm, fast endpoint can return the

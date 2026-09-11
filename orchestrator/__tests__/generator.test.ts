@@ -40,6 +40,17 @@ function fakePool() {
   return { connect: jest.fn(async () => client) } as unknown as GeneratorDeps['pool'];
 }
 
+/** Like fakePool(), but answers submitOne()'s `SELECT status ... FOR UPDATE`
+ * re-check with a real 'planned' row so submission actually proceeds
+ * instead of being skipped as already-claimed. */
+function fakePoolWithPlannedJob() {
+  const client = {
+    query: jest.fn(async (sql: string) => (sql.includes('SELECT status FROM jobs') ? { rows: [{ status: 'planned' }] } : { rows: [] })),
+    release: jest.fn(),
+  };
+  return { connect: jest.fn(async () => client) } as unknown as GeneratorDeps['pool'];
+}
+
 const STEP: CatalogEntry = {
   seq: 1,
   name: 'image',
@@ -124,5 +135,71 @@ describe('agents/generator.ts runStep() — cold-start stall detection (M3 fix)'
     };
 
     await expect(runStep(deps, 'win_test', STEP, 5)).resolves.toBeUndefined();
+  });
+});
+
+describe('agents/generator.ts submitOne() — ENDPOINT_PAUSED retry (2026-09-11 incident)', () => {
+  it('retries a 409 ENDPOINT_PAUSED /run response and succeeds once RunPod catches up to the PATCH', async () => {
+    (jobsRepo.stepJobCounts as jest.Mock)
+      .mockResolvedValueOnce({ total: 1, terminal: 0 })
+      .mockResolvedValue({ total: 1, terminal: 1 });
+    (jobsRepo.claimNextBatch as jest.Mock).mockResolvedValueOnce([
+      { id: 1, projectId: 'p1', frameId: 'f1', input: {} },
+    ]);
+
+    let runCalls = 0;
+    const fetchImpl = jest.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/health')) return fakeRes(200, { workers: { ready: 1, running: 0 } });
+      if (url.includes('/run')) {
+        runCalls += 1;
+        if (runCalls < 3) {
+          return fakeRes(409, { status: 409, code: 'ENDPOINT_PAUSED', detail: 'Endpoint is paused' });
+        }
+        return fakeRes(200, { id: 'job-1', status: 'COMPLETED', output: { url: 'https://x/out.mp4' } });
+      }
+      return fakeRes(200, {});
+    });
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const sleepImpl = jest.fn(async () => {});
+    const deps: GeneratorDeps = {
+      pool: fakePoolWithPlannedJob(),
+      runpod,
+      cfg: FAST_CFG,
+      publicBaseUrl: 'https://vps.example',
+      webhookSecret: 'secret',
+      sleepImpl,
+    };
+
+    await expect(runStep(deps, 'win_test', STEP, 5)).resolves.toBeUndefined();
+    expect(runCalls).toBe(3); // 2 paused rejections + 1 success
+    expect(sleepImpl).toHaveBeenCalledTimes(2); // one backoff wait per retried attempt
+  });
+
+  it('gives up and throws after exhausting retries on a /run that stays paused', async () => {
+    (jobsRepo.stepJobCounts as jest.Mock).mockResolvedValue({ total: 1, terminal: 0 });
+    (jobsRepo.claimNextBatch as jest.Mock).mockResolvedValueOnce([
+      { id: 1, projectId: 'p1', frameId: 'f1', input: {} },
+    ]);
+
+    const fetchImpl = jest.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/health')) return fakeRes(200, { workers: { ready: 0, running: 0 } });
+      if (url.includes('/run')) return fakeRes(409, { status: 409, code: 'ENDPOINT_PAUSED', detail: 'still paused' });
+      return fakeRes(200, {});
+    });
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: GeneratorDeps = {
+      pool: fakePoolWithPlannedJob(),
+      runpod,
+      cfg: FAST_CFG,
+      publicBaseUrl: 'https://vps.example',
+      webhookSecret: 'secret',
+      sleepImpl: jest.fn(async () => {}),
+    };
+
+    const err = await runStep(deps, 'win_test', STEP, 5).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.status).toBe(409);
   });
 });

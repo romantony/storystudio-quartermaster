@@ -77,6 +77,7 @@ beforeEach(() => {
   (cohortsRepo.setCurrentStep as jest.Mock).mockResolvedValue(undefined);
   (fleetAgent.allocate as jest.Mock).mockResolvedValue(undefined);
   (fleetAgent.release as jest.Mock).mockResolvedValue(undefined);
+  (fleetAgent.emergencyDrain as jest.Mock).mockResolvedValue(undefined);
 });
 
 describe('driveCohort() — gating concurrency', () => {
@@ -129,9 +130,13 @@ describe('driveCohort() — error handling', () => {
     expect(fleetAgent.release).not.toHaveBeenCalled();
     // the cohort loop returned (didn't hang forever on the pending
     // gateStep() promise) — reaching this line at all proves that.
+    // Real 2026-09-11 incident: this path used to leave allocate()'s
+    // already-raised workers orphaned for 2+ hours because nothing
+    // compensated on a runStep() failure. It must now.
+    expect(fleetAgent.emergencyDrain).toHaveBeenCalledWith(expect.anything(), 'e165se4r3eo5hp');
   });
 
-  it('stops the cohort on an allocate() failure without calling runStep()/gateStep()', async () => {
+  it('stops the cohort on an allocate() failure without calling runStep()/gateStep(), but still drains', async () => {
     (stepsRepo.listSteps as jest.Mock).mockResolvedValue([{ ...dbStep(1), gate: 'image' }]);
     (fleetAgent.allocate as jest.Mock).mockRejectedValue(new Error('cap breach'));
 
@@ -139,5 +144,25 @@ describe('driveCohort() — error handling', () => {
 
     expect(generatorAgent.runStep).not.toHaveBeenCalled();
     expect(qualityAgent.gateStep).not.toHaveBeenCalled();
+    // allocate() PATCHes workersMax before its own cap_breach/unreachable
+    // checks can fail, so even this early failure must still drain.
+    expect(fleetAgent.emergencyDrain).toHaveBeenCalledWith(expect.anything(), 'e165se4r3eo5hp');
+  });
+
+  it('drains again on a release() failure (idempotent backstop, resends the PATCH)', async () => {
+    // seq 2 (tts) is genuinely ungated in the real catalog (gate: null), so
+    // this doesn't touch gateStep() at all — deliberately avoiding seq 1
+    // (image, gate: 'image'), where jest.clearAllMocks() (unlike
+    // mockReset()) leaves a PRIOR test's gateStep() mock implementation in
+    // place across tests; an earlier version of this test used seq 1 and
+    // hung forever inheriting the "never resolves" gateStep() stub from the
+    // test above it.
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2)]);
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+    (fleetAgent.release as jest.Mock).mockRejectedValue(new Error('drain timeout'));
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(fleetAgent.emergencyDrain).toHaveBeenCalledWith(expect.anything(), 'rnqxi6c0mlq517');
   });
 });
