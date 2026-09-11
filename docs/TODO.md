@@ -2,7 +2,31 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
-## Next session (2026-09-11) — QM Orchestrator live acceptance tests
+## Next session — M5 phase 1 live verification (stopped 2026-09-11, resume here)
+
+M5 phase 1 (Project Assembler Agent + step 6/merge, commit `713f889`) is built, deployed,
+watchdog fix verified live (caught + auto-drained 2 real idle `postprod-lite` workers that
+had been running unclaimed since M1, ~a day). **Step 6 itself was never actually reached/
+tested live** — stopped mid-run at the operator's request before the assembler got a chance
+to fire. Pick up here:
+
+- Bulk steps 1→3 ran clean (cohort `win_2026_09_11_12`, project
+  `m5-live-verify-20260911-06`). Real, useful signal along the way: the motion gate's
+  Replicate calls worked again (this morning's under-$5-credit throttling is resolved —
+  worth confirming that's durable, not a fluke) and returned a **genuine content FAIL,
+  score 4.9** on this prompt/output — a real prompt-quality data point, not an infra issue.
+- Stopped before the resulting rework cycle finished; manually drained `wan2-i2v` (5 real
+  workers, mid-rework) before ending the session. Cohort marked `failed`, all 4 endpoints
+  confirmed at 0 real workers, watchdog confirmed silent.
+- **To resume:** clean up `win_2026_09_11_12`'s leftover project/steps rows the same way
+  earlier same-window tests needed (`DELETE FROM projects/steps WHERE ...`) if still in that
+  6h window, then resubmit and watch specifically for step 6 (merge) — allocate-once on
+  `postprod-lite`, per-project draw, release-once, zero watchdog alerts. That's M5 phase 1's
+  actual "done when" bar; it hasn't been met yet.
+- Use a less content-failure-prone test prompt this time (or accept a rework cycle as part
+  of the test) so the run isn't blocked on the motion gate again before reaching step 6.
+
+## Prior session (2026-09-11) — QM Orchestrator live acceptance tests
 
 Both M3 and M4 are code-complete, tested (116/116 orchestrator tests), deployed to the
 VPS, and confirmed healthy — but neither has been proven against real RunPod/Replicate
