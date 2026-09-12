@@ -9,6 +9,7 @@ import { buildTtsInput } from '../src/steps/builders/tts';
 import { buildI2vInput } from '../src/steps/builders/i2v';
 import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
+import { buildUpscaleInput } from '../src/steps/builders/upscale';
 import type { BuildContext, FrameJobInput } from '../src/steps/builders/types';
 
 const baseJob: FrameJobInput = {
@@ -214,5 +215,30 @@ describe('buildConcatInput (step 8, singleJobPerProject — project-scoped, no s
 
   it('throws when perFrameOutputs is entirely absent', () => {
     expect(() => buildConcatInput(projectCtx(undefined))).toThrow(/need at least 2 merged clips/);
+  });
+});
+
+describe('buildUpscaleInput (step 10, singleJobPerProject depending on ANOTHER singleJobPerProject step)', () => {
+  const projectCtx = (perFrameOutputs?: Record<number, string[]>): BuildContext => ({
+    job: baseJob,
+    resolvedDeps: {},
+    perFrameOutputs,
+    projectId: 'proj_8812',
+    frameId: null,
+  });
+
+  it('builds an upscale request from step 8\'s one concat output, defaulting target_height to 1080', () => {
+    const out = buildUpscaleInput(projectCtx({ 8: ['https://pub.example/proj_8812_concat.mp4'] }));
+    expect(out).toEqual({
+      mode: 'upscale',
+      video_url: 'https://pub.example/proj_8812_concat.mp4',
+      target_height: 1080,
+      project_id: 'proj_8812',
+    });
+  });
+
+  it('throws when step 8\'s output is unresolved', () => {
+    expect(() => buildUpscaleInput(projectCtx(undefined))).toThrow(/no resolved concat video URL/);
+    expect(() => buildUpscaleInput(projectCtx({ 8: [] }))).toThrow(/no resolved concat video URL/);
   });
 });

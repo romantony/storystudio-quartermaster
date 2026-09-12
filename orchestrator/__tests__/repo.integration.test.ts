@@ -267,6 +267,66 @@ maybeDescribe('db repo layer (integration)', () => {
     expect(after[0].frameId).toBeNull();
     expect(after[0].depsRemaining).toBe(0);
   });
+
+  it('jobs: a singleJobPerProject consumer fans in on ANOTHER singleJobPerProject producer\'s single completion (2026-09-12, step 10/upscale <- step 8/concat)', async () => {
+    const cohort = { id: sharedCohortId };
+    const project = (
+      await insertProject(pool, {
+        id: uniqueId('proj'),
+        cohortId: cohort.id,
+        requestId: uniqueId('req'),
+        tier: 'narration-premium',
+        language: 'en',
+        request: {},
+        callbackUrl: null,
+      })
+    ).project;
+
+    const base = seqBase();
+    const [seqConcat, seqUpscale] = [base, base + 2];
+    await insertSteps(pool, cohort.id, [
+      { seq: seqConcat, name: 'concat', endpointId: 'e6', workersTarget: 2, gate: null, drainAfter: false, dependsOn: [], jobTotal: 1 },
+      { seq: seqUpscale, name: 'upscale', endpointId: 'e6', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [seqConcat], jobTotal: 1 },
+    ]);
+
+    await insertJobs(pool, cohort.id, [
+      { projectId: project.id, stepSeq: seqConcat, seq: 0, frameId: null, depsRemaining: 0, input: {} },
+      // Fan-in of exactly 1 — concat only ever completes once.
+      { projectId: project.id, stepSeq: seqUpscale, seq: 0, frameId: null, depsRemaining: 1, input: {} },
+    ]);
+
+    // Not claimable yet.
+    const before = await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const claimed = await claimNextBatch(client, cohort.id, seqUpscale, 5);
+      await client.query('ROLLBACK');
+      return claimed;
+    });
+    expect(before).toHaveLength(0);
+
+    const concatJob = await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const rows = await claimNextBatch(client, cohort.id, seqConcat, 5, project.id);
+      await markSubmitted(client, rows[0].id, uniqueId('rp-job'));
+      await client.query('COMMIT');
+      return rows[0];
+    });
+    await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      await markTerminal(client, concatJob.id, { status: 'complete', output: { video: 'https://pub.example/concat.mp4' } });
+      await client.query('COMMIT');
+    });
+
+    const after = await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const claimed = await claimNextBatch(client, cohort.id, seqUpscale, 5);
+      await client.query('ROLLBACK');
+      return claimed;
+    });
+    expect(after).toHaveLength(1);
+    expect(after[0].frameId).toBeNull();
+    expect(after[0].depsRemaining).toBe(0);
+  });
 });
 
 maybeDescribe('db repo layer — endpoint_state (integration, M3)', () => {

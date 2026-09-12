@@ -191,7 +191,12 @@ export async function markTerminal(
   // still count toward a dependent's fan-in, or that dependent's
   // deps_remaining gets stuck above zero forever — real gap closed 2026-09-12
   // while adding step 8 (concat), which fans in on every frame's step 6.
-  if ((outcome.status === 'complete' || outcome.status === 'failed') && job.frameId) {
+  //
+  // Not gated on job.frameId (removed 2026-09-12 while adding step 10/
+  // upscale): a singleJobPerProject producer (e.g. step 8/concat) has
+  // frame_id NULL itself but can still have a singleJobPerProject dependent
+  // (step 10 depends on step 8's one output) — that decrement must fire too.
+  if (outcome.status === 'complete' || outcome.status === 'failed') {
     const dependents = await dependentSteps(client, job.cohortId, job.stepSeq);
     if (dependents.length > 0) {
       // project_id required, not just cohort_id + frame_id — frame_id alone
@@ -200,14 +205,24 @@ export async function markTerminal(
       // "f1" step would also decrement project B's same-numbered frame's
       // deps_remaining, letting a job go 'ready' with a dependency that
       // never actually ran in its own project.
-      await client.query(
-        `UPDATE jobs SET deps_remaining = GREATEST(deps_remaining - 1, 0)
-           WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq = ANY($4)`,
-        [job.cohortId, job.projectId, job.frameId, dependents],
-      );
-      // A singleJobPerProject dependent (e.g. step 8/concat) has no frame_id
-      // of its own — it fans in on every frame's completion of this step, so
-      // every one of those N completions must decrement its ONE row once.
+      //
+      // Only meaningful for a per-frame producer (job.frameId set) — a
+      // `frame_id = NULL` comparison never matches any row in SQL, so this
+      // would be a safe no-op either way, but skipping it when there's no
+      // frame makes the intent explicit rather than relying on that.
+      if (job.frameId) {
+        await client.query(
+          `UPDATE jobs SET deps_remaining = GREATEST(deps_remaining - 1, 0)
+             WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq = ANY($4)`,
+          [job.cohortId, job.projectId, job.frameId, dependents],
+        );
+      }
+      // A singleJobPerProject dependent (e.g. step 8/concat, step 10/upscale)
+      // has no frame_id of its own — it fans in on every completion of this
+      // step (one from each frame for a per-frame producer like merge, or
+      // the single completion of another singleJobPerProject producer like
+      // concat), so every one of those completions must decrement its ONE
+      // row once.
       await client.query(
         `UPDATE jobs SET deps_remaining = GREATEST(deps_remaining - 1, 0)
            WHERE cohort_id = $1 AND project_id = $2 AND frame_id IS NULL AND step_seq = ANY($3)`,

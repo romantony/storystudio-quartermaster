@@ -27,6 +27,7 @@ import { buildTtsInput } from './builders/tts';
 import { buildI2vInput } from './builders/i2v';
 import { buildMergeInput } from './builders/merge';
 import { buildConcatInput } from './builders/concat';
+import { buildUpscaleInput } from './builders/upscale';
 import type { PayloadBuilder } from './builders/types';
 
 function endpointFor(counterKey: string): string {
@@ -132,6 +133,20 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     scope: 'project',
     singleJobPerProject: true,
     builder: buildConcatInput,
+  },
+  {
+    // Second singleJobPerProject step, but depending on ANOTHER
+    // singleJobPerProject step (8) rather than fanning in on every frame —
+    // its fan-in is 1, not req.frames.length (see agents/planner.ts's
+    // buildStepsAndJobs()). Gated by options.upscale (STEP_TOPOLOGY).
+    seq: 10,
+    name: 'upscale',
+    endpointId: POSTPROD_LITE_ENDPOINT_ID,
+    gate: null,
+    dependsOn: [8],
+    scope: 'project',
+    singleJobPerProject: true,
+    builder: buildUpscaleInput,
   },
 ] as const;
 

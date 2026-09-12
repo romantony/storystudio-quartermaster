@@ -208,6 +208,7 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
 
   const mergeEntry = catalogEntry(6)!;
   const concatEntry = catalogEntry(8)!;
+  const upscaleEntry = catalogEntry(10)!;
 
   it('a per-frame step (merge) still plans one job per frame — unchanged behavior', () => {
     const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry], req, 'proj_1', 25);
@@ -232,6 +233,17 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
   it('computeDrainAfter still collapses 6->8 since both target postprod-lite', () => {
     const { steps } = _internal.buildStepsAndJobs([mergeEntry, concatEntry], req, 'proj_1', 25);
     expect(steps.map((s) => s.drainAfter)).toEqual([false, true]);
+  });
+
+  it('a singleJobPerProject step depending on ANOTHER singleJobPerProject step fans in on 1, not frames.length (step 10/upscale <- step 8/concat)', () => {
+    const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry, concatEntry, upscaleEntry], req, 'proj_1', 25);
+    const upscaleStep = steps.find((s) => s.seq === 10)!;
+    expect(upscaleStep.jobTotal).toBe(1);
+
+    const upscaleJobs = jobs.filter((j) => j.stepSeq === 10);
+    expect(upscaleJobs).toHaveLength(1);
+    // NOT 3 (req.frames.length) — concat only ever completes once.
+    expect(upscaleJobs[0]).toMatchObject({ frameId: null, seq: 0, projectId: 'proj_1', depsRemaining: 1, input: {} });
   });
 });
 

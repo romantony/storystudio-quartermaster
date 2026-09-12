@@ -190,15 +190,24 @@ function buildStepsAndJobs(
     const dependsOnPlanned = c.dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d));
 
     if (c.singleJobPerProject) {
+      // Each dependency step contributes one decrement per producer job it
+      // actually plans: req.frames.length for an ordinary per-frame step
+      // (e.g. step 6/merge), or exactly 1 for another singleJobPerProject
+      // step (e.g. step 10/upscale depending on step 8/concat's one output)
+      // — a project-scoped producer only ever completes once. Widened
+      // 2026-09-12 alongside db/repo/jobs.ts's markTerminal(), which now
+      // fires this decrement on 'failed' too, so one bad frame (or a failed
+      // upstream singleJobPerProject job) can't stall this forever.
+      const depsRemaining = dependsOnPlanned.reduce((sum, depSeq) => {
+        const depEntry = catalogued.find((cc) => cc.seq === depSeq);
+        return sum + (depEntry?.singleJobPerProject ? 1 : req.frames.length);
+      }, 0);
       jobs.push({
         projectId,
         stepSeq: c.seq,
         seq: 0,
         frameId: null,
-        // N-way fan-in: each dependency step contributes one decrement per
-        // frame (db/repo/jobs.ts's markTerminal(), widened 2026-09-12 to also
-        // fire on 'failed' so one bad frame can't stall this forever).
-        depsRemaining: dependsOnPlanned.length * req.frames.length,
+        depsRemaining,
         // Unused — a singleJobPerProject builder (e.g. buildConcatInput)
         // reads ctx.perFrameOutputs, never ctx.job. Every job row needs an
         // `input`, so an empty object stands in rather than widening
