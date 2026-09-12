@@ -22,9 +22,11 @@
 import { FLEET } from '../fleet-registry';
 import { POSTPROD_LITE_ENDPOINT_ID } from './tail-endpoints';
 import { buildImageInput } from './builders/image';
+import { buildImageEditInput } from './builders/image-edit';
 import { buildTtsInput } from './builders/tts';
 import { buildI2vInput } from './builders/i2v';
 import { buildMergeInput } from './builders/merge';
+import { buildConcatInput } from './builders/concat';
 import type { PayloadBuilder } from './builders/types';
 
 function endpointFor(counterKey: string): string {
@@ -45,6 +47,13 @@ export interface CatalogEntry {
   gate: string | null;
   dependsOn: number[];
   scope: StepScope;
+  /** Orthogonal to `scope`: when true, agents/planner.ts plans exactly ONE
+   * job for this step per project (frameId: null) instead of one per frame,
+   * fanned in on ALL of dependsOn's per-frame outputs — see
+   * agents/generator.ts's resolveProjectDeps() and
+   * steps/builders/concat.ts's header comment for the full mechanism.
+   * Unset/false preserves today's one-job-per-frame behavior. */
+  singleJobPerProject?: boolean;
   builder: PayloadBuilder;
 }
 
@@ -56,6 +65,23 @@ export interface CatalogEntry {
 // run hand-scale one endpoint to a small real number (see the M2 plan's
 // decision 5) instead of always expecting a full 25.
 export const STEP_CATALOG: readonly CatalogEntry[] = [
+  {
+    // Narration Premium's reference-image flow (options.referenceImage) —
+    // mutually exclusive with seq 1 (see agents/planner.ts's STEP_TOPOLOGY).
+    // seq 0, not a new number after 13: it must sort BEFORE seq 1/2/3/6,
+    // since agents/orchestrator.ts's driveCohort() runs bulk steps in strict
+    // ascending seq order, and this replaces step 1's position in the plan
+    // when it runs. Not part of the original 1-13 spec topology, same kind
+    // of orchestrator-specific extension as tail-endpoints.ts's
+    // POSTPROD_LITE_ENDPOINT_ID.
+    seq: 0,
+    name: 'image-i2i',
+    endpointId: endpointFor('runpod:qwen-image-edit'),
+    gate: 'image', // same gate as seq 1 — quality.ts keys off `gate`, not seq
+    dependsOn: [],
+    scope: 'bulk',
+    builder: buildImageEditInput,
+  },
   {
     seq: 1,
     name: 'image',
@@ -79,7 +105,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     name: 'animation',
     endpointId: endpointFor('runpod:wan2-i2v'),
     gate: 'motion', // §6.5's motion gate — M4
-    dependsOn: [1],
+    dependsOn: [0, 1], // whichever image step actually ran (mutually exclusive)
     scope: 'bulk',
     builder: buildI2vInput,
   },
@@ -91,6 +117,21 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     dependsOn: [2, 3],
     scope: 'project', // M5 phase 1 — agents/assembler.ts, not the bulk generator
     builder: buildMergeInput,
+  },
+  {
+    // First singleJobPerProject step: one job for the whole project, fanned
+    // in on every frame's step-6 output, not one job per frame like every
+    // other catalogued step. Shares postprod-lite with merge, so it rides
+    // the same assembler.ts tail allocation with zero drain in between
+    // (computeDrainAfter already collapses same-endpoint adjacent steps).
+    seq: 8,
+    name: 'concat',
+    endpointId: POSTPROD_LITE_ENDPOINT_ID,
+    gate: null,
+    dependsOn: [6],
+    scope: 'project',
+    singleJobPerProject: true,
+    builder: buildConcatInput,
   },
 ] as const;
 

@@ -24,7 +24,7 @@ import { ensureCohort } from '../db/repo/cohorts';
 import { insertProject, getProject } from '../db/repo/projects';
 import { insertSteps, type NewStep } from '../db/repo/steps';
 import { insertJobs, type NewJob } from '../db/repo/jobs';
-import { STEP_CATALOG, catalogEntry } from '../steps/catalog';
+import { STEP_CATALOG, catalogEntry, type CatalogEntry } from '../steps/catalog';
 import type { FrameJobInput } from '../steps/builders/types';
 import { estimateMinutes } from '../telemetry/ledger';
 
@@ -37,6 +37,10 @@ const FrameSchema = z
     durationS: z.number().positive(),
     motionPrompt: z.string().optional(),
     textManifest: z.object({ elements: z.array(z.unknown()), fps: z.number() }).optional(),
+    // Narration Premium's reference-image flow (options.referenceImage) —
+    // the caller (StoryStudio, in the real product flow) generates this
+    // once and attaches it to every frame; see steps/builders/image-edit.ts.
+    referenceImageUrl: z.string().url().optional(),
   })
   .strict();
 
@@ -49,6 +53,13 @@ const OptionsSchema = z
     removeSilence: z.boolean().default(false),
     textOverlay: z.boolean().default(false),
     qualityGates: z.enum(['full', 'sampled', 'image-only', 'off']).default('full'),
+    // Narration Premium: run step 0 (image-i2i, qwen-image-edit) instead of
+    // step 1 (t2i, qwen-image-gen) — see STEP_TOPOLOGY below. Defaults to
+    // today's Basic-tier behavior.
+    referenceImage: z.boolean().default(false),
+    // Narration Premium: route step 2 (tts) to the Qwen3-TTS voice-design
+    // payload instead of Kokoro's — see steps/builders/tts.ts.
+    voiceEngine: z.enum(['kokoro', 'qwen']).default('kokoro'),
     shorts: z
       .object({
         enabled: z.boolean().default(false),
@@ -75,6 +86,13 @@ export const RequestSchema = z
     callbackUrl: z.string().url(),
     options: OptionsSchema,
     frames: z.array(FrameSchema).min(1),
+    // Qwen3-TTS voice-design fields (options.voiceEngine === 'qwen'),
+    // request-level like the real AWS contract's §9.1 shape — mirrors
+    // voiceSpeaker/voiceInstruct/voiceLanguage in
+    // docs/storystudio-qm-new-sfn-trigger.md §9.2. Ignored for Kokoro.
+    voiceSpeaker: z.string().optional(),
+    voiceInstruct: z.string().optional(),
+    voiceLanguage: z.string().optional(),
   })
   .strict();
 
@@ -104,7 +122,12 @@ export class PlanValidationError extends Error {
  * deliberately absent — it stays on the existing AWS Lambda, not part of the
  * orchestrator's own plan (impl plan §13 M1 note). */
 const STEP_TOPOLOGY: ReadonlyArray<{ seq: number; dialogueOnly?: boolean; gatedBy?: (o: OrchestratorRequest['options']) => boolean }> = [
-  { seq: 1 },
+  // seq 0 (image-i2i) and seq 1 (image t2i) are mutually exclusive — the
+  // Narration Premium reference-image flow (options.referenceImage) runs
+  // seq 0 instead of seq 1, never both. See steps/catalog.ts's header
+  // comment on why seq 0 (not 14) — it must sort before seq 1/2/3/6.
+  { seq: 0, gatedBy: (o) => o.referenceImage },
+  { seq: 1, gatedBy: (o) => !o.referenceImage },
   { seq: 2 },
   { seq: 3 },
   { seq: 4, dialogueOnly: true },
@@ -136,10 +159,104 @@ function computeDrainAfter(steps: NewStep[]): void {
   if (steps.length > 0) steps[steps.length - 1].drainAfter = true;
 }
 
+/** Pure step/job construction — no DB, no clock — so it's unit-testable via
+ * `_internal` the same way resolveStepSet/computeDrainAfter already are.
+ * Branches per catalogued step on `c.singleJobPerProject`
+ * (steps/catalog.ts): unset/false plans one job per frame (unchanged
+ * behavior); true plans exactly ONE project-scoped job (frameId: null),
+ * fanned in on every frame's eventual completion of each dependency step —
+ * see agents/generator.ts's resolveProjectDeps() and db/repo/jobs.ts's
+ * markTerminal() for the runtime side that decrements it N times. */
+function buildStepsAndJobs(
+  catalogued: CatalogEntry[],
+  req: OrchestratorRequest,
+  projectId: string,
+  workersTarget: number,
+): { steps: NewStep[]; jobs: NewJob[] } {
+  const steps: NewStep[] = catalogued.map((c) => ({
+    seq: c.seq,
+    name: c.name,
+    endpointId: c.endpointId,
+    workersTarget,
+    gate: c.gate,
+    drainAfter: true, // overwritten by computeDrainAfter below
+    dependsOn: c.dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d)),
+    jobTotal: c.singleJobPerProject ? 1 : req.frames.length,
+  }));
+  computeDrainAfter(steps);
+
+  const jobs: NewJob[] = [];
+  for (const c of catalogued) {
+    const dependsOnPlanned = c.dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d));
+
+    if (c.singleJobPerProject) {
+      jobs.push({
+        projectId,
+        stepSeq: c.seq,
+        seq: 0,
+        frameId: null,
+        // N-way fan-in: each dependency step contributes one decrement per
+        // frame (db/repo/jobs.ts's markTerminal(), widened 2026-09-12 to also
+        // fire on 'failed' so one bad frame can't stall this forever).
+        depsRemaining: dependsOnPlanned.length * req.frames.length,
+        // Unused — a singleJobPerProject builder (e.g. buildConcatInput)
+        // reads ctx.perFrameOutputs, never ctx.job. Every job row needs an
+        // `input`, so an empty object stands in rather than widening
+        // FrameJobInput's required fields just for a value nothing reads.
+        input: {},
+      });
+      continue;
+    }
+
+    req.frames.forEach((frame, idx) => {
+      const input: FrameJobInput = {
+        frameId: frame.frameId,
+        imagePrompt: frame.imagePrompt,
+        narration: frame.narration,
+        durationS: frame.durationS,
+        motionPrompt: frame.motionPrompt,
+        aspectRatio: req.aspectRatio,
+        language: req.language,
+        referenceImageUrl: frame.referenceImageUrl,
+        voiceEngine: req.options.voiceEngine,
+        voiceSpeaker: req.voiceSpeaker,
+        voiceInstruct: req.voiceInstruct,
+        voiceLanguage: req.voiceLanguage,
+      };
+      jobs.push({
+        projectId,
+        stepSeq: c.seq,
+        seq: idx,
+        frameId: frame.frameId,
+        depsRemaining: dependsOnPlanned.length,
+        input,
+      });
+    });
+  }
+
+  return { steps, jobs };
+}
+
 export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequest: unknown): Promise<PlanAck> {
   const parsed = RequestSchema.safeParse(rawRequest);
   if (!parsed.success) throw new PlanValidationError(parsed.error.issues);
   const req = parsed.data;
+
+  // options.referenceImage routes every frame through step 0 (image-i2i),
+  // which throws at build time if referenceImageUrl is missing — fail fast
+  // here instead, with a clear message, rather than mid-run per frame.
+  if (req.options.referenceImage) {
+    const missing = req.frames.filter((f) => !f.referenceImageUrl).map((f) => f.frameId);
+    if (missing.length > 0) {
+      throw new PlanValidationError([
+        {
+          code: z.ZodIssueCode.custom,
+          path: ['frames'],
+          message: `options.referenceImage is true but these frames have no referenceImageUrl: ${missing.join(', ')}`,
+        },
+      ]);
+    }
+  }
 
   // §10.1 request-level idempotency: a replayed requestId returns the
   // original acknowledgement, never a second plan.
@@ -187,42 +304,8 @@ export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequ
         throw new Error(`plan: project ${req.projectId} already exists under a different requestId`);
       }
 
-      const newSteps: NewStep[] = catalogued.map((c) => ({
-        seq: c.seq,
-        name: c.name,
-        endpointId: c.endpointId,
-        workersTarget: cfg.workersHead,
-        gate: c.gate,
-        drainAfter: true, // overwritten by computeDrainAfter below
-        dependsOn: c.dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d)),
-        jobTotal: req.frames.length,
-      }));
-      computeDrainAfter(newSteps);
+      const { steps: newSteps, jobs: newJobs } = buildStepsAndJobs(catalogued, req, project.id, cfg.workersHead);
       await insertSteps(client, cohort.id, newSteps);
-
-      const newJobs: NewJob[] = [];
-      for (const c of catalogued) {
-        const dependsOnPlanned = c.dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d));
-        req.frames.forEach((frame, idx) => {
-          const input: FrameJobInput = {
-            frameId: frame.frameId,
-            imagePrompt: frame.imagePrompt,
-            narration: frame.narration,
-            durationS: frame.durationS,
-            motionPrompt: frame.motionPrompt,
-            aspectRatio: req.aspectRatio,
-            language: req.language,
-          };
-          newJobs.push({
-            projectId: project.id,
-            stepSeq: c.seq,
-            seq: idx,
-            frameId: frame.frameId,
-            depsRemaining: dependsOnPlanned.length,
-            input,
-          });
-        });
-      }
       await insertJobs(client, cohort.id, newJobs);
 
       await client.query('COMMIT');
@@ -283,6 +366,6 @@ async function ackFromExisting(
 }
 
 /** Exposed for tests — the affinity rule and step-set resolution are pure. */
-export const _internal = { computeDrainAfter, resolveStepSet, STEP_TOPOLOGY };
+export const _internal = { computeDrainAfter, resolveStepSet, STEP_TOPOLOGY, buildStepsAndJobs };
 
 export const _catalogSize = STEP_CATALOG.length;

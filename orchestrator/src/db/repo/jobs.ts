@@ -186,7 +186,12 @@ export async function markTerminal(
   );
   const job = toJob(rows[0]);
 
-  if (outcome.status === 'complete' && job.frameId) {
+  // Fires on BOTH complete and failed, not just complete: a hard-failed
+  // per-frame job (e.g. a merge that never produced a usable clip) must
+  // still count toward a dependent's fan-in, or that dependent's
+  // deps_remaining gets stuck above zero forever — real gap closed 2026-09-12
+  // while adding step 8 (concat), which fans in on every frame's step 6.
+  if ((outcome.status === 'complete' || outcome.status === 'failed') && job.frameId) {
     const dependents = await dependentSteps(client, job.cohortId, job.stepSeq);
     if (dependents.length > 0) {
       // project_id required, not just cohort_id + frame_id — frame_id alone
@@ -199,6 +204,14 @@ export async function markTerminal(
         `UPDATE jobs SET deps_remaining = GREATEST(deps_remaining - 1, 0)
            WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq = ANY($4)`,
         [job.cohortId, job.projectId, job.frameId, dependents],
+      );
+      // A singleJobPerProject dependent (e.g. step 8/concat) has no frame_id
+      // of its own — it fans in on every frame's completion of this step, so
+      // every one of those N completions must decrement its ONE row once.
+      await client.query(
+        `UPDATE jobs SET deps_remaining = GREATEST(deps_remaining - 1, 0)
+           WHERE cohort_id = $1 AND project_id = $2 AND frame_id IS NULL AND step_seq = ANY($3)`,
+        [job.cohortId, job.projectId, dependents],
       );
     }
   }

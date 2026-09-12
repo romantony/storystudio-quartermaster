@@ -140,6 +140,28 @@ async function resolveDeps(client: PoolClient, cohortId: string, projectId: stri
   return resolved;
 }
 
+/** Resolves a `singleJobPerProject` step's fan-in dependencies (e.g. step 8's
+ * concat needs every frame's step-6 output, not one frame's) — the
+ * project-scoped counterpart to resolveDeps() above. `ORDER BY seq` recovers
+ * each frame's original narrative order for free: planner.ts already assigns
+ * a per-frame job's `seq` from its index in the request's frames[] array, so
+ * no separate ordering field is needed. `status IN ('complete','failed')`
+ * matches markTerminal()'s widened fan-in decrement (db/repo/jobs.ts) — a
+ * hard-failed frame still counts toward this job becoming claimable, but its
+ * output naturally has no resolvable URL and is filtered out below rather
+ * than blocking the whole project's concat on one bad frame. */
+async function resolveProjectDeps(client: PoolClient, cohortId: string, projectId: string, dependsOn: number[]): Promise<Record<number, string[]>> {
+  const resolved: Record<number, string[]> = {};
+  for (const seq of dependsOn) {
+    const { rows } = await client.query<{ output: unknown }>(
+      `SELECT output FROM jobs WHERE cohort_id = $1 AND project_id = $2 AND step_seq = $3 AND status IN ('complete', 'failed') ORDER BY seq ASC`,
+      [cohortId, projectId, seq],
+    );
+    resolved[seq] = rows.map((r) => runpodOutUrl(r.output)).filter((url): url is string => !!url);
+  }
+  return resolved;
+}
+
 async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, job: JobRow): Promise<void> {
   const client = await deps.pool.connect();
   try {
@@ -157,9 +179,11 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
 
     const frameInput = job.input as FrameJobInput;
     const resolvedDeps = job.frameId ? await resolveDeps(client, cohortId, job.projectId, job.frameId, step.dependsOn) : {};
+    const perFrameOutputs = job.frameId ? undefined : await resolveProjectDeps(client, cohortId, job.projectId, step.dependsOn);
     const payload = step.builder({
       job: frameInput,
       resolvedDeps,
+      perFrameOutputs,
       projectId: job.projectId,
       frameId: job.frameId,
     });

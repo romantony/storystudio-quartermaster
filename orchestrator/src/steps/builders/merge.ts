@@ -1,7 +1,12 @@
 /**
  * Step 6 (av merge) payload builder. Targets postprod-lite's `merge` mode
- * (orchestrator/containers/media.md): `{video_url, audio_url}` ->
- * `{video, duration_s, gen_time_s}`. Depends on step 2 (tts, the audio) and
+ * (orchestrator/containers/media.md): `{mode:'merge', video_url, audio_url}`
+ * -> `{video, duration_s, gen_time_s}` — `mode` is required (postprod-lite
+ * hosts 8 functions on one endpoint; a missing/null mode 400s with "Invalid
+ * mode 'None'") and was missing here until the first real live run of this
+ * step (2026-09-12) failed all 36 frames with exactly that error — M5
+ * phase 1 had never actually reached step 6 live before that. Depends on
+ * step 2 (tts, the audio) and
  * step 3 (animation, the video) — the generator resolves both dependencies'
  * output URLs into `ctx.resolvedDeps` before calling this builder (see
  * steps/builders/types.ts), same mechanism i2v.ts already uses for its one
@@ -27,6 +32,7 @@ export const buildMergeInput: PayloadBuilder = (ctx: BuildContext): Record<strin
     throw new Error(`merge builder: no resolved animation video URL for frame ${ctx.frameId ?? '(none)'}`);
   }
   return {
+    mode: 'merge',
     video_url: videoUrl,
     audio_url: audioUrl,
     ...attribution,

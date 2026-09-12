@@ -199,6 +199,74 @@ maybeDescribe('db repo layer (integration)', () => {
     const counts81 = await stepJobCounts(pool, cohort.id, seqImage);
     expect(counts81).toEqual({ total: 1, terminal: 1 });
   });
+
+  it('jobs: a singleJobPerProject consumer (frame_id NULL) fans in on every frame\'s producer completion, including a failed one (2026-09-12, step 8/concat)', async () => {
+    const cohort = { id: sharedCohortId };
+    const project = (
+      await insertProject(pool, {
+        id: uniqueId('proj'),
+        cohortId: cohort.id,
+        requestId: uniqueId('req'),
+        tier: 'narration-premium',
+        language: 'en',
+        request: {},
+        callbackUrl: null,
+      })
+    ).project;
+
+    const base = seqBase();
+    const [seqMerge, seqConcat] = [base, base + 2];
+    await insertSteps(pool, cohort.id, [
+      { seq: seqMerge, name: 'merge', endpointId: 'e6', workersTarget: 2, gate: null, drainAfter: false, dependsOn: [], jobTotal: 3 },
+      { seq: seqConcat, name: 'concat', endpointId: 'e6', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [seqMerge], jobTotal: 1 },
+    ]);
+
+    const frameIds = [uniqueId('frame'), uniqueId('frame'), uniqueId('frame')];
+    await insertJobs(pool, cohort.id, [
+      ...frameIds.map((frameId, idx) => ({ projectId: project.id, stepSeq: seqMerge, seq: idx, frameId, depsRemaining: 0, input: {} })),
+      // 3-way fan-in: one row, no frame, waiting on all 3 merge jobs above.
+      { projectId: project.id, stepSeq: seqConcat, seq: 0, frameId: null, depsRemaining: 3, input: {} },
+    ]);
+
+    async function claimAndComplete(frameId: string, outcome: { status: 'complete'; output: unknown } | { status: 'failed'; error: unknown }) {
+      const claimed = await withClient(pool, async (client) => {
+        await client.query('BEGIN');
+        const rows = await claimNextBatch(client, cohort.id, seqMerge, 5, project.id);
+        const row = rows.find((r) => r.frameId === frameId)!;
+        await markSubmitted(client, row.id, uniqueId('rp-job'));
+        await client.query('COMMIT');
+        return row;
+      });
+      await withClient(pool, async (client) => {
+        await client.query('BEGIN');
+        await markTerminal(client, claimed.id, outcome);
+        await client.query('COMMIT');
+      });
+    }
+
+    // Not claimable yet — still waiting on all 3 frames.
+    const before = await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const claimed = await claimNextBatch(client, cohort.id, seqConcat, 5);
+      await client.query('ROLLBACK');
+      return claimed;
+    });
+    expect(before).toHaveLength(0);
+
+    await claimAndComplete(frameIds[0], { status: 'complete', output: { video: 'https://pub.example/f0.mp4' } });
+    await claimAndComplete(frameIds[1], { status: 'failed', error: { status: 'FAILED' } }); // a hard failure must still count toward fan-in
+    await claimAndComplete(frameIds[2], { status: 'complete', output: { video: 'https://pub.example/f2.mp4' } });
+
+    const after = await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const claimed = await claimNextBatch(client, cohort.id, seqConcat, 5);
+      await client.query('ROLLBACK');
+      return claimed;
+    });
+    expect(after).toHaveLength(1);
+    expect(after[0].frameId).toBeNull();
+    expect(after[0].depsRemaining).toBe(0);
+  });
 });
 
 maybeDescribe('db repo layer — endpoint_state (integration, M3)', () => {
