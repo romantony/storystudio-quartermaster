@@ -28,6 +28,7 @@ import { buildI2vInput } from './builders/i2v';
 import { buildMergeInput } from './builders/merge';
 import { buildConcatInput } from './builders/concat';
 import { buildUpscaleInput } from './builders/upscale';
+import { buildCaptionInput } from './builders/caption';
 import type { PayloadBuilder } from './builders/types';
 
 function endpointFor(counterKey: string): string {
@@ -147,6 +148,22 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     scope: 'project',
     singleJobPerProject: true,
     builder: buildUpscaleInput,
+  },
+  {
+    // Reads step 10's output if it ran, else falls back to step 8's — NOT
+    // mutually exclusive like image steps 0/1 (concat always runs; upscale
+    // is independently optional), so listing both here relies on
+    // agents/planner.ts's resolveDirectDependencies() to collapse 8 out of
+    // the fan-in count whenever 10 is also present. Gated by
+    // options.burnCaptions (STEP_TOPOLOGY).
+    seq: 11,
+    name: 'burn-captions',
+    endpointId: POSTPROD_LITE_ENDPOINT_ID,
+    gate: null,
+    dependsOn: [10, 8],
+    scope: 'project',
+    singleJobPerProject: true,
+    builder: buildCaptionInput,
   },
 ] as const;
 

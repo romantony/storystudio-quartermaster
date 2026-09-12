@@ -209,6 +209,7 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
   const mergeEntry = catalogEntry(6)!;
   const concatEntry = catalogEntry(8)!;
   const upscaleEntry = catalogEntry(10)!;
+  const captionEntry = catalogEntry(11)!;
 
   it('a per-frame step (merge) still plans one job per frame — unchanged behavior', () => {
     const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry], req, 'proj_1', 25);
@@ -244,6 +245,29 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     expect(upscaleJobs).toHaveLength(1);
     // NOT 3 (req.frames.length) — concat only ever completes once.
     expect(upscaleJobs[0]).toMatchObject({ frameId: null, seq: 0, projectId: 'proj_1', depsRemaining: 1, input: {} });
+  });
+
+  it('burn-captions (dependsOn:[10,8]) collapses 8 out of the fan-in when 10 is also present — concat/upscale are NOT mutually exclusive like image steps 0/1', () => {
+    const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry, concatEntry, upscaleEntry, captionEntry], req, 'proj_1', 25);
+    const captionStep = steps.find((s) => s.seq === 11)!;
+    // Without the collapse this would be [10,8]; 8 is shadowed since 10
+    // already depends on it, so only 10 should remain a direct dependency.
+    expect(captionStep.dependsOn).toEqual([10]);
+
+    const captionJobs = jobs.filter((j) => j.stepSeq === 11);
+    expect(captionJobs).toHaveLength(1);
+    // Would be 2 (double-counting 8 and 10) without the collapse, and would
+    // never reach 0 since concat's completion only decrements once.
+    expect(captionJobs[0].depsRemaining).toBe(1);
+  });
+
+  it('burn-captions depends only on step 8 when upscale did not run (10 uncatalogued for this request)', () => {
+    const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry, concatEntry, captionEntry], req, 'proj_1', 25);
+    const captionStep = steps.find((s) => s.seq === 11)!;
+    expect(captionStep.dependsOn).toEqual([8]);
+
+    const captionJobs = jobs.filter((j) => j.stepSeq === 11);
+    expect(captionJobs[0].depsRemaining).toBe(1);
   });
 });
 

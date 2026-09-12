@@ -10,6 +10,7 @@ import { buildI2vInput } from '../src/steps/builders/i2v';
 import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
 import { buildUpscaleInput } from '../src/steps/builders/upscale';
+import { buildCaptionInput } from '../src/steps/builders/caption';
 import type { BuildContext, FrameJobInput } from '../src/steps/builders/types';
 
 const baseJob: FrameJobInput = {
@@ -240,5 +241,38 @@ describe('buildUpscaleInput (step 10, singleJobPerProject depending on ANOTHER s
   it('throws when step 8\'s output is unresolved', () => {
     expect(() => buildUpscaleInput(projectCtx(undefined))).toThrow(/no resolved concat video URL/);
     expect(() => buildUpscaleInput(projectCtx({ 8: [] }))).toThrow(/no resolved concat video URL/);
+  });
+});
+
+describe('buildCaptionInput (step 11, TikTok-style burn captions — prefers step 10, falls back to step 8)', () => {
+  const projectCtx = (perFrameOutputs?: Record<number, string[]>): BuildContext => ({
+    job: baseJob,
+    resolvedDeps: {},
+    perFrameOutputs,
+    projectId: 'proj_8812',
+    frameId: null,
+  });
+
+  const tiktokParams = { words_per_group: 3, font_size: 64, highlight_color: 'yellow', position: 'bottom' };
+
+  it('prefers step 10 (upscale) when both 8 and 10 are resolved', () => {
+    const out = buildCaptionInput(
+      projectCtx({ 8: ['https://pub.example/proj_8812_concat.mp4'], 10: ['https://pub.example/proj_8812_upscale.mp4'] }),
+    );
+    expect(out).toEqual({
+      mode: 'caption',
+      video_url: 'https://pub.example/proj_8812_upscale.mp4',
+      project_id: 'proj_8812',
+      ...tiktokParams,
+    });
+  });
+
+  it('falls back to step 8 (concat) when upscale did not run', () => {
+    const out = buildCaptionInput(projectCtx({ 8: ['https://pub.example/proj_8812_concat.mp4'] }));
+    expect(out.video_url).toBe('https://pub.example/proj_8812_concat.mp4');
+  });
+
+  it('throws when neither step 10 nor step 8 is resolved', () => {
+    expect(() => buildCaptionInput(projectCtx(undefined))).toThrow(/no resolved video URL/);
   });
 });

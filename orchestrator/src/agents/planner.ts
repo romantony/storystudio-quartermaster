@@ -167,6 +167,26 @@ function computeDrainAfter(steps: NewStep[]): void {
  * fanned in on every frame's eventual completion of each dependency step —
  * see agents/generator.ts's resolveProjectDeps() and db/repo/jobs.ts's
  * markTerminal() for the runtime side that decrements it N times. */
+/**
+ * Filters a step's declared `dependsOn` down to what's actually catalogued
+ * for this request, then collapses any entry that's ITSELF a dependency of
+ * another surviving entry in the same list — e.g. step 11 (burn captions)
+ * declares `dependsOn: [10, 8]` (prefer step 10/upscale's output, fall back
+ * to step 8/concat's when upscale is off — steps/builders/caption.ts), but
+ * concat and upscale are NOT mutually exclusive like image steps 0/1 are
+ * (concat always runs; upscale is an independent options.upscale toggle) —
+ * when upscale IS on, both 8 and 10 are catalogued, and since 10 already
+ * depends on 8, counting 8 again here would double the fan-in and leave the
+ * job stuck waiting on a second decrement that never comes (10's completion
+ * only decrements ONCE). Not recursive — sufficient for today's chain depth
+ * (8 -> 10 -> 11); a deeper chain would need this applied transitively. */
+function resolveDirectDependencies(dependsOn: number[], catalogued: CatalogEntry[]): number[] {
+  const planned = dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d));
+  return planned.filter(
+    (d) => !planned.some((other) => other !== d && catalogued.find((cc) => cc.seq === other)?.dependsOn.includes(d)),
+  );
+}
+
 function buildStepsAndJobs(
   catalogued: CatalogEntry[],
   req: OrchestratorRequest,
@@ -180,14 +200,14 @@ function buildStepsAndJobs(
     workersTarget,
     gate: c.gate,
     drainAfter: true, // overwritten by computeDrainAfter below
-    dependsOn: c.dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d)),
+    dependsOn: resolveDirectDependencies(c.dependsOn, catalogued),
     jobTotal: c.singleJobPerProject ? 1 : req.frames.length,
   }));
   computeDrainAfter(steps);
 
   const jobs: NewJob[] = [];
   for (const c of catalogued) {
-    const dependsOnPlanned = c.dependsOn.filter((d) => catalogued.some((cc) => cc.seq === d));
+    const dependsOnPlanned = resolveDirectDependencies(c.dependsOn, catalogued);
 
     if (c.singleJobPerProject) {
       // Each dependency step contributes one decrement per producer job it
