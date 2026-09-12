@@ -29,7 +29,7 @@ import type { Config } from '../config';
 import type { RunpodClient } from '../runpod/client';
 import { log } from '../telemetry/log';
 import { STEP_CATALOG, type CatalogEntry } from '../steps/catalog';
-import { listSteps } from '../db/repo/steps';
+import { listSteps, updateStepStatus } from '../db/repo/steps';
 import { listProjectIdsForStep } from '../db/repo/jobs';
 import { setProjectStatus } from '../db/repo/projects';
 import { allocate, release, type FleetDeps } from './fleet';
@@ -80,6 +80,21 @@ export async function runAssembler(deps: AssemblerDeps, cohortId: string): Promi
     log().info({ cohortId, projectId }, 'assembler: starting project tail');
     for (const step of tailSteps) {
       await runStep(generatorDeps, cohortId, step, deps.cfg.workersTail, projectId);
+      if (step !== lastStep) {
+        // Real bug found live 2026-09-12, first time any chain longer than
+        // one tail step ran automatically: runStep() leaves a step at
+        // 'generated' (steps_one_live_per_cohort's live-status set) when it
+        // finishes. release() below clears that for lastStep, but nothing
+        // ever did for the steps before it — the NEXT tail step's own
+        // runStep() call then fails immediately, since its own
+        // updateStepStatus('running') collides with the still-'generated'
+        // previous step on that same unique index (one live row per
+        // COHORT, not per seq). Mark it 'complete' directly here instead of
+        // calling the full release() — that would also drain postprod-lite
+        // between steps, defeating the whole point of the tail collapse
+        // (one shared warm pool across 6->7->8->10->11->12).
+        await updateStepStatus(deps.pool, cohortId, step.seq, 'complete', { finishedAt: new Date() });
+      }
       await setProjectStatus(deps.pool, projectId, `${step.name}-complete`);
     }
     log().info({ cohortId, projectId }, 'assembler: project tail complete');

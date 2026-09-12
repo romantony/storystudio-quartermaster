@@ -166,6 +166,30 @@ describe('agents/assembler.ts runAssembler()', () => {
     ]);
   });
 
+  it('marks every intermediate tail step \'complete\' directly (not via release()) so the NEXT step\'s own updateStepStatus(\'running\') does not collide on steps_one_live_per_cohort — real bug found live 2026-09-12, first time a 2+-step tail ran automatically', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([
+      dbStep(6, 'merge', 'n6252hm01qz0xh'),
+      dbStep(8, 'concat', 'n6252hm01qz0xh'),
+    ]);
+    (jobsRepo.listProjectIdsForStep as jest.Mock).mockResolvedValue(['proj_a']);
+
+    await runAssembler(BASE_DEPS, 'win_test');
+
+    // seq 6 (not lastStep) gets a direct 'complete' — NOT release(), which
+    // would also drain postprod-lite and defeat the tail collapse.
+    expect(stepsRepo.updateStepStatus).toHaveBeenCalledWith(
+      expect.anything(),
+      'win_test',
+      6,
+      'complete',
+      expect.objectContaining({ finishedAt: expect.any(Date) }),
+    );
+    // seq 8 (lastStep) is NOT touched here — release() (mocked, asserted
+    // elsewhere) is solely responsible for it.
+    expect(stepsRepo.updateStepStatus).not.toHaveBeenCalledWith(expect.anything(), 'win_test', 8, expect.anything(), expect.anything());
+    expect(stepsRepo.updateStepStatus).toHaveBeenCalledTimes(1);
+  });
+
   it('propagates a runStep() failure without calling release() — the driver (orchestrator.ts) owns the emergency-drain backstop', async () => {
     (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(6, 'merge', 'n6252hm01qz0xh')]);
     (jobsRepo.listProjectIdsForStep as jest.Mock).mockResolvedValue(['proj_a']);
