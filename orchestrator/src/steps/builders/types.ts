@@ -39,6 +39,12 @@ export interface FrameJobInput {
   voiceSpeaker?: string;
   voiceInstruct?: string;
   voiceLanguage?: string;
+  /** Step 5 (bgm generation) only — this job has no dependsOn to resolve an
+   * output URL from, so its prompt/target duration travel here instead of
+   * through `resolvedDeps`/`perFrameOutputs` like every other
+   * singleJobPerProject step. See agents/planner.ts's buildStepsAndJobs(). */
+  bgmPrompt?: string;
+  totalDurationS?: number;
 }
 
 /** Populated by the generator from the same-frame job's `output` in every

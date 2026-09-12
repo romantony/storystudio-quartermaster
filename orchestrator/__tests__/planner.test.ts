@@ -134,6 +134,24 @@ describe('RequestSchema', () => {
     expect(parsed.success).toBe(true);
   });
 
+  it('accepts a top-level bgmPrompt (options.bgm — step 5/12)', () => {
+    const parsed = RequestSchema.safeParse({
+      requestId: 'req_1',
+      projectId: 'proj_1',
+      source: 'mcp',
+      tier: 'narration-premium',
+      product: 'documentary',
+      language: 'en',
+      aspectRatio: '16:9',
+      resolution: '1920x1080',
+      callbackUrl: 'https://convex.example/api/qm/result',
+      options: { bgm: true },
+      bgmPrompt: 'cinematic orchestral, warm and reflective, no vocals',
+      frames: [{ frameId: 'f_1', imagePrompt: 'p', narration: 'n', durationS: 5 }],
+    });
+    expect(parsed.success).toBe(true);
+  });
+
   it('rejects an empty frames array', () => {
     const parsed = RequestSchema.safeParse({
       requestId: 'req_1',
@@ -206,10 +224,12 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     ],
   };
 
+  const bgmEntry = catalogEntry(5)!;
   const mergeEntry = catalogEntry(6)!;
   const concatEntry = catalogEntry(8)!;
   const upscaleEntry = catalogEntry(10)!;
   const captionEntry = catalogEntry(11)!;
+  const bgmOverlayEntry = catalogEntry(12)!;
 
   it('a per-frame step (merge) still plans one job per frame — unchanged behavior', () => {
     const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry], req, 'proj_1', 25);
@@ -269,6 +289,46 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     const captionJobs = jobs.filter((j) => j.stepSeq === 11);
     expect(captionJobs[0].depsRemaining).toBe(1);
   });
+
+  it('step 5 (bgm) has dependsOn:[] so its one job is immediately claimable, and carries bgmPrompt/totalDurationS since it has no dependency output to read', () => {
+    const reqWithBgm = { ...req, bgmPrompt: 'cinematic orchestral, warm and reflective, no vocals' };
+    const { steps, jobs } = _internal.buildStepsAndJobs([bgmEntry], reqWithBgm, 'proj_1', 25);
+    expect(steps).toEqual([
+      { seq: 5, name: 'bgm', endpointId: bgmEntry.endpointId, workersTarget: 25, gate: null, drainAfter: true, dependsOn: [], jobTotal: 1 },
+    ]);
+    const bgmJobs = jobs.filter((j) => j.stepSeq === 5);
+    expect(bgmJobs).toHaveLength(1);
+    expect(bgmJobs[0]).toMatchObject({
+      frameId: null,
+      depsRemaining: 0,
+      input: { bgmPrompt: 'cinematic orchestral, warm and reflective, no vocals', totalDurationS: 15 }, // 3 frames x 5s
+    });
+  });
+
+  it('step 12 (bgm-overlay, dependsOn:[11,10,8,5]) collapses down to [11,5] when the whole chain is present — 11 already covers 10 and 8', () => {
+    const { steps, jobs } = _internal.buildStepsAndJobs(
+      [bgmEntry, mergeEntry, concatEntry, upscaleEntry, captionEntry, bgmOverlayEntry],
+      req,
+      'proj_1',
+      25,
+    );
+    const overlayStep = steps.find((s) => s.seq === 12)!;
+    expect(overlayStep.dependsOn).toEqual([11, 5]);
+
+    const overlayJobs = jobs.filter((j) => j.stepSeq === 12);
+    expect(overlayJobs).toHaveLength(1);
+    // Would be 4 (double/triple-counting 8, 10, and 11) without the collapse.
+    expect(overlayJobs[0].depsRemaining).toBe(2);
+  });
+
+  it('step 12 (bgm-overlay) depends on [8,5] when only concat and bgm ran (no upscale, no captions)', () => {
+    const { steps, jobs } = _internal.buildStepsAndJobs([bgmEntry, mergeEntry, concatEntry, bgmOverlayEntry], req, 'proj_1', 25);
+    const overlayStep = steps.find((s) => s.seq === 12)!;
+    expect(overlayStep.dependsOn).toEqual([8, 5]);
+
+    const overlayJobs = jobs.filter((j) => j.stepSeq === 12);
+    expect(overlayJobs[0].depsRemaining).toBe(2);
+  });
 });
 
 describe('plan() — options.referenceImage validation (runs before any DB access)', () => {
@@ -286,6 +346,23 @@ describe('plan() — options.referenceImage validation (runs before any DB acces
       resolution: '1920x1080',
       callbackUrl: 'https://convex.example/api/qm/result',
       options: { referenceImage: true },
+      frames: [{ frameId: 'f_1', imagePrompt: 'p', narration: 'n', durationS: 5 }],
+    };
+    await expect(plan(fakePool, { workersHead: 25 }, req)).rejects.toThrow(PlanValidationError);
+  });
+
+  it('rejects an options.bgm request with no bgmPrompt', async () => {
+    const req = {
+      requestId: 'req_2',
+      projectId: 'proj_2',
+      source: 'mcp',
+      tier: 'narration-premium',
+      product: 'documentary',
+      language: 'en',
+      aspectRatio: '16:9',
+      resolution: '1920x1080',
+      callbackUrl: 'https://convex.example/api/qm/result',
+      options: { bgm: true },
       frames: [{ frameId: 'f_1', imagePrompt: 'p', narration: 'n', durationS: 5 }],
     };
     await expect(plan(fakePool, { workersHead: 25 }, req)).rejects.toThrow(PlanValidationError);

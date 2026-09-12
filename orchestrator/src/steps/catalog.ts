@@ -29,6 +29,8 @@ import { buildMergeInput } from './builders/merge';
 import { buildConcatInput } from './builders/concat';
 import { buildUpscaleInput } from './builders/upscale';
 import { buildCaptionInput } from './builders/caption';
+import { buildBgmInput } from './builders/bgm';
+import { buildBgmOverlayInput } from './builders/bgm-overlay';
 import type { PayloadBuilder } from './builders/types';
 
 function endpointFor(counterKey: string): string {
@@ -112,6 +114,23 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     builder: buildI2vInput,
   },
   {
+    // singleJobPerProject but scope:'bulk' — it has dependsOn:[] (nothing to
+    // wait on), so it runs alongside steps 0-3 (driveCohort()'s bulk loop)
+    // rather than waiting for the assembly tail to start; scope and
+    // singleJobPerProject are orthogonal (steps/catalog.ts's CatalogEntry
+    // doc). Its prompt/target duration travel via ctx.job, not
+    // ctx.perFrameOutputs — see steps/builders/bgm.ts. Gated by options.bgm
+    // (STEP_TOPOLOGY, same flag step 12 rides).
+    seq: 5,
+    name: 'bgm',
+    endpointId: endpointFor('runpod:bgm-s2t'),
+    gate: null,
+    dependsOn: [],
+    scope: 'bulk',
+    singleJobPerProject: true,
+    builder: buildBgmInput,
+  },
+  {
     seq: 6,
     name: 'merge',
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
@@ -164,6 +183,22 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     scope: 'project',
     singleJobPerProject: true,
     builder: buildCaptionInput,
+  },
+  {
+    // Last step in the assembly tail. Reads whichever of 11/10/8 is the
+    // "final video" for this request (same non-mutually-exclusive fallback
+    // as step 11, hence listing the full chain in dependsOn so
+    // agents/planner.ts's resolveDirectDependencies() can collapse the
+    // shadowed entries), plus step 5's bgm track. Gated by options.bgm
+    // (STEP_TOPOLOGY, same flag step 5 rides).
+    seq: 12,
+    name: 'bgm-overlay',
+    endpointId: POSTPROD_LITE_ENDPOINT_ID,
+    gate: null,
+    dependsOn: [11, 10, 8, 5],
+    scope: 'project',
+    singleJobPerProject: true,
+    builder: buildBgmOverlayInput,
   },
 ] as const;
 

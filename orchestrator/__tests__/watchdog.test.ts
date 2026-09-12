@@ -140,18 +140,21 @@ describe('watchdog checkOnce', () => {
 
 describe('watchedEndpoints', () => {
   const MULTITALK: FleetEndpoint = { counterKey: 'runpod:multitalk', endpointId: 'mt6vmstwzw0evp', workers: 2 };
-  const BGM: FleetEndpoint = { counterKey: 'runpod:bgm-s2t', endpointId: '6apg6j7suzuezw', workers: 4 };
+  // A FLEET entry no catalogued step targets — bgm-s2t (formerly this
+  // example) got a real catalogued step (5, 2026-09-12) and had to be
+  // dropped from this role; this id is deliberately fictitious/unused.
+  const UNUSED: FleetEndpoint = { counterKey: 'runpod:unused-example', endpointId: 'unused0000000000', workers: 4 };
 
   it('excludes FLEET endpoints no catalogued step uses — a real false-positive found live 2026-09-10', () => {
-    const fleet = [ENDPOINT, MULTITALK, BGM];
+    const fleet = [ENDPOINT, MULTITALK, UNUSED];
     const watched = watchedEndpoints(fleet);
     expect(watched.map((e) => e.endpointId)).not.toContain(MULTITALK.endpointId);
-    expect(watched.map((e) => e.endpointId)).not.toContain(BGM.endpointId);
+    expect(watched.map((e) => e.endpointId)).not.toContain(UNUSED.endpointId);
   });
 
   it('includes every FLEET endpoint a catalogued step references', () => {
     const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId));
-    const fleet = [ENDPOINT, MULTITALK, BGM, ...[...cataloguedIds].map((id) => ({ counterKey: id, endpointId: id, workers: 1 }))];
+    const fleet = [ENDPOINT, MULTITALK, UNUSED, ...[...cataloguedIds].map((id) => ({ counterKey: id, endpointId: id, workers: 1 }))];
     const watched = watchedEndpoints(fleet);
     for (const id of cataloguedIds) {
       expect(watched.map((e) => e.endpointId)).toContain(id);
@@ -162,7 +165,7 @@ describe('watchedEndpoints', () => {
     const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId));
     // Deliberately empty/unrelated FLEET — the old fleet.filter(...) implementation
     // would have watched nothing at all in this case, silently.
-    const watched = watchedEndpoints([MULTITALK, BGM]);
+    const watched = watchedEndpoints([MULTITALK, UNUSED]);
     for (const id of cataloguedIds) {
       expect(watched.map((e) => e.endpointId)).toContain(id);
     }

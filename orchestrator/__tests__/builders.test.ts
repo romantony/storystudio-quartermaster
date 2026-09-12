@@ -11,6 +11,8 @@ import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
 import { buildUpscaleInput } from '../src/steps/builders/upscale';
 import { buildCaptionInput } from '../src/steps/builders/caption';
+import { buildBgmInput } from '../src/steps/builders/bgm';
+import { buildBgmOverlayInput } from '../src/steps/builders/bgm-overlay';
 import type { BuildContext, FrameJobInput } from '../src/steps/builders/types';
 
 const baseJob: FrameJobInput = {
@@ -274,5 +276,87 @@ describe('buildCaptionInput (step 11, TikTok-style burn captions — prefers ste
 
   it('throws when neither step 10 nor step 8 is resolved', () => {
     expect(() => buildCaptionInput(projectCtx(undefined))).toThrow(/no resolved video URL/);
+  });
+});
+
+describe('buildBgmInput (step 5, bgm generation — reads ctx.job, not ctx.perFrameOutputs)', () => {
+  const bgmCtx = (job: Partial<FrameJobInput>): BuildContext => ({
+    job: { ...baseJob, ...job },
+    resolvedDeps: {},
+    projectId: 'proj_8812',
+    frameId: null,
+  });
+
+  it('builds a bgm request from bgmPrompt/totalDurationS', () => {
+    const out = bgmCtx({ bgmPrompt: 'cinematic orchestral, warm and reflective, no vocals', totalDurationS: 45 });
+    expect(buildBgmInput(out)).toEqual({
+      mode: 'bgm',
+      prompt: 'cinematic orchestral, warm and reflective, no vocals',
+      duration_s: 45,
+      steps: 20,
+      guidance: 7.0,
+      project_id: 'proj_8812',
+    });
+  });
+
+  it('caps duration_s at 120s — ACE-Step does not reliably generate longer', () => {
+    const out = buildBgmInput(bgmCtx({ bgmPrompt: 'p', totalDurationS: 300 }));
+    expect(out.duration_s).toBe(120);
+  });
+
+  it('defaults totalDurationS to 30s when absent', () => {
+    const out = buildBgmInput(bgmCtx({ bgmPrompt: 'p', totalDurationS: undefined }));
+    expect(out.duration_s).toBe(30);
+  });
+
+  it('throws when bgmPrompt is missing', () => {
+    expect(() => buildBgmInput(bgmCtx({ bgmPrompt: undefined }))).toThrow(/no bgmPrompt/);
+  });
+});
+
+describe('buildBgmOverlayInput (step 12, last in the tail — prefers caption, then upscale, then concat, plus the bgm track)', () => {
+  const projectCtx = (perFrameOutputs?: Record<number, string[]>): BuildContext => ({
+    job: baseJob,
+    resolvedDeps: {},
+    perFrameOutputs,
+    projectId: 'proj_8812',
+    frameId: null,
+  });
+
+  it('prefers step 11 (caption) when 11, 10, and 8 are all resolved', () => {
+    const out = buildBgmOverlayInput(
+      projectCtx({
+        8: ['https://pub.example/concat.mp4'],
+        10: ['https://pub.example/upscale.mp4'],
+        11: ['https://pub.example/caption.mp4'],
+        5: ['https://pub.example/bgm.wav'],
+      }),
+    );
+    expect(out).toEqual({
+      mode: 'mix_bgm',
+      video_url: 'https://pub.example/caption.mp4',
+      bgm_url: 'https://pub.example/bgm.wav',
+      bgm_volume: 0.15,
+      project_id: 'proj_8812',
+    });
+  });
+
+  it('falls back to step 10 then step 8 when later steps did not run', () => {
+    expect(buildBgmOverlayInput(projectCtx({ 8: ['https://pub.example/concat.mp4'], 5: ['https://pub.example/bgm.wav'] })).video_url).toBe(
+      'https://pub.example/concat.mp4',
+    );
+    expect(
+      buildBgmOverlayInput(
+        projectCtx({ 8: ['https://pub.example/concat.mp4'], 10: ['https://pub.example/upscale.mp4'], 5: ['https://pub.example/bgm.wav'] }),
+      ).video_url,
+    ).toBe('https://pub.example/upscale.mp4');
+  });
+
+  it('throws when no video source resolved', () => {
+    expect(() => buildBgmOverlayInput(projectCtx({ 5: ['https://pub.example/bgm.wav'] }))).toThrow(/no resolved video URL/);
+  });
+
+  it('throws when the bgm track is unresolved', () => {
+    expect(() => buildBgmOverlayInput(projectCtx({ 8: ['https://pub.example/concat.mp4'] }))).toThrow(/no resolved bgm track URL/);
   });
 });

@@ -93,6 +93,11 @@ export const RequestSchema = z
     voiceSpeaker: z.string().optional(),
     voiceInstruct: z.string().optional(),
     voiceLanguage: z.string().optional(),
+    // Step 5 (bgm generation, ACE-Step) — request-level like voiceSpeaker et
+    // al., matches the real AWS contract's bgmPrompt. Required (checked
+    // below, not by zod, so the error names the right field) whenever
+    // options.bgm is true.
+    bgmPrompt: z.string().optional(),
   })
   .strict();
 
@@ -228,11 +233,15 @@ function buildStepsAndJobs(
         seq: 0,
         frameId: null,
         depsRemaining,
-        // Unused — a singleJobPerProject builder (e.g. buildConcatInput)
-        // reads ctx.perFrameOutputs, never ctx.job. Every job row needs an
-        // `input`, so an empty object stands in rather than widening
-        // FrameJobInput's required fields just for a value nothing reads.
-        input: {},
+        // Most singleJobPerProject builders (concat, upscale, caption) never
+        // read ctx.job — they only need ctx.perFrameOutputs — but step 5
+        // (bgm generation) has no dependsOn to resolve outputs from at all,
+        // so its prompt/target duration have to travel here instead. Cheap
+        // to include unconditionally rather than special-casing bgm.
+        input: {
+          bgmPrompt: req.bgmPrompt,
+          totalDurationS: req.frames.reduce((sum, f) => sum + f.durationS, 0),
+        },
       });
       continue;
     }
@@ -285,6 +294,14 @@ export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequ
         },
       ]);
     }
+  }
+
+  // options.bgm plans step 5 (bgm generation), which throws at build time
+  // without a prompt to generate from — fail fast here instead.
+  if (req.options.bgm && !req.bgmPrompt) {
+    throw new PlanValidationError([
+      { code: z.ZodIssueCode.custom, path: ['bgmPrompt'], message: 'options.bgm is true but bgmPrompt is missing' },
+    ]);
   }
 
   // §10.1 request-level idempotency: a replayed requestId returns the
