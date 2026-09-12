@@ -51,8 +51,13 @@ describe('resolveStepSet', () => {
     expect(resolved).toEqual([1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13]);
   });
 
-  it('step 7 (Remotion) never appears — it stays on the existing AWS Lambda, not the orchestrator plan', () => {
+  it('step 7 is NOT the spec\'s Remotion (textOverlay never gates it — Remotion stays on the existing AWS Lambda)', () => {
     expect(_internal.resolveStepSet({ ...base, options: { ...base.options, textOverlay: true } })).not.toContain(7);
+  });
+
+  it('step 7 (repurposed for remove-silence, 2026-09-12) appears only when options.removeSilence is true', () => {
+    expect(_internal.resolveStepSet(base)).not.toContain(7);
+    expect(_internal.resolveStepSet({ ...base, options: { ...base.options, removeSilence: true } })).toEqual([1, 2, 3, 6, 7, 8]);
   });
 
   it('options.referenceImage swaps step 1 (t2i) for step 0 (image-i2i) — never both', () => {
@@ -226,6 +231,7 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
 
   const bgmEntry = catalogEntry(5)!;
   const mergeEntry = catalogEntry(6)!;
+  const removeSilenceEntry = catalogEntry(7)!;
   const concatEntry = catalogEntry(8)!;
   const upscaleEntry = catalogEntry(10)!;
   const captionEntry = catalogEntry(11)!;
@@ -249,6 +255,28 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     const concatJobs = jobs.filter((j) => j.stepSeq === 8);
     expect(concatJobs).toHaveLength(1);
     expect(concatJobs[0]).toMatchObject({ frameId: null, seq: 0, projectId: 'proj_1', depsRemaining: 3, input: {} });
+  });
+
+  it('remove-silence (7, per-frame, NOT singleJobPerProject) plans one job per frame, and concat (dependsOn:[7,6]) collapses to [7] when it ran', () => {
+    const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry, removeSilenceEntry, concatEntry], req, 'proj_1', 25);
+    const removeSilenceStep = steps.find((s) => s.seq === 7)!;
+    expect(removeSilenceStep.jobTotal).toBe(3); // per-frame, unlike every singleJobPerProject step added this session
+    expect(jobs.filter((j) => j.stepSeq === 7)).toHaveLength(3);
+
+    const concatStep = steps.find((s) => s.seq === 8)!;
+    // Without the collapse this would be [7,6]; 6 is shadowed since 7
+    // already depends on it.
+    expect(concatStep.dependsOn).toEqual([7]);
+    const concatJobs = jobs.filter((j) => j.stepSeq === 8);
+    // Still 3 (frames.length), not double-counted — both 7 and 6 are
+    // per-frame producers, so only ONE of them should ever be counted.
+    expect(concatJobs[0].depsRemaining).toBe(3);
+  });
+
+  it('concat depends only on step 6 when remove-silence did not run (7 uncatalogued for this request)', () => {
+    const { steps } = _internal.buildStepsAndJobs([mergeEntry, concatEntry], req, 'proj_1', 25);
+    const concatStep = steps.find((s) => s.seq === 8)!;
+    expect(concatStep.dependsOn).toEqual([6]);
   });
 
   it('computeDrainAfter still collapses 6->8 since both target postprod-lite', () => {

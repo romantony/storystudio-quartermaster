@@ -9,6 +9,7 @@ import { buildTtsInput } from '../src/steps/builders/tts';
 import { buildI2vInput } from '../src/steps/builders/i2v';
 import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
+import { buildRemoveSilenceInput } from '../src/steps/builders/remove-silence';
 import { buildUpscaleInput } from '../src/steps/builders/upscale';
 import { buildCaptionInput } from '../src/steps/builders/caption';
 import { buildBgmInput } from '../src/steps/builders/bgm';
@@ -218,6 +219,38 @@ describe('buildConcatInput (step 8, singleJobPerProject — project-scoped, no s
 
   it('throws when perFrameOutputs is entirely absent', () => {
     expect(() => buildConcatInput(projectCtx(undefined))).toThrow(/need at least 2 merged clips/);
+  });
+
+  it('prefers step 7 (remove-silence) over step 6 (merge) when both are resolved', () => {
+    const out = buildConcatInput(
+      projectCtx({
+        6: ['https://pub.example/f_001_merge.mp4', 'https://pub.example/f_002_merge.mp4'],
+        7: ['https://pub.example/f_001_trimmed.mp4', 'https://pub.example/f_002_trimmed.mp4'],
+      }),
+    );
+    expect(out.video_urls).toEqual(['https://pub.example/f_001_trimmed.mp4', 'https://pub.example/f_002_trimmed.mp4']);
+  });
+
+  it('falls back to step 6 (merge) when remove-silence did not run (step 7 empty/absent)', () => {
+    const urls = ['https://pub.example/f_001_merge.mp4', 'https://pub.example/f_002_merge.mp4'];
+    expect(buildConcatInput(projectCtx({ 6: urls, 7: [] })).video_urls).toEqual(urls);
+    expect(buildConcatInput(projectCtx({ 6: urls })).video_urls).toEqual(urls);
+  });
+});
+
+describe('buildRemoveSilenceInput (step 7, per-frame — sits between merge and concat)', () => {
+  it('builds a remove_silence request from the resolved step-6 merge output', () => {
+    const out = buildRemoveSilenceInput(ctx({ resolvedDeps: { 6: { url: 'https://pub.example/f_001_merge.mp4' } } }));
+    expect(out).toEqual({
+      mode: 'remove_silence',
+      video_url: 'https://pub.example/f_001_merge.mp4',
+      project_id: 'proj_8812',
+      frame_id: 'f_001',
+    });
+  });
+
+  it('throws when step 6 has no resolved output', () => {
+    expect(() => buildRemoveSilenceInput(ctx({ resolvedDeps: {} }))).toThrow(/no resolved merge video URL/);
   });
 });
 

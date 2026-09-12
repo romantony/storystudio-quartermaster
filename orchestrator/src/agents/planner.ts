@@ -123,9 +123,13 @@ export class PlanValidationError extends Error {
 }
 
 /** The full spec step topology (§3), independent of what's catalogued today.
- * Used only to resolve WHICH steps a request wants; step 7 (Remotion) is
- * deliberately absent — it stays on the existing AWS Lambda, not part of the
- * orchestrator's own plan (impl plan §13 M1 note). */
+ * Used only to resolve WHICH steps a request wants. Step 7 was the spec's
+ * Remotion overlay — permanently out of scope for the orchestrator (stays on
+ * the existing AWS Lambda, impl plan §13 M1 note) — so as of 2026-09-12 this
+ * orchestrator repurposes the number for its own remove-silence step
+ * instead, the same way seq 0 (image-i2i) is a number outside the original
+ * 1-13 spec chosen purely to sort correctly: remove-silence has to run
+ * between merge (6) and concat (8), and 7 is the only free integer there. */
 const STEP_TOPOLOGY: ReadonlyArray<{ seq: number; dialogueOnly?: boolean; gatedBy?: (o: OrchestratorRequest['options']) => boolean }> = [
   // seq 0 (image-i2i) and seq 1 (image t2i) are mutually exclusive — the
   // Narration Premium reference-image flow (options.referenceImage) runs
@@ -138,6 +142,7 @@ const STEP_TOPOLOGY: ReadonlyArray<{ seq: number; dialogueOnly?: boolean; gatedB
   { seq: 4, dialogueOnly: true },
   { seq: 5, gatedBy: (o) => o.bgm },
   { seq: 6 },
+  { seq: 7, gatedBy: (o) => o.removeSilence }, // repurposed from spec's Remotion slot — see header comment above
   { seq: 8 },
   { seq: 9, gatedBy: (o) => o.subtitles },
   { seq: 10, gatedBy: (o) => o.upscale },

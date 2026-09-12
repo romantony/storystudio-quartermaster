@@ -31,6 +31,7 @@ import { buildUpscaleInput } from './builders/upscale';
 import { buildCaptionInput } from './builders/caption';
 import { buildBgmInput } from './builders/bgm';
 import { buildBgmOverlayInput } from './builders/bgm-overlay';
+import { buildRemoveSilenceInput } from './builders/remove-silence';
 import type { PayloadBuilder } from './builders/types';
 
 function endpointFor(counterKey: string): string {
@@ -140,16 +141,37 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     builder: buildMergeInput,
   },
   {
+    // Repurposes the spec's Remotion slot (agents/planner.ts's
+    // STEP_TOPOLOGY header comment) — sorts between merge (6) and concat
+    // (8), the only free integer there, since it trims each frame's clip
+    // BEFORE they're joined ("concat-and-trim", matching the real system's
+    // convention). A plain per-frame step, NOT singleJobPerProject, unlike
+    // everything else added this session — same shape as merge/i2v. Gated
+    // by options.removeSilence (STEP_TOPOLOGY).
+    seq: 7,
+    name: 'remove-silence',
+    endpointId: POSTPROD_LITE_ENDPOINT_ID,
+    gate: null,
+    dependsOn: [6],
+    scope: 'project',
+    builder: buildRemoveSilenceInput,
+  },
+  {
     // First singleJobPerProject step: one job for the whole project, fanned
-    // in on every frame's step-6 output, not one job per frame like every
-    // other catalogued step. Shares postprod-lite with merge, so it rides
-    // the same assembler.ts tail allocation with zero drain in between
+    // in on every frame's clip, from whichever of step 7 (if
+    // options.removeSilence ran) or step 6 (always) produced it — NOT
+    // mutually exclusive (merge always runs; remove-silence is
+    // independently optional), so listing both relies on
+    // agents/planner.ts's resolveDirectDependencies() to collapse 6 out of
+    // the fan-in count whenever 7 is also present (7 already depends on 6).
+    // Shares postprod-lite with merge/remove-silence, so it rides the same
+    // assembler.ts tail allocation with zero drain in between
     // (computeDrainAfter already collapses same-endpoint adjacent steps).
     seq: 8,
     name: 'concat',
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
     gate: null,
-    dependsOn: [6],
+    dependsOn: [7, 6],
     scope: 'project',
     singleJobPerProject: true,
     builder: buildConcatInput,
