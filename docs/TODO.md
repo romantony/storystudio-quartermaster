@@ -75,6 +75,23 @@ To do, in order:
    **If `sfx_volume` is raised (see step 3 findings), re-check this:** SFX above −35 dB will stop pauses
    being trimmed.
 6. License reminder: MMAudio checkpoints are CC-BY-NC-4.0. `options.sfx` is opt-in by design.
+7. **MMAudio mp4 + audio prompt (2026-09-15, user request). Built, deployed, live-verified, committed + pushed.**
+   - Step 15 sends `return_video: true`, and MMAudio returns the clip with SFX/ambience muxed in (video
+     stream-copied: bit-identical to DreamX). Merge now consumes that mp4 with `sfx_from_video: true`
+     (narration over the mp4's own audio, same normalization). The standalone SFX mp3 isn't used.
+   - Prompt: new optional per-frame `audioPrompt`. Fallback is
+     `ambient environmental sound and sound effects of the scene: <imagePrompt>` (was `motionPrompt`,
+     i.e. camera direction). **StoryStudio/MCP must start sending `audioPrompt`** to get authored prompts.
+   - `runpodOutUrl` now resolves video keys before audio keys (MMAudio's output has both). None of the
+     102 historical job outputs had both.
+   - postprod-lite: `sfx_from_video`, plus a **44.1 kHz mix output**. amix followed the 24 kHz TTS rate
+     and removed SFX content above 12 kHz; f02's MMAudio track was almost all above that. Image
+     `:sfx-from-video-20260915` = `:latest` (thin overlay).
+   - Live (manual payloads matching the builders): MMAudio ×3 → merge ×3, 44.1 kHz, narration ×0.999,
+     SFX at the normalized level. Outputs `…/storystudio/video/sfx-video-e2e-20260915-01_f0{1,2,3}_merge.mp4`.
+   - Pending: a real cohort run through the planner/builders (not yet exercised end-to-end).
+     204 orchestrator tests pass.
+   - Gotcha: python urllib → rest.runpod.io gets Cloudflare 403 (error 1010) regardless of UA; use curl.
 
 ## Next session — M5 phase 1 live verification (stopped 2026-09-11, resume here)
 

@@ -402,6 +402,18 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
       expect(steps.find((s) => s.seq === 15)!.dependsOn).toEqual([3]);
     });
 
+    it('carries each frame\'s optional audioPrompt onto its jobs, and the schema accepts it', () => {
+      const withAudio = {
+        ...req,
+        frames: [{ ...req.frames[0], audioPrompt: 'rain on a tin roof' }, req.frames[1], req.frames[2]],
+      };
+      expect(RequestSchema.safeParse(withAudio).success).toBe(true);
+      const { jobs } = _internal.buildStepsAndJobs([animationEntry, sfxEntry], withAudio, 'proj_1', 25);
+      const sfxJobs = jobs.filter((j) => j.stepSeq === 15);
+      expect((sfxJobs[0].input as { audioPrompt?: string }).audioPrompt).toBe('rain on a tin roof');
+      expect((sfxJobs[1].input as { audioPrompt?: string }).audioPrompt).toBeUndefined();
+    });
+
     it('merge fans in on [15] alone for the full chain, and every merge job carries sfx + upscaleFrames', () => {
       const { steps, jobs } = _internal.buildStepsAndJobs(
         [ttsEntry, animationEntry, mergeEntry, upscaleFrameEntry, sfxEntry],

@@ -15,6 +15,9 @@ export interface FrameJobInput {
   narration: string;
   durationS: number;
   motionPrompt?: string;
+  /** Step 15's MMAudio prompt (SFX/ambience/environmental sound). Optional;
+   * builders/sfx.ts derives one from imagePrompt when absent. */
+  audioPrompt?: string;
   aspectRatio?: string;
   language?: string;
   /** Per-project voice selection, if the request carries one (not in the

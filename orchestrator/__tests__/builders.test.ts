@@ -257,50 +257,70 @@ describe('buildMergeInput (step 6)', () => {
 describe('buildMergeInput with step 15 (per-frame MMAudio SFX)', () => {
   const base = { 2: { url: 'https://pub.example/f_001.wav' }, 3: { url: 'https://pub.example/f_001.mp4' } };
 
-  it('passes the SFX track as sfx_url and uses the upscaled clip — the full image/tts/i2v/upscale/sfx/merge chain', () => {
+  it('uses MMAudio\'s mp4 as the video and flags sfx_from_video — the full image/tts/i2v/upscale/sfx/merge chain', () => {
     const out = buildMergeInput(
       ctx({
         job: { ...baseJob, upscaleFrames: true, sfx: true },
-        resolvedDeps: { ...base, 14: { url: 'https://pub.example/f_001_up.mp4' }, 15: { url: 'https://pub.example/f_001_sfx.mp3' } },
+        resolvedDeps: {
+          ...base,
+          14: { url: 'https://pub.example/f_001_up.mp4' },
+          15: { url: 'https://pub.example/f_001_mmaudio_v2a_video.mp4' },
+        },
       }),
     );
     expect(out).toEqual({
       mode: 'merge',
-      video_url: 'https://pub.example/f_001_up.mp4',
+      video_url: 'https://pub.example/f_001_mmaudio_v2a_video.mp4',
       audio_url: 'https://pub.example/f_001.wav',
-      sfx_url: 'https://pub.example/f_001_sfx.mp3',
+      sfx_from_video: true,
       project_id: 'proj_8812',
       frame_id: 'f_001',
     });
+    expect(out).not.toHaveProperty('sfx_url');
   });
 
-  it('omits sfx_url entirely when sfx was not planned', () => {
-    expect(buildMergeInput(ctx({ resolvedDeps: base }))).not.toHaveProperty('sfx_url');
+  it('omits sfx_from_video and keeps the step 14/3 clip when sfx was not planned', () => {
+    const out = buildMergeInput(ctx({ resolvedDeps: { ...base, 15: { url: 'https://pub.example/stray.mp4' } } }));
+    expect(out).not.toHaveProperty('sfx_from_video');
+    expect(out.video_url).toBe('https://pub.example/f_001.mp4');
   });
 
   it('throws when sfx was planned but this frame\'s SFX job failed', () => {
     expect(() => buildMergeInput(ctx({ job: { ...baseJob, sfx: true }, resolvedDeps: base }))).toThrow(
-      /sfx was planned but no resolved sfx audio URL/,
+      /sfx was planned but no resolved sfx video URL/,
     );
+  });
+
+  it('throws when the SFX output resolved to an audio-only file (MMAudio returned no mp4)', () => {
+    expect(() =>
+      buildMergeInput(ctx({ job: { ...baseJob, sfx: true }, resolvedDeps: { ...base, 15: { url: 'https://pub.example/f_001_sfx.mp3' } } })),
+    ).toThrow(/audio-only/);
   });
 });
 
 describe('buildSfxInput (step 15, MMAudio v2a)', () => {
-  it('runs v2a on the upscaled clip when step 14 ran, steered by motionPrompt, with music/speech negated', () => {
+  it('runs v2a on the upscaled clip with return_video, steered by the frame\'s audioPrompt, with music/speech negated', () => {
     const out = buildSfxInput(
       ctx({
-        job: { ...baseJob, upscaleFrames: true },
+        job: { ...baseJob, upscaleFrames: true, audioPrompt: '  gulls, lapping water, distant foghorn  ' },
         resolvedDeps: { 3: { url: 'https://pub.example/f_001.mp4' }, 14: { url: 'https://pub.example/f_001_up.mp4' } },
       }),
     );
     expect(out).toEqual({
       mode: 'v2a',
       video_url: 'https://pub.example/f_001_up.mp4',
-      prompt: 'slow push in',
+      prompt: 'gulls, lapping water, distant foghorn',
       negative_prompt: 'music, speech, voice, singing',
+      return_video: true,
       project_id: 'proj_8812',
       frame_id: 'f_001',
     });
+  });
+
+  it('builds the prompt from imagePrompt, never motionPrompt, when no audioPrompt is given', () => {
+    const out = buildSfxInput(ctx({ resolvedDeps: { 3: { url: 'https://pub.example/f_001.mp4' } } }));
+    expect(out.prompt).toBe('ambient environmental sound and sound effects of the scene: wide shot, harbour at dawn, fog on the water');
+    expect(out.prompt).not.toContain('slow push in');
   });
 
   it('falls back to step 3\'s clip when upscale was not planned', () => {

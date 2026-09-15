@@ -36,6 +36,9 @@ const FrameSchema = z
     narration: z.string().min(1),
     durationS: z.number().positive(),
     motionPrompt: z.string().optional(),
+    // Sound description for step 15 (MMAudio): SFX, ambience, environmental
+    // sound. Falls back to a prompt built from imagePrompt (builders/sfx.ts).
+    audioPrompt: z.string().min(1).optional(),
     textManifest: z.object({ elements: z.array(z.unknown()), fps: z.number() }).optional(),
     // Narration Premium's reference-image flow (options.referenceImage) —
     // the caller (StoryStudio, in the real product flow) generates this
@@ -279,6 +282,7 @@ function buildStepsAndJobs(
         narration: frame.narration,
         durationS: frame.durationS,
         motionPrompt: frame.motionPrompt,
+        audioPrompt: frame.audioPrompt,
         aspectRatio: req.aspectRatio,
         language: req.language,
         referenceImageUrl: frame.referenceImageUrl,

@@ -18,6 +18,18 @@ describe('runpodOutUrl', () => {
     expect(runpodOutUrl(captionOutput)).toBe('https://pub.example/output_caption.mp4');
   });
 
+  it('prefers video over audio when an output carries both — step 15 (MMAudio, return_video)\'s real shape', () => {
+    const mmaudioOutput = {
+      mode: 'v2a',
+      audio_key: 'storystudio/sfx/p_f01_mmaudio_v2a.mp3',
+      audio_url: 'https://pub.example/sfx/p_f01_mmaudio_v2a.mp3',
+      video_key: 'storystudio/video/p_f01_mmaudio_v2a_video.mp4',
+      video_url: 'https://pub.example/video/p_f01_mmaudio_v2a_video.mp4',
+      duration_s: 5.04,
+    };
+    expect(runpodOutUrl(mmaudioOutput)).toBe('https://pub.example/video/p_f01_mmaudio_v2a_video.mp4');
+  });
+
   it('still resolves a standalone srt output (no video present) — step 9/transcribe-shaped', () => {
     const transcribeOutput = { text: 'hello', chunks: [], srt: 'https://pub.example/output.srt' };
     expect(runpodOutUrl(transcribeOutput)).toBe('https://pub.example/output.srt');

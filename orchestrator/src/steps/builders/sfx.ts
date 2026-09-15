@@ -7,17 +7,29 @@
  * upscaled clip isn't needed for quality; reading it just keeps the SFX
  * timed to exactly the clip merge will use.
  *
- * `prompt` is the frame's motionPrompt: MMAudio conditions on the visuals
- * already, and a scene description steers it better than nothing.
+ * `return_video: true` (2026-09-15): MMAudio returns the clip with the
+ * generated audio muxed in (`video_url`, video stream-copied, no re-encode),
+ * and that mp4 — not the standalone `audio_url` mp3 — is what merge
+ * consumes: postprod-lite lays the narration over the mp4's own audio
+ * (builders/merge.ts, `sfx_from_video`). runpod/output.ts resolves
+ * `video_url` ahead of `audio_url` for this output shape.
+ *
+ * `prompt` is a sound description: the frame's `audioPrompt` when the
+ * request carries one, else one built from `imagePrompt`. Not motionPrompt —
+ * that's camera direction ("slow push in"), which says nothing about sound.
  * `negative_prompt` keeps it from generating music or voices on top of the
- * narration and BGM. Only the generated track (`audio_url`) is consumed —
- * postprod-lite's merge mixes it under the narration (builders/merge.ts).
- * No duration_s: v2a defaults to the whole video (<= 30s; clips are <= 7s).
+ * narration and BGM. No duration_s: v2a defaults to the whole video (<= 30s;
+ * clips are <= 7s).
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
 const ANIMATION_STEP_SEQ = 3;
 const UPSCALE_FRAME_STEP_SEQ = 14;
+
+export function sfxPrompt(job: { audioPrompt?: string; imagePrompt: string }): string {
+  if (job.audioPrompt?.trim()) return job.audioPrompt.trim();
+  return `ambient environmental sound and sound effects of the scene: ${job.imagePrompt}`;
+}
 
 export const buildSfxInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
   const attribution: Record<string, unknown> = { project_id: ctx.projectId };
@@ -32,8 +44,9 @@ export const buildSfxInput: PayloadBuilder = (ctx: BuildContext): Record<string,
   return {
     mode: 'v2a',
     video_url: videoUrl,
-    prompt: ctx.job.motionPrompt ?? '',
+    prompt: sfxPrompt(ctx.job),
     negative_prompt: 'music, speech, voice, singing',
+    return_video: true,
     ...attribution,
   };
 };

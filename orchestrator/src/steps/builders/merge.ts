@@ -14,9 +14,12 @@
  *
  * No `upscale`/`upscale_target` flag on this step — upscaling is either
  * step 14 (per-frame, upstream of this step: its clip replaces step 3's
- * below) or step 10 (whole concat video, downstream). Step 15's SFX track,
- * when planned, rides along as `sfx_url` (postprod-lite mixes it under the
- * narration — requires the 2026-09-14 postprod-lite image).
+ * below) or step 10 (whole concat video, downstream). When step 15 is
+ * planned, its MMAudio mp4 (the same clip with SFX/ambience muxed in,
+ * video stream-copied) replaces the step 14/3 clip, and `sfx_from_video`
+ * tells postprod-lite to use that mp4's own audio as the SFX layer under the
+ * narration — requires the 2026-09-15 postprod-lite image. The standalone
+ * SFX mp3 is not used.
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
@@ -39,22 +42,28 @@ export const buildMergeInput: PayloadBuilder = (ctx: BuildContext): Record<strin
   if (ctx.job.upscaleFrames && !ctx.resolvedDeps[UPSCALE_FRAME_STEP_SEQ]?.url) {
     throw new Error(`merge builder: upscale was planned but no resolved upscaled video URL for frame ${ctx.frameId ?? '(none)'}`);
   }
-  const videoUrl = ctx.resolvedDeps[UPSCALE_FRAME_STEP_SEQ]?.url ?? ctx.resolvedDeps[ANIMATION_STEP_SEQ]?.url;
+  // Same no-silent-degrade rule as upscale above, for step 15's SFX mp4.
+  const sfxVideoUrl = ctx.job.sfx ? ctx.resolvedDeps[SFX_STEP_SEQ]?.url : undefined;
+  if (ctx.job.sfx && !sfxVideoUrl) {
+    throw new Error(`merge builder: sfx was planned but no resolved sfx video URL for frame ${ctx.frameId ?? '(none)'}`);
+  }
+  // An audio-only URL here means MMAudio didn't return the muxed mp4
+  // (return_video missing/ignored) — fail rather than hand ffmpeg an mp3
+  // as the video input.
+  if (sfxVideoUrl && /\.(mp3|wav|flac|m4a|aac)(\?|$)/i.test(sfxVideoUrl)) {
+    throw new Error(`merge builder: sfx output for frame ${ctx.frameId ?? '(none)'} is audio-only (${sfxVideoUrl}), expected MMAudio's mp4`);
+  }
+  const videoUrl = sfxVideoUrl ?? ctx.resolvedDeps[UPSCALE_FRAME_STEP_SEQ]?.url ?? ctx.resolvedDeps[ANIMATION_STEP_SEQ]?.url;
   if (!videoUrl) {
     throw new Error(`merge builder: no resolved animation video URL for frame ${ctx.frameId ?? '(none)'}`);
-  }
-  // Same no-silent-degrade rule as upscale above, for step 15's SFX track.
-  const sfxUrl = ctx.resolvedDeps[SFX_STEP_SEQ]?.url;
-  if (ctx.job.sfx && !sfxUrl) {
-    throw new Error(`merge builder: sfx was planned but no resolved sfx audio URL for frame ${ctx.frameId ?? '(none)'}`);
   }
   return {
     mode: 'merge',
     video_url: videoUrl,
     audio_url: audioUrl,
-    // postprod-lite mixes it under the narration at its default sfx_volume
-    // 0.22 — the level set for Dialogue Basic SFX (2026-08-13).
-    ...(sfxUrl ? { sfx_url: sfxUrl } : {}),
+    // postprod-lite mixes the mp4's own audio under the narration at its
+    // default sfx_volume 0.22 (loudness-normalized to the narration first).
+    ...(sfxVideoUrl ? { sfx_from_video: true } : {}),
     ...attribution,
   };
 };

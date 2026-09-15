@@ -16,6 +16,11 @@
  * `srt`/`srt_url`: every current and foreseeable caller in this orchestrator
  * that consumes a step producing both wants the video, never the SRT alone,
  * as a "resolved dependency URL" to feed into a later step.
+ *
+ * Same rule for audio (2026-09-15): step 15 (MMAudio, `return_video`) returns
+ * BOTH `audio_url` (the bare SFX mp3) and `video_url` (the clip with that
+ * audio muxed in), and merge wants the mp4 — so video keys now sort before
+ * `audio`/`audio_url` too. Audio-only outputs (tts, bgm) are unaffected.
  */
 export function runpodOutUrl(p: unknown): string | undefined {
   const dig = (x: unknown): string | undefined => {
@@ -23,8 +28,8 @@ export function runpodOutUrl(p: unknown): string | undefined {
     if (Array.isArray(x)) return x.map(dig).find(Boolean);
     if (x && typeof x === 'object') {
       const keys = [
-        'image', 'image_url', 'imageUrl', 'audio', 'audio_url',
-        'video_url', 'videoUrl', 'video', 'srt', 'srt_url',
+        'image', 'image_url', 'imageUrl', 'video_url', 'videoUrl', 'video',
+        'audio', 'audio_url', 'srt', 'srt_url',
         'output_url', 'url', 'output', 'result', 'artifacts',
       ];
       return keys.map((k) => dig((x as Record<string, unknown>)[k])).find(Boolean);
