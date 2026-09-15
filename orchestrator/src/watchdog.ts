@@ -102,7 +102,9 @@ export async function checkOnce(
 
     const state = await getState(pool, endpoint.endpointId);
     const staleMs = state ? Date.now() - state.observedAt.getTime() : Infinity;
-    const orphaned = !state?.heldByStep || staleMs > cfg.orphanGraceMs;
+    // `== null`, not `!heldByStep`: step seq 0 (image-i2i) is a real claim —
+    // the falsy check flagged every step-0 run as orphaned (found live 2026-09-15).
+    const orphaned = state?.heldByStep == null || staleMs > cfg.orphanGraceMs;
     if (!orphaned) continue;
 
     await alert(cfg.watchdogAlertWebhookUrl, {

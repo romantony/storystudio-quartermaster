@@ -47,7 +47,7 @@ function stateRow(overrides: Partial<{ held_by_step: number | null; observed_at:
     workers_min: 10,
     workers_ready: 10,
     held_by_cohort: overrides.held_by_step === null ? null : 'win_2026_09_10_18',
-    held_by_step: overrides.held_by_step ?? 3,
+    held_by_step: 'held_by_step' in overrides ? overrides.held_by_step : 3,
     observed_at: overrides.observed_at ?? new Date(),
   };
 }
@@ -76,6 +76,35 @@ describe('watchdog checkOnce', () => {
     await checkOnce(runpod, pool, WATCHDOG_CFG, [ENDPOINT]);
 
     expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('does NOT flag an orphan when a fresh claim is held by step seq 0 — falsy-seq false positive found live 2026-09-15', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, fixture('health.json')));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const pool = fakePool(stateRow({ held_by_step: 0, observed_at: new Date() }));
+    const logger = require('../src/telemetry/log').log();
+    const errorSpy = jest.spyOn(logger, 'error');
+
+    await checkOnce(runpod, pool, WATCHDOG_CFG, [ENDPOINT]);
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('flags an orphan when a claim row exists but no step holds it (released)', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, fixture('health.json')));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const pool = fakePool(stateRow({ held_by_step: null, observed_at: new Date() }));
+    const logger = require('../src/telemetry/log').log();
+    const errorSpy = jest.spyOn(logger, 'error');
+
+    await checkOnce(runpod, pool, WATCHDOG_CFG, [ENDPOINT]);
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ endpointId: ENDPOINT.endpointId }),
+      expect.stringContaining('ORPHANED'),
+    );
     errorSpy.mockRestore();
   });
 
