@@ -117,7 +117,7 @@ Unknown fields are rejected (the schema is strict), so send only what's listed h
 | `requestId` | string | yes | **Idempotency key.** Re-sending the same `requestId` returns the original acknowledgement and never plans twice. Use a new one per generation attempt. |
 | `projectId` | string | yes | StoryStudio's Convex project id. Echoed back in the result. One project id can only be planned under one `requestId`. |
 | `source` | `"mcp"` | yes | Literal value. |
-| `tier` | string | yes | e.g. `narration-basic`, `narration-premium`. A tier containing `dialogue` adds the lip-sync step, which the orchestrator doesn't support yet. |
+| `tier` | string | yes | Free-form label, echoed back as sent (e.g. `narration-premium`, `narrationPremium`). The only value the orchestrator acts on: a tier containing `dialogue` adds the lip-sync step, which it doesn't support yet. |
 | `product` | string | yes | e.g. `documentary`. Echoed back in the result metadata. |
 | `language` | string | yes | e.g. `en`. |
 | `aspectRatio` | string | yes | `16:9`, `9:16` or `1:1`. |
@@ -395,8 +395,9 @@ Any frame URL is `null` if the step that produces it didn't run or failed.
 | `metrics` | `queuedMs`, `runMs`, and cost estimates in USD. Cost fields can be `null` (not measured). |
 | `errors[]` | `{ frameId, step, agent, reason, triedRungs }` for each failed or unfinished job. Capped at 200 entries; `errorsTotal` gives the full count when capped. |
 
-**Asset URLs** are public R2 URLs and don't expire. StoryStudio can reference them directly or copy
-them into its own storage.
+**Asset URLs** are public links on StoryStudio's own Cloudflare-hosted storage (`pub-….r2.dev` or
+`storyaistudio.app`), never temporary provider links: outputs from third-party providers are re-hosted
+before they're reported. StoryStudio can reference them directly or copy them elsewhere.
 
 ---
 
