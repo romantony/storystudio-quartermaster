@@ -20,7 +20,7 @@
  * reasoning. agents/orchestrator.ts's driveCohort() branches on this field.
  */
 import { FLEET } from '../fleet-registry';
-import { POSTPROD_LITE_ENDPOINT_ID } from './tail-endpoints';
+import { POSTPROD_LITE_ENDPOINT_ID, DREAMX_REFINER_ENDPOINT_ID, MMAUDIO_ENDPOINT_ID } from './tail-endpoints';
 import { buildImageInput } from './builders/image';
 import { buildImageEditInput } from './builders/image-edit';
 import { buildTtsInput } from './builders/tts';
@@ -32,6 +32,8 @@ import { buildCaptionInput } from './builders/caption';
 import { buildBgmInput } from './builders/bgm';
 import { buildBgmOverlayInput } from './builders/bgm-overlay';
 import { buildRemoveSilenceInput } from './builders/remove-silence';
+import { buildUpscaleFrameInput } from './builders/upscale-frame';
+import { buildSfxInput } from './builders/sfx';
 import type { PayloadBuilder } from './builders/types';
 
 function endpointFor(counterKey: string): string {
@@ -59,6 +61,12 @@ export interface CatalogEntry {
    * steps/builders/concat.ts's header comment for the full mechanism.
    * Unset/false preserves today's one-job-per-frame behavior. */
   singleJobPerProject?: boolean;
+  /** Hard ceiling on this step's workers_target, applied by
+   * agents/planner.ts on top of cfg.workersHead. For an endpoint whose real
+   * capacity is far below the cohort-scale default (step 14's DreamX
+   * refiner: 3 RTX 6000 Ada workers, not 25) — without it allocate() would
+   * PATCH workersMax to 25 and eat most of the 40-worker account cap. */
+  maxWorkers?: number;
   builder: PayloadBuilder;
 }
 
@@ -68,7 +76,8 @@ export interface CatalogEntry {
 // workers_target from config; agents/fleet.ts verifies against whatever was
 // actually persisted for that cohort, which is what lets the M2 acceptance
 // run hand-scale one endpoint to a small real number (see the M2 plan's
-// decision 5) instead of always expecting a full 25.
+// decision 5) instead of always expecting a full 25. `maxWorkers` above is
+// only a ceiling on that config value, never a target.
 export const STEP_CATALOG: readonly CatalogEntry[] = [
   {
     // Narration Premium's reference-image flow (options.referenceImage) —
@@ -110,7 +119,14 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     name: 'animation',
     endpointId: endpointFor('runpod:wan2-i2v'),
     gate: 'motion', // §6.5's motion gate — M4
-    dependsOn: [0, 1], // whichever image step actually ran (mutually exclusive)
+    // [0,1]: whichever image step actually ran (mutually exclusive). [2]:
+    // added 2026-09-12 — i2v's duration_s must track TTS's ACTUAL generated
+    // audio length, not the caller's pre-estimated frame.durationS (the two
+    // routinely diverge; merge's `-shortest` was silently clipping narration
+    // when the estimate undershot). Serializes animation behind tts (was
+    // parallel with it before), a deliberate latency-for-correctness
+    // tradeoff — see steps/builders/i2v.ts.
+    dependsOn: [0, 1, 2],
     scope: 'bulk',
     builder: buildI2vInput,
   },
@@ -136,7 +152,12 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     name: 'merge',
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
     gate: null,
-    dependsOn: [2, 3],
+    // [14, 3]: prefer step 14's upscaled clip, else step 3's raw one — NOT
+    // mutually exclusive (animation always runs; 14 is optional), so
+    // agents/planner.ts's resolveDirectDependencies() collapses 3 out of the
+    // fan-in whenever 14 is planned, same as concat's [7, 6]. [15]: the
+    // frame's SFX track (options.sfx), mixed under the narration.
+    dependsOn: [2, 15, 14, 3],
     scope: 'project', // M5 phase 1 — agents/assembler.ts, not the bulk generator
     builder: buildMergeInput,
   },
@@ -180,7 +201,9 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     // Second singleJobPerProject step, but depending on ANOTHER
     // singleJobPerProject step (8) rather than fanning in on every frame —
     // its fan-in is 1, not req.frames.length (see agents/planner.ts's
-    // buildStepsAndJobs()). Gated by options.upscale (STEP_TOPOLOGY).
+    // buildStepsAndJobs()). Gated by options.upscale with
+    // options.upscaleEngine 'realesrgan' (STEP_TOPOLOGY) — step 14 is the
+    // per-frame DreamX alternative.
     seq: 10,
     name: 'upscale',
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
@@ -221,6 +244,42 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     scope: 'project',
     singleJobPerProject: true,
     builder: buildBgmOverlayInput,
+  },
+  {
+    // Per-frame upscale on DreamX's SR-DiT refiner (options.upscale with
+    // options.upscaleEngine 'dreamx') — the alternative to step 10, which
+    // upscales the whole concat video on postprod-lite and can't use this
+    // endpoint (241-frame input limit; see steps/builders/upscale-frame.ts).
+    // seq 14, not a number between 3 and 6: the only free integers there
+    // are taken (4 = the spec's dialogue lip-sync slot, 5 = bgm), and none
+    // is needed — driveCohort() runs every bulk step before handing off to
+    // the assembler, so a bulk seq 14 still finishes before merge (6)
+    // starts; its only real ordering constraint is after step 3, which any
+    // seq > 3 satisfies. Listed last here and in STEP_TOPOLOGY so both stay
+    // seq-sorted like every other consumer expects.
+    seq: 14,
+    name: 'upscale-frame',
+    endpointId: DREAMX_REFINER_ENDPOINT_ID,
+    gate: null,
+    dependsOn: [3],
+    scope: 'bulk',
+    maxWorkers: 3, // endpoint's real pool — see CatalogEntry.maxWorkers
+    builder: buildUpscaleFrameInput,
+  },
+  {
+    // Per-frame SFX (options.sfx) on MMAudio — after upscale (14), before
+    // merge (6), per the requested frame flow. Bulk, like 14: seq 15 sorts
+    // after 14 in driveCohort()'s bulk loop, and every bulk step finishes
+    // before the assembler starts merge. Non-commercial weights — see
+    // tail-endpoints.ts's MMAUDIO_ENDPOINT_ID.
+    seq: 15,
+    name: 'sfx',
+    endpointId: MMAUDIO_ENDPOINT_ID,
+    gate: null,
+    dependsOn: [14, 3],
+    scope: 'bulk',
+    maxWorkers: 4, // endpoint's real pool
+    builder: buildSfxInput,
   },
 ] as const;
 

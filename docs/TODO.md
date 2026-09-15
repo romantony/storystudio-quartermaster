@@ -2,6 +2,80 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## Next session (2026-09-15) — DreamX upscale (step 14) + MMAudio SFX (step 15): deploy + live test
+
+New per-frame flow when `options.upscale` (engine `dreamx`, the default) and `options.sfx` are set:
+image → tts → animation (3) → **upscale-frame (14, DreamX `w0h49vn1pn0r87`)** → **sfx (15, MMAudio
+`nzkcsef9t2iv7s`)** → merge (6, postprod-lite, now with `sfx_url` mixed under narration at 0.22).
+
+State at end of 2026-09-14:
+- **Step 14:** code + tests done, **deployed to the VPS** (orchestrator + watchdog rebuilt).
+  Builder payload live-verified on DreamX: `sr_scale: 2.25` → 1856×1056, 81 frames kept, ~66s/clip.
+  (Wan2 "480p" is really 832×464, so `target_height: 1080` gets rejected at 2.328x. 2K isn't reachable.)
+- **Step 15:** orchestrator code + tests done (198/198, tsc clean), **NOT deployed to the VPS**.
+  MMAudio v2a verified live on the upscaled clip (5.04s SFX in 5.6s).
+- **postprod-lite `merge` + `sfx_url`:** handler changed in `~/flux4B-Wan2/Flux-klien-4b/postprod-lite`
+  (**uncommitted**). Image built locally and **pushed** as `romantony/story-studio-postprod-lite:latest`
+  (+ `:sfx-merge-20260914`). ffmpeg levels verified in Ubuntu 22.04 and inside the built image with
+  real assets: narration −27.3 dB unchanged, SFX at 0.22x, no volume jump when the SFX ends first.
+  **The endpoint has not been refreshed**, so standby workers may still run the old image.
+- **Nothing committed** in either repo. The quartermaster working tree also has the uncommitted
+  tts→i2v duration change from 2026-09-12.
+
+To do, in order:
+1. ~~**Refresh postprod-lite**~~ **DONE 2026-09-15.** Endpoint was already at workersMax 0 with 0 workers
+   (the orchestrator now scales it per step), so there was nothing stale to drain. Opened it to 1 worker
+   with the watchdog paused. A fresh worker (`ho1h3nqnp0tdla`, ~7 min cold pull) ran a real `merge` on the
+   09-12 f01 clip + narration, using the 09-12 BGM mp3 as the `sfx_url` stand-in. It returned
+   `sfx_mixed: true`. Least-squares fit against the sources: narration ×0.998 (unchanged), SFX ×0.220,
+   residual −57.8 dB. Output is stereo 48k when SFX is mixed (mono 24k without). Restored to workersMax 0,
+   watchdog restarted.
+2. ~~**Deploy step 15 to the VPS.**~~ **DONE 2026-09-15.** No open cohort. A full-tree hash compare
+   (local vs VPS `src/` + `__tests__/`) found 13 differing files, all local-only additions: the step-15 set,
+   plus 09-12 test additions that had never been synced (`assembler`, `repo.integration`, `watchdog`,
+   `runpod-output` tests). No VPS-only edits. Local tsc clean, 198 passed / 11 skipped. Run jest from the
+   repo root: running it inside `orchestrator/` skips ts-jest and every suite fails to parse. Backed up
+   the old VPS copies to `/opt/qm-orchestrator/pre-step15-backup-20260915.tgz`, synced (hashes verified),
+   rebuilt + restarted orchestrator and watchdog. Built image contains `dist/steps/builders/sfx.js`. The
+   watchdog now watches `nzkcsef9t2iv7s` and autodrained MMAudio's standby pool on its first tick
+   (0 workers ~10s later).
+3. ~~**Full live cohort test**~~ **PASSED 2026-09-15.** Cohort `win_2026_09_15_00`, project
+   `sfx-upscale-e2e-20260915-01` (3-frame Maya, upscale+sfx+removeSilence, gates off). 22/22 jobs, 0 failures,
+   02:45→03:19 (34 min). Step 14 capped at 3 workers, merge fan-in `[15]`. Checked each item:
+   - DreamX output 1856×1056 on all 3 frames. Merge `sfx_mixed: true` ×3.
+   - Fit against each frame's own TTS + MMAudio track: narration ×0.998–0.999, SFX ×0.214–0.219,
+     residual ≤ −59 dB.
+   - All endpoints back to 0 workers. Cohort row closed manually (M6 gap).
+   - Final concat: `…/20260915031859_5e6c4ec7-16a7-44ce-bf72-566cfc907765-u2_concat.mp4` (10.06s).
+   **Findings (both addressed 2026-09-15):**
+   - **SFX sounded quiet → loudness normalization added.** postprod-lite `merge` now gains the SFX to the
+     narration's EBU R128 integrated loudness before `sfx_volume` (capped at +30 dB and at a −1 dBFS peak;
+     skipped if either track is silent). The result reports `sfx_gain_db`. Live-verified on
+     `n6252hm01qz0xh`: f03 +5.9 dB (SFX ×0.432 measured, 0.434 expected), f02 −4.7 dB.
+     **Turned out MMAudio isn't actually quiet**: gated loudness is about the narration's (f01 −23.2 vs
+     −23.6 LUFS). The low mean came from silence between events. So normalization removes per-clip swings
+     but doesn't raise average audibility; that's `sfx_volume` 0.22 (≈13 LU under narration). **Open:**
+     listen and decide whether to raise `sfx_volume`, then re-check remove_silence.
+     Gotcha: image ffmpeg 4.4.2 rejects `ebur128 framelog=quiet` but still prints an all-zero Summary.
+     Use `framelog=verbose` and check the return code.
+   - **Watchdog false positive on step seq 0 → fixed + deployed.** `src/watchdog.ts` `!heldByStep` →
+     `heldByStep == null`, regression tests added (200 passed). Live proof pending the next cohort that
+     runs step 0.
+   - **Local disk:** the root disk filled (279G) during the postprod-lite rebuild. BuildKit had evicted
+     cache at 99% disk, so the rebuild ran from scratch and wrote a new 26 GB image. Deployed the loudnorm
+     change as a thin `FROM :sfx-merge-20260914` + `COPY handler.py` overlay (pushed `:latest` +
+     `:sfx-loudnorm-20260915`). A CI build from git reproduces the same content.
+4. ~~**Commit**~~ **DONE 2026-09-15** (user-approved). quartermaster: orchestrator changes (steps 14 + 15,
+   the 09-12 tts-duration/clone-artifact change, the watchdog fix). `flux4B-Wan2-storystudio`: postprod-lite
+   handler + API.md. **Not pushed.** Push postprod-lite before any CI build so CI doesn't overwrite `:latest`
+   with an image missing the sfx/loudnorm changes.
+5. ~~Open question: `remove_silence` + SFX~~ **Answered 2026-09-15.** At `sfx_volume` 0.22 the SFX sits mostly
+   under silencedetect's −35 dB threshold (100ms-RMS max −28 to −38.5 dB), so removal still works. It trimmed
+   a 0.63s pause in f02, and f01/f03 were untouched. It will cut SFX-only moments along with dead air.
+   **If `sfx_volume` is raised (see step 3 findings), re-check this:** SFX above −35 dB will stop pauses
+   being trimmed.
+6. License reminder: MMAudio checkpoints are CC-BY-NC-4.0. `options.sfx` is opt-in by design.
+
 ## Next session — M5 phase 1 live verification (stopped 2026-09-11, resume here)
 
 M5 phase 1 (Project Assembler Agent + step 6/merge, commit `713f889`) is built, deployed,

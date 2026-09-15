@@ -11,6 +11,8 @@ import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
 import { buildRemoveSilenceInput } from '../src/steps/builders/remove-silence';
 import { buildUpscaleInput } from '../src/steps/builders/upscale';
+import { buildUpscaleFrameInput } from '../src/steps/builders/upscale-frame';
+import { buildSfxInput } from '../src/steps/builders/sfx';
 import { buildCaptionInput } from '../src/steps/builders/caption';
 import { buildBgmInput } from '../src/steps/builders/bgm';
 import { buildBgmOverlayInput } from '../src/steps/builders/bgm-overlay';
@@ -124,6 +126,31 @@ describe('buildTtsInput (step 2)', () => {
     expect(out.instruct).toBe('calm, warm documentary narrator');
     expect(out.language).toBe('English');
   });
+
+  it('Qwen branch prefers cloneArtifactUrl over speaker/instruct design mode when both are present', () => {
+    const out = buildTtsInput(
+      ctx({
+        job: {
+          ...baseJob,
+          voiceEngine: 'qwen',
+          cloneArtifactUrl: 'https://pub.example/voice-clones/en-us-doc-f.pt',
+          voiceSpeaker: 'Ryan',
+          voiceInstruct: 'ignored once a clone artifact is present',
+        },
+      }),
+    );
+    expect(out).toEqual({
+      mode: 'tts',
+      engine: 'qwen',
+      text: baseJob.narration,
+      language: 'English',
+      clone_artifact_url: 'https://pub.example/voice-clones/en-us-doc-f.pt',
+      project_id: 'proj_8812',
+      frame_id: 'f_001',
+    });
+    expect(out.speaker).toBeUndefined();
+    expect(out.instruct).toBeUndefined();
+  });
 });
 
 describe('buildI2vInput (step 3)', () => {
@@ -163,6 +190,26 @@ describe('buildI2vInput (step 3)', () => {
     const out = buildI2vInput(ctx({ resolvedDeps: { 1: { url: 'https://pub.example/t2i.png' } } }));
     expect(out.image).toBe('https://pub.example/t2i.png');
   });
+
+  it('sizes duration_s off tts\'s ACTUAL generated audio length, not the caller\'s estimated durationS — real incident, 2026-09-12: the estimate was clipping narration', () => {
+    const out = buildI2vInput(
+      ctx({
+        resolvedDeps: { 1: { url: 'https://pub.example/t2i.png' }, 2: { url: 'https://pub.example/f_001.wav', durationS: 6.4 } },
+        job: { ...baseJob, durationS: 3 }, // caller's estimate — must be ignored in favor of durationS above
+      }),
+    );
+    expect(out.duration_s).toBe(7); // ceil(6.4), clamped into [3,7]
+  });
+
+  it('falls back to the caller\'s durationS when tts has no resolved durationS (defensive; should not happen once step 2 is a real dependency)', () => {
+    const out = buildI2vInput(
+      ctx({
+        resolvedDeps: { 1: { url: 'https://pub.example/t2i.png' } },
+        job: { ...baseJob, durationS: 4.1 },
+      }),
+    );
+    expect(out.duration_s).toBe(5); // ceil(4.1) — unchanged pre-existing behavior
+  });
 });
 
 describe('buildMergeInput (step 6)', () => {
@@ -188,6 +235,103 @@ describe('buildMergeInput (step 6)', () => {
     expect(() => buildMergeInput(ctx({ resolvedDeps: { 2: { url: 'https://pub.example/f_001.wav' } } }))).toThrow(
       /no resolved animation video URL/,
     );
+  });
+
+  it('prefers step 14\'s upscaled clip over step 3\'s when upscale was planned', () => {
+    const out = buildMergeInput(
+      ctx({
+        job: { ...baseJob, upscaleFrames: true },
+        resolvedDeps: { ...deps.resolvedDeps, 14: { url: 'https://pub.example/f_001_1080p.mp4' } },
+      }),
+    );
+    expect(out.video_url).toBe('https://pub.example/f_001_1080p.mp4');
+  });
+
+  it('throws instead of falling back to the 480p clip when upscale was planned but this frame\'s upscale failed', () => {
+    expect(() => buildMergeInput(ctx({ job: { ...baseJob, upscaleFrames: true }, ...deps }))).toThrow(
+      /upscale was planned but no resolved upscaled video URL/,
+    );
+  });
+});
+
+describe('buildMergeInput with step 15 (per-frame MMAudio SFX)', () => {
+  const base = { 2: { url: 'https://pub.example/f_001.wav' }, 3: { url: 'https://pub.example/f_001.mp4' } };
+
+  it('passes the SFX track as sfx_url and uses the upscaled clip — the full image/tts/i2v/upscale/sfx/merge chain', () => {
+    const out = buildMergeInput(
+      ctx({
+        job: { ...baseJob, upscaleFrames: true, sfx: true },
+        resolvedDeps: { ...base, 14: { url: 'https://pub.example/f_001_up.mp4' }, 15: { url: 'https://pub.example/f_001_sfx.mp3' } },
+      }),
+    );
+    expect(out).toEqual({
+      mode: 'merge',
+      video_url: 'https://pub.example/f_001_up.mp4',
+      audio_url: 'https://pub.example/f_001.wav',
+      sfx_url: 'https://pub.example/f_001_sfx.mp3',
+      project_id: 'proj_8812',
+      frame_id: 'f_001',
+    });
+  });
+
+  it('omits sfx_url entirely when sfx was not planned', () => {
+    expect(buildMergeInput(ctx({ resolvedDeps: base }))).not.toHaveProperty('sfx_url');
+  });
+
+  it('throws when sfx was planned but this frame\'s SFX job failed', () => {
+    expect(() => buildMergeInput(ctx({ job: { ...baseJob, sfx: true }, resolvedDeps: base }))).toThrow(
+      /sfx was planned but no resolved sfx audio URL/,
+    );
+  });
+});
+
+describe('buildSfxInput (step 15, MMAudio v2a)', () => {
+  it('runs v2a on the upscaled clip when step 14 ran, steered by motionPrompt, with music/speech negated', () => {
+    const out = buildSfxInput(
+      ctx({
+        job: { ...baseJob, upscaleFrames: true },
+        resolvedDeps: { 3: { url: 'https://pub.example/f_001.mp4' }, 14: { url: 'https://pub.example/f_001_up.mp4' } },
+      }),
+    );
+    expect(out).toEqual({
+      mode: 'v2a',
+      video_url: 'https://pub.example/f_001_up.mp4',
+      prompt: 'slow push in',
+      negative_prompt: 'music, speech, voice, singing',
+      project_id: 'proj_8812',
+      frame_id: 'f_001',
+    });
+  });
+
+  it('falls back to step 3\'s clip when upscale was not planned', () => {
+    const out = buildSfxInput(ctx({ resolvedDeps: { 3: { url: 'https://pub.example/f_001.mp4' } } }));
+    expect(out.video_url).toBe('https://pub.example/f_001.mp4');
+  });
+
+  it('throws when upscale was planned but that frame\'s upscale failed', () => {
+    expect(() =>
+      buildSfxInput(ctx({ job: { ...baseJob, upscaleFrames: true }, resolvedDeps: { 3: { url: 'https://pub.example/f_001.mp4' } } })),
+    ).toThrow(/upscale was planned/);
+  });
+});
+
+describe('buildUpscaleFrameInput (step 14, per-frame DreamX refiner)', () => {
+  it('upscales step 3\'s clip at the refiner\'s max sr_scale 2.25', () => {
+    expect(buildUpscaleFrameInput(ctx({ resolvedDeps: { 3: { url: 'https://pub.example/f_001.mp4' } } }))).toEqual({
+      video_url: 'https://pub.example/f_001.mp4',
+      sr_scale: 2.25,
+      project_id: 'proj_8812',
+      frame_id: 'f_001',
+    });
+  });
+
+  it('never sends target_height — Wan2 "480p" is really 464p, so 1080 would be 2.328x and rejected (real incident, 2026-09-14)', () => {
+    const out = buildUpscaleFrameInput(ctx({ resolvedDeps: { 3: { url: 'https://pub.example/f_001.mp4' } } }));
+    expect(out).not.toHaveProperty('target_height');
+  });
+
+  it('throws when the animation video URL is unresolved', () => {
+    expect(() => buildUpscaleFrameInput(ctx())).toThrow(/no resolved animation video URL/);
   });
 });
 

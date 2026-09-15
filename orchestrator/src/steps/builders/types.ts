@@ -45,11 +45,33 @@ export interface FrameJobInput {
    * singleJobPerProject step. See agents/planner.ts's buildStepsAndJobs(). */
   bgmPrompt?: string;
   totalDurationS?: number;
+  /** Request-level (like voiceSpeaker et al) precomputed Qwen3-TTS voice
+   * clone artifact (.pt) — the real product's `storystudio-qm-new-sfn-
+   * trigger.md` §9.2 `cloneArtifactUrl`; StoryStudio picks the voice_id and
+   * resolves it to this URL before calling the orchestrator (see
+   * /home/roman-antony/qwen-voice-clone/docs/voice-catalog.json for the
+   * catalog StoryStudio picks from). Takes priority over
+   * voiceSpeaker/voiceInstruct design mode — see steps/builders/tts.ts. */
+  cloneArtifactUrl?: string;
+  /** True when step 14 (per-frame DreamX upscale) was planned for this
+   * request. Lets steps/builders/merge.ts tell "upscale wasn't requested"
+   * (use step 3's clip) apart from "upscale was requested but this frame's
+   * job failed" (throw — never silently merge a 464p clip into a 1056p
+   * project). */
+  upscaleFrames?: boolean;
+  /** True when step 15 (per-frame MMAudio SFX) was planned — same purpose
+   * as upscaleFrames: merge throws on a missing SFX track instead of
+   * silently shipping that frame without one. */
+  sfx?: boolean;
 }
 
 /** Populated by the generator from the same-frame job's `output` in every
- * step named in this step's `dependsOn`. Keyed by step seq. */
-export type ResolvedDeps = Record<number, { url?: string } | undefined>;
+ * step named in this step's `dependsOn`. Keyed by step seq. `durationS` is
+ * only ever populated for step 2 (tts)'s output — see
+ * agents/generator.ts's resolveDeps() and steps/builders/i2v.ts, which reads
+ * it to size the video to the ACTUAL generated audio rather than the
+ * caller's pre-estimated frame.durationS. */
+export type ResolvedDeps = Record<number, { url?: string; durationS?: number } | undefined>;
 
 export interface BuildContext {
   job: FrameJobInput;

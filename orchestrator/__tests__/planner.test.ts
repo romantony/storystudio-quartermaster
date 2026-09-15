@@ -30,6 +30,8 @@ describe('resolveStepSet', () => {
       qualityGates: 'full' as const,
       referenceImage: false,
       voiceEngine: 'kokoro' as const,
+      upscaleEngine: 'realesrgan' as 'dreamx' | 'realesrgan',
+      sfx: false,
       shorts: { enabled: false },
     },
     frames: [{ frameId: 'f_1', imagePrompt: 'p', narration: 'n', durationS: 5 }],
@@ -58,6 +60,29 @@ describe('resolveStepSet', () => {
   it('step 7 (repurposed for remove-silence, 2026-09-12) appears only when options.removeSilence is true', () => {
     expect(_internal.resolveStepSet(base)).not.toContain(7);
     expect(_internal.resolveStepSet({ ...base, options: { ...base.options, removeSilence: true } })).toEqual([1, 2, 3, 6, 7, 8]);
+  });
+
+  it('options.upscale with upscaleEngine dreamx plans step 14 (per-frame DreamX), never step 10', () => {
+    const resolved = _internal.resolveStepSet({ ...base, options: { ...base.options, upscale: true, upscaleEngine: 'dreamx' } });
+    expect(resolved).toEqual([1, 2, 3, 6, 8, 14]);
+    expect(resolved).not.toContain(10);
+  });
+
+  it('options.upscale with upscaleEngine realesrgan plans step 10, never step 14', () => {
+    const resolved = _internal.resolveStepSet({ ...base, options: { ...base.options, upscale: true } });
+    expect(resolved).toEqual([1, 2, 3, 6, 8, 10]);
+  });
+
+  it('upscaleEngine alone (upscale false) plans neither upscale step', () => {
+    const resolved = _internal.resolveStepSet({ ...base, options: { ...base.options, upscaleEngine: 'dreamx' } });
+    expect(resolved).toEqual([1, 2, 3, 6, 8]);
+  });
+
+  it('options.sfx plans step 15 (MMAudio), alone or after step 14', () => {
+    expect(_internal.resolveStepSet({ ...base, options: { ...base.options, sfx: true } })).toEqual([1, 2, 3, 6, 8, 15]);
+    expect(
+      _internal.resolveStepSet({ ...base, options: { ...base.options, sfx: true, upscale: true, upscaleEngine: 'dreamx' } }),
+    ).toEqual([1, 2, 3, 6, 8, 14, 15]);
   });
 
   it('options.referenceImage swaps step 1 (t2i) for step 0 (image-i2i) — never both', () => {
@@ -220,6 +245,8 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
       qualityGates: 'full' as const,
       referenceImage: false,
       voiceEngine: 'kokoro' as const,
+      upscaleEngine: 'realesrgan' as 'dreamx' | 'realesrgan',
+      sfx: false,
       shorts: { enabled: false },
     },
     frames: [
@@ -356,6 +383,70 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
 
     const overlayJobs = jobs.filter((j) => j.stepSeq === 12);
     expect(overlayJobs[0].depsRemaining).toBe(2);
+  });
+
+  describe('step 15 (per-frame MMAudio SFX)', () => {
+    const ttsEntry = catalogEntry(2)!;
+    const animationEntry = catalogEntry(3)!;
+    const upscaleFrameEntry = catalogEntry(14)!;
+    const sfxEntry = catalogEntry(15)!;
+
+    it('is bulk, capped at 4 workers, and depends on 14 when upscale is planned (3 collapsed)', () => {
+      const { steps } = _internal.buildStepsAndJobs([animationEntry, upscaleFrameEntry, sfxEntry], req, 'proj_1', 25);
+      expect(sfxEntry.scope).toBe('bulk');
+      expect(steps.find((s) => s.seq === 15)).toMatchObject({ workersTarget: 4, dependsOn: [14], jobTotal: 3 });
+    });
+
+    it('depends on 3 directly when upscale is not planned', () => {
+      const { steps } = _internal.buildStepsAndJobs([animationEntry, sfxEntry], req, 'proj_1', 25);
+      expect(steps.find((s) => s.seq === 15)!.dependsOn).toEqual([3]);
+    });
+
+    it('merge fans in on [15] alone for the full chain, and every merge job carries sfx + upscaleFrames', () => {
+      const { steps, jobs } = _internal.buildStepsAndJobs(
+        [ttsEntry, animationEntry, mergeEntry, upscaleFrameEntry, sfxEntry],
+        req,
+        'proj_1',
+        25,
+      );
+      expect(steps.find((s) => s.seq === 6)!.dependsOn).toEqual([15]);
+      const mergeJobs = jobs.filter((j) => j.stepSeq === 6);
+      expect(mergeJobs.every((j) => j.depsRemaining === 1)).toBe(true);
+      expect(mergeJobs.every((j) => (j.input as { sfx?: boolean; upscaleFrames?: boolean }).sfx === true)).toBe(true);
+      expect(mergeJobs.every((j) => (j.input as { sfx?: boolean; upscaleFrames?: boolean }).upscaleFrames === true)).toBe(true);
+    });
+  });
+
+  describe('step 14 (per-frame DreamX upscale)', () => {
+    const ttsEntry = catalogEntry(2)!;
+    const animationEntry = catalogEntry(3)!;
+    const upscaleFrameEntry = catalogEntry(14)!;
+
+    it('is a bulk per-frame step capped at the endpoint\'s 3 workers, not cfg.workersHead', () => {
+      const { steps, jobs } = _internal.buildStepsAndJobs([animationEntry, upscaleFrameEntry], req, 'proj_1', 25);
+      const step = steps.find((s) => s.seq === 14)!;
+      expect(upscaleFrameEntry.scope).toBe('bulk');
+      expect(step).toMatchObject({ workersTarget: 3, dependsOn: [3], jobTotal: 3 });
+      expect(steps.find((s) => s.seq === 3)!.workersTarget).toBe(25); // uncapped steps unchanged
+      expect(jobs.filter((j) => j.stepSeq === 14).every((j) => j.depsRemaining === 1)).toBe(true);
+    });
+
+    it('merge (dependsOn:[2,14,3]) collapses to [14] when 14 is planned, and every per-frame job carries upscaleFrames', () => {
+      const { steps, jobs } = _internal.buildStepsAndJobs([ttsEntry, animationEntry, mergeEntry, upscaleFrameEntry], req, 'proj_1', 25);
+      // 3 is shadowed by 14 (14 depends on 3), 2 by 3 (animation depends on
+      // tts since 2026-09-12) — merge still RESOLVES all three at build time
+      // (generator.ts reads the catalog's dependsOn), this is only the fan-in.
+      expect(steps.find((s) => s.seq === 6)!.dependsOn).toEqual([14]);
+      const mergeJobs = jobs.filter((j) => j.stepSeq === 6);
+      expect(mergeJobs.every((j) => j.depsRemaining === 1)).toBe(true);
+      expect(mergeJobs.every((j) => (j.input as { upscaleFrames?: boolean }).upscaleFrames === true)).toBe(true);
+    });
+
+    it('merge fans in on [3] and has no upscaleFrames flag when 14 is not planned', () => {
+      const { steps, jobs } = _internal.buildStepsAndJobs([ttsEntry, animationEntry, mergeEntry], req, 'proj_1', 25);
+      expect(steps.find((s) => s.seq === 6)!.dependsOn).toEqual([3]);
+      expect(jobs.filter((j) => j.stepSeq === 6).every((j) => (j.input as { upscaleFrames?: boolean }).upscaleFrames === undefined)).toBe(true);
+    });
   });
 });
 

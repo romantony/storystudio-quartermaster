@@ -14,11 +14,25 @@
  * outright. Math.ceil, not Math.round: overshoot, never undershoot, so a
  * later merge's `-shortest` never clips the last syllable of narration
  * (same bug/fix runpod.ts documents at its i2v case).
+ *
+ * Sized off TTS's ACTUAL generated audio duration (`resolvedDeps[2]
+ * .durationS`), not the caller's pre-estimated `ctx.job.durationS` —
+ * real incident, 2026-09-12: script-side duration estimates routinely
+ * diverged from what Kokoro/Qwen actually produced for a given narration
+ * line, and since merge (step 6) trims with `-shortest`, an underestimated
+ * video was silently clipping the tail of the narration (no continuity
+ * between frames). catalog.ts now lists step 2 (tts) in step 3's
+ * `dependsOn` so the generator resolves it before calling this builder,
+ * serializing tts->animation instead of running them in parallel — the
+ * latency cost of getting the real number instead of guessing. Falls back
+ * to `ctx.job.durationS` only if resolvedDeps somehow lacks it (defensive;
+ * should not happen once the catalog dependency is in place).
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
 const IMAGE_EDIT_STEP_SEQ = 0;
 const IMAGE_STEP_SEQ = 1;
+const TTS_STEP_SEQ = 2;
 
 export const buildI2vInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
   const attribution: Record<string, unknown> = { project_id: ctx.projectId };
@@ -27,11 +41,12 @@ export const buildI2vInput: PayloadBuilder = (ctx: BuildContext): Record<string,
   if (!imageUrl) {
     throw new Error(`i2v builder: no resolved image URL for frame ${ctx.frameId ?? '(none)'}`);
   }
+  const actualTtsDurationS = ctx.resolvedDeps[TTS_STEP_SEQ]?.durationS;
   return {
     image: imageUrl,
     prompt: ctx.job.motionPrompt ?? '',
     resolution: '480p',
-    duration_s: Math.min(7, Math.max(3, Math.ceil(ctx.job.durationS))),
+    duration_s: Math.min(7, Math.max(3, Math.ceil(actualTtsDurationS ?? ctx.job.durationS))),
     sample_steps: 4,
     ...attribution,
   };

@@ -4,12 +4,17 @@
  * `rnqxi6c0mlq517` endpoint, selected per-request via `ctx.job.voiceEngine`
  * (options.voiceEngine, default 'kokoro'; see agents/planner.ts).
  *
- * The Qwen branch here is voice-*design* only (speaker/instruct/language) —
- * runpod.ts's real 3-way priority also supports a `clone_artifact_url` fast
- * path and a `voice_url`+`voice_transcript` slow path for actual voice
- * cloning from a reference clip, neither of which the orchestrator has a
- * source for yet (no prior clone artifact, no reference audio in the §9.1
- * request shape) — not built here, deliberately.
+ * Ported runpod.ts's `clone_artifact_url` fast path (2026-09-12) — the
+ * orchestrator now has a source for it: StoryStudio resolves its own
+ * voice_id (see /home/roman-antony/qwen-voice-clone/docs/voice-catalog.json)
+ * to a precomputed .pt artifact URL and sends it as the request-level
+ * `cloneArtifactUrl` (agents/planner.ts). Per
+ * runpod/qwen-voice-clone-stepfunction-request.md, a clone_artifact_url
+ * request omits instruct/speaker entirely — the artifact already encodes
+ * the cloned voice's identity and style. Still no `voice_url`+
+ * `voice_transcript` slow path (no reference-clip source in the §9.1
+ * request shape) — falls through to speaker/instruct design mode when
+ * cloneArtifactUrl is absent, same as before.
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
@@ -25,6 +30,16 @@ export const buildTtsInput: PayloadBuilder = (ctx: BuildContext): Record<string,
   if (ctx.frameId) attribution.frame_id = ctx.frameId;
 
   if (ctx.job.voiceEngine === 'qwen') {
+    if (ctx.job.cloneArtifactUrl) {
+      return {
+        mode: 'tts',
+        engine: 'qwen',
+        text: ctx.job.narration,
+        language: ctx.job.voiceLanguage || 'English',
+        clone_artifact_url: ctx.job.cloneArtifactUrl,
+        ...attribution,
+      };
+    }
     return {
       mode: 'tts',
       engine: 'qwen',

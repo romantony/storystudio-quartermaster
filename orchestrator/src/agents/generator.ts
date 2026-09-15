@@ -134,8 +134,16 @@ async function resolveDeps(client: PoolClient, cohortId: string, projectId: stri
       `SELECT output FROM jobs WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq = $4 AND status = 'complete'`,
       [cohortId, projectId, frameId, seq],
     );
-    const url = rows[0] ? runpodOutUrl(rows[0].output) : undefined;
-    resolved[seq] = url ? { url } : undefined;
+    const output = rows[0]?.output;
+    const url = output ? runpodOutUrl(output) : undefined;
+    // duration_s: only tts's output shape carries it, but reading it
+    // unconditionally off any dependency's raw output is harmless — every
+    // other step's output either lacks the key or nothing reads it there.
+    const durationS =
+      output && typeof output === 'object' && 'duration_s' in output && typeof (output as { duration_s: unknown }).duration_s === 'number'
+        ? (output as { duration_s: number }).duration_s
+        : undefined;
+    resolved[seq] = url || durationS !== undefined ? { url, durationS } : undefined;
   }
   return resolved;
 }

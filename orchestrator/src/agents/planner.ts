@@ -49,6 +49,14 @@ const OptionsSchema = z
     bgm: z.boolean().default(false),
     subtitles: z.boolean().default(false),
     upscale: z.boolean().default(false),
+    // Which upscaler options.upscale runs: 'dreamx' = step 14, DreamX SR-DiT
+    // per frame before merge (464p -> 1056p, sr_scale 2.25); 'realesrgan' = step 10,
+    // postprod-lite's Real-ESRGAN on the whole concat video. Mutually
+    // exclusive — see STEP_TOPOLOGY.
+    upscaleEngine: z.enum(['dreamx', 'realesrgan']).default('dreamx'),
+    // Per-frame MMAudio SFX (step 15), mixed under the narration at merge.
+    // Off by default — MMAudio's weights are non-commercial (CC-BY-NC-4.0).
+    sfx: z.boolean().default(false),
     burnCaptions: z.boolean().default(false),
     removeSilence: z.boolean().default(false),
     textOverlay: z.boolean().default(false),
@@ -93,6 +101,15 @@ export const RequestSchema = z
     voiceSpeaker: z.string().optional(),
     voiceInstruct: z.string().optional(),
     voiceLanguage: z.string().optional(),
+    // Qwen3-TTS voice CLONE fast path (options.voiceEngine === 'qwen'):
+    // StoryStudio resolves its own voice_id (see
+    // /home/roman-antony/qwen-voice-clone/docs/voice-catalog.json) to this
+    // precomputed .pt artifact URL and sends it here — same real-product
+    // §9.2 field, matches runpod.ts's `cloneArtifactUrl` 3-way priority
+    // (clone artifact > voice_url/transcript > speaker/instruct design
+    // mode). Takes priority over voiceSpeaker/voiceInstruct when both are
+    // present — see steps/builders/tts.ts.
+    cloneArtifactUrl: z.string().url().optional(),
     // Step 5 (bgm generation, ACE-Step) — request-level like voiceSpeaker et
     // al., matches the real AWS contract's bgmPrompt. Required (checked
     // below, not by zod, so the error names the right field) whenever
@@ -145,10 +162,14 @@ const STEP_TOPOLOGY: ReadonlyArray<{ seq: number; dialogueOnly?: boolean; gatedB
   { seq: 7, gatedBy: (o) => o.removeSilence }, // repurposed from spec's Remotion slot — see header comment above
   { seq: 8 },
   { seq: 9, gatedBy: (o) => o.subtitles },
-  { seq: 10, gatedBy: (o) => o.upscale },
+  { seq: 10, gatedBy: (o) => o.upscale && o.upscaleEngine === 'realesrgan' },
   { seq: 11, gatedBy: (o) => o.burnCaptions },
   { seq: 12, gatedBy: (o) => o.bgm }, // overlays step 5's output; same flag
   { seq: 13, gatedBy: (o) => o.shorts.enabled },
+  // Per-frame DreamX upscale, bulk scope — runs before merge despite its
+  // seq; see steps/catalog.ts's seq 14 entry for why it isn't numbered 4.
+  { seq: 14, gatedBy: (o) => o.upscale && o.upscaleEngine === 'dreamx' },
+  { seq: 15, gatedBy: (o) => o.sfx }, // per-frame MMAudio SFX, bulk, before merge like 14
 ];
 
 function resolveStepSet(req: OrchestratorRequest): number[] {
@@ -207,7 +228,7 @@ function buildStepsAndJobs(
     seq: c.seq,
     name: c.name,
     endpointId: c.endpointId,
-    workersTarget,
+    workersTarget: Math.min(workersTarget, c.maxWorkers ?? workersTarget),
     gate: c.gate,
     drainAfter: true, // overwritten by computeDrainAfter below
     dependsOn: resolveDirectDependencies(c.dependsOn, catalogued),
@@ -265,6 +286,9 @@ function buildStepsAndJobs(
         voiceSpeaker: req.voiceSpeaker,
         voiceInstruct: req.voiceInstruct,
         voiceLanguage: req.voiceLanguage,
+        cloneArtifactUrl: req.cloneArtifactUrl,
+        upscaleFrames: catalogued.some((cc) => cc.seq === 14) || undefined,
+        sfx: catalogued.some((cc) => cc.seq === 15) || undefined,
       };
       jobs.push({
         projectId,

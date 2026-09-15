@@ -17,6 +17,8 @@ const DEFAULT_SEC_PER_JOB: Record<string, number> = {
   image: 12,
   tts: 8,
   animation: 90, // Wan2.2 4-step Lightning rung — see qm-orchestrator-wan2-cfg-rungs
+  'upscale-frame': 60, // DreamX refiner, one real 2x job measured 56s (2026-09-14)
+  sfx: 6, // MMAudio v2a, 5s clip measured 5.6s warm (2026-09-14)
 };
 const DEFAULT_WARM_SEC = 174; // spec §8's measured cold-start figure
 
