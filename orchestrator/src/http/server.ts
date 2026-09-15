@@ -14,6 +14,7 @@ import { healthRoutes } from './routes/health';
 import { requestsRoutes } from './routes/requests';
 import { webhookRoutes } from './routes/webhooks';
 import { adminRoutes } from './routes/admin';
+import { harnessRoutes } from './routes/harness';
 
 /** Return type is inferred so the pino logger's type provider is preserved. */
 export async function buildServer(cfg: Config, logger: Logger, deps: { pool: Pool; runpod: RunpodClient }) {
@@ -27,6 +28,7 @@ export async function buildServer(cfg: Config, logger: Logger, deps: { pool: Poo
   await app.register(requestsRoutes, { pool: deps.pool, cfg, runpod: deps.runpod, publicBaseUrl: cfg.publicBaseUrl });
   await app.register(webhookRoutes, { pool: deps.pool, cfg });
   await app.register(adminRoutes, { pool: deps.pool, runpod: deps.runpod });
+  await app.register(harnessRoutes, { pool: deps.pool, cfg });
 
   return app;
 }

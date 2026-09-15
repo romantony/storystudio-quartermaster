@@ -13,6 +13,7 @@ import { closePool, initPool, getPool } from './db/pool';
 import { buildServer } from './http/server';
 import { createLogger, setLogger } from './telemetry/log';
 import { RunpodClient } from './runpod/client';
+import { driveCohort } from './agents/orchestrator';
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -26,6 +27,19 @@ async function main(): Promise<void> {
   const app = await buildServer(cfg, logger, { pool: getPool(), runpod });
   await app.listen({ host: '0.0.0.0', port: cfg.port });
   logger.info(`listening on :${cfg.port}`);
+
+  // Resume cohorts a restart (deploy, crash) left mid-run. driveCohort() is
+  // driven entirely by Postgres state: completed steps are skipped, planned
+  // jobs are submitted, submitted jobs are reconciled via /status. A minimal
+  // slice of M6's boot reconciliation (§10.2), added 2026-09-15 so deploying
+  // a fix doesn't strand the running cohort.
+  const { rows: running } = await getPool().query<{ id: string }>(`SELECT id FROM cohorts WHERE status = 'running'`);
+  for (const { id } of running) {
+    logger.warn({ cohortId: id }, 'boot: resuming running cohort');
+    void driveCohort({ pool: getPool(), runpod, cfg, publicBaseUrl: cfg.publicBaseUrl }, id).catch((err) =>
+      logger.error({ err, cohortId: id }, 'boot: resumed driveCohort crashed'),
+    );
+  }
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {

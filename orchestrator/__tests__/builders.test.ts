@@ -474,6 +474,70 @@ describe('buildCaptionInput (step 11, TikTok-style burn captions — prefers ste
   it('throws when neither step 10 nor step 8 is resolved', () => {
     expect(() => buildCaptionInput(projectCtx(undefined))).toThrow(/no resolved video URL/);
   });
+
+  describe('script-timed chunks (no Whisper)', () => {
+    const narrations = [
+      { frameId: 'f1', narration: 'Maya Rao was quiet.' },
+      { frameId: 'f2', narration: 'Nobody noticed.' },
+      { frameId: 'f3', narration: 'Then the wall opened.' },
+    ];
+    const withDetails = (details: BuildContext['perFrameDetails'], job: Partial<FrameJobInput> = {}): BuildContext => ({
+      ...projectCtx({ 8: ['https://pub.example/concat.mp4'] }),
+      job: { ...baseJob, narrations, ...job },
+      perFrameDetails: details,
+    });
+
+    it('times each frame\'s words across its trimmed clip, offset by the clips before it', () => {
+      const out = buildCaptionInput(
+        withDetails({
+          7: [
+            { frameId: 'f1', url: 'https://pub.example/f1_trim.mp4', durationS: 2.0 },
+            { frameId: 'f2', url: 'https://pub.example/f2_trim.mp4', durationS: 1.5 },
+            { frameId: 'f3', url: 'https://pub.example/f3_trim.mp4', durationS: 3.0 },
+          ],
+          6: [
+            { frameId: 'f1', url: 'https://pub.example/f1_merge.mp4', durationS: 2.5 },
+            { frameId: 'f2', url: 'https://pub.example/f2_merge.mp4', durationS: 2.0 },
+            { frameId: 'f3', url: 'https://pub.example/f3_merge.mp4', durationS: 3.5 },
+          ],
+        }),
+      );
+      const chunks = out.chunks as Array<{ text: string; timestamp: [number, number] }>;
+      expect(chunks.map((c) => c.text)).toEqual(['Maya', 'Rao', 'was', 'quiet.', 'Nobody', 'noticed.', 'Then', 'the', 'wall', 'opened.']);
+      // f1: weights 5,4,4,7 of 20 over 2.0s
+      expect(chunks.slice(0, 4).map((c) => c.timestamp)).toEqual([[0, 0.5], [0.5, 0.9], [0.9, 1.3], [1.3, 2]]);
+      expect(chunks[4].timestamp[0]).toBe(2); // f2 starts where f1's trimmed clip ends
+      expect(chunks[6].timestamp[0]).toBe(3.5); // f3 after 2.0 + 1.5
+      expect(chunks[9].timestamp[1]).toBe(6.5);
+    });
+
+    it('skips a failed frame exactly like concat does, and uses merge durations when remove-silence did not run', () => {
+      const out = buildCaptionInput(
+        withDetails({
+          6: [
+            { frameId: 'f1', url: 'https://pub.example/f1_merge.mp4', durationS: 2.5 },
+            { frameId: 'f2', url: undefined, durationS: undefined },
+            { frameId: 'f3', url: 'https://pub.example/f3_merge.mp4', durationS: 3.5 },
+          ],
+        }),
+      );
+      const chunks = out.chunks as Array<{ text: string; timestamp: [number, number] }>;
+      expect(chunks.map((c) => c.text)).not.toContain('Nobody');
+      expect(chunks.find((c) => c.text === 'Then')!.timestamp[0]).toBe(2.5);
+    });
+
+    it('falls back to Whisper (no chunks) when a joined clip has no duration or no narration', () => {
+      const noDuration = buildCaptionInput(
+        withDetails({ 7: [{ frameId: 'f1', url: 'https://pub.example/f1_trim.mp4', durationS: undefined }] }),
+      );
+      expect(noDuration).not.toHaveProperty('chunks');
+      const noNarration = buildCaptionInput(
+        withDetails({ 7: [{ frameId: 'f9', url: 'https://pub.example/f9_trim.mp4', durationS: 2 }] }),
+      );
+      expect(noNarration).not.toHaveProperty('chunks');
+      expect(buildCaptionInput(projectCtx({ 8: ['https://pub.example/concat.mp4'] }))).not.toHaveProperty('chunks');
+    });
+  });
 });
 
 describe('buildBgmInput (step 5, bgm generation — reads ctx.job, not ctx.perFrameOutputs)', () => {

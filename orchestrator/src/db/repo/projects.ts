@@ -93,3 +93,14 @@ export async function getProjectByRequestId(db: Queryable, requestId: string): P
 export async function setProjectStatus(db: Queryable, id: string, status: string): Promise<void> {
   await db.query('UPDATE projects SET status = $2 WHERE id = $1', [id, status]);
 }
+
+/** Every project planned into a cohort — harness/index.ts's prepareCohort()
+ * walks these before the bulk steps start. */
+export async function listProjectsForCohort(db: Queryable, cohortId: string): Promise<Project[]> {
+  const { rows } = await db.query(
+    `SELECT id, cohort_id, request_id, tier, language, status, request, result, callback_url
+       FROM projects WHERE cohort_id = $1`,
+    [cohortId],
+  );
+  return rows.map(toProject);
+}

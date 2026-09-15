@@ -14,6 +14,10 @@ export interface UngatedJob {
   projectId: string;
   frameId: string | null;
   qualityAttempts: number;
+  /** Every rung label already tried on this job (jobs.tried_rungs) — the
+   * prompt harness's corrective ladder (harness/correct/ladder.ts) uses
+   * this to avoid retrying the same measure twice. */
+  triedRungs: string[];
   input: unknown;
   output: unknown;
 }
@@ -22,7 +26,7 @@ export interface UngatedJob {
  * status='complete' AND quality_status IS NULL. */
 export async function listUngated(db: Queryable, cohortId: string, stepSeq: number): Promise<UngatedJob[]> {
   const { rows } = await db.query(
-    `SELECT id, project_id, frame_id, quality_attempts, input, output
+    `SELECT id, project_id, frame_id, quality_attempts, tried_rungs, input, output
        FROM jobs
       WHERE cohort_id = $1 AND step_seq = $2 AND status = 'complete' AND quality_status IS NULL
       ORDER BY seq`,
@@ -33,6 +37,7 @@ export async function listUngated(db: Queryable, cohortId: string, stepSeq: numb
     projectId: r.project_id,
     frameId: r.frame_id,
     qualityAttempts: r.quality_attempts,
+    triedRungs: r.tried_rungs ?? [],
     input: r.input,
     output: r.output,
   }));
@@ -46,11 +51,12 @@ export async function countUngated(db: Queryable, cohortId: string, stepSeq: num
   return Number(rows[0].count);
 }
 
-/** Redundant-by-construction with listUngated once runStep() has exited
- * (a rework write always reopens runStep()'s terminal>=total condition, so
- * no planned/submitted row for a gated step should ever coexist with
- * gateStep() having returned) — kept as a real, cheap, separate check
- * rather than an inference fleet.ts's release() silently trusts to hold. */
+/** planned/submitted jobs on a gated step — gateStep() keeps waiting while
+ * any exist (a rework in progress). The assumption this comment used to make,
+ * that a rework "reopens runStep()'s terminal>=total condition", only holds
+ * while runStep() is still looping; since 2026-09-15 runStep() itself stays in
+ * its loop until the gate has settled every completed job (agents/generator.ts),
+ * which is what makes that true. */
 export async function countInFlightForGatedStep(db: Queryable, cohortId: string, stepSeq: number): Promise<number> {
   const { rows } = await db.query<{ count: string }>(
     `SELECT count(*) FROM jobs WHERE cohort_id = $1 AND step_seq = $2 AND status IN ('planned', 'submitted')`,
@@ -114,6 +120,18 @@ export async function latestImageScoreForFrame(db: Queryable, cohortId: string, 
   return rows[0]?.weighted_score != null ? Number(rows[0].weighted_score) : null;
 }
 
+/** The frame's source image (whichever image step ran, 0 or 1) — context for
+ * the motion-prompt rewriter (quality/rewrite.ts). */
+export async function sourceImageForFrame(db: Queryable, cohortId: string, projectId: string, frameId: string): Promise<unknown> {
+  const { rows } = await db.query<{ output: unknown }>(
+    `SELECT output FROM jobs
+      WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq IN (0, 1) AND status = 'complete'
+      ORDER BY step_seq LIMIT 1`,
+    [cohortId, projectId, frameId],
+  );
+  return rows[0]?.output;
+}
+
 /** PASS — quality_status='pass', jobs.status untouched (stays 'complete'). */
 export async function applyPass(client: PoolClient, v: VerdictWrite): Promise<void> {
   await recordVerdict(client, v);
@@ -129,7 +147,13 @@ export async function applyPass(client: PoolClient, v: VerdictWrite): Promise<vo
 export async function applyRework(
   client: PoolClient,
   v: VerdictWrite,
-  opts: { promptField: 'imagePrompt' | 'motionPrompt'; correctedPrompt: string; rungLabel: string },
+  opts: {
+    promptField: 'imagePrompt' | 'motionPrompt';
+    correctedPrompt: string;
+    rungLabel: string;
+    /** Extra input fields merged in (e.g. fallbackRung, originalImagePrompt). */
+    inputPatch?: Record<string, unknown>;
+  },
 ): Promise<void> {
   await recordVerdict(client, v);
   await client.query(
@@ -138,9 +162,9 @@ export async function applyRework(
             quality_status = NULL,
             quality_attempts = quality_attempts + 1,
             tried_rungs = tried_rungs || ARRAY[$3]::text[],
-            input = jsonb_set(input, ARRAY[$2]::text[], to_jsonb($4::text))
+            input = jsonb_set(input, ARRAY[$2]::text[], to_jsonb($4::text)) || $5::jsonb
       WHERE id = $1`,
-    [v.jobId, opts.promptField, opts.rungLabel, opts.correctedPrompt],
+    [v.jobId, opts.promptField, opts.rungLabel, opts.correctedPrompt, JSON.stringify(opts.inputPatch ?? {})],
   );
 }
 

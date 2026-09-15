@@ -15,6 +15,7 @@ import * as fleetAgent from '../src/agents/fleet';
 import * as generatorAgent from '../src/agents/generator';
 import * as qualityAgent from '../src/agents/quality';
 import * as assemblerAgent from '../src/agents/assembler';
+import * as finalizeModule from '../src/result/finalize';
 
 jest.mock('../src/db/repo/steps');
 jest.mock('../src/db/repo/cohorts');
@@ -27,6 +28,7 @@ jest.mock('../src/agents/quality', () => ({
   ...jest.requireActual('../src/agents/quality'),
   gateStep: jest.fn(),
 }));
+jest.mock('../src/result/finalize');
 jest.mock('../src/agents/assembler', () => ({
   ...jest.requireActual('../src/agents/assembler'),
   runAssembler: jest.fn(),
@@ -84,6 +86,74 @@ beforeEach(() => {
   (fleetAgent.release as jest.Mock).mockResolvedValue(undefined);
   (fleetAgent.emergencyDrain as jest.Mock).mockResolvedValue(undefined);
   (assemblerAgent.runAssembler as jest.Mock).mockResolvedValue(undefined);
+  (finalizeModule.finalizeCohort as jest.Mock).mockResolvedValue(undefined);
+});
+
+describe('driveCohort() — always finalizes (§6.7, M5 2026-09-15)', () => {
+  it("finalizes with 'completed' when every step finished", async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2), dbStep(6)]);
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(finalizeModule.finalizeCohort).toHaveBeenCalledTimes(1);
+    expect(finalizeModule.finalizeCohort).toHaveBeenCalledWith(expect.anything(), 'win_test', 'completed');
+    // after the assembler, not before
+    expect((finalizeModule.finalizeCohort as jest.Mock).mock.invocationCallOrder[0]).toBeGreaterThan(
+      (assemblerAgent.runAssembler as jest.Mock).mock.invocationCallOrder[0],
+    );
+  });
+
+  it('raises auxiliary fallback endpoints for a gated step and always releases them, even when the step fails', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([{ ...dbStep(3), gate: 'motion' }]);
+    (fleetAgent.allocateAuxiliary as jest.Mock).mockResolvedValue(undefined);
+    (fleetAgent.releaseAuxiliary as jest.Mock).mockResolvedValue(undefined);
+    (generatorAgent.runStep as jest.Mock).mockRejectedValue(new Error('boom'));
+    (qualityAgent.gateStep as jest.Mock).mockResolvedValue(undefined);
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(fleetAgent.allocateAuxiliary).toHaveBeenCalledWith(expect.anything(), 'win_test', 3, { endpointId: 'n6252hm01qz0xh', workers: 1 });
+    expect(fleetAgent.releaseAuxiliary).toHaveBeenCalledWith(expect.anything(), 'n6252hm01qz0xh');
+  });
+
+  it('skips bulk steps already complete (resume after a restart) without re-allocating them', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([{ ...dbStep(2), status: 'complete' }, dbStep(3)]);
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+    (qualityAgent.gateStep as jest.Mock).mockResolvedValue(undefined);
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(fleetAgent.allocate).toHaveBeenCalledTimes(1);
+    expect(fleetAgent.allocate).toHaveBeenCalledWith(expect.anything(), 'win_test', expect.objectContaining({ seq: 3 }));
+  });
+
+  it("finalizes with 'stopped' when the driver stops early (allocate failure)", async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2)]);
+    (fleetAgent.allocate as jest.Mock).mockRejectedValue(new Error('cap breach'));
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(finalizeModule.finalizeCohort).toHaveBeenCalledWith(expect.anything(), 'win_test', 'stopped');
+  });
+
+  it("finalizes with 'stopped' when the assembler throws", async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2), dbStep(6)]);
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+    (assemblerAgent.runAssembler as jest.Mock).mockRejectedValue(new Error('merge stalled'));
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    expect(finalizeModule.finalizeCohort).toHaveBeenCalledWith(expect.anything(), 'win_test', 'stopped');
+  });
+
+  it('a finalize failure is logged, never thrown out of the fire-and-forget driver', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2)]);
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+    (finalizeModule.finalizeCohort as jest.Mock).mockRejectedValue(new Error('db down'));
+
+    await expect(driveCohort(BASE_DEPS, 'win_test')).resolves.toBeUndefined();
+  });
 });
 
 describe('driveCohort() — gating concurrency', () => {

@@ -91,7 +91,9 @@ export function extractJson(text: string): unknown {
   throw new ReplicateError(`no valid JSON found in LLM output: ${trimmed.slice(0, 300)}`);
 }
 
-async function createPrediction(deps: ReplicateDeps, model: string, body: unknown): Promise<{ id: string }> {
+export type ReplicateTransport = Pick<ReplicateDeps, 'apiToken' | 'apiBase' | 'timeoutMs' | 'fetchImpl'>;
+
+export async function createPrediction(deps: ReplicateTransport, model: string, body: unknown): Promise<{ id: string }> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), deps.timeoutMs);
@@ -110,7 +112,7 @@ async function createPrediction(deps: ReplicateDeps, model: string, body: unknow
   }
 }
 
-async function getPrediction(deps: ReplicateDeps, id: string): Promise<{ status: string; output?: unknown; error?: unknown }> {
+export async function getPrediction(deps: ReplicateTransport, id: string): Promise<{ status: string; output?: unknown; error?: unknown }> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), deps.timeoutMs);
@@ -138,6 +140,13 @@ async function pollPrediction(deps: ReplicateDeps, id: string): Promise<unknown>
     await sleep(deps.pollIntervalMs);
   }
   throw new ReplicateError(`Replicate prediction ${id} timed out after ${deps.maxPollAttempts * deps.pollIntervalMs}ms`);
+}
+
+/** Create + poll a text-output model (e.g. openai/gpt-5-mini) and return its
+ * concatenated text. Used by quality/rewrite.ts. */
+export async function runReplicateText(deps: ReplicateDeps, model: string, input: Record<string, unknown>): Promise<string> {
+  const prediction = await createPrediction(deps, model, input);
+  return extractOutputText(await pollPrediction(deps, prediction.id));
 }
 
 async function runModel(deps: ReplicateDeps, model: string, input: VisionCallInput): Promise<unknown> {
@@ -168,8 +177,9 @@ export async function callVisionJson(deps: ReplicateDeps, input: VisionCallInput
     try {
       return await runModel(deps, deps.visionModelFallback, input);
     } catch (fallbackErr) {
+      const msg = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 240);
       throw new ReplicateError(
-        `both vision models failed (primary: ${deps.visionModel}, fallback: ${deps.visionModelFallback})`,
+        `both vision models failed (primary: ${deps.visionModel}: ${msg(err)}; fallback: ${deps.visionModelFallback}: ${msg(fallbackErr)})`,
         { primary: err, fallback: fallbackErr },
       );
     }

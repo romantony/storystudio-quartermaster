@@ -6,6 +6,7 @@
  * passes it in as `resolvedDeps` right before calling the builder, so the
  * builder itself never touches the database.
  */
+import type { ShotContract } from '../../harness/contract';
 
 /** Per-frame fields the planner writes into `jobs.input` at plan time,
  * pulled straight off the §9.1 request's `frames[]` entry. */
@@ -48,6 +49,10 @@ export interface FrameJobInput {
    * singleJobPerProject step. See agents/planner.ts's buildStepsAndJobs(). */
   bgmPrompt?: string;
   totalDurationS?: number;
+  /** singleJobPerProject jobs only: every frame's narration in request order.
+   * Step 11 (captions) turns it into word timestamps instead of re-running
+   * Whisper (builders/caption.ts). */
+  narrations?: Array<{ frameId: string; narration: string }>;
   /** Request-level (like voiceSpeaker et al) precomputed Qwen3-TTS voice
    * clone artifact (.pt) — the real product's `storystudio-qm-new-sfn-
    * trigger.md` §9.2 `cloneArtifactUrl`; StoryStudio picks the voice_id and
@@ -66,7 +71,41 @@ export interface FrameJobInput {
    * as upscaleFrames: merge throws on a missing SFX track instead of
    * silently shipping that frame without one. */
   sfx?: boolean;
+  /** Set by the quality gate on a frame's last rework (agents/quality.ts):
+   * route the next attempt to a different model — steps/catalog.ts's
+   * `fallbacks` maps it to an endpoint/provider and payload builder. */
+  fallbackRung?: FallbackRung;
+  /** The prompts as first requested, kept once a QA rewrite replaces
+   * imagePrompt/motionPrompt, so later rewrites still see the original. */
+  originalImagePrompt?: string;
+  originalMotionPrompt?: string;
+
+  // ── prompt harness (docs/qm-orchestrator-prompt-harness-implementation-plan.md) ──
+  /** The frame's shot contract, written by harness/prepare.ts at plan time
+   * (or by the quality-gate ladder on a rework). Absent = the harness was
+   * off, or extraction/validation failed for this frame — every consumer
+   * (agents/quality.ts's harness branch) falls back to the pre-harness
+   * behavior when this is undefined. */
+  contract?: ShotContract;
+  /** Hash of the active guardrail set (image ∪ video) this frame's prompts
+   * were produced against — see harness/guardrails/store.ts's
+   * guardrailSetVersion(). Stamped so a later finding/correction is
+   * attributable to an exact rule set. */
+  harnessVersion?: string;
+  /** options.promptHarness === 'lint': the harness-compiled prompts,
+   * recorded alongside the caller's own imagePrompt/motionPrompt (which
+   * stay live) for offline comparison — never read by any builder. */
+  harnessImagePrompt?: string;
+  harnessMotionPrompt?: string;
+  /** Set when the contract's transformation is 'state_change' (V-ACT-02) —
+   * this beat genuinely needs two frames on a 4-step model. Report-only:
+   * the orchestrator still submits a best-effort single-frame prompt (a
+   * 'continuation' rewrite of the same contract) rather than blocking, and
+   * surfaces this flag in the §9.6 result callback for the caller to act on. */
+  splitShot?: boolean;
 }
+
+export type FallbackRung = 'flux-4b' | 'replicate-wan22-fast';
 
 /** Populated by the generator from the same-frame job's `output` in every
  * step named in this step's `dependsOn`. Keyed by step seq. `durationS` is
@@ -88,6 +127,10 @@ export interface BuildContext {
    * one array per step instead of one URL — see agents/generator.ts's
    * resolveProjectDeps(). Per-frame builders never see this populated. */
   perFrameOutputs?: Record<number, string[]>;
+  /** Same population rule as perFrameOutputs, but one entry per frame job
+   * (failed frames included, `url` undefined) with its frame id and the
+   * output's `duration_s` when it reported one. */
+  perFrameDetails?: Record<number, Array<{ frameId: string | null; url?: string; durationS?: number }>>;
 }
 
 export type PayloadBuilder = (ctx: BuildContext) => Record<string, unknown>;

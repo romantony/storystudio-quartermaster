@@ -165,6 +165,33 @@ export async function stepJobCounts(
 }
 
 /**
+ * A RunPod-side job failure (FAILED/CANCELLED/TIMED_OUT — e.g. CUDA OOM on a
+ * leaky worker, seen live 2026-09-15 on 2 Wan2 jobs from one worker): put the
+ * job back to 'planned' for another attempt while `attempts < maxAttempts`,
+ * instead of failing the frame for good. Dependents are NOT decremented on a
+ * retry — the job hasn't reached a terminal state. runpod_job_id is cleared
+ * so a late webhook for the dead RunPod job resolves to no job and no-ops.
+ * Returns true when retried; otherwise it falls through to markTerminal().
+ */
+export async function markFailedOrRetry(
+  client: PoolClient,
+  jobId: number,
+  error: unknown,
+  maxAttempts: number,
+): Promise<boolean> {
+  const { rowCount } = await client.query(
+    `UPDATE jobs
+        SET status = 'planned', attempts = attempts + 1, runpod_job_id = NULL,
+            submitted_at = NULL, completed_at = NULL, error = $2
+      WHERE id = $1 AND attempts < $3`,
+    [jobId, error, maxAttempts],
+  );
+  if ((rowCount ?? 0) > 0) return true;
+  await markTerminal(client, jobId, { status: 'failed', error });
+  return false;
+}
+
+/**
  * Marks a job complete or failed and, on completion, decrements
  * `deps_remaining` on every dependent job for the SAME frame (impl plan
  * §6.4/§8.3 — never on a job about to be reworked, but M2 has no rework path
@@ -255,6 +282,25 @@ export async function listStale(
  * insertion order — agents/assembler.ts's per-project loop (M5 phase 1)
  * uses this instead of "every project in the cohort" so a project that
  * somehow has no tail work planned is silently skipped, not stalled on. */
+/**
+ * Merges `patch` into `input` for every still-`planned` job matching
+ * (cohortId, projectId, frameId) across `stepSeqs` — the prompt harness's
+ * write-back after plan-time preparation (harness/index.ts's
+ * prepareCohort()). Only touches 'planned' rows so a resumed cohort
+ * (index.ts re-drives 'running' cohorts on boot) never rewrites a step that
+ * already generated against its original prompt.
+ */
+export async function patchFrameJobInputs(
+  db: Queryable,
+  params: { cohortId: string; projectId: string; frameId: string; stepSeqs: number[]; patch: Record<string, unknown> },
+): Promise<void> {
+  await db.query(
+    `UPDATE jobs SET input = input || $5::jsonb
+      WHERE cohort_id = $1 AND project_id = $2 AND frame_id = $3 AND step_seq = ANY($4::int[]) AND status = 'planned'`,
+    [params.cohortId, params.projectId, params.frameId, params.stepSeqs, JSON.stringify(params.patch)],
+  );
+}
+
 export async function listProjectIdsForStep(db: Queryable, cohortId: string, stepSeq: number): Promise<string[]> {
   const { rows } = await db.query<{ project_id: string }>(
     `SELECT DISTINCT project_id FROM jobs WHERE cohort_id = $1 AND step_seq = $2 ORDER BY project_id`,

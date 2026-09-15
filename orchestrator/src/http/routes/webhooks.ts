@@ -16,10 +16,10 @@ import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import type { Config } from '../../config';
 import { log } from '../../telemetry/log';
-import { getJobByRunpodId, markTerminal } from '../../db/repo/jobs';
+import { getJobByRunpodId, markFailedOrRetry, markTerminal } from '../../db/repo/jobs';
 import { incrementStepCounters } from '../../db/repo/steps';
 import { recordJobCost } from '../../db/repo/costs';
-import { webhookToken } from '../../agents/generator';
+import { jobEndpointId, webhookToken } from '../../agents/generator';
 import { runpodOutUrl } from '../../runpod/output';
 import { isTerminal } from '../../runpod/types';
 import { catalogEntry } from '../../steps/catalog';
@@ -32,7 +32,7 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 export async function webhookRoutes(app: FastifyInstance, opts: { pool: Pool; cfg: Config }): Promise<void> {
-  app.post<{ Params: { jobToken: string }; Body: { id?: string; status?: string; output?: unknown; executionTime?: number; delayTime?: number } }>(
+  app.post<{ Params: { jobToken: string }; Body: { id?: string; status?: string; output?: unknown; error?: unknown; executionTime?: number; delayTime?: number } }>(
     '/v1/webhooks/runpod/:jobToken',
     async (req, reply) => {
       // Answer fast — see the module docstring.
@@ -79,19 +79,24 @@ export async function webhookRoutes(app: FastifyInstance, opts: { pool: Pool; cf
         }
 
         const client = await opts.pool.connect();
+        let retried = false;
         try {
           await client.query('BEGIN');
           if (body.status === 'COMPLETED') {
             await markTerminal(client, job.id, { status: 'complete', output: body.output });
             await recordJobCost(client, {
               jobId: job.id,
-              endpointId: catalogEntry(job.stepSeq)?.endpointId ?? 'unknown',
+              endpointId: (() => {
+                const entry = catalogEntry(job.stepSeq);
+                return entry ? jobEndpointId(entry, job.input) : 'unknown';
+              })(),
               executionMs: body.executionTime ?? null,
               delayMs: body.delayTime ?? null,
               workerRateUsdS: opts.cfg.workerRateUsdS,
             });
           } else if (body.status && isTerminal(body.status)) {
-            await markTerminal(client, job.id, { status: 'failed', error: { status: body.status } });
+            const error = { status: body.status, error: typeof body.error === 'string' ? body.error.slice(0, 500) : undefined };
+            retried = await markFailedOrRetry(client, job.id, error, opts.cfg.maxAttempts);
           } else {
             // IN_QUEUE / IN_PROGRESS deliveries shouldn't normally arrive on
             // this endpoint, but do nothing rather than mis-transition.
@@ -99,6 +104,10 @@ export async function webhookRoutes(app: FastifyInstance, opts: { pool: Pool; cf
             return;
           }
           await client.query('COMMIT');
+          if (retried) {
+            log().warn({ jobId: job.id, status: body.status, error: body.error }, 'webhook: RunPod job failed, requeued for another attempt');
+            return;
+          }
           await incrementStepCounters(
             opts.pool,
             job.cohortId,

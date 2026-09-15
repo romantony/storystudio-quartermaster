@@ -24,7 +24,9 @@
 import type { Pool, PoolClient } from 'pg';
 import type { Config } from '../config';
 import type { CatalogEntry } from '../steps/catalog';
-import type { FrameJobInput } from '../steps/builders/types';
+import type { FallbackRung, FrameJobInput } from '../steps/builders/types';
+import { rewritePrompt } from '../quality/rewrite';
+import { harnessGateOneJob } from '../harness/quality-bridge';
 import { log } from '../telemetry/log';
 import { updateStepStatus } from '../db/repo/steps';
 import {
@@ -37,6 +39,7 @@ import {
   applyExhausted,
   applySkipped,
   latestImageScoreForFrame,
+  sourceImageForFrame,
   type UngatedJob,
 } from '../db/repo/quality';
 import { runpodOutUrl } from '../runpod/output';
@@ -69,6 +72,9 @@ export interface QualityDeps {
     | 'qualityVideoGateThreshold'
     | 'qualityVideoPassThreshold'
     | 'qualityVideoReviewThreshold'
+    | 'qualityEvalMaxFailures'
+    | 'replicateRewriteModel'
+    | 'replicateRewriteReasoning'
   >;
 }
 
@@ -101,6 +107,14 @@ function truncate(text: string, max = 240): string {
  * ladder exists in this codebase yet; that's §16 q1's Wan 2.2 sweep, itself
  * gated on this gate existing first), so both reworks are same-endpoint
  * prompt corrections for M4. */
+/** Names the model the next attempt runs on, for the prompt rewriter. */
+export function targetModelLabel(gate: 'image' | 'motion', input: FrameJobInput, fallbackRung: FallbackRung | undefined): string {
+  if (fallbackRung === 'flux-4b') return 'FLUX.2 klein 4B (image-to-image with a character reference image)';
+  if (fallbackRung === 'replicate-wan22-fast') return 'Wan 2.2 image-to-video (non-distilled), 480p, ~5-7 s';
+  if (gate === 'motion') return 'Wan 2.2 image-to-video, 4-step Lightning distillation, 480p, ~5-7 s';
+  return input.referenceImageUrl ? 'Qwen-Image-Edit (edits a character reference image)' : 'Qwen-Image (text-to-image)';
+}
+
 function correctedPrompt(original: string, issueSummary: string): string {
   const note = truncate(issueSummary);
   return note ? `${original} (avoid: ${note})` : original;
@@ -154,7 +168,52 @@ duplicate/hallucinated bodies, not just the first frame.`;
   return scoreVideo(vlmResult as { scores?: Record<string, number>; motion_type_detected?: string; issues?: Issue[]; summary?: string }, thresholds);
 }
 
-async function gateOneJob(deps: QualityDeps, cohortId: string, gate: 'image' | 'motion', job: UngatedJob): Promise<void> {
+/** Evaluation-call failures (not verdicts) per job within one gateStep() run.
+ * Before 2026-09-15 an infra failure retried every tick forever — one clip
+ * Replicate's Gemini persistently can't process ("E006 Video processing
+ * failed", seen live on win_2026_09_15_06) would have hung the cohort. */
+async function recordEvalFailure(
+  deps: QualityDeps,
+  gate: 'image' | 'motion',
+  job: UngatedJob,
+  err: unknown,
+  failures: Map<number, number>,
+  assetUrl: string | null,
+): Promise<void> {
+  const n = (failures.get(job.id) ?? 0) + 1;
+  failures.set(job.id, n);
+  if (n < deps.cfg.qualityEvalMaxFailures) {
+    log().warn({ jobId: job.id, gate, err, failures: n }, 'quality: evaluation call failed, will retry next tick');
+    return;
+  }
+  // Give up on EVALUATING this asset, not on the asset: let it through
+  // unevaluated, with a verdict row saying so (buildResult() counts it as
+  // not gated), rather than blocking every other frame behind it.
+  const message = err instanceof Error ? err.message : String(err);
+  await withTransaction(deps.pool, async (client) => {
+    await applyPass(client, {
+      jobId: job.id,
+      gate,
+      attempt: job.qualityAttempts + 1,
+      verdict: 'EVAL_ERROR',
+      issues: [{ category: 'EVALUATION_UNAVAILABLE', description: message.slice(0, 500) }],
+      action: 'skipped_eval_error',
+      ruleCandidate: false,
+      costUsd: null,
+      assetUrl,
+      weightedScore: null,
+    });
+  });
+  log().error({ jobId: job.id, gate, failures: n, error: message }, 'quality: evaluation failed repeatedly, passing asset through unevaluated');
+}
+
+async function gateOneJob(
+  deps: QualityDeps,
+  cohortId: string,
+  gate: 'image' | 'motion',
+  job: UngatedJob,
+  evalFailures: Map<number, number>,
+): Promise<void> {
   const input = job.input as FrameJobInput;
   const assetUrl = runpodOutUrl(job.output) ?? null;
 
@@ -164,8 +223,8 @@ async function gateOneJob(deps: QualityDeps, cohortId: string, gate: 'image' | '
       result = await evaluateImage(deps, job);
     } catch (err) {
       // Infra failure (Replicate timeout, both models down) — NOT a content
-      // verdict. Must not consume a rework attempt; log and retry next tick.
-      log().warn({ jobId: job.id, gate, err }, 'quality: evaluation call failed, will retry next tick');
+      // verdict. Must not consume a rework attempt; retry next tick, capped.
+      await recordEvalFailure(deps, gate, job, err, evalFailures, assetUrl);
       return;
     }
   } else {
@@ -177,7 +236,7 @@ async function gateOneJob(deps: QualityDeps, cohortId: string, gate: 'image' | '
     try {
       result = await evaluateVideo(deps, job, imageScore);
     } catch (err) {
-      log().warn({ jobId: job.id, gate, err }, 'quality: evaluation call failed, will retry next tick');
+      await recordEvalFailure(deps, gate, job, err, evalFailures, assetUrl);
       return;
     }
   }
@@ -200,17 +259,80 @@ async function gateOneJob(deps: QualityDeps, cohortId: string, gate: 'image' | '
     weightedScore: result.weightedScore,
   };
 
+  // Rework ladder (2026-09-15), maxAttempts reworks before accepting:
+  //   every rework: an LLM rewrites the prompt from the QA issues;
+  //   the LAST rework also switches model (image -> Flux-4B,
+  //   motion -> Replicate Wan 2.2 i2v fast; steps/catalog.ts `fallbacks`).
+  // The rewrite is a network call, so it runs before the transaction.
+  const reworking = result.passStatus !== 'PASS' && result.passStatus !== 'GATED' && job.qualityAttempts < deps.cfg.maxAttempts;
+  let rework: Parameters<typeof applyRework>[2] | undefined;
+
+  // Prompt harness (docs/qm-orchestrator-prompt-harness-implementation-plan.md
+  // §7.6/§9.2): a job the harness prepared at plan time carries a
+  // ShotContract — its rework goes through the guardrail-driven corrective
+  // ladder instead of the plain LLM-defect-summary rewrite below. A job
+  // with no contract (harness off, or extraction failed for this frame)
+  // falls straight to the unchanged legacy path.
+  if (input.contract) {
+    const harnessOutcome = await harnessGateOneJob({
+      pool: deps.pool,
+      replicate: deps.replicate as ReplicateDeps,
+      regenerateCfg: { model: deps.cfg.replicateRewriteModel, reasoningEffort: deps.cfg.replicateRewriteReasoning },
+      cohortId,
+      gate,
+      jobId: job.id,
+      projectId: job.projectId,
+      frameId: job.frameId,
+      attempt,
+      triedRungs: job.triedRungs,
+      input,
+      result,
+      assetUrl,
+      canRework: reworking,
+      maxAttemptsReached: attempt >= deps.cfg.maxAttempts,
+      targetModelLabel: targetModelLabel(gate, input, input.fallbackRung),
+    });
+    rework = harnessOutcome.rework;
+  } else if (reworking) {
+    const switchModel = attempt >= deps.cfg.maxAttempts;
+    const fallbackRung: FallbackRung | undefined = switchModel ? (gate === 'image' ? 'flux-4b' : 'replicate-wan22-fast') : undefined;
+    const originalField = gate === 'image' ? 'originalImagePrompt' : 'originalMotionPrompt';
+    const firstPrompt = (input[originalField] as string | undefined) ?? originalPrompt;
+    const sourceImage =
+      gate === 'image' ? assetUrl : runpodOutUrl(await sourceImageForFrame(deps.pool, cohortId, job.projectId, job.frameId ?? ''));
+    const rewritten = await rewritePrompt(
+      deps.replicate as ReplicateDeps,
+      { model: deps.cfg.replicateRewriteModel, reasoningEffort: deps.cfg.replicateRewriteReasoning },
+      {
+        gate,
+        originalPrompt: firstPrompt,
+        currentPrompt: originalPrompt,
+        issues: result.issues,
+        summary: result.summary,
+        imageUrl: sourceImage ?? undefined,
+        narration: input.narration,
+        imagePrompt: gate === 'motion' ? input.imagePrompt : undefined,
+        targetModel: targetModelLabel(gate, input, fallbackRung),
+      },
+    );
+    rework = {
+      promptField,
+      correctedPrompt: rewritten ?? correctedPrompt(originalPrompt, issueSummary),
+      rungLabel: fallbackRung ? `${gate}:${fallbackRung}:${attempt}` : `${gate}:${rewritten ? 'prompt-rewrite' : 'prompt-correction'}:${attempt}`,
+      inputPatch: {
+        ...(input[originalField] ? {} : { [originalField]: originalPrompt }),
+        ...(fallbackRung ? { fallbackRung } : {}),
+      },
+    };
+  }
+
   await withTransaction(deps.pool, async (client) => {
     if (result.passStatus === 'PASS' || result.passStatus === 'GATED') {
       // GATED (motion gate skipped its VLM call) is a pass-through, not a
       // rejection — the image gate already caught what needed catching.
       await applyPass(client, write);
-    } else if (job.qualityAttempts < deps.cfg.maxAttempts) {
-      await applyRework(client, write, {
-        promptField,
-        correctedPrompt: correctedPrompt(originalPrompt, issueSummary),
-        rungLabel: `${gate}:prompt-correction:${attempt}`,
-      });
+    } else if (rework) {
+      await applyRework(client, write, rework);
     } else {
       await applyExhausted(client, write);
     }
@@ -240,6 +362,7 @@ export async function gateStep(deps: QualityDeps, cohortId: string, step: Catalo
   log().info({ stepSeq: step.seq, gate }, 'quality: gating step');
 
   let warnedSampled = false;
+  const evalFailures = new Map<number, number>();
 
   for (;;) {
     const ungated = await listUngated(deps.pool, cohortId, step.seq);
@@ -258,7 +381,7 @@ export async function gateStep(deps: QualityDeps, cohortId: string, step: Catalo
         );
       }
 
-      await gateOneJob(deps, cohortId, gate, job);
+      await gateOneJob(deps, cohortId, gate, job, evalFailures);
     }
 
     const [stillUngated, inFlight] = await Promise.all([

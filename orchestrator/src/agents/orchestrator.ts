@@ -23,11 +23,13 @@ import type { RunpodClient } from '../runpod/client';
 import { log } from '../telemetry/log';
 import { listSteps } from '../db/repo/steps';
 import { getCohort, setCurrentStep } from '../db/repo/cohorts';
-import { catalogEntry } from '../steps/catalog';
-import { allocate, release, emergencyDrain, type FleetDeps } from './fleet';
+import { auxiliaryEndpoints, catalogEntry } from '../steps/catalog';
+import { allocate, release, emergencyDrain, allocateAuxiliary, releaseAuxiliary, type FleetDeps } from './fleet';
 import { runStep, GeneratorStallError, type GeneratorDeps } from './generator';
 import { gateStep, type QualityDeps } from './quality';
 import { runAssembler, type AssemblerDeps } from './assembler';
+import { finalizeCohort, type DriverOutcome } from '../result/finalize';
+import { prepareCohort, type HarnessDeps } from '../harness';
 
 export interface DriverDeps {
   pool: Pool;
@@ -37,11 +39,28 @@ export interface DriverDeps {
 }
 
 /**
- * Runs a cohort's steps to completion. Called fire-and-forget from
- * POST /v1/requests (the ack returns immediately; this keeps going in the
- * background) — errors are logged, not thrown into the HTTP response.
+ * Runs a cohort's steps to completion, then always finalizes it
+ * (result/finalize.ts: §9.6 results, cohort row closed, callbacks) — on a
+ * stall too, so a caller learns its project failed instead of waiting
+ * forever. Called fire-and-forget from POST /v1/requests (the ack returns
+ * immediately; this keeps going in the background) — errors are logged, not
+ * thrown into the HTTP response.
  */
 export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<void> {
+  let outcome: DriverOutcome = 'stopped';
+  try {
+    outcome = (await runCohort(deps, cohortId)) ? 'completed' : 'stopped';
+  } finally {
+    try {
+      await finalizeCohort({ pool: deps.pool, cfg: deps.cfg }, cohortId, outcome);
+    } catch (err) {
+      log().error({ cohortId, outcome, err }, 'driver: finalize failed');
+    }
+  }
+}
+
+/** true = every catalogued step finished; false = the driver stopped early. */
+async function runCohort(deps: DriverDeps, cohortId: string): Promise<boolean> {
   const fleetDeps: FleetDeps = { pool: deps.pool, runpod: deps.runpod, cfg: deps.cfg };
   const generatorDeps: GeneratorDeps = {
     pool: deps.pool,
@@ -49,6 +68,11 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
     cfg: deps.cfg,
     publicBaseUrl: deps.publicBaseUrl,
     webhookSecret: deps.cfg.webhookSecret,
+    replicate: {
+      apiToken: deps.cfg.replicateApiToken,
+      apiBase: deps.cfg.replicateApiBase,
+      timeoutMs: deps.cfg.replicateTimeoutMs,
+    },
   };
   const qualityDeps: QualityDeps = {
     pool: deps.pool,
@@ -75,72 +99,109 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
   const runnable = catalogued.filter((x) => x.catalog.scope === 'bulk');
   const tailPlanned = catalogued.some((x) => x.catalog.scope === 'project');
 
+  // Prompt harness (docs/qm-orchestrator-prompt-harness-implementation-plan.md
+  // §6.1): turns each frame's request prompts into a guardrail-compiled
+  // pair before steps 0/1 (image) and 3 (motion) claim their jobs. Runs
+  // once per cohort, before the bulk loop below — every write it makes
+  // targets status='planned' rows, so it is a no-op on anything already
+  // generated (a resumed cohort re-drives this harmlessly). Best-effort by
+  // construction (prepareCohort() itself never throws past a per-project
+  // catch) — a harness failure must never stall a cohort the way an
+  // allocate()/runStep() failure does below.
+  const harnessDeps: HarnessDeps = { pool: deps.pool, cfg: deps.cfg };
+  try {
+    await prepareCohort(harnessDeps, cohortId);
+  } catch (err) {
+    log().error({ cohortId, err }, 'driver: prompt harness prepareCohort failed, cohort continues on original prompts');
+  }
+
   for (const { dbStep, catalog } of runnable) {
-    await setCurrentStep(deps.pool, cohortId, dbStep.seq);
-    log().info({ cohortId, seq: dbStep.seq, name: catalog.name }, 'driver: starting step');
-
-    try {
-      await allocate(fleetDeps, cohortId, { ...catalog, workers: dbStep.workersTarget });
-    } catch (err) {
-      log().error({ cohortId, seq: dbStep.seq, err }, 'driver: allocate failed, stopping cohort (stalled)');
-      // allocate() PATCHes workersMax up before its own failure modes
-      // (unreachable, cap_breach) can fire — those raised workers must not
-      // be left behind just because the step never got past allocation.
-      await emergencyDrain(fleetDeps, catalog.endpointId);
-      return;
+    // Resume (index.ts re-drives 'running' cohorts on boot): a step that
+    // already reached 'complete' was generated, gated and released — don't
+    // re-allocate and re-drain its endpoint for nothing.
+    if (dbStep.status === 'complete') {
+      log().info({ cohortId, seq: dbStep.seq }, 'driver: step already complete, skipping');
+      continue;
     }
-
-    const runStepPromise = runStep(generatorDeps, cohortId, catalog, dbStep.workersTarget);
-    const gateStepPromise = catalog.gate ? gateStep(qualityDeps, cohortId, catalog, dbStep.workersTarget) : undefined;
-    // A no-op catch on each promise individually, BEFORE the Promise.all
-    // below — otherwise the one that doesn't win the race below still has
-    // its rejection observed asynchronously later (by the try/catch), so
-    // this isn't strictly needed for the current single-await shape, but
-    // keeps the invariant explicit as this function's shape evolves.
-    runStepPromise.catch(() => undefined);
-    gateStepPromise?.catch(() => undefined);
-
-    try {
-      // Promise.all, NOT allSettled: rejects as soon as EITHER promise
-      // does, so a runStep() stall stops the cohort immediately rather
-      // than waiting for a possibly still-running gateStep() to also
-      // finish first (allSettled's actual behavior — verified by a real
-      // test that hung for gateStep() never resolving until this was
-      // fixed). Known, accepted limitation: the promise that didn't cause
-      // the rejection may still be running in the background after this
-      // function returns — gateStep()'s loop has no cancellation
-      // mechanism yet. Acceptable for now: the cohort is already being
-      // abandoned on error, and gateStep()'s own loop naturally winds down
-      // once its jobs_ungated query empties out.
-      await (gateStepPromise ? Promise.all([runStepPromise, gateStepPromise]) : runStepPromise);
-    } catch (err) {
-      const stalled = err instanceof GeneratorStallError;
-      log().error(
-        { cohortId, seq: dbStep.seq, err },
-        stalled ? 'driver: generator stalled, stopping cohort' : 'driver: step failed, stopping cohort',
-      );
-      // The real 2026-09-11 incident: this path used to just return, leaving
-      // the workers allocate() had already raised for this step orphaned —
-      // billing, unclaimed, for 2+ hours until a human noticed the
-      // watchdog's alert-only log lines and drained manually.
-      await emergencyDrain(fleetDeps, catalog.endpointId);
-      return;
-    }
-
-    if (dbStep.drainAfter) {
+    // Model-switch fallbacks (steps/catalog.ts) may submit to other endpoints
+    // during this step; raise their ceilings now and always drop them after.
+    const auxEndpoints = catalog.gate && deps.cfg.qualityGates !== 'off' ? auxiliaryEndpoints(catalog) : [];
+    for (const aux of auxEndpoints) {
       try {
-        await release(fleetDeps, cohortId, catalog);
+        await allocateAuxiliary(fleetDeps, cohortId, dbStep.seq, aux);
       } catch (err) {
-        log().error({ cohortId, seq: dbStep.seq, err }, 'driver: release failed, stopping cohort (stalled)');
-        // release()'s own drain PATCH may not have gone out at all (e.g. it
-        // threw before reaching the PATCH) or may have gone out but timed
-        // out waiting for confirmation — either way, resend it. Idempotent:
-        // harmless if release() already succeeded in PATCHing to 0.
-        await emergencyDrain(fleetDeps, catalog.endpointId);
-        return;
+        log().warn({ cohortId, seq: dbStep.seq, endpointId: aux.endpointId, err }, 'driver: auxiliary allocation failed, fallbacks on it will queue');
       }
-    } else {
-      log().info({ cohortId, seq: dbStep.seq }, 'driver: drainAfter=false, keeping endpoint warm for next step');
+    }
+    try {
+      await setCurrentStep(deps.pool, cohortId, dbStep.seq);
+      log().info({ cohortId, seq: dbStep.seq, name: catalog.name }, 'driver: starting step');
+
+      try {
+        await allocate(fleetDeps, cohortId, { ...catalog, workers: dbStep.workersTarget });
+      } catch (err) {
+        log().error({ cohortId, seq: dbStep.seq, err }, 'driver: allocate failed, stopping cohort (stalled)');
+        // allocate() PATCHes workersMax up before its own failure modes
+        // (unreachable, cap_breach) can fire — those raised workers must not
+        // be left behind just because the step never got past allocation.
+        await emergencyDrain(fleetDeps, catalog.endpointId);
+        return false;
+      }
+
+      const runStepPromise = runStep(generatorDeps, cohortId, catalog, dbStep.workersTarget);
+      const gateStepPromise = catalog.gate ? gateStep(qualityDeps, cohortId, catalog, dbStep.workersTarget) : undefined;
+      // A no-op catch on each promise individually, BEFORE the Promise.all
+      // below — otherwise the one that doesn't win the race below still has
+      // its rejection observed asynchronously later (by the try/catch), so
+      // this isn't strictly needed for the current single-await shape, but
+      // keeps the invariant explicit as this function's shape evolves.
+      runStepPromise.catch(() => undefined);
+      gateStepPromise?.catch(() => undefined);
+
+      try {
+        // Promise.all, NOT allSettled: rejects as soon as EITHER promise
+        // does, so a runStep() stall stops the cohort immediately rather
+        // than waiting for a possibly still-running gateStep() to also
+        // finish first (allSettled's actual behavior — verified by a real
+        // test that hung for gateStep() never resolving until this was
+        // fixed). Known, accepted limitation: the promise that didn't cause
+        // the rejection may still be running in the background after this
+        // function returns — gateStep()'s loop has no cancellation
+        // mechanism yet. Acceptable for now: the cohort is already being
+        // abandoned on error, and gateStep()'s own loop naturally winds down
+        // once its jobs_ungated query empties out.
+        await (gateStepPromise ? Promise.all([runStepPromise, gateStepPromise]) : runStepPromise);
+      } catch (err) {
+        const stalled = err instanceof GeneratorStallError;
+        log().error(
+          { cohortId, seq: dbStep.seq, err },
+          stalled ? 'driver: generator stalled, stopping cohort' : 'driver: step failed, stopping cohort',
+        );
+        // The real 2026-09-11 incident: this path used to just return, leaving
+        // the workers allocate() had already raised for this step orphaned —
+        // billing, unclaimed, for 2+ hours until a human noticed the
+        // watchdog's alert-only log lines and drained manually.
+        await emergencyDrain(fleetDeps, catalog.endpointId);
+        return false;
+      }
+
+      if (dbStep.drainAfter) {
+        try {
+          await release(fleetDeps, cohortId, catalog);
+        } catch (err) {
+          log().error({ cohortId, seq: dbStep.seq, err }, 'driver: release failed, stopping cohort (stalled)');
+          // release()'s own drain PATCH may not have gone out at all (e.g. it
+          // threw before reaching the PATCH) or may have gone out but timed
+          // out waiting for confirmation — either way, resend it. Idempotent:
+          // harmless if release() already succeeded in PATCHing to 0.
+          await emergencyDrain(fleetDeps, catalog.endpointId);
+          return false;
+        }
+      } else {
+        log().info({ cohortId, seq: dbStep.seq }, 'driver: drainAfter=false, keeping endpoint warm for next step');
+      }
+    } finally {
+      for (const aux of auxEndpoints) await releaseAuxiliary(fleetDeps, aux.endpointId);
     }
   }
 
@@ -161,12 +222,13 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
       // one it allocated (see assembler.ts's runAssembler()).
       const firstTailStep = catalogued.find((x) => x.catalog.scope === 'project')?.catalog;
       if (firstTailStep) await emergencyDrain(fleetDeps, firstTailStep.endpointId);
-      return;
+      return false;
     }
   }
 
   await setCurrentStep(deps.pool, cohortId, null);
   log().info({ cohortId }, 'driver: every catalogued step for this cohort is done');
+  return true;
 }
 
 /** Read-only convenience for the admin routes / tests. */

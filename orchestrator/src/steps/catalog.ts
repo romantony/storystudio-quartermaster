@@ -34,13 +34,25 @@ import { buildBgmOverlayInput } from './builders/bgm-overlay';
 import { buildRemoveSilenceInput } from './builders/remove-silence';
 import { buildUpscaleFrameInput } from './builders/upscale-frame';
 import { buildSfxInput } from './builders/sfx';
-import type { PayloadBuilder } from './builders/types';
+import { buildFluxImageInput, buildReplicateWanInput, buildNormalizeInput } from './builders/fallbacks';
+import type { BuildContext, FallbackRung, FrameJobInput, PayloadBuilder } from './builders/types';
 
 function endpointFor(counterKey: string): string {
   const entry = FLEET.find((e) => e.counterKey === counterKey);
   if (!entry) throw new Error(`fleet-registry.ts has no entry for ${counterKey}`);
   return entry.endpointId;
 }
+
+/** Image model switch: FLUX.2 klein 4B on qwen-image-gen (steps 0 and 1). */
+const FLUX_IMAGE_FALLBACK = (): FallbackRoute => ({
+  provider: 'runpod',
+  endpointId: endpointFor('runpod:qwen-image-gen'),
+  builder: buildFluxImageInput,
+  auxWorkers: 2,
+});
+
+/** Motion model switch: Replicate Wan 2.2 i2v fast, normalized on postprod-lite (step 3). */
+export const REPLICATE_WAN_FALLBACK_MODEL = 'wan-video/wan-2.2-i2v-fast';
 
 /** 'bulk' = agents/generator.ts drives it across the whole cohort at once.
  * 'project' = agents/assembler.ts drives it one project's tail at a time.
@@ -68,6 +80,44 @@ export interface CatalogEntry {
    * PATCH workersMax to 25 and eat most of the 40-worker account cap. */
   maxWorkers?: number;
   builder: PayloadBuilder;
+  /** Model-switch routes the quality gate can send a frame to on its last
+   * rework (FrameJobInput.fallbackRung). See steps/builders/fallbacks.ts. */
+  fallbacks?: Partial<Record<FallbackRung, FallbackRoute>>;
+}
+
+export type FallbackRoute =
+  | {
+      provider: 'runpod';
+      endpointId: string;
+      builder: PayloadBuilder;
+      /** workersMax the driver raises on this endpoint for the step when it
+       * isn't the step's own endpoint (agents/fleet.ts allocateAuxiliary). */
+      auxWorkers: number;
+    }
+  | {
+      provider: 'replicate';
+      model: string;
+      builder: PayloadBuilder;
+      /** Second hop on RunPod once the prediction succeeds. */
+      normalize: { endpointId: string; builder: (videoUrl: string, ctx: Pick<BuildContext, 'projectId' | 'frameId'>) => Record<string, unknown> };
+      auxWorkers: number;
+    };
+
+/** The route a job's next attempt uses, if the gate switched its model. */
+export function fallbackRouteFor(step: Pick<CatalogEntry, 'fallbacks'>, input: unknown): FallbackRoute | undefined {
+  const rung = (input as FrameJobInput | null)?.fallbackRung;
+  return rung ? step.fallbacks?.[rung] : undefined;
+}
+
+/** RunPod endpoints a step's fallbacks may submit to, other than its own. */
+export function auxiliaryEndpoints(step: Pick<CatalogEntry, 'endpointId' | 'fallbacks'>): Array<{ endpointId: string; workers: number }> {
+  const out = new Map<string, number>();
+  for (const route of Object.values(step.fallbacks ?? {})) {
+    if (!route) continue;
+    const endpointId = route.provider === 'runpod' ? route.endpointId : route.normalize.endpointId;
+    if (endpointId !== step.endpointId) out.set(endpointId, Math.max(out.get(endpointId) ?? 0, route.auxWorkers));
+  }
+  return [...out].map(([endpointId, workers]) => ({ endpointId, workers }));
 }
 
 // Deliberately no `workers` field here — worker count is a plan-time,
@@ -95,6 +145,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     dependsOn: [],
     scope: 'bulk',
     builder: buildImageEditInput,
+    fallbacks: { 'flux-4b': FLUX_IMAGE_FALLBACK() },
   },
   {
     seq: 1,
@@ -104,6 +155,11 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     dependsOn: [],
     scope: 'bulk',
     builder: buildImageInput,
+    // Same endpoint as the step itself, so no auxiliary allocation — but a
+    // worker that already loaded Qwen may OOM loading Flux too
+    // (~/Qwen-Edit/docs/quartermaster-endpoint-integration.md); a failed
+    // fallback retries via markFailedOrRetry and lands on another worker.
+    fallbacks: { 'flux-4b': FLUX_IMAGE_FALLBACK() },
   },
   {
     seq: 2,
@@ -129,6 +185,15 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     dependsOn: [0, 1, 2],
     scope: 'bulk',
     builder: buildI2vInput,
+    fallbacks: {
+      'replicate-wan22-fast': {
+        provider: 'replicate',
+        model: REPLICATE_WAN_FALLBACK_MODEL,
+        builder: buildReplicateWanInput,
+        normalize: { endpointId: POSTPROD_LITE_ENDPOINT_ID, builder: buildNormalizeInput },
+        auxWorkers: 1,
+      },
+    },
   },
   {
     // singleJobPerProject but scope:'bulk' — it has dependsOn:[] (nothing to
@@ -224,7 +289,10 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     name: 'burn-captions',
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
     gate: null,
-    dependsOn: [10, 8],
+    // 7/6 are listed only so the generator resolves each frame's trimmed
+    // (or merged) clip duration for the script-timed captions — the planner
+    // collapses them away (both are 8's own deps), so the fan-in stays [10|8].
+    dependsOn: [10, 8, 7, 6],
     scope: 'project',
     singleJobPerProject: true,
     builder: buildCaptionInput,

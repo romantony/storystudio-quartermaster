@@ -17,15 +17,56 @@
  * explicit here rather than relying on defaults, same lesson as the step 6
  * merge `mode` bug: never assume an endpoint's default matches intent).
  *
- * Re-runs its own baked-in Whisper pass on the concatenated audio rather
- * than consuming step 9's transcript (documented, accepted limitation —
- * containers/media.md's "Behaviour the orchestrator must account for") —
- * step 9 is not a dependency here for that reason.
+ * Captions come from the script, not ASR, whenever possible (2026-09-15):
+ * postprod-lite's blind Whisper pass drops the last seconds of long videos
+ * (chunked long-form pipeline, 2026-09-10) and misspells names. Each
+ * concatenated frame's narration is spread across that frame's clip
+ * duration (step 7's trimmed clip, else step 6's merge), words weighted by
+ * character count, and passed as `chunks` — the same method verified live on
+ * 2026-09-10. Falls back to Whisper (no `chunks`) if any included frame lacks
+ * a duration or narration, rather than guessing.
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
 const UPSCALE_STEP_SEQ = 10;
 const CONCAT_STEP_SEQ = 8;
+const REMOVE_SILENCE_STEP_SEQ = 7;
+const MERGE_STEP_SEQ = 6;
+
+export interface WordChunk {
+  text: string;
+  timestamp: [number, number];
+}
+
+/** Word-level chunks from the narration script, timed against the clips that
+ * concat actually joined (same source-step choice as builders/concat.ts:
+ * trimmed clips if step 7 produced any, else merged clips; failed frames are
+ * skipped exactly as concat skips them). Undefined when it can't be exact. */
+export function scriptChunks(ctx: BuildContext): WordChunk[] | undefined {
+  const trimmed = ctx.perFrameDetails?.[REMOVE_SILENCE_STEP_SEQ] ?? [];
+  const source = trimmed.some((d) => d.url) ? trimmed : (ctx.perFrameDetails?.[MERGE_STEP_SEQ] ?? []);
+  const included = source.filter((d) => d.url);
+  const narrations = new Map((ctx.job.narrations ?? []).map((n) => [n.frameId, n.narration] as const));
+  if (included.length === 0) return undefined;
+
+  const chunks: WordChunk[] = [];
+  let offset = 0;
+  for (const clip of included) {
+    const narration = clip.frameId ? narrations.get(clip.frameId) : undefined;
+    if (clip.durationS === undefined || clip.durationS <= 0 || !narration?.trim()) return undefined;
+    const words = narration.trim().split(/\s+/);
+    const weights = words.map((w) => w.length + 1);
+    const total = weights.reduce((a, b) => a + b, 0);
+    let t = offset;
+    words.forEach((word, i) => {
+      const end = t + (clip.durationS! * weights[i]) / total;
+      chunks.push({ text: word, timestamp: [Math.round(t * 100) / 100, Math.round(end * 100) / 100] });
+      t = end;
+    });
+    offset += clip.durationS;
+  }
+  return chunks;
+}
 
 const WORDS_PER_GROUP = 3;
 const FONT_SIZE = 64;
@@ -37,6 +78,7 @@ export const buildCaptionInput: PayloadBuilder = (ctx: BuildContext): Record<str
   if (!videoUrl) {
     throw new Error(`caption builder: no resolved video URL (checked upscale then concat) for project ${ctx.projectId}`);
   }
+  const chunks = scriptChunks(ctx);
   return {
     mode: 'caption',
     video_url: videoUrl,
@@ -44,6 +86,7 @@ export const buildCaptionInput: PayloadBuilder = (ctx: BuildContext): Record<str
     font_size: FONT_SIZE,
     highlight_color: HIGHLIGHT_COLOR,
     position: POSITION,
+    ...(chunks ? { chunks } : {}),
     project_id: ctx.projectId,
   };
 };

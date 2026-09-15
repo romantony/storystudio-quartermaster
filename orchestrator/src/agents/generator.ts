@@ -17,14 +17,16 @@ import type { Pool, PoolClient } from 'pg';
 import type { Config } from '../config';
 import { backoffMs, type RunpodClient } from '../runpod/client';
 import { isTerminal, RunpodError, type RunResponse } from '../runpod/types';
-import type { CatalogEntry } from '../steps/catalog';
-import type { FrameJobInput, ResolvedDeps } from '../steps/builders/types';
+import { auxiliaryEndpoints, fallbackRouteFor, type CatalogEntry, type FallbackRoute } from '../steps/catalog';
+import type { BuildContext, FrameJobInput, ResolvedDeps } from '../steps/builders/types';
 import { log } from '../telemetry/log';
-import { claimNextBatch, markSubmitted, markTerminal, listInFlight, stepJobCounts, listStale, type JobRow } from '../db/repo/jobs';
+import { claimNextBatch, markSubmitted, markTerminal, markFailedOrRetry, listInFlight, stepJobCounts, listStale, type JobRow } from '../db/repo/jobs';
 import { updateStepStatus, incrementStepCounters } from '../db/repo/steps';
 import { recordJobCost } from '../db/repo/costs';
 import { touchObserved } from '../db/repo/endpoint-state';
 import { runpodOutUrl } from '../runpod/output';
+import { countUngated } from '../db/repo/quality';
+import { createPrediction, getPrediction, type ReplicateTransport } from '../quality/replicate';
 
 export interface GeneratorDeps {
   pool: Pool;
@@ -32,7 +34,7 @@ export interface GeneratorDeps {
   // warmTimeoutMs: fleet.ts's allocate() no longer polls for readiness (M3
   // fix, 2026-09-10) — runStep()'s own non-blocking cold-start check owns
   // that timeout now, reusing the same config value.
-  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs'>;
+  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs' | 'maxAttempts'>;
   /** Base URL this process is reachable at (e.g. https://orchestrator.ai-storystudio.com),
    * used to build each job's per-job webhook callback URL. */
   publicBaseUrl: string;
@@ -40,6 +42,21 @@ export interface GeneratorDeps {
   /** Injectable for tests so the ENDPOINT_PAUSED retry backoff does not
    * actually wait. Defaults to a real setTimeout-based sleep. */
   sleepImpl?: (ms: number) => Promise<void>;
+  /** Replicate transport for 'replicate' fallback routes (steps/catalog.ts).
+   * Optional: without it such a job fails at submission like any build error. */
+  replicate?: ReplicateTransport;
+}
+
+/** Prefix on jobs.runpod_job_id while a job is a Replicate prediction (the
+ * first hop of a 'replicate' fallback route). Webhooks never match it. */
+export const REPLICATE_HANDLE_PREFIX = 'replicate:';
+
+/** The RunPod endpoint a job is (or will be) running on. */
+export function jobEndpointId(step: CatalogEntry, input: unknown): string {
+  const route = fallbackRouteFor(step, input);
+  if (route?.provider === 'runpod') return route.endpointId;
+  if (route?.provider === 'replicate') return route.normalize.endpointId;
+  return step.endpointId;
 }
 
 /**
@@ -158,16 +175,26 @@ async function resolveDeps(client: PoolClient, cohortId: string, projectId: stri
  * hard-failed frame still counts toward this job becoming claimable, but its
  * output naturally has no resolvable URL and is filtered out below rather
  * than blocking the whole project's concat on one bad frame. */
-async function resolveProjectDeps(client: PoolClient, cohortId: string, projectId: string, dependsOn: number[]): Promise<Record<number, string[]>> {
-  const resolved: Record<number, string[]> = {};
+async function resolveProjectDeps(
+  client: PoolClient,
+  cohortId: string,
+  projectId: string,
+  dependsOn: number[],
+): Promise<{ urls: Record<number, string[]>; details: NonNullable<BuildContext['perFrameDetails']> }> {
+  const urls: Record<number, string[]> = {};
+  const details: NonNullable<BuildContext['perFrameDetails']> = {};
   for (const seq of dependsOn) {
-    const { rows } = await client.query<{ output: unknown }>(
-      `SELECT output FROM jobs WHERE cohort_id = $1 AND project_id = $2 AND step_seq = $3 AND status IN ('complete', 'failed') ORDER BY seq ASC`,
+    const { rows } = await client.query<{ output: unknown; frame_id: string | null }>(
+      `SELECT output, frame_id FROM jobs WHERE cohort_id = $1 AND project_id = $2 AND step_seq = $3 AND status IN ('complete', 'failed') ORDER BY seq ASC`,
       [cohortId, projectId, seq],
     );
-    resolved[seq] = rows.map((r) => runpodOutUrl(r.output)).filter((url): url is string => !!url);
+    details[seq] = rows.map((r) => {
+      const d = (r.output as { duration_s?: unknown } | null)?.duration_s;
+      return { frameId: r.frame_id, url: runpodOutUrl(r.output), durationS: typeof d === 'number' ? d : undefined };
+    });
+    urls[seq] = details[seq].map((x) => x.url).filter((url): url is string => !!url);
   }
-  return resolved;
+  return { urls, details };
 }
 
 async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, job: JobRow): Promise<void> {
@@ -187,20 +214,52 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
 
     const frameInput = job.input as FrameJobInput;
     const resolvedDeps = job.frameId ? await resolveDeps(client, cohortId, job.projectId, job.frameId, step.dependsOn) : {};
-    const perFrameOutputs = job.frameId ? undefined : await resolveProjectDeps(client, cohortId, job.projectId, step.dependsOn);
-    const payload = step.builder({
-      job: frameInput,
-      resolvedDeps,
-      perFrameOutputs,
-      projectId: job.projectId,
-      frameId: job.frameId,
-    });
+    const projectDeps = job.frameId ? undefined : await resolveProjectDeps(client, cohortId, job.projectId, step.dependsOn);
+    const route: FallbackRoute | undefined = fallbackRouteFor(step, frameInput);
+    let payload: Record<string, unknown>;
+    try {
+      if (route?.provider === 'replicate' && !deps.replicate?.apiToken) {
+        throw new Error(`fallback ${frameInput.fallbackRung}: no Replicate API token configured`);
+      }
+      payload = (route?.builder ?? step.builder)({
+        job: frameInput,
+        resolvedDeps,
+        perFrameOutputs: projectDeps?.urls,
+        perFrameDetails: projectDeps?.details,
+        projectId: job.projectId,
+        frameId: job.frameId,
+      });
+    } catch (err) {
+      // A builder refusing THIS job (e.g. its upstream frame failed, so there
+      // is no image to animate) fails this job only — never the whole step.
+      // Real incident 2026-09-15 (win_2026_09_15_06): f12's image failed on
+      // RunPod, its i2v builder threw, and the throw aborted all 36 frames'
+      // animation and the cohort. markTerminal() still decrements dependents,
+      // so the frame drops out downstream exactly like a RunPod failure.
+      const message = err instanceof Error ? err.message : String(err);
+      await markTerminal(client, job.id, { status: 'failed', error: { stage: 'build', error: message } });
+      await client.query('COMMIT');
+      await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
+      log().warn({ jobId: job.id, stepSeq: step.seq, frameId: job.frameId, error: message }, 'generator: payload build failed, job marked failed');
+      return;
+    }
 
+    if (route?.provider === 'replicate') {
+      // Hop 1 of the model-switch video fallback: a Replicate prediction,
+      // polled by reconcileTick(), which then submits hop 2 (normalize).
+      const prediction = await createPrediction(deps.replicate!, route.model, payload);
+      await markSubmitted(client, job.id, `${REPLICATE_HANDLE_PREFIX}${prediction.id}`);
+      await client.query('COMMIT');
+      log().info({ jobId: job.id, stepSeq: step.seq, model: route.model, predictionId: prediction.id }, 'generator: fallback submitted to Replicate');
+      return;
+    }
+
+    const endpointId = route?.provider === 'runpod' ? route.endpointId : step.endpointId;
     const jobToken = webhookToken(deps.webhookSecret, job.id);
     const webhookUrl = `${deps.publicBaseUrl}/v1/webhooks/runpod/${jobToken}`;
 
-    const res = await runWithPausedRetry(deps, job.id, step.endpointId, () =>
-      deps.runpod.run(step.endpointId, payload, webhookUrl),
+    const res = await runWithPausedRetry(deps, job.id, endpointId, () =>
+      deps.runpod.run(endpointId, payload, webhookUrl),
     );
 
     if (res.status === 'COMPLETED') {
@@ -210,7 +269,7 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
       await markTerminal(client, job.id, { status: 'complete', output: res.output });
       await recordJobCost(client, {
         jobId: job.id,
-        endpointId: step.endpointId,
+        endpointId,
         executionMs: res.executionTime ?? null,
         delayMs: res.delayTime ?? null,
         workerRateUsdS: deps.cfg.workerRateUsdS,
@@ -220,10 +279,10 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
       log().info({ jobId: job.id, stepSeq: step.seq }, 'generator: synchronous completion');
     } else if (isTerminal(res.status)) {
       await markSubmitted(client, job.id, res.id);
-      await markTerminal(client, job.id, { status: 'failed', error: { status: res.status } });
+      const retried = await markFailedOrRetry(client, job.id, { status: res.status }, deps.cfg.maxAttempts);
       await client.query('COMMIT');
-      await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
-      log().warn({ jobId: job.id, stepSeq: step.seq, status: res.status }, 'generator: submission returned terminal failure');
+      if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
+      log().warn({ jobId: job.id, stepSeq: step.seq, status: res.status, retried }, 'generator: submission returned terminal failure');
     } else {
       await markSubmitted(client, job.id, res.id);
       await client.query('COMMIT');
@@ -257,26 +316,38 @@ export async function reconcileTick(
   const stale = await listStale(deps.pool, cohortId, step.seq, new Date(Date.now() - baselineSec * 1000), projectId);
   for (const job of stale) {
     if (!job.runpodJobId) continue;
+    if (job.runpodJobId.startsWith(REPLICATE_HANDLE_PREFIX)) {
+      try {
+        await advanceReplicateJob(deps, cohortId, step, job);
+      } catch (err) {
+        log().warn({ jobId: job.id, err }, 'generator: replicate fallback check failed, will retry next tick');
+      }
+      continue;
+    }
+    const endpointId = jobEndpointId(step, job.input);
     try {
-      const res = await deps.runpod.status(step.endpointId, job.runpodJobId);
+      const res = await deps.runpod.status(endpointId, job.runpodJobId);
       if (res.status === 'COMPLETED' || isTerminal(res.status)) {
         const client = await deps.pool.connect();
+        let retried = false;
         try {
           await client.query('BEGIN');
           if (res.status === 'COMPLETED') {
             await markTerminal(client, job.id, { status: 'complete', output: res.output });
             await recordJobCost(client, {
               jobId: job.id,
-              endpointId: step.endpointId,
+              endpointId,
               executionMs: res.executionTime ?? null,
               delayMs: res.delayTime ?? null,
               workerRateUsdS: deps.cfg.workerRateUsdS,
             });
           } else {
-            await markTerminal(client, job.id, { status: 'failed', error: { status: res.status } });
+            retried = await markFailedOrRetry(client, job.id, { status: res.status }, deps.cfg.maxAttempts);
           }
           await client.query('COMMIT');
-          await incrementStepCounters(deps.pool, cohortId, step.seq, res.status === 'COMPLETED' ? 'job_completed' : 'job_failed');
+          if (!retried) {
+            await incrementStepCounters(deps.pool, cohortId, step.seq, res.status === 'COMPLETED' ? 'job_completed' : 'job_failed');
+          }
         } catch (err) {
           await client.query('ROLLBACK').catch(() => undefined);
           throw err;
@@ -323,7 +394,14 @@ export async function runStep(
 
   for (;;) {
     const { total, terminal } = await stepJobCounts(deps.pool, cohortId, step.seq, projectId);
-    if (terminal >= total) break;
+    // A gated step isn't done when every job is terminal — the quality gate
+    // may still send one back to 'planned' (rework), and nothing else ever
+    // resubmits it once this loop has returned. Real deadlock, 2026-09-15
+    // (cohort win_2026_09_15_06): step 0 exited, then f12/f13's second image
+    // rework landed 30 s later and gateStep() waited forever on 2 planned
+    // jobs. Race-free: a verdict atomically either marks a job gated or
+    // un-terminals it, so this check always sees one or the other.
+    if (terminal >= total && (!step.gate || (await countUngated(deps.pool, cohortId, step.seq)) === 0)) break;
 
     const inFlight = (await listInFlight(deps.pool, cohortId, step.seq, projectId)).length;
     const room = Math.max(0, targetWorkers - inFlight);
@@ -339,6 +417,7 @@ export async function runStep(
     // actively generating, not just at allocation — watchdog.ts's orphan
     // grace window is measured from this timestamp.
     await touchObserved(deps.pool, step.endpointId);
+    for (const aux of auxiliaryEndpoints(step)) await touchObserved(deps.pool, aux.endpointId);
 
     // Non-blocking cold-start check — only probes until this step has
     // observed a real ready worker; a no-op for the rest of the step once
@@ -402,4 +481,84 @@ async function claimBatchReadOnly(pool: Pool, cohortId: string, stepSeq: number,
   } finally {
     client.release();
   }
+}
+
+/**
+ * Hop 1 -> hop 2 of a 'replicate' fallback (steps/catalog.ts): once the
+ * Replicate prediction succeeds, send its (expiring, 832x480) clip to the
+ * route's normalize step on RunPod with the job's normal webhook, and re-point
+ * the job at that RunPod id — the webhook/reconcile path then completes the
+ * row exactly like any other RunPod job. A failed prediction goes through
+ * markFailedOrRetry(), so it gets the same retry budget as a RunPod failure.
+ */
+async function advanceReplicateJob(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, job: JobRow): Promise<void> {
+  const route = fallbackRouteFor(step, job.input);
+  if (route?.provider !== 'replicate' || !deps.replicate) return;
+  const predictionId = job.runpodJobId!.slice(REPLICATE_HANDLE_PREFIX.length);
+  const prediction = await getPrediction(deps.replicate, predictionId);
+
+  if (prediction.status === 'succeeded') {
+    const out = prediction.output;
+    const videoUrl = typeof out === 'string' ? out : Array.isArray(out) ? String(out[0] ?? '') : runpodOutUrl(out);
+    if (!videoUrl || !videoUrl.startsWith('http')) {
+      await failOrRetry(deps, cohortId, step, job, { provider: 'replicate', predictionId, error: 'prediction succeeded without a video URL' });
+      return;
+    }
+    const payload = route.normalize.builder(videoUrl, { projectId: job.projectId, frameId: job.frameId });
+    const webhookUrl = `${deps.publicBaseUrl}/v1/webhooks/runpod/${webhookToken(deps.webhookSecret, job.id)}`;
+    const res = await runWithPausedRetry(deps, job.id, route.normalize.endpointId, () =>
+      deps.runpod.run(route.normalize.endpointId, payload, webhookUrl),
+    );
+    const client = await deps.pool.connect();
+    let outcome: 'submitted' | 'complete' | 'failed' | 'retried' = 'submitted';
+    try {
+      await client.query('BEGIN');
+      await markSubmitted(client, job.id, res.id);
+      if (res.status === 'COMPLETED') {
+        await markTerminal(client, job.id, { status: 'complete', output: res.output });
+        await recordJobCost(client, {
+          jobId: job.id,
+          endpointId: route.normalize.endpointId,
+          executionMs: res.executionTime ?? null,
+          delayMs: res.delayTime ?? null,
+          workerRateUsdS: deps.cfg.workerRateUsdS,
+        });
+        outcome = 'complete';
+      } else if (isTerminal(res.status)) {
+        outcome = (await markFailedOrRetry(client, job.id, { status: res.status, stage: 'normalize' }, deps.cfg.maxAttempts)) ? 'retried' : 'failed';
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+    if (outcome === 'complete') await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_completed');
+    if (outcome === 'failed') await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
+    log().info({ jobId: job.id, predictionId, runpodJobId: res.id, outcome }, 'generator: replicate fallback output sent to normalize');
+    return;
+  }
+
+  if (prediction.status === 'failed' || prediction.status === 'canceled') {
+    const error = typeof prediction.error === 'string' ? prediction.error.slice(0, 500) : JSON.stringify(prediction.error ?? null).slice(0, 500);
+    await failOrRetry(deps, cohortId, step, job, { provider: 'replicate', predictionId, status: prediction.status, error });
+  }
+}
+
+async function failOrRetry(deps: GeneratorDeps, cohortId: string, step: CatalogEntry, job: JobRow, error: Record<string, unknown>): Promise<void> {
+  const client = await deps.pool.connect();
+  let retried = false;
+  try {
+    await client.query('BEGIN');
+    retried = await markFailedOrRetry(client, job.id, error, deps.cfg.maxAttempts);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+  if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
+  log().warn({ jobId: job.id, error, retried }, 'generator: fallback job failed');
 }

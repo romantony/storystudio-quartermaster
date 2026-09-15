@@ -110,6 +110,33 @@ const ConfigSchema = z.object({
   // would never fire; this collapses the REWORK tier deliberately rather
   // than leaving it dead code above an unreachable band.
   qualityVideoReviewThreshold: numeric(5.0).pipe(z.number()),
+  // Consecutive evaluation-call failures (Replicate errors, not verdicts)
+  // before an asset is passed through unevaluated (verdict EVAL_ERROR).
+  qualityEvalMaxFailures: numeric(3).pipe(z.number().int().positive()),
+  // QA rework prompt rewriter (2026-09-15): Replicate-hosted LLM that
+  // rewrites a rejected image/motion prompt from the evaluator's issues.
+  replicateRewriteModel: z.string().default('openai/gpt-5-mini'),
+  replicateRewriteReasoning: z.enum(['minimal', 'low', 'medium', 'high']).default('low'),
+
+  // ── prompt harness (docs/qm-orchestrator-prompt-harness-implementation-plan.md) ──
+  // Bounded concurrency for harness/index.ts's prepareCohort() — how many
+  // projects' GPT-5 mini extract/regenerate calls run at once. Per-request
+  // rollout is options.promptHarness (planner.ts); this has no off switch
+  // of its own — 'off' is set per-request, not per-account, since a single
+  // account-wide kill switch would fight the milestone-by-milestone rollout
+  // the implementation plan describes (§0, §12).
+  harnessToolConcurrency: numeric(8).pipe(z.number().int().positive()),
+
+  // ── result callback (impl plan §6.7 / M5) ─────────────────────────────
+  // Optional HMAC key for X-QM-Signature on the §9.6 result POST. Its own
+  // secret, not ORCH_WEBHOOK_SECRET: the receiver (Convex) must be able to
+  // verify callbacks without also being able to mint RunPod webhook tokens.
+  // Unset = unsigned.
+  callbackSecret: z.string().min(1).optional(),
+  callbackMaxAttempts: numeric(8).pipe(z.number().int().positive()),
+  callbackBaseDelayMs: numeric(1_000).pipe(z.number().int().positive()),
+  callbackMaxDelayMs: numeric(300_000).pipe(z.number().int().positive()),
+  callbackTimeoutMs: numeric(15_000).pipe(z.number().int().positive()),
 });
 
 export type Config = Readonly<z.infer<typeof ConfigSchema>>;
@@ -158,6 +185,15 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   qualityVideoGateThreshold: 'QA_VIDEO_GATE_THRESHOLD',
   qualityVideoPassThreshold: 'QA_VIDEO_PASS_THRESHOLD',
   qualityVideoReviewThreshold: 'QA_VIDEO_REVIEW_THRESHOLD',
+  qualityEvalMaxFailures: 'QA_EVAL_MAX_FAILURES',
+  replicateRewriteModel: 'REPLICATE_REWRITE_MODEL',
+  replicateRewriteReasoning: 'REPLICATE_REWRITE_REASONING',
+  harnessToolConcurrency: 'ORCH_HARNESS_TOOL_CONCURRENCY',
+  callbackSecret: 'ORCH_CALLBACK_SECRET',
+  callbackMaxAttempts: 'ORCH_CALLBACK_MAX_ATTEMPTS',
+  callbackBaseDelayMs: 'ORCH_CALLBACK_BASE_DELAY_MS',
+  callbackMaxDelayMs: 'ORCH_CALLBACK_MAX_DELAY_MS',
+  callbackTimeoutMs: 'ORCH_CALLBACK_TIMEOUT_MS',
 };
 
 /**

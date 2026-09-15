@@ -84,10 +84,23 @@ export class CohortBusyError extends Error {
  * 'running' immediately (M6's queue-behind-if-already-running rule is not
  * implemented yet — every M2 cohort assumes it may run right away, and
  * throws CohortBusyError in the one case that assumption doesn't hold).
+ *
+ * A window whose cohort already FINISHED (completed/failed) gets a fresh
+ * cohort, `<windowId>_r2`, `_r3`, ... (2026-09-15): reusing the finished row
+ * made the planner collide with that cohort's existing `steps` rows
+ * (steps_pkey), so any second request in the same 6 h window failed — found
+ * submitting a test right after the Maya production cohort closed.
  */
 export async function ensureCohort(db: Queryable, at: Date = new Date()): Promise<Cohort> {
-  const id = windowId(at);
+  const base = windowId(at);
   const { opensAt, closesAt } = windowBounds(at);
+  const { rows: existing } = await db.query<{ id: string; status: string }>(
+    `SELECT id, status FROM cohorts WHERE id = $1 OR id LIKE $2`,
+    [base, `${base}\\_r%`],
+  );
+  const finished = new Set(existing.filter((r) => r.status === 'completed' || r.status === 'failed').map((r) => r.id));
+  let id = base;
+  for (let n = 2; finished.has(id); n++) id = `${base}_r${n}`;
   try {
     const { rows } = await db.query(
       `INSERT INTO cohorts (id, opens_at, closes_at, status, started_at)

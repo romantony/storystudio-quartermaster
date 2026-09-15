@@ -14,10 +14,12 @@ import type { CatalogEntry } from '../src/steps/catalog';
 import * as jobsRepo from '../src/db/repo/jobs';
 import * as stepsRepo from '../src/db/repo/steps';
 import * as endpointStateRepo from '../src/db/repo/endpoint-state';
+import * as qualityRepo from '../src/db/repo/quality';
 
 jest.mock('../src/db/repo/jobs');
 jest.mock('../src/db/repo/steps');
 jest.mock('../src/db/repo/endpoint-state');
+jest.mock('../src/db/repo/quality');
 
 const CFG = {
   runpodApiBase: 'https://api.runpod.ai/v2',
@@ -63,7 +65,7 @@ const STEP: CatalogEntry = {
 
 // Fast, real-timer-friendly: tiny warmTimeoutMs and reconcileIntervalMs so a
 // stall test completes in well under a second of real wall-clock time.
-const FAST_CFG = { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60 };
+const FAST_CFG = { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60, maxAttempts: 2 };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -241,5 +243,72 @@ describe('agents/generator.ts runStep() — optional projectId scoping (M5 phase
     await runStep(deps, 'win_test', STEP, 5);
 
     expect(jobsRepo.stepJobCounts).toHaveBeenCalledWith(expect.anything(), 'win_test', STEP.seq, undefined);
+  });
+});
+
+describe('agents/generator.ts runStep() — gated steps wait for the gate (deadlock fix, 2026-09-15)', () => {
+  const GATED: CatalogEntry = { ...STEP, gate: 'image' };
+  const deps = (): GeneratorDeps => ({
+    pool: fakePool(),
+    runpod: new RunpodClient(CFG, { fetchImpl: jest.fn(async () => fakeRes(200, { workers: { ready: 1, running: 0 } })), sleepImpl: jest.fn(async () => {}) }),
+    cfg: FAST_CFG,
+    publicBaseUrl: 'https://vps.example',
+    webhookSecret: 'secret',
+  });
+
+  it('keeps looping while completed jobs are still ungated, then resubmits a job the gate sent back to planned', async () => {
+    // tick 1: all terminal but 2 ungated -> keep looping
+    // tick 2: gate reworked one -> 1 not terminal -> loop claims it
+    // tick 3: all terminal and gated -> exit
+    (jobsRepo.stepJobCounts as jest.Mock)
+      .mockResolvedValueOnce({ total: 36, terminal: 36 })
+      .mockResolvedValueOnce({ total: 36, terminal: 35 })
+      .mockResolvedValue({ total: 36, terminal: 36 });
+    (qualityRepo.countUngated as jest.Mock).mockResolvedValueOnce(2).mockResolvedValue(0);
+
+    await runStep(deps(), 'win_test', GATED, 5);
+
+    expect(jobsRepo.stepJobCounts).toHaveBeenCalledTimes(3);
+    expect(jobsRepo.claimNextBatch).toHaveBeenCalled(); // the reworked job was eligible for resubmission
+    const finalStatus = (stepsRepo.updateStepStatus as jest.Mock).mock.calls.at(-1);
+    expect(finalStatus?.[3]).toBe('generated');
+  });
+
+  it('never consults the gate for an ungated step', async () => {
+    (jobsRepo.stepJobCounts as jest.Mock).mockResolvedValue({ total: 3, terminal: 3 });
+    await runStep(deps(), 'win_test', STEP, 5);
+    expect(qualityRepo.countUngated).not.toHaveBeenCalled();
+  });
+});
+
+describe('agents/generator.ts submitOne() — a builder error fails one job, not the step (2026-09-15)', () => {
+  it('marks the job failed with stage "build" and lets runStep() finish', async () => {
+    const THROWING: CatalogEntry = {
+      ...STEP,
+      builder: (() => {
+        throw new Error('i2v builder: no resolved image URL for frame f12');
+      }) as CatalogEntry['builder'],
+    };
+    (jobsRepo.stepJobCounts as jest.Mock).mockResolvedValueOnce({ total: 2, terminal: 1 }).mockResolvedValue({ total: 2, terminal: 2 });
+    (jobsRepo.claimNextBatch as jest.Mock).mockResolvedValueOnce([
+      { id: 480, projectId: 'p', cohortId: 'win_test', stepSeq: 1, seq: 11, frameId: 'f12', status: 'planned', input: {} },
+    ]);
+    const fetchImpl = jest.fn(async () => fakeRes(200, { workers: { ready: 1, running: 0 } }));
+    const deps: GeneratorDeps = {
+      pool: fakePoolWithPlannedJob(),
+      runpod: new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) }),
+      cfg: FAST_CFG,
+      publicBaseUrl: 'https://vps.example',
+      webhookSecret: 'secret',
+    };
+
+    await expect(runStep(deps, 'win_test', THROWING, 5)).resolves.toBeUndefined();
+    expect(jobsRepo.markTerminal).toHaveBeenCalledWith(expect.anything(), 480, {
+      status: 'failed',
+      error: { stage: 'build', error: 'i2v builder: no resolved image URL for frame f12' },
+    });
+    expect(stepsRepo.incrementStepCounters).toHaveBeenCalledWith(expect.anything(), 'win_test', 1, 'job_failed');
+    // no /run was ever attempted for the unbuildable job
+    expect((fetchImpl.mock.calls as unknown as Array<[string]>).some((c) => String(c[0]).endsWith("/run"))).toBe(false);
   });
 });

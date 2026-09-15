@@ -79,6 +79,17 @@ maybeDescribe('db repo layer (integration)', () => {
     expect(a.opensAt.toISOString()).toBe(opensAt.toISOString());
     expect(a.closesAt.toISOString()).toBe(closesAt.toISOString());
     await pool.query(`UPDATE cohorts SET status = 'completed' WHERE id = $1`, [a.id]);
+
+    // A window whose cohort already finished opens a fresh cohort instead of
+    // reusing the finished row (2026-09-15: steps_pkey collision).
+    const c = await ensureCohort(pool, new Date('2026-09-01T15:00:00Z'));
+    expect(c.id).toBe('win_2026_09_01_12_r2');
+    expect(c.status).toBe('running');
+    expect((await ensureCohort(pool, at)).id).toBe('win_2026_09_01_12_r2'); // still running -> reused
+    await pool.query(`UPDATE cohorts SET status = 'failed' WHERE id = $1`, [c.id]);
+    const d = await ensureCohort(pool, at);
+    expect(d.id).toBe('win_2026_09_01_12_r3');
+    await pool.query(`UPDATE cohorts SET status = 'completed' WHERE id = $1`, [d.id]);
   });
 
   it('insertProject is idempotent on request_id — a replay returns the same project, wasNew=false', async () => {

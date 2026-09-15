@@ -44,6 +44,14 @@ const FrameSchema = z
     // the caller (StoryStudio, in the real product flow) generates this
     // once and attaches it to every frame; see steps/builders/image-edit.ts.
     referenceImageUrl: z.string().url().optional(),
+    // Prompt harness (docs/qm-orchestrator-prompt-harness-implementation-plan.md
+    // §4): the caller's own structured shot description for this frame,
+    // taking priority over harness/tool/extract.ts's GPT-5 mini extraction.
+    // Deliberately z.unknown() here, not harness/contract.ts's
+    // ShotContractSchema — keeps this file's request contract independent
+    // of the harness's internal schema; harness/prepare.ts re-validates it
+    // and falls back to extraction on a bad shape.
+    shot: z.unknown().optional(),
   })
   .strict();
 
@@ -64,6 +72,13 @@ const OptionsSchema = z
     removeSilence: z.boolean().default(false),
     textOverlay: z.boolean().default(false),
     qualityGates: z.enum(['full', 'sampled', 'image-only', 'off']).default('full'),
+    // Prompt harness rollout switch (implementation plan §0/§6.1): 'off'
+    // skips it entirely; 'lint' runs the full pipeline but keeps the
+    // caller's original prompts (harness output goes into
+    // jobs.input.harnessImagePrompt/harnessMotionPrompt for comparison);
+    // 'enforce' actually submits the harness-compiled/regenerated prompts.
+    // Defaults to 'lint' during rollout, per the plan's milestone table.
+    promptHarness: z.enum(['off', 'lint', 'enforce']).default('lint'),
     // Narration Premium: run step 0 (image-i2i, qwen-image-edit) instead of
     // step 1 (t2i, qwen-image-gen) — see STEP_TOPOLOGY below. Defaults to
     // today's Basic-tier behavior.
@@ -270,6 +285,7 @@ function buildStepsAndJobs(
         input: {
           bgmPrompt: req.bgmPrompt,
           totalDurationS: req.frames.reduce((sum, f) => sum + f.durationS, 0),
+          narrations: req.frames.map((f) => ({ frameId: f.frameId, narration: f.narration })),
         },
       });
       continue;

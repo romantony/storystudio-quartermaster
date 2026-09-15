@@ -11,6 +11,8 @@
     "dev:watchdog": "ts-node src/watchdog.ts",
     "start:watchdog": "node dist/watchdog.js",
     "gen:fleet": "ts-node --transpileOnly scripts/gen-fleet-registry.ts",
+    "harness:lint": "ts-node --transpileOnly scripts/harness-lint.ts",
+    "harness:promote": "ts-node --transpileOnly scripts/harness-promote.ts",
     "migrate": "ts-node src/db/migrate.ts up",
     "migrate:down": "ts-node src/db/migrate.ts down",
     "migrate:status": "ts-node src/db/migrate.ts status"

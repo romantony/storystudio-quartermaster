@@ -240,3 +240,40 @@ export async function release(deps: FleetDeps, cohortId: string, step: CatalogEn
   await updateStepStatus(pool, cohortId, step.seq, 'complete', { finishedAt: new Date() });
   log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step drained and complete');
 }
+
+/**
+ * Auxiliary endpoints (2026-09-15): a gated step's model-switch fallbacks can
+ * submit to endpoints other than the step's own (Flux on qwen-image-gen while
+ * step 0 runs on qwen-image-edit; postprod-lite `normalize` while step 3 runs
+ * on wan2-i2v — steps/catalog.ts `auxiliaryEndpoints`). The driver raises a
+ * small workersMax ceiling on each for the duration of the step. Only the
+ * ceiling moves (workersMin stays 0, same as allocate()), so an unused
+ * auxiliary costs nothing; the claim is recorded so the watchdog sees
+ * fallback workers as owned, and runStep() keeps it fresh.
+ */
+export async function allocateAuxiliary(
+  deps: FleetDeps,
+  cohortId: string,
+  stepSeq: number,
+  aux: { endpointId: string; workers: number },
+): Promise<void> {
+  if (deps.cfg.fleetLive) {
+    await deps.runpod.patchWorkers(aux.endpointId, { workersMax: aux.workers });
+    log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: auxiliary endpoint ceiling raised (live)');
+  } else {
+    log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: SHADOW — would raise auxiliary endpoint ceiling');
+  }
+  await upsertHeld(deps.pool, aux.endpointId, { cohortId, stepSeq, workersMax: aux.workers, workersMin: 0, workersReady: 0 });
+}
+
+/** Drops an auxiliary endpoint back to 0 and clears its claim. Never throws —
+ * it runs on every driver exit path, including failures. */
+export async function releaseAuxiliary(deps: FleetDeps, endpointId: string): Promise<void> {
+  try {
+    if (deps.cfg.fleetLive) await deps.runpod.patchWorkers(endpointId, { workersMin: 0, workersMax: 0 });
+    await clearHeld(deps.pool, endpointId);
+    log().info({ endpointId }, 'fleet: auxiliary endpoint released');
+  } catch (err) {
+    log().error({ endpointId, err }, 'fleet: auxiliary release failed — watchdog autodrain is the backstop');
+  }
+}

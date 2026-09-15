@@ -2,6 +2,43 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## 2026-09-15 (later same day) — prompt harness & guardrails: built, NOT deployed/committed
+
+Implements `docs/qm-orchestrator-prompt-harness-implementation-plan.md` H1-H2-H4 (contract, seed
+guardrails, lint, compile, GPT-5 mini regenerate tool, corrective ladder, findings/corrections).
+All in `orchestrator/src/harness/` + migration `009_prompt_harness.sql` + wiring into
+`planner.ts`/`orchestrator.ts`/`quality.ts`/`config.ts`. 315/315 tests passing (28 suites, 44 new
+harness tests), `tsc --noEmit` clean. `npm run harness:lint -- <request.json>` and
+`npm run harness:promote` work locally (smoke-tested against a fixture request, zero network calls
+when every frame carries `shot`).
+
+**Design deviations from the doc, deliberate:**
+- `prepareCohort()` runs synchronously in `orchestrator.ts` before the bulk loop (not the doc's
+  async-before-bulk-steps phrasing — same effect, simpler: no separate job-graph bookkeeping).
+- The video ladder's fix for a `fixTarget: 'image_prompt'` finding (V-CAM-03/V-DIR-02) edits and
+  recompiles the CURRENT (motion) prompt only — it does NOT reopen the sibling image job. That
+  would touch `jobs.deps_remaining`, which 005_invariants.sql and the generator's dependency graph
+  rely on; scoped out rather than risked. Flagged via `crossDomainFixDeferred` in the finding.
+- The legacy `quality/rewrite.ts` path is UNCHANGED and still used for any job without
+  `input.contract` (harness off, or extraction failed) — every existing rework test passes
+  untouched. The harness ladder only activates when a contract is present.
+
+**Not built (explicitly out of scope this pass):**
+- The Python `motion_probe` mode on postprod-lite (§7.4) — client code exists
+  (`harness/probe/motion-probe.ts`), calls will fail gracefully until that endpoint exists (same
+  build-then-deploy pattern as DreamX/MMAudio). The video ladder works from VLM issues alone until
+  then.
+- §7.5's calibration sweep (360 live Wan2 clips, ~$7) — the profile capability tables
+  (`harness/profiles/*.ts`) are hand-seeded from the Maya evidence, not yet measured.
+- §9.4's replay-before-activate — `harness:promote` writes `proposed` rows; activation is manual
+  (`POST /v1/harness/guardrails/:id/:version/activate`), no replay report yet.
+- Migration 009 not applied anywhere live; nothing in this branch has been deployed to the VPS.
+
+**Next steps, in order:** apply migration 009 on the VPS DB; run a real cohort with
+`promptHarness: 'lint'` (shadow mode) to compare `harnessImagePrompt`/`harnessMotionPrompt` against
+production output before flipping to `'enforce'`; re-run the Maya request (§13 acceptance test) once
+in `'enforce'` mode.
+
 ## Next session (2026-09-15) — DreamX upscale (step 14) + MMAudio SFX (step 15): deploy + live test
 
 New per-frame flow when `options.upscale` (engine `dreamx`, the default) and `options.sfx` are set:
@@ -93,7 +130,35 @@ To do, in order:
      204 orchestrator tests pass.
    - Gotcha: python urllib → rest.runpod.io gets Cloudflare 403 (error 1010) regardless of UA; use curl.
 
-## Next session — M5 phase 1 live verification (stopped 2026-09-11, resume here)
+## M5 — remaining work (audited 2026-09-15)
+
+The plan doc's §13 M5 checklist is stale. Actual state:
+
+- ✅ Project Assembler Agent + the whole tail (6/7/8/10/11/12) ran live on 09-12 and 09-15.
+- ✅ `resolveDeps()` project_id filter (§16 q12).
+- ✅ **§6.7 result assembler + callback. Built 2026-09-15, deployed to the VPS (migration 008 applied), NOT committed.**
+  - `src/result/assemble.ts`: §9.6 builder. The leaf is the last step in execution order (the spec's
+    `max(seq)` rule is wrong since 14/15 run before merge). Status is completed / partial / failed.
+    `errors[]` capped at 200 with `errorsTotal`.
+  - `src/result/callback.ts`: 8 attempts, 1s→5min backoff; retries network errors, 5xx, 408, 425, 429;
+    any other 4xx = rejected. Optional `X-QM-Signature` HMAC (new `ORCH_CALLBACK_SECRET`, unset on
+    the VPS = unsigned).
+  - `src/result/finalize.ts`: `driveCohort` now ALWAYS finalizes, stalls included. It stores the result,
+    sets project status, **closes the cohort row** (no more manual `UPDATE cohorts`), then delivers
+    callbacks concurrently, persisting each attempt in `projects.callback_attempts`. The cohort row
+    closes before delivery, a deliberate deviation so a down receiver can't hold
+    `cohorts_one_running` for about 16 minutes.
+  - Verified: 224 tests pass. Migration 008 up/down/up on throwaway PG. End-to-end on a copy of real
+    cohort `win_2026_09_15_00`: result `completed`, real final URL/bytes/resolution/steps/cost; a local
+    receiver got 503 then 200 → `delivered`, both attempts persisted, signature valid, cohort closed.
+  - **Pending: a live cohort run** (combine with item 7's MMAudio-mp4 cohort test above).
+- ⬜ `allocation_costs` never written, so there's no tail-collapse evidence and §9.6 `metrics.warmCostUsd`
+  is null.
+- ⬜ Catalog steps 9 (subtitles/SRT), 13 (shorts; `assets.shorts[]` stays `[]`), 4 (lip-sync, dialogue-only).
+- ⬜ **Convex receiver in storystudio-unified.** None exists. M5's "done when" = Convex receives the
+  §9.6 result. Needs a route plus signature verification (share `ORCH_CALLBACK_SECRET`).
+
+## (Superseded 2026-09-15) M5 phase 1 live verification — tail ran live 09-12 and 09-15
 
 M5 phase 1 (Project Assembler Agent + step 6/merge, commit `713f889`) is built, deployed,
 watchdog fix verified live (caught + auto-drained 2 real idle `postprod-lite` workers that
