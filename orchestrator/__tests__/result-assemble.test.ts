@@ -74,10 +74,11 @@ describe('buildResult', () => {
     const r = buildResult(facts(fullChain()));
     expect(r.status).toBe('completed');
     expect(r).toMatchObject({ requestId: 'req_1', projectId: 'proj_1', cohortId: 'win_2026_09_15_00', errors: [] });
-    expect(r.assets).toEqual({
+    expect(r.assets).toMatchObject({
       final: { url: 'https://r2/concat.mp4', durationS: 10.06, bytes: null, resolution: '1856x1056' },
       shorts: [],
     });
+    expect(r.assets.frames).toHaveLength(3);
     // bulk steps first in seq order (14/15 before the tail), then the tail
     expect(r.steps.map((s) => s.seq)).toEqual([0, 2, 3, 14, 15, 6, 7, 8]);
     expect(r.steps.find((s) => s.seq === 14)).toMatchObject({ total: 3, completed: 3, failed: 0, warmMs: 2000, runMs: 5000 });
@@ -168,5 +169,71 @@ describe('buildResult', () => {
     const r = buildResult(facts(jobs));
     expect(r.errors).toHaveLength(MAX_ERRORS);
     expect(r.errorsTotal).toBe(MAX_ERRORS + 25);
+  });
+});
+
+describe('buildResult — frames[] and project metadata (StoryStudio contract, 2026-09-15)', () => {
+  const request = {
+    tier: 'narration-premium',
+    product: 'documentary',
+    language: 'en',
+    aspectRatio: '16:9',
+    resolution: '1920x1080',
+    options: { upscale: true, sfx: true, removeSilence: true },
+    // Deliberately NOT in job order, to prove frames[] follows the request.
+    frames: [{ frameId: 'f02' }, { frameId: 'f01' }, { frameId: 'f03' }],
+  };
+  const finishedAt = new Date('2026-09-15T03:19:00Z');
+
+  it('lists every frame in request order with image, narration, clip and merged-clip URLs', () => {
+    const base = facts(fullChain());
+    const r = buildResult({ ...base, project: { ...base.project, request }, finishedAt });
+    expect(r.assets.frames.map((fr) => fr.frameId)).toEqual(['f02', 'f01', 'f03']);
+    expect(r.assets.frames[1]).toEqual({
+      index: 1,
+      frameId: 'f01',
+      status: 'completed',
+      qualityFlagged: false,
+      imageUrl: 'https://r2/f01.png',
+      narrationAudioUrl: 'https://r2/f01.wav',
+      narrationDurationS: 3.4,
+      clipUrl: 'https://r2/f01_up.mp4', // DreamX output preferred over the raw i2v clip
+      mergedClipUrl: 'https://r2/f01_trim.mp4', // remove-silence output preferred over merge
+    });
+  });
+
+  it('echoes project metadata and timestamps', () => {
+    const base = facts(fullChain());
+    const r = buildResult({ ...base, project: { ...base.project, request }, finishedAt });
+    expect(r.project).toEqual({
+      tier: 'narration-premium',
+      product: 'documentary',
+      language: 'en',
+      aspectRatio: '16:9',
+      resolution: '1920x1080',
+      frameCount: 3,
+      options: { upscale: true, sfx: true, removeSilence: true },
+    });
+    expect(r.createdAt).toBe(T0.toISOString());
+    expect(r.finishedAt).toBe(finishedAt.toISOString());
+  });
+
+  it('falls back to the raw clip / merge output, and marks a frame failed when any of its jobs failed', () => {
+    nextId = 1;
+    const jobs = [
+      job(1, 'f01', { image_url: 'https://r2/f01.png' }),
+      job(2, 'f01', { audio: 'https://r2/f01.wav' }),
+      job(3, 'f01', { video_url: 'https://r2/f01_i2v.mp4' }),
+      job(6, 'f01', { video: 'https://r2/f01_merge.mp4' }),
+      job(1, 'f02', { image_url: 'https://r2/f02.png' }),
+      job(2, 'f02', { audio: 'https://r2/f02.wav' }),
+      job(3, 'f02', null, { status: 'failed', error: { error: 'CUDA OOM' } }),
+      job(6, 'f02', null, { status: 'planned', submittedAt: null, completedAt: null }),
+      job(8, null, { video: 'https://r2/concat.mp4' }),
+    ];
+    const r = buildResult(facts(jobs));
+    expect(r.project).toBeNull(); // no stored request
+    expect(r.assets.frames[0]).toMatchObject({ frameId: 'f01', status: 'completed', clipUrl: 'https://r2/f01_i2v.mp4', mergedClipUrl: 'https://r2/f01_merge.mp4' });
+    expect(r.assets.frames[1]).toMatchObject({ frameId: 'f02', status: 'failed', imageUrl: 'https://r2/f02.png', clipUrl: null, mergedClipUrl: null });
   });
 });

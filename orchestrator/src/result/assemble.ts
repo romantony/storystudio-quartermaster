@@ -32,13 +32,48 @@ export interface ResultError {
   triedRungs: string[];
 }
 
+/** Request metadata echoed back so the receiver doesn't need its own copy
+ * of the submitted request to act on the result (added 2026-09-15). */
+export interface ResultProjectMeta {
+  tier: string;
+  product: string;
+  language: string;
+  aspectRatio: string;
+  resolution: string;
+  frameCount: number;
+  options: Record<string, unknown>;
+}
+
+/** One entry per requested frame, in request order (added 2026-09-15).
+ * Every URL is null when the step that produces it didn't run or failed. */
+export interface ResultFrame {
+  index: number;
+  frameId: string;
+  status: 'completed' | 'failed';
+  /** Quality gate accepted the asset only after exhausting its reworks. */
+  qualityFlagged: boolean;
+  /** Generated still (step 0 reference-image edit, or step 1 text-to-image). */
+  imageUrl: string | null;
+  /** Narration audio (step 2). */
+  narrationAudioUrl: string | null;
+  narrationDurationS: number | null;
+  /** Animated clip without narration: DreamX-upscaled (step 14) when upscale ran, else the raw i2v clip (step 3). */
+  clipUrl: string | null;
+  /** Clip with narration (and SFX when requested) mixed in: silence-trimmed (step 7) when that ran, else merge (step 6). */
+  mergedClipUrl: string | null;
+}
+
 export interface QmResult {
   requestId: string;
   projectId: string;
   cohortId: string;
   status: ResultStatus;
+  createdAt: string;
+  finishedAt: string;
+  project: ResultProjectMeta | null;
   assets: {
     final: { url: string; durationS: number | null; bytes: number | null; resolution: string | null } | null;
+    frames: ResultFrame[];
     subtitles?: { url: string; burnedIn: boolean };
     bgm?: { url: string };
     shorts: Array<{ index: number; url: string; srtUrl?: string; startS?: number; endS?: number }>;
@@ -72,7 +107,9 @@ export interface QmResult {
 }
 
 export interface ResultFacts {
-  project: { id: string; requestId: string; cohortId: string; createdAt: Date };
+  project: { id: string; requestId: string; cohortId: string; createdAt: Date; request?: unknown };
+  /** Result assembly time; defaults to now. Injectable so buildResult() stays deterministic in tests. */
+  finishedAt?: Date;
   steps: Array<{ seq: number; name: string; warmAt: Date | null; startedAt: Date | null; finishedAt: Date | null }>;
   jobs: Array<{
     id: number;
@@ -95,9 +132,61 @@ export interface ResultFacts {
  * in one callback body. */
 export const MAX_ERRORS = 200;
 
+const IMAGE_EDIT_STEP_SEQ = 0;
+const IMAGE_STEP_SEQ = 1;
+const TTS_STEP_SEQ = 2;
+const ANIMATION_STEP_SEQ = 3;
 const BGM_STEP_SEQ = 5;
+const MERGE_STEP_SEQ = 6;
+const REMOVE_SILENCE_STEP_SEQ = 7;
 const CAPTION_STEP_SEQ = 11;
 const UPSCALE_FRAME_STEP_SEQ = 14;
+
+function projectMeta(request: unknown): ResultProjectMeta | null {
+  const r = asRecord(request);
+  if (!r) return null;
+  const str = (x: unknown) => (typeof x === 'string' ? x : '');
+  return {
+    tier: str(r.tier),
+    product: str(r.product),
+    language: str(r.language),
+    aspectRatio: str(r.aspectRatio),
+    resolution: str(r.resolution),
+    frameCount: Array.isArray(r.frames) ? r.frames.length : 0,
+    options: asRecord(r.options) ?? {},
+  };
+}
+
+function buildFrames(f: ResultFacts): ResultFrame[] {
+  const requested = asRecord(f.project.request)?.frames;
+  const order: string[] = Array.isArray(requested)
+    ? requested.map((fr) => asRecord(fr)?.frameId).filter((id): id is string => typeof id === 'string')
+    : [...new Set(f.jobs.map((j) => j.frameId).filter((id): id is string => !!id))];
+
+  return order.map((frameId, index) => {
+    const own = f.jobs.filter((j) => j.frameId === frameId);
+    const done = (seq: number) => own.find((j) => j.stepSeq === seq && j.status === 'complete');
+    const urlOf = (...seqs: number[]) => {
+      for (const seq of seqs) {
+        const u = runpodOutUrl(done(seq)?.output);
+        if (u) return u;
+      }
+      return null;
+    };
+    const tts = done(TTS_STEP_SEQ);
+    return {
+      index,
+      frameId,
+      status: own.length > 0 && own.every((j) => j.status === 'complete') ? 'completed' : 'failed',
+      qualityFlagged: own.some((j) => j.qualityStatus === 'fail'),
+      imageUrl: urlOf(IMAGE_EDIT_STEP_SEQ, IMAGE_STEP_SEQ),
+      narrationAudioUrl: urlOf(TTS_STEP_SEQ),
+      narrationDurationS: num(asRecord(tts?.output)?.duration_s),
+      clipUrl: urlOf(UPSCALE_FRAME_STEP_SEQ, ANIMATION_STEP_SEQ),
+      mergedClipUrl: urlOf(REMOVE_SILENCE_STEP_SEQ, MERGE_STEP_SEQ),
+    };
+  });
+}
 
 function asRecord(x: unknown): Record<string, unknown> | undefined {
   return x && typeof x === 'object' && !Array.isArray(x) ? (x as Record<string, unknown>) : undefined;
@@ -165,7 +254,7 @@ export function buildResult(f: ResultFacts): QmResult {
       resolution: w && h ? `${w}x${h}` : null,
     };
   }
-  const assets: QmResult['assets'] = { final, shorts: [] };
+  const assets: QmResult['assets'] = { final, frames: buildFrames(f), shorts: [] };
   const captionSrt = asRecord(outputOf(CAPTION_STEP_SEQ))?.srt;
   if (typeof captionSrt === 'string' && captionSrt.startsWith('http')) {
     assets.subtitles = { url: captionSrt, burnedIn: true };
@@ -227,6 +316,9 @@ export function buildResult(f: ResultFacts): QmResult {
     projectId: f.project.id,
     cohortId: f.project.cohortId,
     status,
+    createdAt: f.project.createdAt.toISOString(),
+    finishedAt: (f.finishedAt ?? new Date()).toISOString(),
+    project: projectMeta(f.project.request),
     assets,
     steps,
     quality: {
@@ -251,7 +343,7 @@ export function buildResult(f: ResultFacts): QmResult {
 
 export async function loadResultFacts(db: Queryable, projectId: string): Promise<ResultFacts | undefined> {
   const { rows: projectRows } = await db.query(
-    `SELECT id, request_id, cohort_id, created_at FROM projects WHERE id = $1`,
+    `SELECT id, request_id, cohort_id, created_at, request FROM projects WHERE id = $1`,
     [projectId],
   );
   const p = projectRows[0];
@@ -285,7 +377,7 @@ export async function loadResultFacts(db: Queryable, projectId: string): Promise
 
   const toNum = (x: unknown) => (x === null || x === undefined ? null : Number(x));
   return {
-    project: { id: p.id, requestId: p.request_id, cohortId: p.cohort_id, createdAt: p.created_at },
+    project: { id: p.id, requestId: p.request_id, cohortId: p.cohort_id, createdAt: p.created_at, request: p.request },
     steps: steps.rows.map((s) => ({ seq: s.seq, name: s.name, warmAt: s.warm_at, startedAt: s.started_at, finishedAt: s.finished_at })),
     jobs: jobs.rows.map((j) => ({
       id: Number(j.id),

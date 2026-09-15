@@ -2,7 +2,7 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
-## 2026-09-15 (later same day) — prompt harness & guardrails: built, NOT deployed/committed
+## 2026-09-15 (later same day) — prompt harness & guardrails: built, committed `99cbbe5`, deployed to the VPS
 
 Implements `docs/qm-orchestrator-prompt-harness-implementation-plan.md` H1-H2-H4 (contract, seed
 guardrails, lint, compile, GPT-5 mini regenerate tool, corrective ladder, findings/corrections).
@@ -32,12 +32,13 @@ when every frame carries `shot`).
   (`harness/profiles/*.ts`) are hand-seeded from the Maya evidence, not yet measured.
 - §9.4's replay-before-activate — `harness:promote` writes `proposed` rows; activation is manual
   (`POST /v1/harness/guardrails/:id/:version/activate`), no replay report yet.
-- Migration 009 not applied anywhere live; nothing in this branch has been deployed to the VPS.
+- Migration 009 **applied** on the VPS DB 2026-09-15 (all 4 tables confirmed). Both services rebuilt
+  + restarted, `/v1/health` green, `GET /v1/harness/guardrails` smoke-tested live.
 
-**Next steps, in order:** apply migration 009 on the VPS DB; run a real cohort with
-`promptHarness: 'lint'` (shadow mode) to compare `harnessImagePrompt`/`harnessMotionPrompt` against
-production output before flipping to `'enforce'`; re-run the Maya request (§13 acceptance test) once
-in `'enforce'` mode.
+**Remaining, in order:** run a real cohort with `promptHarness: 'lint'` (shadow mode) to compare
+`harnessImagePrompt`/`harnessMotionPrompt` against production output — **not yet done, no cohort has
+run through the harness live**; then flip a project to `'enforce'`; then re-run the Maya request
+(§13 acceptance test) in `'enforce'` mode.
 
 ## Next session (2026-09-15) — DreamX upscale (step 14) + MMAudio SFX (step 15): deploy + live test
 
