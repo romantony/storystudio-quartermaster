@@ -9,7 +9,7 @@
  * RunpodClient (same mocked-fetch convention as runpod-client.test.ts).
  */
 import { RunpodClient } from '../src/runpod/client';
-import { runStep, GeneratorStallError, type GeneratorDeps } from '../src/agents/generator';
+import { runStep, reconcileTick, GeneratorStallError, type GeneratorDeps } from '../src/agents/generator';
 import type { CatalogEntry } from '../src/steps/catalog';
 import * as jobsRepo from '../src/db/repo/jobs';
 import * as stepsRepo from '../src/db/repo/steps';
@@ -423,5 +423,81 @@ describe('agents/generator.ts submitOne() — source: "lambda" dispatch (2026-09
       output: { video: 'https://pub.example/f1_merge.mp4' },
     });
     expect(stepsRepo.incrementStepCounters).toHaveBeenCalledWith(expect.anything(), 'win_test', 16, 'job_completed');
+  });
+});
+
+describe('agents/generator.ts reconcileTick() — a terminal RunPod status-check error requeues instead of polling forever (real incident, 2026-09-16, cohort win_2026_09_16_12_r2)', () => {
+  const CFG = {
+    runpodApiBase: 'https://api.runpod.ai/v2',
+    runpodRestBase: 'https://rest.runpod.io/v1',
+    runpodApiKey: 'test-key',
+    runpodMaxRetries: 0,
+    runpodTimeoutMs: 1000,
+  };
+  const STALE_JOB = {
+    id: 849,
+    projectId: 'proj',
+    cohortId: 'c',
+    stepSeq: 1,
+    seq: 4,
+    frameId: 'f04',
+    status: 'submitted',
+    runpodJobId: 'c857c922-ba7a-46b9-9a56-42a47968950c-u2',
+    attempts: 1,
+    input: {},
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (jobsRepo.listStale as jest.Mock).mockResolvedValue([STALE_JOB]);
+  });
+
+  it('a 404 ("job not found" — RunPod genuinely lost the job) requeues via markFailedOrRetry instead of logging and waiting forever', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(404, { status: 404, title: 'Not Found', detail: 'job not found' }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    (jobsRepo.markFailedOrRetry as jest.Mock).mockResolvedValue(true);
+    const deps: GeneratorDeps = { pool: fakePool(), runpod, cfg: FAST_CFG, publicBaseUrl: 'https://vps.example', webhookSecret: 'secret' };
+
+    await reconcileTick(deps, 'win_test', STEP, 60);
+
+    expect(jobsRepo.markFailedOrRetry).toHaveBeenCalledWith(
+      expect.anything(),
+      849,
+      expect.objectContaining({ error: expect.stringContaining('job not found') }),
+      FAST_CFG.maxAttempts,
+    );
+  });
+
+  it('once retries are exhausted on a terminal status-check error, the job fails for good and the step counter reflects it', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(404, { status: 404, title: 'Not Found', detail: 'job not found' }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    (jobsRepo.markFailedOrRetry as jest.Mock).mockResolvedValue(false);
+    const deps: GeneratorDeps = { pool: fakePool(), runpod, cfg: FAST_CFG, publicBaseUrl: 'https://vps.example', webhookSecret: 'secret' };
+
+    await reconcileTick(deps, 'win_test', STEP, 60);
+
+    expect(stepsRepo.incrementStepCounters).toHaveBeenCalledWith(expect.anything(), 'win_test', STEP.seq, 'job_failed');
+  });
+
+  it('a plain network error (not a RunpodError) keeps the original silent-retry-next-tick behavior, never calling markFailedOrRetry', async () => {
+    const fetchImpl = jest.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: GeneratorDeps = { pool: fakePool(), runpod, cfg: FAST_CFG, publicBaseUrl: 'https://vps.example', webhookSecret: 'secret' };
+
+    await expect(reconcileTick(deps, 'win_test', STEP, 60)).resolves.toBeUndefined();
+
+    expect(jobsRepo.markFailedOrRetry).not.toHaveBeenCalled();
+  });
+
+  it('a Transient-classified RunPod error (e.g. 429/5xx) also keeps polling rather than requeuing prematurely', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(503, { status: 503, title: 'Service Unavailable' }));
+    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
+    const deps: GeneratorDeps = { pool: fakePool(), runpod, cfg: FAST_CFG, publicBaseUrl: 'https://vps.example', webhookSecret: 'secret' };
+
+    await expect(reconcileTick(deps, 'win_test', STEP, 60)).resolves.toBeUndefined();
+
+    expect(jobsRepo.markFailedOrRetry).not.toHaveBeenCalled();
   });
 });

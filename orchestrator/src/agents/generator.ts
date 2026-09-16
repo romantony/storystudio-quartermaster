@@ -456,7 +456,43 @@ export async function reconcileTick(
         }
       }
     } catch (err) {
-      log().warn({ jobId: job.id, err }, 'generator: reconcile status check failed, will retry next tick');
+      // Real incident, live 2026-09-16 (cohort win_2026_09_16_12_r2, prod
+      // traffic): RunPod GET /status 404'd ("job not found") on 3 jobs
+      // forever — the job was genuinely gone from RunPod's side (endpoint
+      // was showing `workers.throttled` at the time), no webhook was ever
+      // coming, yet this branch just logged and moved on every tick. Since
+      // `terminal` (stepJobCounts) never reached `total`, runStep()'s exit
+      // condition never fired AND the warm-timeout stall escape only fires
+      // when terminal===0 (see its own comment above) — 3 stuck jobs
+      // wedged the entire step, and everything downstream of it, forever.
+      // RunpodError already classifies its own status code (types.ts's
+      // classifyError — 404 falls out as 'TerminalRetryable', same taxonomy
+      // 429/5xx use to mean "keep polling, this is transient"): anything
+      // NOT 'Transient' means RunPod is telling us definitively this job ID
+      // will never resolve, so treat it exactly like a terminal RunPod
+      // status — requeue for a fresh submission (new runpod_job_id) via the
+      // existing retry ceiling, don't poll a dead job ID forever. A plain
+      // network/timeout error (not a RunpodError, or classified Transient)
+      // keeps the original silent-retry-next-tick behavior — those really
+      // might resolve on their own.
+      if (err instanceof RunpodError && err.klass !== 'Transient') {
+        const client = await deps.pool.connect();
+        try {
+          await client.query('BEGIN');
+          const errorText = `status check: ${err.message}`;
+          const retried = await markFailedOrRetry(client, job.id, { error: errorText }, retryCeiling(errorText, deps.cfg));
+          await client.query('COMMIT');
+          if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
+          log().warn({ jobId: job.id, err, retried }, 'generator: reconcile status check got a terminal RunPod error, requeued/failed rather than polling forever');
+        } catch (innerErr) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          log().error({ jobId: job.id, err: innerErr }, 'generator: failed to requeue after terminal RunPod status-check error');
+        } finally {
+          client.release();
+        }
+      } else {
+        log().warn({ jobId: job.id, err }, 'generator: reconcile status check failed, will retry next tick');
+      }
     }
   }
 }
