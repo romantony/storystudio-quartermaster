@@ -133,7 +133,7 @@ describe('generator: Replicate fallback hops', () => {
     return {
       pool: p,
       runpod: new RunpodClient(CFG, { fetchImpl: fetchImpl as unknown as typeof fetch, sleepImpl: jest.fn(async () => {}) }),
-      cfg: { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60_000, maxAttempts: 2, lambdaRenderRateUsdS: 0.000127 },
+      cfg: { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60_000, maxAttempts: 2, maxResourceAttempts: 5, lambdaRenderRateUsdS: 0.000127 },
       publicBaseUrl: 'https://vps.example',
       webhookSecret: 'secret',
       replicate: { apiToken: 'r8', apiBase: 'https://api.replicate.com/v1', timeoutMs: 1000 },

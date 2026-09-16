@@ -16,7 +16,7 @@ import { createHmac } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import type { Config } from '../config';
 import { backoffMs, type RunpodClient } from '../runpod/client';
-import { isTerminal, RunpodError, type RunResponse } from '../runpod/types';
+import { isTerminal, RunpodError, extractErrorText, isResourceExhaustionError, type RunResponse } from '../runpod/types';
 import { auxiliaryEndpoints, fallbackRouteFor, type CatalogEntry, type FallbackRoute } from '../steps/catalog';
 import type { BuildContext, FrameJobInput, ResolvedDeps } from '../steps/builders/types';
 import { log } from '../telemetry/log';
@@ -36,7 +36,7 @@ export interface GeneratorDeps {
   // warmTimeoutMs: fleet.ts's allocate() no longer polls for readiness (M3
   // fix, 2026-09-10) — runStep()'s own non-blocking cold-start check owns
   // that timeout now, reusing the same config value.
-  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs' | 'maxAttempts' | 'lambdaRenderRateUsdS'>;
+  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs' | 'maxAttempts' | 'maxResourceAttempts' | 'lambdaRenderRateUsdS'>;
   /** Base URL this process is reachable at (e.g. https://orchestrator.ai-storystudio.com),
    * used to build each job's per-job webhook callback URL. */
   publicBaseUrl: string;
@@ -61,6 +61,15 @@ export interface GeneratorDeps {
 /** Prefix on jobs.runpod_job_id while a job is a Replicate prediction (the
  * first hop of a 'replicate' fallback route). Webhooks never match it. */
 export const REPLICATE_HANDLE_PREFIX = 'replicate:';
+
+/** The retry budget for THIS failure — `maxResourceAttempts` (higher) for a
+ * detected resource-exhaustion error (runpod/types.ts's
+ * isResourceExhaustionError()), `maxAttempts` otherwise. Exported so
+ * http/routes/webhooks.ts (the other place a RunPod failure lands) applies
+ * the identical policy. */
+export function retryCeiling(errorText: string | undefined, cfg: Pick<Config, 'maxAttempts' | 'maxResourceAttempts'>): number {
+  return isResourceExhaustionError(errorText) ? Math.max(cfg.maxAttempts, cfg.maxResourceAttempts) : cfg.maxAttempts;
+}
 
 /** The RunPod endpoint a job is (or will be) running on. */
 export function jobEndpointId(step: CatalogEntry, input: unknown): string {
@@ -294,7 +303,7 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
         result = await invokeRemotionOverlay(deps.lambda, payload as unknown as RemotionOverlayInput);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        const retried = await markFailedOrRetry(client, job.id, { error: message }, deps.cfg.maxAttempts);
+        const retried = await markFailedOrRetry(client, job.id, { error: message }, retryCeiling(message, deps.cfg));
         await client.query('COMMIT');
         if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
         log().warn({ jobId: job.id, stepSeq: step.seq, error: message, retried }, 'generator: lambda invoke failed');
@@ -316,7 +325,7 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
         permanentUrl = await persistToR2(deps.r2, result.overlayRenderedUrl, r2Key);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        const retried = await markFailedOrRetry(client, job.id, { error: message }, deps.cfg.maxAttempts);
+        const retried = await markFailedOrRetry(client, job.id, { error: message }, retryCeiling(message, deps.cfg));
         await client.query('COMMIT');
         if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
         log().warn({ jobId: job.id, stepSeq: step.seq, error: message, retried }, 'generator: r2 persist of lambda output failed');
@@ -368,7 +377,8 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
       log().info({ jobId: job.id, stepSeq: step.seq }, 'generator: synchronous completion');
     } else if (isTerminal(res.status)) {
       await markSubmitted(client, job.id, res.id);
-      const retried = await markFailedOrRetry(client, job.id, { status: res.status }, deps.cfg.maxAttempts);
+      const errorText = extractErrorText(res.error, res.output);
+      const retried = await markFailedOrRetry(client, job.id, { status: res.status, error: errorText }, retryCeiling(errorText, deps.cfg));
       await client.query('COMMIT');
       if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
       log().warn({ jobId: job.id, stepSeq: step.seq, status: res.status, retried }, 'generator: submission returned terminal failure');
@@ -431,7 +441,8 @@ export async function reconcileTick(
               workerRateUsdS: deps.cfg.workerRateUsdS,
             });
           } else {
-            retried = await markFailedOrRetry(client, job.id, { status: res.status }, deps.cfg.maxAttempts);
+            const errorText = extractErrorText(res.error, res.output);
+            retried = await markFailedOrRetry(client, job.id, { status: res.status, error: errorText }, retryCeiling(errorText, deps.cfg));
           }
           await client.query('COMMIT');
           if (!retried) {
@@ -619,7 +630,8 @@ async function advanceReplicateJob(deps: GeneratorDeps, cohortId: string, step: 
         });
         outcome = 'complete';
       } else if (isTerminal(res.status)) {
-        outcome = (await markFailedOrRetry(client, job.id, { status: res.status, stage: 'normalize' }, deps.cfg.maxAttempts)) ? 'retried' : 'failed';
+        const errorText = extractErrorText(res.error, res.output);
+        outcome = (await markFailedOrRetry(client, job.id, { status: res.status, stage: 'normalize', error: errorText }, retryCeiling(errorText, deps.cfg))) ? 'retried' : 'failed';
       }
       await client.query('COMMIT');
     } catch (err) {
@@ -645,7 +657,7 @@ async function failOrRetry(deps: GeneratorDeps, cohortId: string, step: CatalogE
   let retried = false;
   try {
     await client.query('BEGIN');
-    retried = await markFailedOrRetry(client, job.id, error, deps.cfg.maxAttempts);
+    retried = await markFailedOrRetry(client, job.id, error, retryCeiling(extractErrorText(error), deps.cfg));
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => undefined);

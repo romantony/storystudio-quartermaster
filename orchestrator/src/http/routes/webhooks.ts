@@ -19,9 +19,9 @@ import { log } from '../../telemetry/log';
 import { getJobByRunpodId, markFailedOrRetry, markTerminal } from '../../db/repo/jobs';
 import { incrementStepCounters } from '../../db/repo/steps';
 import { recordJobCost } from '../../db/repo/costs';
-import { jobEndpointId, webhookToken } from '../../agents/generator';
+import { jobEndpointId, webhookToken, retryCeiling } from '../../agents/generator';
 import { runpodOutUrl } from '../../runpod/output';
-import { isTerminal } from '../../runpod/types';
+import { isTerminal, extractErrorText } from '../../runpod/types';
 import { catalogEntry } from '../../steps/catalog';
 
 function safeEqual(a: string, b: string): boolean {
@@ -95,8 +95,9 @@ export async function webhookRoutes(app: FastifyInstance, opts: { pool: Pool; cf
               workerRateUsdS: opts.cfg.workerRateUsdS,
             });
           } else if (body.status && isTerminal(body.status)) {
-            const error = { status: body.status, error: typeof body.error === 'string' ? body.error.slice(0, 500) : undefined };
-            retried = await markFailedOrRetry(client, job.id, error, opts.cfg.maxAttempts);
+            const errorText = extractErrorText(body.error, body.output);
+            const error = { status: body.status, error: errorText?.slice(0, 500) };
+            retried = await markFailedOrRetry(client, job.id, error, retryCeiling(errorText, opts.cfg));
           } else {
             // IN_QUEUE / IN_PROGRESS deliveries shouldn't normally arrive on
             // this endpoint, but do nothing rather than mis-transition.

@@ -14,10 +14,55 @@ export interface RunResponse {
   status: JobStatus;
   /** Present when a warm endpoint completed the job synchronously on /run. */
   output?: unknown;
+  /** RunPod top-level error string on a FAILED job — not always populated;
+   * a worker crash often only surfaces its error inside `output` instead. */
+  error?: unknown;
   /** RunPod top-level billed duration (ms). Not output.gen_time_s — see runpod.ts. */
   executionTime?: number;
   /** Queue wait (ms). NOT billed. */
   delayTime?: number;
+}
+
+/** Best-effort text extraction from whatever shape a failure's error/output
+ * came back as — a bare string, `{error}`/`{message}`, or worst case the
+ * whole thing JSON-stringified. Used only for `isResourceExhaustionError()`
+ * classification below, never stored as-is (callers still truncate/shape
+ * what actually gets written to `jobs.error`). */
+export function extractErrorText(...values: unknown[]): string | undefined {
+  for (const v of values) {
+    if (typeof v === 'string' && v) return v;
+    if (v && typeof v === 'object') {
+      const obj = v as Record<string, unknown>;
+      if (typeof obj.error === 'string' && obj.error) return obj.error;
+      if (typeof obj.message === 'string' && obj.message) return obj.message;
+    }
+  }
+  for (const v of values) {
+    if (v !== undefined && v !== null) {
+      try {
+        return JSON.stringify(v);
+      } catch {
+        // fall through
+      }
+    }
+  }
+  return undefined;
+}
+
+/** A worker ran out of a physical resource (GPU VRAM, disk, etc.) rather
+ * than the job itself being unrunnable — real incident 2026-09-16: the
+ * orchestrator's very first live StoryStudio request hit "CUDA out of
+ * memory" on 5/18 image jobs (qwen-image-gen's endpoint mixes A40/A6000
+ * ~44GB cards with 80GB A100s in its allowed GPU pool; the workload's peak
+ * VRAM sits right at the smaller cards' ceiling). This is transient and
+ * worker-assignment-dependent, not a defect in the request — a retry has a
+ * real chance of landing on a different, adequately-sized worker, unlike a
+ * genuine content/validation failure. See agents/generator.ts's/
+ * http/routes/webhooks.ts's retryCeiling() for where this raises the retry
+ * budget above the default `maxAttempts`. */
+export function isResourceExhaustionError(text: string | undefined): boolean {
+  if (!text) return false;
+  return /out of memory|out-of-memory\b/i.test(text);
 }
 
 export interface StatusResponse extends RunResponse {}

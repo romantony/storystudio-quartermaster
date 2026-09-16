@@ -65,7 +65,7 @@ const STEP: CatalogEntry = {
 
 // Fast, real-timer-friendly: tiny warmTimeoutMs and reconcileIntervalMs so a
 // stall test completes in well under a second of real wall-clock time.
-const FAST_CFG = { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60, maxAttempts: 2, lambdaRenderRateUsdS: 0.000127 };
+const FAST_CFG = { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60, maxAttempts: 2, maxResourceAttempts: 5, lambdaRenderRateUsdS: 0.000127 };
 
 beforeEach(() => {
   jest.clearAllMocks();

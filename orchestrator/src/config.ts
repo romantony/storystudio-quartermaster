@@ -65,6 +65,14 @@ const ConfigSchema = z.object({
   drainTimeoutMs: numeric(300_000).pipe(z.number().int().positive()),
   reconcileIntervalMs: numeric(60_000).pipe(z.number().int().positive()),
   maxAttempts: numeric(2).pipe(z.number().int().positive()),
+  // Real incident, 2026-09-16 (this orchestrator's first live StoryStudio
+  // request): 5/18 image jobs hit "CUDA out of memory" and both exhausted
+  // maxAttempts=2 permanently, dropping those frames from the final video.
+  // The failure wasn't a defect in the request — a retry has a real chance
+  // of landing on a different, adequately-sized RunPod worker (see
+  // runpod/types.ts's isResourceExhaustionError() header comment) — so
+  // this class of failure gets a higher ceiling than a generic one.
+  maxResourceAttempts: numeric(5).pipe(z.number().int().positive()),
   qualityGates: z.enum(['full', 'sampled', 'image-only', 'off']).default('full'),
   workerRateUsdS: numeric(0.00021).pipe(z.number().positive()),
 
@@ -199,6 +207,7 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   drainTimeoutMs: 'ORCH_DRAIN_TIMEOUT_MS',
   reconcileIntervalMs: 'ORCH_RECONCILE_INTERVAL_MS',
   maxAttempts: 'ORCH_MAX_ATTEMPTS',
+  maxResourceAttempts: 'ORCH_MAX_RESOURCE_ATTEMPTS',
   qualityGates: 'ORCH_QUALITY_GATES',
   workerRateUsdS: 'WORKER_RATE_USD_S',
   watchdogIntervalMs: 'WATCHDOG_INTERVAL_MS',
