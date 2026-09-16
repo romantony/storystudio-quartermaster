@@ -151,10 +151,16 @@ maybeDescribe('db repo layer (integration)', () => {
     const second = { ...first, workersTarget: 4, jobTotal: 7 };
     await insertSteps(pool, cohort.id, [first]);
     await expect(insertSteps(pool, cohort.id, [second])).resolves.toBeUndefined();
-    // ON CONFLICT DO NOTHING — the original row wins, not silently
-    // overwritten by the second project's own numbers.
+    // ON CONFLICT DO UPDATE (job_total only) — the row itself (endpoint/
+    // workersTarget/gate/dependsOn) is cohort-wide and stays as the first
+    // project set it, but job_total accumulates: the joining project's own
+    // frames really did add jobs to this step (confirmed live 2026-09-16 —
+    // a stale job_total under-reported /v1/cohorts/:id for a real 2-project
+    // cohort even though runStep()'s own completion check, a live
+    // COUNT(*), was unaffected).
     const [row] = (await listSteps(pool, cohort.id)).filter((s) => s.seq === seq);
     expect(row.workersTarget).toBe(2);
+    expect(row.jobTotal).toBe(10);
   });
 
   it('stepsJoinable: true with no steps planned yet (the ordinary single-project case)', async () => {

@@ -78,23 +78,30 @@ const STEP_COLUMNS = `cohort_id, seq, name, endpoint_id, workers_target, gate, d
                        warm_at, started_at, finished_at`;
 
 /** Batch insert, within the planner's one transaction (impl plan §6.2 step 7).
- * `ON CONFLICT (cohort_id, seq) DO NOTHING` (2026-09-16, multi-project cohort
- * join fix): a second project joining an already-planned cohort resolves the
- * same seq numbers the first project already inserted — `steps`' PRIMARY KEY
- * (cohort_id, seq) would otherwise raise a duplicate-key error on every
- * shared step. Safe as a no-op: the existing row's endpoint/gate/dependsOn
- * are cohort-wide anyway (steps/catalog.ts is static, not per-project), so
- * there's nothing project-specific to merge in. See stepsJoinable() below —
- * callers must check that BEFORE calling this, since silently skipping the
- * insert here says nothing about whether anything will ever poll that row
- * again for the new project's jobs. */
+ * `ON CONFLICT (cohort_id, seq) DO UPDATE ... job_total = steps.job_total +
+ * EXCLUDED.job_total` (2026-09-16, multi-project cohort join fix, refined
+ * 2026-09-16 live): a second project joining an already-planned cohort
+ * resolves the same seq numbers the first project already inserted —
+ * `steps`' PRIMARY KEY (cohort_id, seq) would otherwise raise a
+ * duplicate-key error on every shared step. The row itself (endpoint/gate/
+ * dependsOn/status) is cohort-wide anyway (steps/catalog.ts is static, not
+ * per-project) so nothing there needs merging — but `job_total` DOES: it's
+ * this step's job count, and a joining project adds its own frames' worth of
+ * jobs to it (confirmed live: a 2nd project's jobs land in `jobs` regardless,
+ * so leaving job_total at the 1st project's count alone under-reports the
+ * step everywhere that column is read — /v1/cohorts/:id, the admin
+ * dashboard — even though runStep()'s own completion check is unaffected,
+ * since it live-COUNT(*)s `jobs` rather than reading this column). See
+ * stepsJoinable() below — callers must check that BEFORE calling this, since
+ * silently no-op'ing (or here, accumulating) says nothing about whether
+ * anything will ever poll that row again for the new project's jobs. */
 export async function insertSteps(db: Queryable, cohortId: string, steps: NewStep[]): Promise<void> {
   for (const s of steps) {
     await db.query(
       `INSERT INTO steps (cohort_id, seq, name, endpoint_id, workers_target, gate, drain_after,
                            depends_on, status, job_total, job_completed, job_failed)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 0, 0)
-       ON CONFLICT (cohort_id, seq) DO NOTHING`,
+       ON CONFLICT (cohort_id, seq) DO UPDATE SET job_total = steps.job_total + EXCLUDED.job_total`,
       [cohortId, s.seq, s.name, s.endpointId, s.workersTarget, s.gate, s.drainAfter, s.dependsOn, s.jobTotal],
     );
   }
