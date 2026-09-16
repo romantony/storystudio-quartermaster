@@ -94,6 +94,22 @@ export async function setProjectStatus(db: Queryable, id: string, status: string
   await db.query('UPDATE projects SET status = $2 WHERE id = $1', [id, status]);
 }
 
+/** agents/rework.ts's splice-completion write — same shape as
+ * result/finalize.ts's own inline UPDATE, factored out here since rework is
+ * a second call site for "a project just got a final result." Resets
+ * callback_status to 'pending' so the normal delivery path re-fires the
+ * customer-facing callback, exactly like a first-time completion. */
+export async function updateProjectResult(
+  db: Queryable,
+  id: string,
+  input: { result: unknown; status: string },
+): Promise<void> {
+  await db.query(
+    `UPDATE projects SET result = $2, status = $3, finished_at = now(), callback_status = 'pending' WHERE id = $1`,
+    [id, input.result, input.status],
+  );
+}
+
 /** Every project planned into a cohort — harness/index.ts's prepareCohort()
  * walks these before the bulk steps start. */
 export async function listProjectsForCohort(db: Queryable, cohortId: string): Promise<Project[]> {

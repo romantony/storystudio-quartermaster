@@ -38,6 +38,12 @@ const ConfigSchema = z.object({
   // ── ingress auth ───────────────────────────────────────────────────────
   ingestToken: z.string().min(1, 'ORCH_INGEST_TOKEN is required'),
   webhookSecret: z.string().min(1, 'ORCH_WEBHOOK_SECRET is required'),
+  // Admin dashboard + fleet/cohort/rework routes (http/routes/admin.ts,
+  // 2026-09-16) — deliberately its own secret, not ingestToken, so a
+  // credential StoryStudio holds (for POST /v1/requests) can't also trigger
+  // a rework or read cost data. GET /v1/fleet and /v1/cohorts/:id had no
+  // auth at all before this — closed while adding the rest of this surface.
+  adminToken: z.string().min(1, 'ORCH_ADMIN_TOKEN is required'),
   // Spec §11: "hostname stability is now a correctness requirement, not a
   // convenience" — every submitted job's webhook URL is built from this. No
   // default; a wrong or missing value breaks every callback for the cohort
@@ -213,6 +219,7 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   pgPoolMax: 'PG_POOL_MAX',
   pgStatementTimeoutMs: 'PG_STATEMENT_TIMEOUT_MS',
   ingestToken: 'ORCH_INGEST_TOKEN',
+  adminToken: 'ORCH_ADMIN_TOKEN',
   webhookSecret: 'ORCH_WEBHOOK_SECRET',
   publicBaseUrl: 'ORCH_PUBLIC_BASE_URL',
   runpodApiKey: 'RUNPOD_API_KEY',
