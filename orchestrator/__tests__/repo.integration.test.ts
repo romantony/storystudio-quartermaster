@@ -11,8 +11,8 @@
 import { Pool, type PoolClient } from 'pg';
 import { ensureCohort, windowBounds } from '../src/db/repo/cohorts';
 import { insertProject, getProject } from '../src/db/repo/projects';
-import { insertSteps, listSteps, dependentSteps } from '../src/db/repo/steps';
-import { insertJobs, claimNextBatch, markSubmitted, markTerminal, stepJobCounts } from '../src/db/repo/jobs';
+import { insertSteps, listSteps, dependentSteps, stepsJoinable, updateStepStatus } from '../src/db/repo/steps';
+import { insertJobs, claimNextBatch, markSubmitted, markTerminal, markFailedOrRetry, stepJobCounts } from '../src/db/repo/jobs';
 import { upsertHeld, touchObserved, clearHeld, getState } from '../src/db/repo/endpoint-state';
 
 const DB_URL = process.env.DATABASE_URL;
@@ -140,6 +140,60 @@ maybeDescribe('db repo layer (integration)', () => {
     expect(dependents).toContain(seqAnim);
   });
 
+  it('insertSteps is idempotent on (cohort_id, seq) — a second project joining the cohort never crashes on steps_pkey (2026-09-16)', async () => {
+    const cohort = { id: sharedCohortId };
+    const seq = seqBase();
+    const first = { seq, name: 'image', endpointId: 'e1', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 3 };
+    // Same seq, different workersTarget/jobTotal — simulates a second
+    // project's own buildStepsAndJobs() call resolving the same catalog
+    // entry. Must not throw.
+    const second = { ...first, workersTarget: 4, jobTotal: 7 };
+    await insertSteps(pool, cohort.id, [first]);
+    await expect(insertSteps(pool, cohort.id, [second])).resolves.toBeUndefined();
+    // ON CONFLICT DO NOTHING — the original row wins, not silently
+    // overwritten by the second project's own numbers.
+    const [row] = (await listSteps(pool, cohort.id)).filter((s) => s.seq === seq);
+    expect(row.workersTarget).toBe(2);
+  });
+
+  it('stepsJoinable: true with no steps planned yet (the ordinary single-project case)', async () => {
+    const cohort = { id: sharedCohortId };
+    const seq = seqBase(); // never inserted
+    await expect(stepsJoinable(pool, cohort.id, [seq])).resolves.toBe(true);
+  });
+
+  it('stepsJoinable: true when every needed step already exists and is still pending or running', async () => {
+    const cohort = { id: sharedCohortId };
+    const [seqPending, seqRunning] = [seqBase(), seqBase() + 1];
+    await insertSteps(pool, cohort.id, [
+      { seq: seqPending, name: 'image', endpointId: 'e1', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 3 },
+      { seq: seqRunning, name: 'tts', endpointId: 'e2', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 3 },
+    ]);
+    await updateStepStatus(pool, cohort.id, seqRunning, 'running');
+    await expect(stepsJoinable(pool, cohort.id, [seqPending, seqRunning])).resolves.toBe(true);
+  });
+
+  it('stepsJoinable: false when a needed step already finished — the runStep() loop that would claim it has already exited', async () => {
+    const cohort = { id: sharedCohortId };
+    const seq = seqBase();
+    await insertSteps(pool, cohort.id, [
+      { seq, name: 'image', endpointId: 'e1', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 3 },
+    ]);
+    await updateStepStatus(pool, cohort.id, seq, 'complete');
+    await expect(stepsJoinable(pool, cohort.id, [seq])).resolves.toBe(false);
+  });
+
+  it('stepsJoinable: false when the new project needs a brand-new step number the running driver never snapshotted', async () => {
+    const cohort = { id: sharedCohortId };
+    const [seqExisting, seqNew] = [seqBase(), seqBase() + 1];
+    await insertSteps(pool, cohort.id, [
+      { seq: seqExisting, name: 'image', endpointId: 'e1', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 3 },
+    ]);
+    // seqNew was never inserted by anyone — a genuinely new step this
+    // cohort's already-running driver invocation could never have seen.
+    await expect(stepsJoinable(pool, cohort.id, [seqExisting, seqNew])).resolves.toBe(false);
+  });
+
   it('jobs: claim -> submit -> complete decrements the dependent job in the same frame', async () => {
     const cohort = { id: sharedCohortId };
     const project = (
@@ -209,6 +263,61 @@ maybeDescribe('db repo layer (integration)', () => {
 
     const counts81 = await stepJobCounts(pool, cohort.id, seqImage);
     expect(counts81).toEqual({ total: 1, terminal: 1 });
+  });
+
+  it('jobs: claimNextBatch prefers fresh (attempts=0) jobs over a requeued retry, regardless of seq order (2026-09-16)', async () => {
+    const cohort = { id: sharedCohortId };
+    const project = (
+      await insertProject(pool, {
+        id: uniqueId('proj'),
+        cohortId: cohort.id,
+        requestId: uniqueId('req'),
+        tier: 'narration-basic',
+        language: 'en',
+        request: {},
+        callbackUrl: null,
+      })
+    ).project;
+
+    const seq = seqBase();
+    await insertSteps(pool, cohort.id, [
+      { seq, name: 'image', endpointId: 'e1', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 2 },
+    ]);
+    const [frameRetry, frameFresh] = [uniqueId('frame'), uniqueId('frame')];
+    // seq: 0 for the one about to be retried, seq: 1 for the fresh one — a
+    // plain `ORDER BY seq` would claim the retry first; attempts-first
+    // ordering must claim the fresh one first regardless.
+    await insertJobs(pool, cohort.id, [
+      { projectId: project.id, stepSeq: seq, seq: 0, frameId: frameRetry, depsRemaining: 0, input: {} },
+      { projectId: project.id, stepSeq: seq, seq: 1, frameId: frameFresh, depsRemaining: 0, input: {} },
+    ]);
+
+    const retryJobId = await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const [claimed] = await claimNextBatch(client, cohort.id, seq, 1);
+      await markSubmitted(client, claimed.id, uniqueId('rp-job'));
+      await client.query('COMMIT');
+      return claimed.id;
+    });
+    // Fail it — markFailedOrRetry sets it back to 'planned' with attempts=1.
+    await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const retried = await markFailedOrRetry(client, retryJobId, { error: 'boom' }, 2);
+      expect(retried).toBe(true);
+      await client.query('COMMIT');
+    });
+
+    // Both jobs are 'planned' again now (the frameFresh one never ran).
+    // A batch of 1 must claim the fresh (attempts=0) one, not the retry.
+    const nextClaim = await withClient(pool, async (client) => {
+      await client.query('BEGIN');
+      const claimed = await claimNextBatch(client, cohort.id, seq, 1);
+      await client.query('ROLLBACK');
+      return claimed;
+    });
+    expect(nextClaim).toHaveLength(1);
+    expect(nextClaim[0].frameId).toBe(frameFresh);
+    expect(nextClaim[0].attempts).toBe(0);
   });
 
   it('jobs: a singleJobPerProject consumer (frame_id NULL) fans in on every frame\'s producer completion, including a failed one (2026-09-12, step 8/concat)', async () => {

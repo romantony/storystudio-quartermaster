@@ -159,7 +159,14 @@ async function runCohort(deps: DriverDeps, cohortId: string): Promise<boolean> {
         return false;
       }
 
-      const runStepPromise = runStep(generatorDeps, cohortId, catalog, dbStep.workersTarget);
+      // Dispatch ceiling gets cfg.queueBufferWorkers extra headroom (2026-09-16)
+      // so jobs sit queued in RunPod itself instead of waiting on our next
+      // poll tick — allocate() just above kept the REAL worker count at
+      // dbStep.workersTarget unbuffered, so this doesn't cost extra GPU
+      // spend. gateStep() doesn't submit generation jobs, so it stays
+      // unbuffered too.
+      const dispatchTarget = dbStep.workersTarget + deps.cfg.queueBufferWorkers;
+      const runStepPromise = runStep(generatorDeps, cohortId, catalog, dispatchTarget);
       const gateStepPromise = catalog.gate ? gateStep(qualityDeps, cohortId, catalog, dbStep.workersTarget) : undefined;
       // A no-op catch on each promise individually, BEFORE the Promise.all
       // below — otherwise the one that doesn't win the race below still has

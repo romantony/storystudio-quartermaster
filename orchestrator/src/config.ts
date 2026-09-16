@@ -59,6 +59,17 @@ const ConfigSchema = z.object({
   windowCron: z.string().default('0 0,6,12,18 * * *'),
   workersHead: numeric(25).pipe(z.number().int().positive()),
   workersTail: numeric(10).pipe(z.number().int().positive()),
+  // 2026-09-16: lets the bulk/generation dispatch loop submit up to this
+  // many MORE jobs than workersHead's real worker count, so they sit queued
+  // inside RunPod itself rather than waiting on our own next poll tick — no
+  // idle GPU time between one job finishing and the next being noticed.
+  // Deliberately only applied at the bulk runStep() call site
+  // (agents/orchestrator.ts), never to allocate()'s real workersMax PATCH
+  // (that stays at workersHead — no extra real GPU spend) and never to the
+  // assembly tail (workersTail) — postprod-lite's real deployed capacity is
+  // small, and over-queuing there risks a job's RunPod queue wait pushing
+  // past its own execution timeout.
+  queueBufferWorkers: numeric(10).pipe(z.number().int().nonnegative()),
   liveReserveWorkers: numeric(8).pipe(z.number().int().nonnegative()),
   accountCap: numeric(40).pipe(z.number().int().positive()),
   warmTimeoutMs: numeric(480_000).pipe(z.number().int().positive()),
@@ -201,6 +212,7 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   windowCron: 'ORCH_WINDOW_CRON',
   workersHead: 'ORCH_WORKERS_HEAD',
   workersTail: 'ORCH_WORKERS_TAIL',
+  queueBufferWorkers: 'ORCH_QUEUE_BUFFER_WORKERS',
   liveReserveWorkers: 'QM_LIVE_RESERVE_WORKERS',
   accountCap: 'RUNPOD_ACCOUNT_CAP',
   warmTimeoutMs: 'ORCH_WARM_TIMEOUT_MS',

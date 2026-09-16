@@ -80,6 +80,24 @@ export class CohortBusyError extends Error {
 }
 
 /**
+ * Raised by agents/planner.ts's plan() when a second project's requested
+ * steps aren't safely joinable into an already-`running` cohort for this
+ * window (see db/repo/steps.ts's stepsJoinable() for exactly what "safe"
+ * means — 2026-09-16, real incident risk found live: QM_ORCH_MODE=live
+ * means this can now happen for real). Not retried automatically by this
+ * process — the caller's own outbox-drain (StoryStudio's
+ * drainOrchestratorOutbox, every 5 min) already retries with backoff, and
+ * once the running cohort finishes, ensureCohort()'s existing 2026-09-15 fix
+ * hands back a fresh `_r2` cohort that this same request will join cleanly.
+ */
+export class CohortNotJoinableError extends Error {
+  constructor(readonly cohortId: string) {
+    super(`cohort ${cohortId} is running but this request's steps aren't safely joinable — retry once it finishes`);
+    this.name = 'CohortNotJoinableError';
+  }
+}
+
+/**
  * Idempotent insert-or-fetch for the current window's cohort, marked
  * 'running' immediately (M6's queue-behind-if-already-running rule is not
  * implemented yet — every M2 cohort assumes it may run right away, and

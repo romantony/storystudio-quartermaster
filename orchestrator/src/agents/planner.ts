@@ -20,9 +20,9 @@ import { z } from 'zod';
 import type { Pool } from 'pg';
 import type { Config } from '../config';
 import { log } from '../telemetry/log';
-import { ensureCohort } from '../db/repo/cohorts';
+import { ensureCohort, CohortNotJoinableError } from '../db/repo/cohorts';
 import { insertProject, getProject } from '../db/repo/projects';
-import { insertSteps, type NewStep } from '../db/repo/steps';
+import { insertSteps, stepsJoinable, type NewStep } from '../db/repo/steps';
 import { insertJobs, type NewJob } from '../db/repo/jobs';
 import { STEP_CATALOG, catalogEntry, type CatalogEntry } from '../steps/catalog';
 import type { FrameJobInput } from '../steps/builders/types';
@@ -437,11 +437,30 @@ export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequ
         throw new Error(`plan: project ${req.projectId} already exists under a different requestId`);
       }
 
+      // Multi-project cohort join safety (2026-09-16, real incident risk
+      // once QM_ORCH_MODE=live: a second real project can land in the same
+      // 6-hour window while the first is still running — cohorts_one_running
+      // makes a separate cohort impossible, so joining this one is the only
+      // option). db/repo/steps.ts's stepsJoinable() is a no-op true for the
+      // ordinary first-project-into-a-fresh-cohort case; it only rejects a
+      // genuine unsafe join. Checked here, inside the transaction, before
+      // insertSteps()/insertJobs() commit anything for this project.
+      if (!(await stepsJoinable(client, cohort.id, catalogued.map((c) => c.seq)))) {
+        await client.query('ROLLBACK');
+        throw new CohortNotJoinableError(cohort.id);
+      }
+
       const { steps: newSteps, jobs: newJobs } = buildStepsAndJobs(catalogued, req, project.id, cfg.workersHead);
       await insertSteps(client, cohort.id, newSteps);
       await insertJobs(client, cohort.id, newJobs);
 
       await client.query('COMMIT');
+
+      const { rows: projectCountRows } = await client.query<{ count: string }>(
+        `SELECT count(*) FROM projects WHERE cohort_id = $1`,
+        [cohort.id],
+      );
+      const cohortProjects = Number(projectCountRows[0]?.count ?? 1);
 
       const jobCount = newJobs.length;
       const est = estimateMinutes(catalogued.map((c) => ({ name: c.name, jobs: req.frames.length, workers: cfg.workersHead })));
@@ -461,7 +480,11 @@ export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequ
         estimatedResultAt: new Date(Date.now() + est.minutes * 60_000).toISOString(),
         estimateBasis: est.basis,
         jobCount,
-        cohortProjects: 1, // M2 has no multi-project cohorts yet (window scheduler is M6)
+        // Real count, not hardcoded — 2026-09-16 fix makes joining an
+        // already-running cohort's window possible (stepsJoinable() above),
+        // so this can genuinely be >1 now, not just under the still-unbuilt
+        // M6 window scheduler.
+        cohortProjects,
       };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);

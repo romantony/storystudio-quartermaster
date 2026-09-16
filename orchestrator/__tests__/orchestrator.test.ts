@@ -75,6 +75,7 @@ const BASE_DEPS: DriverDeps = {
     replicatePollIntervalMs: 3000,
     replicateMaxPollAttempts: 80,
     replicateTimeoutMs: 120000,
+    queueBufferWorkers: 10,
   } as unknown as DriverDeps['cfg'],
   publicBaseUrl: 'https://vps.example',
 };
@@ -265,7 +266,24 @@ describe('driveCohort() — assembler dispatch fork (M5 phase 1, 2026-09-11)', (
     // skips seq 6 (driveCohort()'s `runnable` filters to scope: 'bulk'),
     // so runStep() itself must never see it.
     expect(generatorAgent.runStep).toHaveBeenCalledTimes(1);
-    expect(generatorAgent.runStep).toHaveBeenCalledWith(expect.anything(), 'win_test', expect.objectContaining({ seq: 2 }), 5);
+    // 5 (dbStep(2)'s workersTarget) + 10 (cfg.queueBufferWorkers) — the bulk
+    // dispatch ceiling is buffered above the real worker count (2026-09-16),
+    // allocate() below still gets the unbuffered 5 (asserted separately).
+    expect(generatorAgent.runStep).toHaveBeenCalledWith(expect.anything(), 'win_test', expect.objectContaining({ seq: 2 }), 15);
+  });
+
+  it('buffers the bulk dispatch ceiling by cfg.queueBufferWorkers but keeps allocate()\'s real worker count unbuffered (2026-09-16)', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([dbStep(2, 7)]);
+    (generatorAgent.runStep as jest.Mock).mockResolvedValue(undefined);
+
+    await driveCohort(BASE_DEPS, 'win_test');
+
+    // allocate() PATCHes RunPod's real workersMax — must stay at the real
+    // 7, never inflated, or this would cost real extra GPU spend.
+    expect(fleetAgent.allocate).toHaveBeenCalledWith(expect.anything(), 'win_test', expect.objectContaining({ workers: 7 }));
+    // runStep()'s dispatch ceiling gets +10 (cfg.queueBufferWorkers) so jobs
+    // can queue inside RunPod itself rather than waiting on our poll tick.
+    expect(generatorAgent.runStep).toHaveBeenCalledWith(expect.anything(), 'win_test', expect.anything(), 17);
   });
 
   it('emergency-drains the tail endpoint and stops the cohort when the assembler fails', async () => {

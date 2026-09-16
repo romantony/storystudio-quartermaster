@@ -111,10 +111,16 @@ export async function claimNextBatch(
 ): Promise<JobRow[]> {
   if (limit <= 0) return [];
   const { rows } = await client.query(
+    // ORDER BY attempts ASC, seq ASC (2026-09-16): a requeued job
+    // (attempts >= 1, set by markFailedOrRetry) is only ever included in a
+    // claimed batch once no fresh attempts=0 job remains unclaimed for this
+    // step — "retry only once everything else has been processed," per the
+    // user's explicit ask, rather than interleaving retries with first
+    // attempts in plain seq order.
     `SELECT ${JOB_COLUMNS} FROM jobs
       WHERE cohort_id = $1 AND step_seq = $2 AND status = 'planned' AND deps_remaining = 0
         ${projectId !== undefined ? 'AND project_id = $4' : ''}
-      ORDER BY seq
+      ORDER BY attempts ASC, seq ASC
       LIMIT $3
       FOR UPDATE SKIP LOCKED`,
     projectId !== undefined ? [cohortId, stepSeq, limit, projectId] : [cohortId, stepSeq, limit],

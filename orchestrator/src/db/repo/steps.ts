@@ -77,16 +77,59 @@ const STEP_COLUMNS = `cohort_id, seq, name, endpoint_id, workers_target, gate, d
                        depends_on, status, job_total, job_completed, job_failed,
                        warm_at, started_at, finished_at`;
 
-/** Batch insert, within the planner's one transaction (impl plan §6.2 step 7). */
+/** Batch insert, within the planner's one transaction (impl plan §6.2 step 7).
+ * `ON CONFLICT (cohort_id, seq) DO NOTHING` (2026-09-16, multi-project cohort
+ * join fix): a second project joining an already-planned cohort resolves the
+ * same seq numbers the first project already inserted — `steps`' PRIMARY KEY
+ * (cohort_id, seq) would otherwise raise a duplicate-key error on every
+ * shared step. Safe as a no-op: the existing row's endpoint/gate/dependsOn
+ * are cohort-wide anyway (steps/catalog.ts is static, not per-project), so
+ * there's nothing project-specific to merge in. See stepsJoinable() below —
+ * callers must check that BEFORE calling this, since silently skipping the
+ * insert here says nothing about whether anything will ever poll that row
+ * again for the new project's jobs. */
 export async function insertSteps(db: Queryable, cohortId: string, steps: NewStep[]): Promise<void> {
   for (const s of steps) {
     await db.query(
       `INSERT INTO steps (cohort_id, seq, name, endpoint_id, workers_target, gate, drain_after,
                            depends_on, status, job_total, job_completed, job_failed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 0, 0)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 0, 0)
+       ON CONFLICT (cohort_id, seq) DO NOTHING`,
       [cohortId, s.seq, s.name, s.endpointId, s.workersTarget, s.gate, s.drainAfter, s.dependsOn, s.jobTotal],
     );
   }
+}
+
+/** Real incident risk, 2026-09-16: `QM_ORCH_MODE=live` means a second real
+ * project can land in the same 6-hour window while the first is still
+ * `running` — `cohorts_one_running` (005_invariants.sql) makes minting it a
+ * separate cohort impossible ("at most one running cohort, account-wide"),
+ * so joining the existing one is the only option. Joining is only SAFE for
+ * a seq the first project already planned (any brand-new seq this project
+ * needs was never in `agents/orchestrator.ts`'s `runCohort()` one-time
+ * `listSteps()` snapshot, so nothing will ever iterate it) AND only while
+ * that step's own `runStep()` claim loop is still actively polling it
+ * (`pending` = not reached yet, `running` = actively claiming — both fine,
+ * since `stepJobCounts()`/`claimNextBatch()` are live queries, not cached;
+ * `generated`/`gating`/`draining`/`complete`/`failed` = that loop already
+ * exited for good, a newly inserted `planned` job there would never be
+ * claimed by anything). Called by agents/planner.ts's plan() BEFORE
+ * insertSteps()/insertJobs() — a `false` here must abort the whole plan
+ * attempt (db/repo/cohorts.ts's CohortNotJoinableError), not just skip the
+ * unsafe steps, since a partially-planned project is worse than none. */
+export async function stepsJoinable(db: Queryable, cohortId: string, seqs: number[]): Promise<boolean> {
+  const existing = await listSteps(db, cohortId);
+  // Nothing planned into this cohort yet at all — this project is the
+  // first, the ordinary single-project case, always safe (matches today's
+  // behavior exactly; nothing to conflict with or race against).
+  if (existing.length === 0) return true;
+  const byS = new Map(existing.map((s) => [s.seq, s.status] as const));
+  for (const seq of seqs) {
+    const status = byS.get(seq);
+    if (status === undefined) return false;
+    if (status !== 'pending' && status !== 'running') return false;
+  }
+  return true;
 }
 
 export async function getStep(db: Queryable, cohortId: string, seq: number): Promise<StepRow | undefined> {
