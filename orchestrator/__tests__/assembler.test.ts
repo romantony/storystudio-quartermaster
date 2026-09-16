@@ -166,7 +166,7 @@ describe('agents/assembler.ts runAssembler()', () => {
     ]);
   });
 
-  it('marks every intermediate tail step \'complete\' directly (not via release()) so the NEXT step\'s own updateStepStatus(\'running\') does not collide on steps_one_live_per_cohort — real bug found live 2026-09-12, first time a 2+-step tail ran automatically', async () => {
+  it('marks EVERY tail step \'complete\' directly (not via release()), lastStep included, so the NEXT project\'s first tail step does not collide on steps_one_live_per_cohort — real bug found live 2026-09-12 (single project, 2+-step tail) and again 2026-09-16 (a real 2nd project\'s tail)', async () => {
     (stepsRepo.listSteps as jest.Mock).mockResolvedValue([
       dbStep(6, 'merge', 'n6252hm01qz0xh'),
       dbStep(8, 'concat', 'n6252hm01qz0xh'),
@@ -175,8 +175,12 @@ describe('agents/assembler.ts runAssembler()', () => {
 
     await runAssembler(BASE_DEPS, 'win_test');
 
-    // seq 6 (not lastStep) gets a direct 'complete' — NOT release(), which
-    // would also drain postprod-lite and defeat the tail collapse.
+    // Every step gets a direct 'complete' — NOT release(), which would also
+    // drain postprod-lite and defeat the tail collapse. lastStep (seq 8) is
+    // included: leaving it 'generated' between projects is exactly what
+    // crashed a real 2nd project's tail live 2026-09-16 (duplicate key on
+    // steps_one_live_per_cohort) — release() below doesn't need 'generated'
+    // as a precondition, so marking it 'complete' first is safe.
     expect(stepsRepo.updateStepStatus).toHaveBeenCalledWith(
       expect.anything(),
       'win_test',
@@ -184,10 +188,29 @@ describe('agents/assembler.ts runAssembler()', () => {
       'complete',
       expect.objectContaining({ finishedAt: expect.any(Date) }),
     );
-    // seq 8 (lastStep) is NOT touched here — release() (mocked, asserted
-    // elsewhere) is solely responsible for it.
-    expect(stepsRepo.updateStepStatus).not.toHaveBeenCalledWith(expect.anything(), 'win_test', 8, expect.anything(), expect.anything());
-    expect(stepsRepo.updateStepStatus).toHaveBeenCalledTimes(1);
+    expect(stepsRepo.updateStepStatus).toHaveBeenCalledWith(
+      expect.anything(),
+      'win_test',
+      8,
+      'complete',
+      expect.objectContaining({ finishedAt: expect.any(Date) }),
+    );
+    expect(stepsRepo.updateStepStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('marking lastStep \'complete\' after each project unblocks the NEXT project\'s first tail step instead of colliding on steps_one_live_per_cohort', async () => {
+    (stepsRepo.listSteps as jest.Mock).mockResolvedValue([
+      dbStep(6, 'merge', 'n6252hm01qz0xh'),
+      dbStep(8, 'concat', 'n6252hm01qz0xh'),
+    ]);
+    (jobsRepo.listProjectIdsForStep as jest.Mock).mockResolvedValue(['proj_a', 'proj_b']);
+
+    await expect(runAssembler(BASE_DEPS, 'win_test')).resolves.toBeUndefined();
+
+    // 2 projects x 2 steps = 4 direct 'complete' writes, and runStep() is
+    // never rejected by a mocked constraint violation in between.
+    expect(stepsRepo.updateStepStatus).toHaveBeenCalledTimes(4);
+    expect(generatorAgent.runStep).toHaveBeenCalledTimes(4);
   });
 
   it('propagates a runStep() failure without calling release() — the driver (orchestrator.ts) owns the emergency-drain backstop', async () => {
