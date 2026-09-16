@@ -13,6 +13,7 @@ import { ensureCohort, windowBounds } from '../src/db/repo/cohorts';
 import { insertProject, getProject } from '../src/db/repo/projects';
 import { insertSteps, listSteps, dependentSteps, stepsJoinable, updateStepStatus } from '../src/db/repo/steps';
 import { insertJobs, claimNextBatch, markSubmitted, markTerminal, markFailedOrRetry, stepJobCounts } from '../src/db/repo/jobs';
+import { enqueueRequest, listEligibleOutbox, markOutboxPlanned, markOutboxRejected } from '../src/db/repo/request-outbox';
 import { upsertHeld, touchObserved, clearHeld, getState } from '../src/db/repo/endpoint-state';
 
 const DB_URL = process.env.DATABASE_URL;
@@ -474,6 +475,47 @@ maybeDescribe('db repo layer (integration)', () => {
     expect(after).toHaveLength(1);
     expect(after[0].frameId).toBeNull();
     expect(after[0].depsRemaining).toBe(0);
+  });
+
+  it('request_outbox: enqueueRequest is idempotent on request_id — a replayed submission returns the same row, not a duplicate (2026-09-16)', async () => {
+    const requestId = uniqueId('req');
+    const first = await enqueueRequest(pool, { requestId, projectId: uniqueId('proj'), payload: { a: 1 } });
+    const second = await enqueueRequest(pool, { requestId, projectId: uniqueId('proj'), payload: { a: 2 } });
+    expect(second.id).toBe(first.id);
+    expect(second.payload).toEqual({ a: 1 }); // DO UPDATE SET request_id = ... — original payload untouched
+    expect(first.status).toBe('queued');
+  });
+
+  it('request_outbox: listEligibleOutbox only returns queued rows received before the cutoff, oldest first', async () => {
+    const early = await enqueueRequest(pool, { requestId: uniqueId('req'), projectId: uniqueId('proj'), payload: {} });
+    const late = await enqueueRequest(pool, { requestId: uniqueId('req'), projectId: uniqueId('proj'), payload: {} });
+    // Backdate `early` so it's unambiguously before the cutoff; leave `late`
+    // at its real now() insert time, after the cutoff.
+    await pool.query(`UPDATE request_outbox SET received_at = now() - interval '1 hour' WHERE id = $1`, [early.id]);
+
+    const cutoff = new Date(Date.now() - 30 * 60_000); // 30 min ago
+    const eligible = await listEligibleOutbox(pool, cutoff);
+    const eligibleIds = eligible.map((r) => r.id);
+    expect(eligibleIds).toContain(early.id);
+    expect(eligibleIds).not.toContain(late.id);
+  });
+
+  it('request_outbox: markOutboxPlanned / markOutboxRejected transition status and are excluded from later listEligibleOutbox calls', async () => {
+    const planned = await enqueueRequest(pool, { requestId: uniqueId('req'), projectId: uniqueId('proj'), payload: {} });
+    const rejected = await enqueueRequest(pool, { requestId: uniqueId('req'), projectId: uniqueId('proj'), payload: {} });
+    await pool.query(`UPDATE request_outbox SET received_at = now() - interval '1 hour' WHERE id IN ($1, $2)`, [
+      planned.id,
+      rejected.id,
+    ]);
+
+    await markOutboxPlanned(pool, planned.id, sharedCohortId);
+    await markOutboxRejected(pool, rejected.id, 'cohort not joinable');
+
+    const cutoff = new Date(Date.now() - 30 * 60_000);
+    const eligible = await listEligibleOutbox(pool, cutoff);
+    const eligibleIds = eligible.map((r) => r.id);
+    expect(eligibleIds).not.toContain(planned.id);
+    expect(eligibleIds).not.toContain(rejected.id);
   });
 });
 

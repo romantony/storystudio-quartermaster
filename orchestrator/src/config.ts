@@ -57,6 +57,18 @@ const ConfigSchema = z.object({
   // ── fleet / window (impl plan §17) ─────────────────────────────────────
   fleetLive: bool(false), // ORCH_FLEET_LIVE — false = log PATCHes, never send
   windowCron: z.string().default('0 0,6,12,18 * * *'),
+  // Two ingestion modes (2026-09-16) — deliberately named apart from
+  // StoryStudio's OWN, unrelated QM_ORCH_MODE (off/shadow/live, their
+  // routing switch): this is purely QM's internal ingestion behavior.
+  // 'project' (default): POST /v1/requests plans and drives each request
+  // immediately on arrival — today's exact behavior. 'batch': requests are
+  // queued (request_outbox) and only planned together, once, when
+  // windowCron fires — see agents/batch-window.ts.
+  schedulingMode: z.enum(['project', 'batch']).default('project'),
+  // Requests received within this many minutes of a window boundary roll to
+  // the NEXT window's batch rather than this one's — gives stragglers a
+  // clean home instead of racing the boundary.
+  windowCutoffMinutes: numeric(15).pipe(z.number().int().nonnegative()),
   workersHead: numeric(25).pipe(z.number().int().positive()),
   workersTail: numeric(10).pipe(z.number().int().positive()),
   // 2026-09-16: lets the bulk/generation dispatch loop submit up to this
@@ -210,6 +222,8 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   runpodTimeoutMs: 'RUNPOD_TIMEOUT_MS',
   fleetLive: 'ORCH_FLEET_LIVE',
   windowCron: 'ORCH_WINDOW_CRON',
+  schedulingMode: 'ORCH_SCHEDULING_MODE',
+  windowCutoffMinutes: 'ORCH_WINDOW_CUTOFF_MINUTES',
   workersHead: 'ORCH_WORKERS_HEAD',
   workersTail: 'ORCH_WORKERS_TAIL',
   queueBufferWorkers: 'ORCH_QUEUE_BUFFER_WORKERS',

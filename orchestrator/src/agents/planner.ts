@@ -362,7 +362,18 @@ function buildStepsAndJobs(
   return { steps, jobs };
 }
 
-export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequest: unknown): Promise<PlanAck> {
+/**
+ * Every check that can run WITHOUT touching the DB — zod shape plus the two
+ * business rules (referenceImage needs referenceImageUrl per frame, bgm
+ * needs a bgmPrompt). Extracted (2026-09-16) so `ORCH_SCHEDULING_MODE=batch`
+ * can reject a malformed request at `POST /v1/requests` time, same as
+ * `project` mode, instead of letting it sit in `request_outbox` for hours
+ * only to fail at the window boundary — matches this file's own "fail fast,
+ * not six hours later" principle (http/routes/requests.ts's docstring).
+ * Also resolves+returns `catalogued` so callers (plan() and the batch
+ * enqueue path) don't redo that work.
+ */
+export function validateRequest(rawRequest: unknown): { req: OrchestratorRequest; catalogued: CatalogEntry[] } {
   const parsed = RequestSchema.safeParse(rawRequest);
   if (!parsed.success) throw new PlanValidationError(parsed.error.issues);
   const req = parsed.data;
@@ -391,6 +402,40 @@ export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequ
     ]);
   }
 
+  const resolvedSeqs = resolveStepSet(req);
+  const uncatalogued = resolvedSeqs.filter((s) => !catalogEntry(s));
+  if (uncatalogued.length > 0) {
+    log().warn(
+      { requestId: req.requestId, uncatalogued },
+      'validateRequest: resolved steps have no catalog entry yet (builder lands in a later milestone) — skipping them',
+    );
+  }
+  const catalogued = resolvedSeqs
+    .map((s) => catalogEntry(s))
+    .filter((c): c is NonNullable<typeof c> => c !== undefined);
+
+  if (catalogued.length === 0) {
+    throw new PlanValidationError([
+      {
+        code: z.ZodIssueCode.custom,
+        path: ['tier'],
+        message: `no catalogued steps resolved for tier=${req.tier} options=${JSON.stringify(req.options)}`,
+      },
+    ]);
+  }
+
+  return { req, catalogued };
+}
+
+/** `at` (2026-09-16): defaults to `new Date()`, matching every `project`-mode
+ * call site's existing behavior exactly. `agents/batch-window.ts`'s
+ * `runBatchWindow()` passes a single fixed timestamp for every row in one
+ * batch run, so they all resolve the same `windowId(at)` (`ensureCohort()`)
+ * deterministically — without this, a batch that takes long enough to cross
+ * a window boundary mid-run could split across two cohorts. */
+export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequest: unknown, at: Date = new Date()): Promise<PlanAck> {
+  const { req, catalogued } = validateRequest(rawRequest);
+
   // §10.1 request-level idempotency: a replayed requestId returns the
   // original acknowledgement, never a second plan.
   const client = await pool.connect();
@@ -401,25 +446,9 @@ export async function plan(pool: Pool, cfg: Pick<Config, 'workersHead'>, rawRequ
       return ackFromExisting(client, existing.cohortId!, req.projectId, req.requestId);
     }
 
-    const resolvedSeqs = resolveStepSet(req);
-    const uncatalogued = resolvedSeqs.filter((s) => !catalogEntry(s));
-    if (uncatalogued.length > 0) {
-      log().warn(
-        { requestId: req.requestId, uncatalogued },
-        'plan: resolved steps have no catalog entry yet (builder lands in a later milestone) — skipping them',
-      );
-    }
-    const catalogued = resolvedSeqs
-      .map((s) => catalogEntry(s))
-      .filter((c): c is NonNullable<typeof c> => c !== undefined);
-
-    if (catalogued.length === 0) {
-      throw new Error(`plan: no catalogued steps resolved for tier=${req.tier} options=${JSON.stringify(req.options)}`);
-    }
-
     await client.query('BEGIN');
     try {
-      const cohort = await ensureCohort(client);
+      const cohort = await ensureCohort(client, at);
       const { project, wasNew } = await insertProject(client, {
         id: req.projectId,
         cohortId: cohort.id,

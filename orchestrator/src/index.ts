@@ -4,16 +4,20 @@
  * deliberately the only place that composition happens (impl plan §2).
  *
  * M2 wires the planner/fleet/generator/driver behind the HTTP routes
- * (agents/orchestrator.ts's driveCohort, called per-request) rather than as
- * standalone background loops — the tumbling-window scheduler that would
- * run them independently of a request lands in M6.
+ * (agents/orchestrator.ts's driveCohort, called per-request) — that's still
+ * the whole story in the default `ORCH_SCHEDULING_MODE=project` mode.
+ * 2026-09-16 adds the `batch` mode's cron trigger (agents/batch-window.ts) —
+ * registered unconditionally below (cheap), but a no-op every firing unless
+ * schedulingMode is actually 'batch'.
  */
+import cron from 'node-cron';
 import { loadConfig } from './config';
 import { closePool, initPool, getPool } from './db/pool';
 import { buildServer } from './http/server';
 import { createLogger, setLogger } from './telemetry/log';
 import { RunpodClient } from './runpod/client';
 import { driveCohort } from './agents/orchestrator';
+import { runBatchWindow } from './agents/batch-window';
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -41,12 +45,23 @@ async function main(): Promise<void> {
     );
   }
 
+  // ORCH_SCHEDULING_MODE=batch's window-close trigger. Fires at every
+  // windowCron boundary regardless of mode — runBatchWindow()'s own first
+  // line is the real gate, so this stays a harmless no-op while the mode is
+  // 'project' (the default).
+  const batchWindowTask = cron.schedule(cfg.windowCron, () => {
+    void runBatchWindow({ pool: getPool(), runpod, cfg, publicBaseUrl: cfg.publicBaseUrl }, new Date()).catch((err) =>
+      logger.error({ err }, 'batch-window: runBatchWindow crashed'),
+    );
+  });
+
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info({ signal }, 'shutting down');
     try {
+      batchWindowTask.stop();
       await app.close();
       await closePool();
       logger.info('shutdown complete');
