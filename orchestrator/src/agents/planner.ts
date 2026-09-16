@@ -39,7 +39,30 @@ const FrameSchema = z
     // Sound description for step 15 (MMAudio): SFX, ambience, environmental
     // sound. Falls back to a prompt built from imagePrompt (builders/sfx.ts).
     audioPrompt: z.string().min(1).optional(),
-    textManifest: z.object({ elements: z.array(z.unknown()), fps: z.number() }).optional(),
+    // Educational/explainer on-screen text (options.textOverlay, step 16 —
+    // steps/builders/remotion-overlay.ts). Reuses StoryStudio's own,
+    // already-existing `FrameRenderManifest` shape verbatim (confirmed
+    // against storystudio-unified/docs/quartermaster/
+    // storystudio-orchestrator-request-examples.md §3 and
+    // frontend/src/remotion-render/frameManifest.types.ts) rather than the
+    // earlier {elements, fps} placeholder this replaced, which didn't match
+    // the real contract. `.passthrough()` on both levels: `layoutHint` and
+    // other manifest/element fields the Remotion Lambda itself already
+    // handles (or degrades gracefully on) aren't this schema's job to
+    // enumerate. `background.src` is intentionally accepted even when empty
+    // — the caller can't know the clip URL before the orchestrator
+    // generates it; the builder overwrites it with the resolved step 6/7
+    // output.
+    textManifest: z
+      .object({
+        fps: z.number(),
+        durationInFrames: z.number(),
+        background: z.object({ type: z.string(), src: z.string() }).passthrough(),
+        camera: z.object({ type: z.string(), from: z.number(), to: z.number() }).passthrough().optional(),
+        textElements: z.array(z.unknown()),
+      })
+      .passthrough()
+      .optional(),
     // Narration Premium's reference-image flow (options.referenceImage) —
     // the caller (StoryStudio, in the real product flow) generates this
     // once and attaches it to every frame; see steps/builders/image-edit.ts.
@@ -159,12 +182,25 @@ export class PlanValidationError extends Error {
 
 /** The full spec step topology (§3), independent of what's catalogued today.
  * Used only to resolve WHICH steps a request wants. Step 7 was the spec's
- * Remotion overlay — permanently out of scope for the orchestrator (stays on
- * the existing AWS Lambda, impl plan §13 M1 note) — so as of 2026-09-12 this
- * orchestrator repurposes the number for its own remove-silence step
- * instead, the same way seq 0 (image-i2i) is a number outside the original
- * 1-13 spec chosen purely to sort correctly: remove-silence has to run
- * between merge (6) and concat (8), and 7 is the only free integer there. */
+ * Remotion overlay; as of 2026-09-12 this orchestrator repurposed the number
+ * for its own remove-silence step instead (Remotion was out of scope for the
+ * orchestrator entirely, impl plan §13 M1 note), the same way seq 0
+ * (image-i2i) is a number outside the original 1-13 spec chosen purely to
+ * sort correctly: remove-silence has to run between merge (6) and concat
+ * (8), and 7 is the only free integer there.
+ *
+ * **Reversed 2026-09-16**: the orchestrator DOES drive Remotion overlay now,
+ * for educational/explainer projects — but still via the existing AWS
+ * Lambda (`QM-remotion-overlay`), not RunPod. Live-tested that Lambda path
+ * first (quality clean, ~11-17s/frame, ~$0.0015/frame — cost isn't the
+ * issue), then wired 2026-09-16 against StoryStudio's own
+ * docs/quartermaster/storystudio-orchestrator-request-examples.md §3 sample
+ * request: `options.textOverlay` gates seq 16 (steps/catalog.ts —
+ * numbered 16, but runs between remove-silence (7) and concat (8) in real
+ * execution order; see that entry's comment), and `frames[].textManifest`
+ * now validates against the real `FrameRenderManifest` shape instead of the
+ * earlier `{elements, fps}` placeholder. See
+ * `orchestrator/containers/README.md`'s `remotion` row. */
 const STEP_TOPOLOGY: ReadonlyArray<{ seq: number; dialogueOnly?: boolean; gatedBy?: (o: OrchestratorRequest['options']) => boolean }> = [
   // seq 0 (image-i2i) and seq 1 (image t2i) are mutually exclusive — the
   // Narration Premium reference-image flow (options.referenceImage) runs
@@ -178,6 +214,7 @@ const STEP_TOPOLOGY: ReadonlyArray<{ seq: number; dialogueOnly?: boolean; gatedB
   { seq: 5, gatedBy: (o) => o.bgm },
   { seq: 6 },
   { seq: 7, gatedBy: (o) => o.removeSilence }, // repurposed from spec's Remotion slot — see header comment above
+  { seq: 16, gatedBy: (o) => o.textOverlay }, // educational/explainer Remotion overlay — see header comment above; numbered 16, runs here
   { seq: 8 },
   { seq: 9, gatedBy: (o) => o.subtitles },
   { seq: 10, gatedBy: (o) => o.upscale && o.upscaleEngine === 'realesrgan' },
@@ -309,6 +346,7 @@ function buildStepsAndJobs(
         cloneArtifactUrl: req.cloneArtifactUrl,
         upscaleFrames: catalogued.some((cc) => cc.seq === 14) || undefined,
         sfx: catalogued.some((cc) => cc.seq === 15) || undefined,
+        textManifest: frame.textManifest,
       };
       jobs.push({
         projectId,

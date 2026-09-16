@@ -54,8 +54,15 @@ describe('resolveStepSet', () => {
     expect(resolved).toEqual([1, 2, 3, 5, 6, 8, 9, 10, 11, 12, 13]);
   });
 
-  it('step 7 is NOT the spec\'s Remotion (textOverlay never gates it — Remotion stays on the existing AWS Lambda)', () => {
-    expect(_internal.resolveStepSet({ ...base, options: { ...base.options, textOverlay: true } })).not.toContain(7);
+  it('step 7 is NOT the spec\'s Remotion (options.textOverlay gates step 16 instead, via the existing AWS Lambda)', () => {
+    const resolved = _internal.resolveStepSet({ ...base, options: { ...base.options, textOverlay: true } });
+    expect(resolved).not.toContain(7);
+    expect(resolved).toEqual([1, 2, 3, 6, 16, 8]);
+  });
+
+  it('options.textOverlay plans step 16 between remove-silence (7) and concat (8) when both are on', () => {
+    const resolved = _internal.resolveStepSet({ ...base, options: { ...base.options, textOverlay: true, removeSilence: true } });
+    expect(resolved).toEqual([1, 2, 3, 6, 7, 16, 8]);
   });
 
   it('step 7 (repurposed for remove-silence, 2026-09-12) appears only when options.removeSilence is true', () => {
@@ -261,6 +268,7 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
   const bgmEntry = catalogEntry(5)!;
   const mergeEntry = catalogEntry(6)!;
   const removeSilenceEntry = catalogEntry(7)!;
+  const remotionEntry = catalogEntry(16)!;
   const concatEntry = catalogEntry(8)!;
   const upscaleEntry = catalogEntry(10)!;
   const captionEntry = catalogEntry(11)!;
@@ -306,6 +314,29 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     const { steps } = _internal.buildStepsAndJobs([mergeEntry, concatEntry], req, 'proj_1', 25);
     const concatStep = steps.find((s) => s.seq === 8)!;
     expect(concatStep.dependsOn).toEqual([6]);
+  });
+
+  it('step 16 (text overlay, per-frame, source lambda) plans one job per frame, and concat (dependsOn:[16,7,6]) collapses to [16] when the whole chain ran', () => {
+    const { steps, jobs } = _internal.buildStepsAndJobs([mergeEntry, removeSilenceEntry, remotionEntry, concatEntry], req, 'proj_1', 25);
+    const remotionStep = steps.find((s) => s.seq === 16)!;
+    expect(remotionStep.jobTotal).toBe(3); // per-frame, like remove-silence
+    expect(jobs.filter((j) => j.stepSeq === 16)).toHaveLength(3);
+
+    const concatStep = steps.find((s) => s.seq === 8)!;
+    // Without the collapse this would be [16,7,6]; both 7 and 6 are shadowed
+    // since 16 already (transitively, via its own dependsOn) covers them.
+    expect(concatStep.dependsOn).toEqual([16]);
+    const concatJobs = jobs.filter((j) => j.stepSeq === 8);
+    expect(concatJobs[0].depsRemaining).toBe(3); // not double/triple-counted
+  });
+
+  it('concat depends on [16,6] (no 7) when text overlay ran without remove-silence', () => {
+    const { steps } = _internal.buildStepsAndJobs([mergeEntry, remotionEntry, concatEntry], req, 'proj_1', 25);
+    const concatStep = steps.find((s) => s.seq === 8)!;
+    // remotionEntry.dependsOn is [7,6]; 7 isn't catalogued here, so
+    // resolveDirectDependencies only sees [6] as remotion's real dependency
+    // and collapses it the same way.
+    expect(concatStep.dependsOn).toEqual([16]);
   });
 
   it('computeDrainAfter still collapses 6->8 since both target postprod-lite', () => {

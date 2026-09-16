@@ -73,6 +73,10 @@ async function runCohort(deps: DriverDeps, cohortId: string): Promise<boolean> {
       apiBase: deps.cfg.replicateApiBase,
       timeoutMs: deps.cfg.replicateTimeoutMs,
     },
+    lambda: {
+      functionName: deps.cfg.remotionLambdaFunctionName,
+      region: deps.cfg.remotionLambdaRegion,
+    },
   };
   const qualityDeps: QualityDeps = {
     pool: deps.pool,

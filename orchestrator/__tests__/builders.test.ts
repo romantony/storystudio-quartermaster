@@ -10,6 +10,7 @@ import { buildI2vInput } from '../src/steps/builders/i2v';
 import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
 import { buildRemoveSilenceInput } from '../src/steps/builders/remove-silence';
+import { buildRemotionOverlayInput } from '../src/steps/builders/remotion-overlay';
 import { buildUpscaleInput } from '../src/steps/builders/upscale';
 import { buildUpscaleFrameInput } from '../src/steps/builders/upscale-frame';
 import { buildSfxInput } from '../src/steps/builders/sfx';
@@ -400,6 +401,17 @@ describe('buildConcatInput (step 8, singleJobPerProject — project-scoped, no s
     expect(buildConcatInput(projectCtx({ 6: urls, 7: [] })).video_urls).toEqual(urls);
     expect(buildConcatInput(projectCtx({ 6: urls })).video_urls).toEqual(urls);
   });
+
+  it('prefers step 16 (text overlay) over both step 7 and step 6 when all three are resolved', () => {
+    const out = buildConcatInput(
+      projectCtx({
+        6: ['https://pub.example/f_001_merge.mp4', 'https://pub.example/f_002_merge.mp4'],
+        7: ['https://pub.example/f_001_trimmed.mp4', 'https://pub.example/f_002_trimmed.mp4'],
+        16: ['https://pub.example/f_001_overlay.mp4', 'https://pub.example/f_002_overlay.mp4'],
+      }),
+    );
+    expect(out.video_urls).toEqual(['https://pub.example/f_001_overlay.mp4', 'https://pub.example/f_002_overlay.mp4']);
+  });
 });
 
 describe('buildRemoveSilenceInput (step 7, per-frame — sits between merge and concat)', () => {
@@ -415,6 +427,54 @@ describe('buildRemoveSilenceInput (step 7, per-frame — sits between merge and 
 
   it('throws when step 6 has no resolved output', () => {
     expect(() => buildRemoveSilenceInput(ctx({ resolvedDeps: {} }))).toThrow(/no resolved merge video URL/);
+  });
+});
+
+describe('buildRemotionOverlayInput (step 16, source: lambda — sits between remove-silence and concat)', () => {
+  const textManifest = {
+    fps: 30,
+    durationInFrames: 150,
+    background: { type: 'video', src: '' },
+    camera: { type: 'push-in', from: 1.0, to: 1.08 },
+    textElements: [{ id: 'title-1', kind: 'title', content: 'PHOTOSYNTHESIS' }],
+  };
+
+  it('overwrites the empty background.src with the resolved step-7 (remove-silence) clip and forces the real duration', () => {
+    const out = buildRemotionOverlayInput(
+      ctx({
+        job: { ...baseJob, textManifest },
+        resolvedDeps: {
+          6: { url: 'https://pub.example/f_001_merge.mp4', durationS: 5.2 },
+          7: { url: 'https://pub.example/f_001_trimmed.mp4', durationS: 4.6 },
+        },
+      }),
+    );
+    expect(out.clipUrl).toBe('https://pub.example/f_001_trimmed.mp4');
+    expect(out.frameId).toBe('f_001');
+    expect(out.duration).toBe(4.6);
+    expect(JSON.parse(out.textManifest as string)).toEqual({ ...textManifest, background: { type: 'video', src: 'https://pub.example/f_001_trimmed.mp4' } });
+  });
+
+  it('falls back to step 6 (merge) when remove-silence did not run', () => {
+    const out = buildRemotionOverlayInput(
+      ctx({
+        job: { ...baseJob, textManifest },
+        resolvedDeps: { 6: { url: 'https://pub.example/f_001_merge.mp4', durationS: 5.2 } },
+      }),
+    );
+    expect(out.clipUrl).toBe('https://pub.example/f_001_merge.mp4');
+    expect(out.duration).toBe(5.2);
+  });
+
+  it('throws when neither step 6 nor step 7 resolved a video URL', () => {
+    expect(() => buildRemotionOverlayInput(ctx({ job: { ...baseJob, textManifest }, resolvedDeps: {} }))).toThrow(
+      /no resolved merge\/remove-silence video URL/,
+    );
+  });
+
+  it('returns a __passthrough marker (not a throw) when the frame has no textManifest — see agents/generator.ts\'s lambda branch', () => {
+    const out = buildRemotionOverlayInput(ctx({ resolvedDeps: { 6: { url: 'https://pub.example/f_001_merge.mp4' } } }));
+    expect(out).toEqual({ __passthrough: true, clipUrl: 'https://pub.example/f_001_merge.mp4' });
   });
 });
 

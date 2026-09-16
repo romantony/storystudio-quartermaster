@@ -137,6 +137,22 @@ const ConfigSchema = z.object({
   callbackBaseDelayMs: numeric(1_000).pipe(z.number().int().positive()),
   callbackMaxDelayMs: numeric(300_000).pipe(z.number().int().positive()),
   callbackTimeoutMs: numeric(15_000).pipe(z.number().int().positive()),
+
+  // ── Remotion text overlay (step 16, steps/catalog.ts's `source: 'lambda'`) ──
+  // The one deliberate AWS SDK exception (2026-09-16) — see
+  // src/lambda/client.ts's header comment. Credentials come from the
+  // default AWS SDK provider chain (env/instance role), not from this
+  // config — the VPS box needs `lambda:InvokeFunction` on this function.
+  remotionLambdaFunctionName: z.string().default('QM-remotion-overlay'),
+  remotionLambdaRegion: z.string().default('us-east-1'),
+  // Same "clearly-labeled estimate, not a measurement" precedent as
+  // qualityVlmCostUsd above: Lambda's job_costs row is computed the same
+  // way as RunPod's (execution_ms * rate), but this rate is derived from
+  // one live-tested render (~$0.00146 over ~11.46s wrapper execution ≈
+  // $0.000127/s), not Remotion's own real per-chunk billing (which isn't
+  // perfectly linear in wall time) — right order of magnitude, correctable
+  // later from real job_costs data.
+  lambdaRenderRateUsdS: numeric(0.000127).pipe(z.number().positive()),
 });
 
 export type Config = Readonly<z.infer<typeof ConfigSchema>>;
@@ -194,6 +210,9 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   callbackBaseDelayMs: 'ORCH_CALLBACK_BASE_DELAY_MS',
   callbackMaxDelayMs: 'ORCH_CALLBACK_MAX_DELAY_MS',
   callbackTimeoutMs: 'ORCH_CALLBACK_TIMEOUT_MS',
+  remotionLambdaFunctionName: 'REMOTION_LAMBDA_FUNCTION_NAME',
+  remotionLambdaRegion: 'REMOTION_LAMBDA_REGION',
+  lambdaRenderRateUsdS: 'LAMBDA_RENDER_RATE_USD_S',
 };
 
 /**

@@ -6,23 +6,25 @@
  *
  * Unlike every other builder, this job has no single frame — its one job per
  * project depends on ALL of that project's per-frame clips at once, from
- * whichever of step 7 (remove-silence, if options.removeSilence ran) or
- * step 6 (merge, always) produced them — agents/generator.ts's
- * resolveProjectDeps() gathers both into `ctx.perFrameOutputs[7]`/`[6]`
- * (empty array for whichever didn't run), already ordered by each frame's
- * original narrative position. Checked by `.length`, not `??`, since an
- * unresolved step still comes back as `[]` (truthy), not `undefined`. No
- * `frame_id` attribution — this output belongs to the whole project, not
- * one frame.
+ * whichever of step 16 (text overlay, if options.textOverlay ran), step 7
+ * (remove-silence, if options.removeSilence ran), or step 6 (merge, always)
+ * produced them — agents/generator.ts's resolveProjectDeps() gathers all
+ * three into `ctx.perFrameOutputs[16]`/`[7]`/`[6]` (empty array for
+ * whichever didn't run), already ordered by each frame's original narrative
+ * position. Checked by `.length`, not `??`, since an unresolved step still
+ * comes back as `[]` (truthy), not `undefined`. No `frame_id` attribution —
+ * this output belongs to the whole project, not one frame.
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
+const TEXT_OVERLAY_STEP_SEQ = 16;
 const REMOVE_SILENCE_STEP_SEQ = 7;
 const MERGE_STEP_SEQ = 6;
 
 export const buildConcatInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
+  const overlaid = ctx.perFrameOutputs?.[TEXT_OVERLAY_STEP_SEQ] ?? [];
   const trimmed = ctx.perFrameOutputs?.[REMOVE_SILENCE_STEP_SEQ] ?? [];
-  const videoUrls = trimmed.length > 0 ? trimmed : (ctx.perFrameOutputs?.[MERGE_STEP_SEQ] ?? []);
+  const videoUrls = overlaid.length > 0 ? overlaid : trimmed.length > 0 ? trimmed : (ctx.perFrameOutputs?.[MERGE_STEP_SEQ] ?? []);
   if (videoUrls.length < 2) {
     throw new Error(`concat builder: need at least 2 merged clips, got ${videoUrls.length} for project ${ctx.projectId}`);
   }

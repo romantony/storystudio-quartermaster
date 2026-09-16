@@ -32,6 +32,7 @@ import { buildCaptionInput } from './builders/caption';
 import { buildBgmInput } from './builders/bgm';
 import { buildBgmOverlayInput } from './builders/bgm-overlay';
 import { buildRemoveSilenceInput } from './builders/remove-silence';
+import { buildRemotionOverlayInput } from './builders/remotion-overlay';
 import { buildUpscaleFrameInput } from './builders/upscale-frame';
 import { buildSfxInput } from './builders/sfx';
 import { buildFluxImageInput, buildReplicateWanInput, buildNormalizeInput } from './builders/fallbacks';
@@ -66,6 +67,16 @@ export interface CatalogEntry {
   gate: string | null;
   dependsOn: number[];
   scope: StepScope;
+  /** Dispatch mechanism for this step's jobs. Unset/'runpod' preserves
+   * today's `deps.runpod.run/status/health` protocol (agents/generator.ts).
+   * 'lambda' is the one deliberate exception (2026-09-16, Remotion text
+   * overlay): a direct, synchronous AWS Lambda invoke instead — no
+   * run/status/webhook cycle, no RunPod worker allocation/health-check
+   * applies (agents/generator.ts's submitOne()/runStep() both branch on
+   * this). config.ts still has no other AWS SDK usage; this is the one
+   * exception, made because the Remotion Lambda already exists and was
+   * live-tested rather than reimplemented on RunPod. */
+  source?: 'runpod' | 'lambda';
   /** Orthogonal to `scope`: when true, agents/planner.ts plans exactly ONE
    * job for this step per project (frameId: null) instead of one per frame,
    * fanned in on ALL of dependsOn's per-frame outputs — see
@@ -243,21 +254,56 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     builder: buildRemoveSilenceInput,
   },
   {
+    // Educational/explainer text overlay (2026-09-16 — see
+    // orchestrator/containers/README.md's `remotion` row and
+    // agents/planner.ts's STEP_TOPOLOGY header comment for the full
+    // history). Not part of the original 1-13 spec numbering or the
+    // postprod-lite tail — seq 16 (next free integer) is fine numerically
+    // ONLY because agents/assembler.ts's plannedTailSteps() orders
+    // project-scope tail steps by their position in STEP_CATALOG below, not
+    // by raw seq value (fixed alongside this entry — see that file). Must
+    // sit here, between remove-silence (7) and concat (8): it needs the
+    // already-merged/trimmed per-frame clip as its Remotion composition's
+    // video background (StoryStudio's own request-examples doc explicitly
+    // leaves `textManifest.background.src` empty for this exact reason —
+    // the orchestrator, not the caller, resolves it, since the clip doesn't
+    // exist yet when StoryStudio submits the request), and concat needs
+    // ITS output once it ran. `source: 'lambda'` — dispatches to the
+    // existing, live-tested AWS `QM-remotion-overlay` Lambda
+    // (src/lambda/client.ts) instead of RunPod; `endpointId` here is a
+    // sentinel only (logging/computeDrainAfter bookkeeping), never passed
+    // to `deps.runpod`. Gated by options.textOverlay (STEP_TOPOLOGY). A
+    // plain per-frame step, NOT singleJobPerProject, same shape as
+    // remove-silence.
+    seq: 16,
+    name: 'remotion-overlay',
+    source: 'lambda',
+    endpointId: 'lambda:qm-remotion-overlay',
+    gate: null,
+    dependsOn: [7, 6],
+    scope: 'project',
+    builder: buildRemotionOverlayInput,
+  },
+  {
     // First singleJobPerProject step: one job for the whole project, fanned
-    // in on every frame's clip, from whichever of step 7 (if
-    // options.removeSilence ran) or step 6 (always) produced it — NOT
-    // mutually exclusive (merge always runs; remove-silence is
-    // independently optional), so listing both relies on
-    // agents/planner.ts's resolveDirectDependencies() to collapse 6 out of
-    // the fan-in count whenever 7 is also present (7 already depends on 6).
-    // Shares postprod-lite with merge/remove-silence, so it rides the same
-    // assembler.ts tail allocation with zero drain in between
-    // (computeDrainAfter already collapses same-endpoint adjacent steps).
+    // in on every frame's clip, from whichever of step 16 (if
+    // options.textOverlay ran), step 7 (if options.removeSilence ran), or
+    // step 6 (always) produced it — NOT mutually exclusive (merge always
+    // runs; remove-silence and text-overlay are each independently
+    // optional), so listing all three relies on agents/planner.ts's
+    // resolveDirectDependencies() to collapse 6/7 out of the fan-in count
+    // whenever a later one is also present (each depends directly on the
+    // one before it). Shares postprod-lite with merge/remove-silence, so it
+    // rides the same assembler.ts tail allocation with zero drain in
+    // between (computeDrainAfter already collapses same-endpoint adjacent
+    // steps) — the Lambda-sourced step 16 riding in the middle doesn't
+    // change that: it just runs while postprod-lite's workers sit idle for
+    // the ~11-17s Remotion call, unbilled (RunPod only bills active workers).
     seq: 8,
     name: 'concat',
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
     gate: null,
-    dependsOn: [7, 6],
+    dependsOn: [16, 7, 6],
     scope: 'project',
     singleJobPerProject: true,
     builder: buildConcatInput,

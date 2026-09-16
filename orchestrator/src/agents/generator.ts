@@ -27,6 +27,7 @@ import { touchObserved } from '../db/repo/endpoint-state';
 import { runpodOutUrl } from '../runpod/output';
 import { countUngated } from '../db/repo/quality';
 import { createPrediction, getPrediction, type ReplicateTransport } from '../quality/replicate';
+import { invokeRemotionOverlay, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
 
 export interface GeneratorDeps {
   pool: Pool;
@@ -34,7 +35,7 @@ export interface GeneratorDeps {
   // warmTimeoutMs: fleet.ts's allocate() no longer polls for readiness (M3
   // fix, 2026-09-10) — runStep()'s own non-blocking cold-start check owns
   // that timeout now, reusing the same config value.
-  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs' | 'maxAttempts'>;
+  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs' | 'maxAttempts' | 'lambdaRenderRateUsdS'>;
   /** Base URL this process is reachable at (e.g. https://orchestrator.ai-storystudio.com),
    * used to build each job's per-job webhook callback URL. */
   publicBaseUrl: string;
@@ -45,6 +46,10 @@ export interface GeneratorDeps {
   /** Replicate transport for 'replicate' fallback routes (steps/catalog.ts).
    * Optional: without it such a job fails at submission like any build error. */
   replicate?: ReplicateTransport;
+  /** AWS Lambda transport for `source: 'lambda'` steps (steps/catalog.ts's
+   * seq 16, Remotion text overlay). Optional: without it such a job fails at
+   * submission with a clear error, same as a missing replicate token above. */
+  lambda?: LambdaTransport;
 }
 
 /** Prefix on jobs.runpod_job_id while a job is a Replicate prediction (the
@@ -254,6 +259,61 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
       return;
     }
 
+    if (step.source === 'lambda') {
+      // No fallback routing, no run/status/webhook cycle — a single
+      // synchronous invoke that already blocks until Remotion's render
+      // finishes (src/lambda/client.ts). Modeled on the RunPod
+      // synchronous-COMPLETED branch below: mark submitted + terminal in
+      // one step, since there's nothing to reconcile later.
+      if (!deps.lambda) throw new Error(`step ${step.seq} (${step.name}) is source:'lambda' but no lambda transport is configured`);
+
+      // steps/builders/remotion-overlay.ts's per-frame-optional escape hatch:
+      // a frame with no textManifest returns this marker instead of a real
+      // Lambda payload — complete immediately with the clip unchanged,
+      // never invoke Lambda at all (no cost, no risk of concat's fan-in
+      // silently dropping this frame — see that builder's header comment).
+      if ((payload as { __passthrough?: boolean }).__passthrough) {
+        const clipUrl = (payload as { clipUrl: string }).clipUrl;
+        await markSubmitted(client, job.id, `lambda:${job.id}`);
+        await markTerminal(client, job.id, { status: 'complete', output: { video: clipUrl } });
+        await client.query('COMMIT');
+        await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_completed');
+        log().info({ jobId: job.id, stepSeq: step.seq }, 'generator: lambda step skipped (no textManifest), clip passed through unchanged');
+        return;
+      }
+
+      const startedAt = Date.now();
+      let result: { overlayRenderedUrl: string };
+      try {
+        result = await invokeRemotionOverlay(deps.lambda, payload as unknown as RemotionOverlayInput);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const retried = await markFailedOrRetry(client, job.id, { error: message }, deps.cfg.maxAttempts);
+        await client.query('COMMIT');
+        if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
+        log().warn({ jobId: job.id, stepSeq: step.seq, error: message, retried }, 'generator: lambda invoke failed');
+        return;
+      }
+      // `video`, not `overlayRenderedUrl`, so runpodOutUrl() (runpod/output.ts)
+      // resolves it downstream the same way every other video-producing
+      // step's output already does — no change needed to its key list.
+      const output = { video: result.overlayRenderedUrl };
+      const executionMs = Date.now() - startedAt;
+      await markSubmitted(client, job.id, `lambda:${job.id}`);
+      await markTerminal(client, job.id, { status: 'complete', output });
+      await recordJobCost(client, {
+        jobId: job.id,
+        endpointId: step.endpointId,
+        executionMs,
+        delayMs: null,
+        workerRateUsdS: deps.cfg.lambdaRenderRateUsdS,
+      });
+      await client.query('COMMIT');
+      await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_completed');
+      log().info({ jobId: job.id, stepSeq: step.seq, executionMs }, 'generator: lambda synchronous completion');
+      return;
+    }
+
     const endpointId = route?.provider === 'runpod' ? route.endpointId : step.endpointId;
     const jobToken = webhookToken(deps.webhookSecret, job.id);
     const webhookUrl = `${deps.publicBaseUrl}/v1/webhooks/runpod/${jobToken}`;
@@ -426,7 +486,12 @@ export async function runStep(
     // so a stuck cold start here costs nothing while waiting, unlike the
     // 2026-09-10 incident where 5 active workers billed for the full
     // warmTimeoutMs with zero job throughput.
-    if (!warmedAt) {
+    // Doesn't apply to a `source: 'lambda'` step at all — there's no RunPod
+    // worker pool to warm-check, and step.endpointId is a sentinel, not a
+    // real RunPod endpoint (deps.runpod.health() would just 404/error on
+    // it every tick for no benefit — jobs complete synchronously in
+    // submitOne(), so `terminal` reaches `total` almost immediately anyway).
+    if (!warmedAt && step.source !== 'lambda') {
       try {
         const h = await deps.runpod.health(step.endpointId);
         const ready = h.workers.ready ?? 0;

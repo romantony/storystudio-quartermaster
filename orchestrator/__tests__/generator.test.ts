@@ -65,7 +65,7 @@ const STEP: CatalogEntry = {
 
 // Fast, real-timer-friendly: tiny warmTimeoutMs and reconcileIntervalMs so a
 // stall test completes in well under a second of real wall-clock time.
-const FAST_CFG = { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60, maxAttempts: 2 };
+const FAST_CFG = { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60, maxAttempts: 2, lambdaRenderRateUsdS: 0.000127 };
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -310,5 +310,84 @@ describe('agents/generator.ts submitOne() — a builder error fails one job, not
     expect(stepsRepo.incrementStepCounters).toHaveBeenCalledWith(expect.anything(), 'win_test', 1, 'job_failed');
     // no /run was ever attempted for the unbuildable job
     expect((fetchImpl.mock.calls as unknown as Array<[string]>).some((c) => String(c[0]).endsWith("/run"))).toBe(false);
+  });
+});
+
+describe('agents/generator.ts submitOne() — source: "lambda" dispatch (2026-09-16, Remotion text overlay)', () => {
+  const LAMBDA_STEP: CatalogEntry = {
+    ...STEP,
+    seq: 16,
+    name: 'remotion-overlay',
+    source: 'lambda',
+    endpointId: 'lambda:qm-remotion-overlay',
+  };
+
+  function stepWithBuilder(builder: CatalogEntry['builder']): CatalogEntry {
+    (jobsRepo.stepJobCounts as jest.Mock).mockResolvedValueOnce({ total: 1, terminal: 0 }).mockResolvedValue({ total: 1, terminal: 1 });
+    (jobsRepo.claimNextBatch as jest.Mock).mockResolvedValueOnce([
+      { id: 900, projectId: 'p', cohortId: 'win_test', stepSeq: 16, seq: 0, frameId: 'f1', status: 'planned', input: {} },
+    ]);
+    return { ...LAMBDA_STEP, builder };
+  }
+
+  function lambdaDeps(invokeImpl: jest.Mock, fetchImpl: jest.Mock = jest.fn()): GeneratorDeps {
+    return {
+      pool: fakePoolWithPlannedJob(),
+      runpod: new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) }),
+      cfg: FAST_CFG,
+      publicBaseUrl: 'https://vps.example',
+      webhookSecret: 'secret',
+      lambda: { functionName: 'QM-remotion-overlay', region: 'us-east-1', invokeImpl },
+    };
+  }
+
+  it('invokes the lambda transport (not deps.runpod), marks the job complete with {video: overlayRenderedUrl}, and records a cost row', async () => {
+    const invokeImpl = jest.fn(async () => ({ overlayRenderedUrl: 'https://pub.example/f1_overlay.mp4' }));
+    const fetchImpl = jest.fn(async () => fakeRes(200, {}));
+    const step = stepWithBuilder((() => ({ clipUrl: 'https://pub.example/f1_merge.mp4', textManifest: '{}' })) as CatalogEntry['builder']);
+
+    await expect(runStep(lambdaDeps(invokeImpl, fetchImpl), 'win_test', step, 5)).resolves.toBeUndefined();
+    expect(invokeImpl).toHaveBeenCalledWith('QM-remotion-overlay', 'us-east-1', {
+      clipUrl: 'https://pub.example/f1_merge.mp4',
+      textManifest: '{}',
+    });
+    // `video`, not `overlayRenderedUrl` — matches runpodOutUrl()'s key list (runpod/output.ts).
+    expect(jobsRepo.markTerminal).toHaveBeenCalledWith(expect.anything(), 900, {
+      status: 'complete',
+      output: { video: 'https://pub.example/f1_overlay.mp4' },
+    });
+    expect(stepsRepo.incrementStepCounters).toHaveBeenCalledWith(expect.anything(), 'win_test', 16, 'job_completed');
+    // no RunPod /run or /health call for a lambda-sourced step
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('fails (or retries) the job when the lambda invoke throws, without ever calling deps.runpod', async () => {
+    const invokeImpl = jest.fn(async () => {
+      throw new Error("Lambda QM-remotion-overlay returned Unhandled: Remotion render failed");
+    });
+    const fetchImpl = jest.fn(async () => fakeRes(200, {}));
+    const step = stepWithBuilder((() => ({ clipUrl: 'https://pub.example/f1_merge.mp4', textManifest: '{}' })) as CatalogEntry['builder']);
+
+    await expect(runStep(lambdaDeps(invokeImpl, fetchImpl), 'win_test', step, 5)).resolves.toBeUndefined();
+    expect(jobsRepo.markFailedOrRetry).toHaveBeenCalledWith(
+      expect.anything(),
+      900,
+      { error: 'Lambda QM-remotion-overlay returned Unhandled: Remotion render failed' },
+      FAST_CFG.maxAttempts,
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('a frame with no textManifest (builder returns __passthrough) completes immediately with the original clip, never invoking lambda', async () => {
+    const invokeImpl = jest.fn();
+    const step = stepWithBuilder((() => ({ __passthrough: true, clipUrl: 'https://pub.example/f1_merge.mp4' })) as CatalogEntry['builder']);
+
+    await expect(runStep(lambdaDeps(invokeImpl), 'win_test', step, 5)).resolves.toBeUndefined();
+    expect(invokeImpl).not.toHaveBeenCalled();
+    expect(jobsRepo.markTerminal).toHaveBeenCalledWith(expect.anything(), 900, {
+      status: 'complete',
+      output: { video: 'https://pub.example/f1_merge.mp4' },
+    });
+    expect(stepsRepo.incrementStepCounters).toHaveBeenCalledWith(expect.anything(), 'win_test', 16, 'job_completed');
   });
 });

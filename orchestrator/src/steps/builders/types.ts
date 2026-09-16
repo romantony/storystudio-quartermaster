@@ -103,16 +103,27 @@ export interface FrameJobInput {
    * 'continuation' rewrite of the same contract) rather than blocking, and
    * surfaces this flag in the §9.6 result callback for the caller to act on. */
   splitShot?: boolean;
+
+  /** Educational/explainer on-screen text (options.textOverlay,
+   * steps/builders/remotion-overlay.ts). StoryStudio's own
+   * `FrameRenderManifest` shape (fps/durationInFrames/background/camera/
+   * textElements) — see agents/planner.ts's FrameSchema. `background.src`
+   * always arrives empty/stale from the caller (it can't know the clip URL
+   * before the orchestrator generates it); the builder overwrites it with
+   * the resolved step 6/7 output. */
+  textManifest?: Record<string, unknown>;
 }
 
 export type FallbackRung = 'flux-4b' | 'replicate-wan22-fast';
 
 /** Populated by the generator from the same-frame job's `output` in every
  * step named in this step's `dependsOn`. Keyed by step seq. `durationS` is
- * only ever populated for step 2 (tts)'s output — see
- * agents/generator.ts's resolveDeps() and steps/builders/i2v.ts, which reads
- * it to size the video to the ACTUAL generated audio rather than the
- * caller's pre-estimated frame.durationS. */
+ * read generically off any dependency's output that carries a `duration_s`
+ * field (agents/generator.ts's resolveDeps()) — steps/builders/i2v.ts reads
+ * step 2 (tts)'s to size the video to the ACTUAL generated audio rather
+ * than the caller's pre-estimated frame.durationS; steps/builders/
+ * remotion-overlay.ts reads step 6/7 (merge/remove-silence)'s the same way,
+ * to force-override Remotion's rendered duration to the clip's real length. */
 export type ResolvedDeps = Record<number, { url?: string; durationS?: number } | undefined>;
 
 export interface BuildContext {

@@ -42,18 +42,29 @@ export interface AssemblerDeps {
   publicBaseUrl: string;
 }
 
-/** The catalogued, planned tail steps for this cohort, in seq order —
- * intersected against what's actually persisted (mirrors driveCohort()'s
- * own `runnable` construction in orchestrator.ts, same reasoning: a step
- * resolved by the planner but not (yet) catalogued never got a `steps` row
- * at all). */
+/** The catalogued, planned tail steps for this cohort, in STEP_CATALOG's
+ * declared order — intersected against what's actually persisted (mirrors
+ * driveCohort()'s own `runnable` construction in orchestrator.ts, same
+ * reasoning: a step resolved by the planner but not (yet) catalogued never
+ * got a `steps` row at all).
+ *
+ * Ordered by STEP_CATALOG array position, NOT by numeric `seq` value — the
+ * bulk-step driver (orchestrator.ts) sorts by seq because 0-5/14/15 really
+ * are meant to run in strict ascending seq order, but the tail's seq numbers
+ * were never guaranteed contiguous (remove-silence is 7 "because 7 is the
+ * only free integer" between merge=6 and concat=8; step 16, added
+ * 2026-09-16, sits BETWEEN 7 and 8 in real execution order despite its
+ * higher number, since concat needs to prefer its output). Sorting by seq
+ * here would silently run concat before its own dependency exists. See
+ * steps/catalog.ts's seq-16 entry for the full story. */
 async function plannedTailSteps(pool: Pool, cohortId: string): Promise<CatalogEntry[]> {
   const dbSteps = await listSteps(pool, cohortId);
   const catalogBySeq = new Map(STEP_CATALOG.map((c) => [c.seq, c] as const));
+  const catalogOrder = new Map(STEP_CATALOG.map((c, i) => [c.seq, i] as const));
   return dbSteps
     .map((s) => catalogBySeq.get(s.seq))
     .filter((c): c is CatalogEntry => c !== undefined && c.scope === 'project')
-    .sort((a, b) => a.seq - b.seq);
+    .sort((a, b) => (catalogOrder.get(a.seq) ?? 0) - (catalogOrder.get(b.seq) ?? 0));
 }
 
 export async function runAssembler(deps: AssemblerDeps, cohortId: string): Promise<void> {
@@ -67,6 +78,10 @@ export async function runAssembler(deps: AssemblerDeps, cohortId: string): Promi
     cfg: deps.cfg,
     publicBaseUrl: deps.publicBaseUrl,
     webhookSecret: deps.cfg.webhookSecret,
+    lambda: {
+      functionName: deps.cfg.remotionLambdaFunctionName,
+      region: deps.cfg.remotionLambdaRegion,
+    },
   };
 
   const firstStep = tailSteps[0];
