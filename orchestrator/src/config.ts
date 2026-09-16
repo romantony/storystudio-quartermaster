@@ -88,6 +88,20 @@ const ConfigSchema = z.object({
   // small, and over-queuing there risks a job's RunPod queue wait pushing
   // past its own execution timeout.
   queueBufferWorkers: numeric(10).pipe(z.number().int().nonnegative()),
+  // 2026-09-16, post-incident (docs/qm-orchestrator-incident-report-2026-09-16-runpod-capacity.md):
+  // runStep() used to submit its full dispatch target (workersHead +
+  // queueBufferWorkers, e.g. 35) in one burst the moment a step started,
+  // against an endpoint allocate() had JUST raised workersMax on — 0 real
+  // workers up yet. Ramps the INITIAL fill instead: dispatchRampBatchSize
+  // jobs go out immediately, then that many more every
+  // dispatchRampIntervalMs, until the full target is reached (5 every 5s ->
+  // 35 by 30s) — RunPod's autoscaler gets a chance to grow real capacity
+  // into a climbing curve instead of a step function. Purely an initial-fill
+  // shape: once the ramp reaches targetWorkers it's mathematically
+  // identical to the steady-state "top back up to targetWorkers as jobs
+  // complete" behavior already in place, no special-casing needed.
+  dispatchRampBatchSize: numeric(5).pipe(z.number().int().positive()),
+  dispatchRampIntervalMs: numeric(5_000).pipe(z.number().int().positive()),
   liveReserveWorkers: numeric(8).pipe(z.number().int().nonnegative()),
   accountCap: numeric(40).pipe(z.number().int().positive()),
   warmTimeoutMs: numeric(480_000).pipe(z.number().int().positive()),
@@ -234,6 +248,8 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   workersHead: 'ORCH_WORKERS_HEAD',
   workersTail: 'ORCH_WORKERS_TAIL',
   queueBufferWorkers: 'ORCH_QUEUE_BUFFER_WORKERS',
+  dispatchRampBatchSize: 'ORCH_DISPATCH_RAMP_BATCH_SIZE',
+  dispatchRampIntervalMs: 'ORCH_DISPATCH_RAMP_INTERVAL_MS',
   liveReserveWorkers: 'QM_LIVE_RESERVE_WORKERS',
   accountCap: 'RUNPOD_ACCOUNT_CAP',
   warmTimeoutMs: 'ORCH_WARM_TIMEOUT_MS',

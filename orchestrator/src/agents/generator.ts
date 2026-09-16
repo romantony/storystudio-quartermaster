@@ -36,7 +36,17 @@ export interface GeneratorDeps {
   // warmTimeoutMs: fleet.ts's allocate() no longer polls for readiness (M3
   // fix, 2026-09-10) — runStep()'s own non-blocking cold-start check owns
   // that timeout now, reusing the same config value.
-  cfg: Pick<Config, 'workerRateUsdS' | 'reconcileIntervalMs' | 'warmTimeoutMs' | 'maxAttempts' | 'maxResourceAttempts' | 'lambdaRenderRateUsdS'>;
+  cfg: Pick<
+    Config,
+    | 'workerRateUsdS'
+    | 'reconcileIntervalMs'
+    | 'warmTimeoutMs'
+    | 'maxAttempts'
+    | 'maxResourceAttempts'
+    | 'lambdaRenderRateUsdS'
+    | 'dispatchRampBatchSize'
+    | 'dispatchRampIntervalMs'
+  >;
   /** Base URL this process is reachable at (e.g. https://orchestrator.ai-storystudio.com),
    * used to build each job's per-job webhook callback URL. */
   publicBaseUrl: string;
@@ -528,6 +538,27 @@ export async function runStep(
   const loopStartedAt = Date.now();
   let warmedAt: Date | null = null;
 
+  // Ramp the INITIAL dispatch instead of bursting the full `targetWorkers`
+  // the instant this step starts, when allocate() has JUST raised
+  // workersMax and 0 real workers are up yet (post-incident, 2026-09-16 —
+  // see config.ts's dispatchRampBatchSize doc comment). `ceil(elapsed /
+  // interval)` batches of `batchSize` have gone out by wall-clock time
+  // `elapsed`, capped at `targetWorkers` — after enough intervals pass this
+  // is mathematically `targetWorkers` regardless, so it seamlessly becomes
+  // the steady-state "top back up as jobs complete" behavior with no
+  // special-casing once the ramp completes. A quick, logged, NON-blocking
+  // health check up front is purely observability (what did the endpoint
+  // look like right as we started dispatching) — matches the M3 principle
+  // of never blocking dispatch on a real worker-readiness poll.
+  if (step.source !== 'lambda') {
+    try {
+      const h = await deps.runpod.health(step.endpointId);
+      log().info({ stepSeq: step.seq, endpointId: step.endpointId, workers: h.workers }, 'generator: workers observed at dispatch start');
+    } catch (err) {
+      log().warn({ stepSeq: step.seq, err }, 'generator: dispatch-start health probe failed, proceeding with the ramp anyway');
+    }
+  }
+
   for (;;) {
     const { total, terminal } = await stepJobCounts(deps.pool, cohortId, step.seq, projectId);
     // A gated step isn't done when every job is terminal — the quality gate
@@ -539,8 +570,12 @@ export async function runStep(
     // un-terminals it, so this check always sees one or the other.
     if (terminal >= total && (!step.gate || (await countUngated(deps.pool, cohortId, step.seq)) === 0)) break;
 
+    const elapsedSinceStart = Date.now() - loopStartedAt;
+    const rampedBatches = Math.floor(elapsedSinceStart / deps.cfg.dispatchRampIntervalMs) + 1;
+    const rampCeiling = Math.min(targetWorkers, rampedBatches * deps.cfg.dispatchRampBatchSize);
+
     const inFlight = (await listInFlight(deps.pool, cohortId, step.seq, projectId)).length;
-    const room = Math.max(0, targetWorkers - inFlight);
+    const room = Math.max(0, rampCeiling - inFlight);
     if (room > 0) {
       const batch = await claimBatchReadOnly(deps.pool, cohortId, step.seq, room, projectId);
       for (const job of batch) {

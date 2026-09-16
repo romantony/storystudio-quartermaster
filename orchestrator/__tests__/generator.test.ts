@@ -65,7 +65,20 @@ const STEP: CatalogEntry = {
 
 // Fast, real-timer-friendly: tiny warmTimeoutMs and reconcileIntervalMs so a
 // stall test completes in well under a second of real wall-clock time.
-const FAST_CFG = { workerRateUsdS: 0.0002, reconcileIntervalMs: 10, warmTimeoutMs: 60, maxAttempts: 2, maxResourceAttempts: 5, lambdaRenderRateUsdS: 0.000127 };
+// dispatchRampBatchSize huge (effectively disables the initial-dispatch ramp,
+// see the dedicated describe block below) so every OTHER test here keeps
+// seeing the full `targetWorkers` room on its very first iteration, exactly
+// as before the ramp was added.
+const FAST_CFG = {
+  workerRateUsdS: 0.0002,
+  reconcileIntervalMs: 10,
+  warmTimeoutMs: 60,
+  maxAttempts: 2,
+  maxResourceAttempts: 5,
+  lambdaRenderRateUsdS: 0.000127,
+  dispatchRampBatchSize: 1000,
+  dispatchRampIntervalMs: 1,
+};
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -499,5 +512,55 @@ describe('agents/generator.ts reconcileTick() — a terminal RunPod status-check
     await expect(reconcileTick(deps, 'win_test', STEP, 60)).resolves.toBeUndefined();
 
     expect(jobsRepo.markFailedOrRetry).not.toHaveBeenCalled();
+  });
+});
+
+describe('agents/generator.ts runStep() — initial dispatch ramp (post-incident, 2026-09-16, docs/qm-orchestrator-incident-report-2026-09-16-runpod-capacity.md)', () => {
+  function rampDeps(cfgOverrides: Partial<GeneratorDeps['cfg']>): GeneratorDeps {
+    return {
+      pool: fakePool(),
+      runpod: new RunpodClient(
+        { runpodApiBase: 'https://api.runpod.ai/v2', runpodRestBase: 'https://rest.runpod.io/v1', runpodApiKey: 'k', runpodMaxRetries: 0, runpodTimeoutMs: 1000 },
+        { fetchImpl: jest.fn(async () => fakeRes(200, { workers: { ready: 1, running: 0 } })), sleepImpl: jest.fn(async () => {}) },
+      ),
+      cfg: { ...FAST_CFG, ...cfgOverrides },
+      publicBaseUrl: 'https://vps.example',
+      webhookSecret: 'secret',
+    };
+  }
+
+  it("the very first batch a step ever claims is capped at dispatchRampBatchSize, not the full target — no burst against an endpoint allocate() just raised workersMax on", async () => {
+    (jobsRepo.stepJobCounts as jest.Mock).mockResolvedValueOnce({ total: 20, terminal: 0 }).mockResolvedValue({ total: 20, terminal: 20 });
+    (jobsRepo.listInFlight as jest.Mock).mockResolvedValue([]);
+    (jobsRepo.claimNextBatch as jest.Mock).mockResolvedValue([]);
+
+    await runStep(rampDeps({ dispatchRampBatchSize: 5, dispatchRampIntervalMs: 5_000 }), 'win_test', STEP, 35);
+
+    expect(jobsRepo.claimNextBatch).toHaveBeenCalledTimes(1);
+    expect(jobsRepo.claimNextBatch).toHaveBeenCalledWith(expect.anything(), 'win_test', STEP.seq, 5, undefined);
+  });
+
+  it('once enough wall-clock time has passed for the ramp to complete, a later claim reaches the full target', async () => {
+    let calls = 0;
+    (jobsRepo.stepJobCounts as jest.Mock).mockImplementation(async () => {
+      calls += 1;
+      return calls > 60 ? { total: 20, terminal: 20 } : { total: 20, terminal: 0 };
+    });
+    (jobsRepo.listInFlight as jest.Mock).mockResolvedValue([]);
+    (jobsRepo.claimNextBatch as jest.Mock).mockResolvedValue([]);
+
+    // Tiny real interval (5ms) x tiny real reconcileIntervalMs sleep (1ms) —
+    // by the time stepJobCounts has been polled 10 times, several ramp
+    // intervals have genuinely elapsed in real wall-clock time.
+    await runStep(
+      rampDeps({ dispatchRampBatchSize: 5, dispatchRampIntervalMs: 5, reconcileIntervalMs: 1 }),
+      'win_test',
+      STEP,
+      20,
+    );
+
+    const limits = (jobsRepo.claimNextBatch as jest.Mock).mock.calls.map((c) => c[3]);
+    expect(limits[0]).toBeLessThan(20); // ramped, not a burst
+    expect(Math.max(...limits)).toBe(20); // but the ramp does reach the full target given enough time
   });
 });
