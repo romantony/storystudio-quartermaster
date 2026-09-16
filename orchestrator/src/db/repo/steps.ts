@@ -100,6 +100,33 @@ export async function insertSteps(db: Queryable, cohortId: string, steps: NewSte
   }
 }
 
+/** Statuses where a step's `runStep()` claim loop (agents/generator.ts) is
+ * still guaranteed to be actively cycling, so a job inserted right now WILL
+ * genuinely get claimed:
+ *  - `pending`/`scaling`/`ready`: allocate() (agents/fleet.ts) is still
+ *    scaling the endpoint up — runStep() hasn't started yet, but it reads
+ *    live DB state once it does, so anything inserted before then is picked
+ *    up for free.
+ *  - `running`: actively claiming.
+ *  - `gating`: **not** "already past running," despite the name — real gap
+ *    found live 2026-09-16, first real two-project join attempt: gateStep()
+ *    (agents/quality.ts) writes this the moment IT starts, concurrently
+ *    with runStep() (agents/orchestrator.ts's `Promise.all`), so it appears
+ *    within milliseconds and persists for the step's entire active
+ *    lifetime, not just its tail. runStep()'s own exit condition for a
+ *    gated step is `terminal >= total && countUngated() === 0` — it does
+ *    NOT exit just because jobs finished generating; it keeps polling until
+ *    every job's quality verdict lands too. So `running`-loop activity and
+ *    `gating`-status are concurrent facts about the SAME step, not
+ *    sequential ones — treating `gating` as unsafe (the original version of
+ *    this function) rejected nearly every real join attempt, since steps 1
+ *    and 3 (image/motion) are gated.
+ * `generated` (an UNGATED step's runStep() already fully exited) and
+ * `draining` (release() draining the endpoint after BOTH runStep() and
+ * gateStep() resolved) are the two states where that loop has genuinely
+ * stopped — along with the terminal `complete`/`failed`. */
+const STEP_STILL_POLLING = new Set(['pending', 'scaling', 'ready', 'running', 'gating']);
+
 /** Real incident risk, 2026-09-16: `QM_ORCH_MODE=live` means a second real
  * project can land in the same 6-hour window while the first is still
  * `running` — `cohorts_one_running` (005_invariants.sql) makes minting it a
@@ -108,15 +135,11 @@ export async function insertSteps(db: Queryable, cohortId: string, steps: NewSte
  * a seq the first project already planned (any brand-new seq this project
  * needs was never in `agents/orchestrator.ts`'s `runCohort()` one-time
  * `listSteps()` snapshot, so nothing will ever iterate it) AND only while
- * that step's own `runStep()` claim loop is still actively polling it
- * (`pending` = not reached yet, `running` = actively claiming — both fine,
- * since `stepJobCounts()`/`claimNextBatch()` are live queries, not cached;
- * `generated`/`gating`/`draining`/`complete`/`failed` = that loop already
- * exited for good, a newly inserted `planned` job there would never be
- * claimed by anything). Called by agents/planner.ts's plan() BEFORE
- * insertSteps()/insertJobs() — a `false` here must abort the whole plan
- * attempt (db/repo/cohorts.ts's CohortNotJoinableError), not just skip the
- * unsafe steps, since a partially-planned project is worse than none. */
+ * that step is in `STEP_STILL_POLLING` above. Called by agents/planner.ts's
+ * plan() BEFORE insertSteps()/insertJobs() — a `false` here must abort the
+ * whole plan attempt (db/repo/cohorts.ts's CohortNotJoinableError), not
+ * just skip the unsafe steps, since a partially-planned project is worse
+ * than none. */
 export async function stepsJoinable(db: Queryable, cohortId: string, seqs: number[]): Promise<boolean> {
   const existing = await listSteps(db, cohortId);
   // Nothing planned into this cohort yet at all — this project is the
@@ -127,7 +150,7 @@ export async function stepsJoinable(db: Queryable, cohortId: string, seqs: numbe
   for (const seq of seqs) {
     const status = byS.get(seq);
     if (status === undefined) return false;
-    if (status !== 'pending' && status !== 'running') return false;
+    if (!STEP_STILL_POLLING.has(status)) return false;
   }
   return true;
 }

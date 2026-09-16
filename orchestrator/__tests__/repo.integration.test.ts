@@ -173,6 +173,34 @@ maybeDescribe('db repo layer (integration)', () => {
     await expect(stepsJoinable(pool, cohort.id, [seqPending, seqRunning])).resolves.toBe(true);
   });
 
+  it('stepsJoinable: true for a gated step already in \'gating\' — real gap found live 2026-09-16', async () => {
+    // gateStep() writes 'gating' the moment it starts, concurrently with
+    // runStep() (not after runStep() finishes) — the first live two-project
+    // join attempt hit this exact case and was wrongly rejected before this
+    // fix, since steps 1/3 (image/motion) are gated and reach 'gating'
+    // within milliseconds of starting.
+    const cohort = { id: sharedCohortId };
+    const seq = seqBase();
+    await insertSteps(pool, cohort.id, [
+      { seq, name: 'image', endpointId: 'e1', workersTarget: 2, gate: 'image', drainAfter: true, dependsOn: [], jobTotal: 3 },
+    ]);
+    await updateStepStatus(pool, cohort.id, seq, 'gating');
+    await expect(stepsJoinable(pool, cohort.id, [seq])).resolves.toBe(true);
+  });
+
+  it('stepsJoinable: false once a step is \'draining\' or \'generated\' — runStep() has genuinely exited by then', async () => {
+    const cohort = { id: sharedCohortId };
+    const [seqDraining, seqGenerated] = [seqBase(), seqBase() + 1];
+    await insertSteps(pool, cohort.id, [
+      { seq: seqDraining, name: 'image', endpointId: 'e1', workersTarget: 2, gate: 'image', drainAfter: true, dependsOn: [], jobTotal: 3 },
+      { seq: seqGenerated, name: 'tts', endpointId: 'e2', workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 3 },
+    ]);
+    await updateStepStatus(pool, cohort.id, seqDraining, 'draining');
+    await updateStepStatus(pool, cohort.id, seqGenerated, 'generated');
+    await expect(stepsJoinable(pool, cohort.id, [seqDraining])).resolves.toBe(false);
+    await expect(stepsJoinable(pool, cohort.id, [seqGenerated])).resolves.toBe(false);
+  });
+
   it('stepsJoinable: false when a needed step already finished — the runStep() loop that would claim it has already exited', async () => {
     const cohort = { id: sharedCohortId };
     const seq = seqBase();
