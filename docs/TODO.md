@@ -2,6 +2,58 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## 2026-09-17 — follow-ups from the admin dashboard + RunPod capacity incident (2026-09-16)
+
+Context: `docs/qm-orchestrator-session-2026-09-16-admin-dashboard-and-incidents.md` +
+`docs/qm-orchestrator-incident-report-2026-09-16-runpod-capacity.md`.
+
+1. **Check RunPod's account/dashboard for the capacity backlog's root cause.** Three different
+   endpoints (image, TTS, animation — separate GPU pools) all showed real, sustained queue delays
+   (8 to ~90 minutes) within the same few-hour window on 2026-09-16, failing 3 real StoryStudio
+   production projects. Multiple independent endpoints, same account, same window → points at an
+   account-level constraint (spend/quota cap, or a region-wide shortage), not one endpoint's own
+   workers being unhealthy. All 3 endpoints reported clean health again by 16:55 UTC the same day —
+   confirm this is durable, not just a lull, and find out *why* it happened if RunPod's dashboard
+   shows anything.
+2. **Decide on the 8-minute `warmTimeoutMs` stall-detection design**, now that it's shown to be
+   premature under a sustained-but-recoverable backlog (jobs that would have succeeded 30-90+ min
+   later were failed and the customer notified at the 8-minute mark). Options from the incident
+   report, not yet decided or built: use `runpod.health()`'s `workers.throttled` as a distinct
+   "RunPod is still working my queue, just slowly" signal vs. true silence; or a longer soft-timeout
+   + alert before a much-later hard fail+drain. This is a deliberate trade-off (a genuinely dead
+   endpoint should still fail reasonably fast) — needs a decision, not a silent change.
+3. **Rework `js76a6d9k3eze1t30xyrrkrwt58eghfj__a1` via the new admin dashboard** — the one project
+   from 2026-09-16 that's a genuine partial-failure candidate (8/13 frames succeeded, 5 genuinely
+   dead from an earlier, unrelated CUDA-OOM incident). This is also the **first real live use of the
+   rework feature** shipped 2026-09-16 — `validateRework()`/`driveRework()` have unit test coverage
+   but no live-fire test yet.
+4. **Verify the dispatch ramp (`a9c7955`) under a real cohort large enough to reach the full 35-job
+   target.** 2026-09-16's live verification only used an 8-frame test project — confirmed the ramp
+   shape (5 immediately, +5 five seconds later) but never exercised it climbing all the way to
+   `workersHead`(25)+`queueBufferWorkers`(10)=35 in a real run.
+5. **Fix `repo.integration.test.ts`'s test-isolation flakiness**: `sharedCohortId` is reused across
+   nearly the whole file and `seqBase()` returns a random (not incrementing) seq — both can collide
+   with an earlier test's leftover row in the same run. 3 tests failed when this suite was run
+   against a real local Postgres on 2026-09-16 (unclear how long this has been broken — this
+   environment apparently never ran it against a real DB before that day).
+6. **Fix `prepareCohort()` (prompt-harness prep) rerunning in full on every cohort resume**, even
+   when it already completed once — confirmed live 2026-09-16: a mid-cohort redeploy cost ~8 extra
+   minutes and real LLM API spend re-processing all 13 frames again before the bulk driver could
+   even resume. Needs a "skip frames the harness already prepared for this cohort" guard.
+7. **Minor hardening**: a very-delayed RunPod webhook can race a reconcile-triggered requeue on the
+   same job row, leaving `status: 'planned'` with a stale `completed_at` populated anyway (harmless
+   in the 2026-09-16 case since the project had already failed, but worth closing). Either have the
+   webhook handler no-op when `attempts` has moved past what its payload corresponds to, or clear
+   the old `runpod_job_id` early enough in the retry path that a late webhook for the superseded id
+   can't match a row.
+8. **Check whether StoryStudio's other two 2026-09-16 retries (basic tier, explainer) eventually
+   landed successfully** now that RunPod capacity is confirmed clean — only one of the three retried
+   submissions was confirmed as a new `projects` row before this session ended.
+9. *(Optional, low priority)* Clean up 2026-09-16's leftover test/synthetic projects and cohorts
+   (`qm-dashboard-test-a/b-20260916`, `qm-dispatch-ramp-test-20260916`, `qm-join-test-*`,
+   `qm-batch-test-*`) if they're cluttering the dashboard — matches this repo's existing convention
+   of otherwise leaving test data parked rather than deleting it.
+
 ## 2026-09-15 (later same day) — prompt harness & guardrails: built, committed `99cbbe5`, deployed to the VPS
 
 Implements `docs/qm-orchestrator-prompt-harness-implementation-plan.md` H1-H2-H4 (contract, seed
