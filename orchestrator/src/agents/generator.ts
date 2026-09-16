@@ -28,6 +28,7 @@ import { runpodOutUrl } from '../runpod/output';
 import { countUngated } from '../db/repo/quality';
 import { createPrediction, getPrediction, type ReplicateTransport } from '../quality/replicate';
 import { invokeRemotionOverlay, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
+import { persistToR2, type R2Transport } from '../r2/client';
 
 export interface GeneratorDeps {
   pool: Pool;
@@ -50,6 +51,11 @@ export interface GeneratorDeps {
    * seq 16, Remotion text overlay). Optional: without it such a job fails at
    * submission with a clear error, same as a missing replicate token above. */
   lambda?: LambdaTransport;
+  /** R2 transport (src/r2/client.ts) — a lambda-sourced step's real output
+   * (currently only step 16) is re-hosted here before being marked
+   * complete, since Remotion Lambda's own S3 bucket isn't QM's storage.
+   * Optional, same fail-fast-at-submission behavior as `lambda` above. */
+  r2?: R2Transport;
 }
 
 /** Prefix on jobs.runpod_job_id while a job is a Replicate prediction (the
@@ -294,10 +300,33 @@ async function submitOne(deps: GeneratorDeps, cohortId: string, step: CatalogEnt
         log().warn({ jobId: job.id, stepSeq: step.seq, error: message, retried }, 'generator: lambda invoke failed');
         return;
       }
+
+      // Remotion Lambda's output lives on ITS OWN S3 bucket, not QM's —
+      // re-host into R2 (src/r2/client.ts) before marking complete, same
+      // "throw, don't fall back to the ephemeral URL" philosophy as the
+      // top-level repo's persistExternalAsset.ts (real incident precedent:
+      // 103/122 shots lost to dead replicate.delivery links because that
+      // persistence didn't exist yet for that provider). A persist failure
+      // is treated exactly like an invoke failure — retry/fail the job,
+      // never complete with a link QM doesn't control the retention of.
+      if (!deps.r2) throw new Error(`step ${step.seq} (${step.name}) is source:'lambda' but no r2 transport is configured`);
+      const r2Key = `remotion-overlay/${job.projectId}/${job.frameId ?? job.id}.mp4`;
+      let permanentUrl: string;
+      try {
+        permanentUrl = await persistToR2(deps.r2, result.overlayRenderedUrl, r2Key);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const retried = await markFailedOrRetry(client, job.id, { error: message }, deps.cfg.maxAttempts);
+        await client.query('COMMIT');
+        if (!retried) await incrementStepCounters(deps.pool, cohortId, step.seq, 'job_failed');
+        log().warn({ jobId: job.id, stepSeq: step.seq, error: message, retried }, 'generator: r2 persist of lambda output failed');
+        return;
+      }
+
       // `video`, not `overlayRenderedUrl`, so runpodOutUrl() (runpod/output.ts)
       // resolves it downstream the same way every other video-producing
       // step's output already does — no change needed to its key list.
-      const output = { video: result.overlayRenderedUrl };
+      const output = { video: permanentUrl };
       const executionMs = Date.now() - startedAt;
       await markSubmitted(client, job.id, `lambda:${job.id}`);
       await markTerminal(client, job.id, { status: 'complete', output });

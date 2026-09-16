@@ -330,7 +330,11 @@ describe('agents/generator.ts submitOne() — source: "lambda" dispatch (2026-09
     return { ...LAMBDA_STEP, builder };
   }
 
-  function lambdaDeps(invokeImpl: jest.Mock, fetchImpl: jest.Mock = jest.fn()): GeneratorDeps {
+  function lambdaDeps(
+    invokeImpl: jest.Mock,
+    fetchImpl: jest.Mock = jest.fn(),
+    r2: { fetchImpl?: jest.Mock; putImpl?: jest.Mock } = {},
+  ): GeneratorDeps {
     return {
       pool: fakePoolWithPlannedJob(),
       runpod: new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) }),
@@ -338,23 +342,38 @@ describe('agents/generator.ts submitOne() — source: "lambda" dispatch (2026-09
       publicBaseUrl: 'https://vps.example',
       webhookSecret: 'secret',
       lambda: { functionName: 'QM-remotion-overlay', region: 'us-east-1', invokeImpl },
+      r2: {
+        accountId: 'acct',
+        bucket: 'e2e-storystudio',
+        publicUrl: 'https://pub-bce4924e66d944668be30268ccf4492c.r2.dev',
+        accessKeyId: 'r2key',
+        secretAccessKey: 'r2secret',
+        fetchImpl: r2.fetchImpl ?? jest.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => 'video/mp4' } })),
+        putImpl: r2.putImpl ?? jest.fn(async () => {}),
+      },
     };
   }
 
-  it('invokes the lambda transport (not deps.runpod), marks the job complete with {video: overlayRenderedUrl}, and records a cost row', async () => {
-    const invokeImpl = jest.fn(async () => ({ overlayRenderedUrl: 'https://pub.example/f1_overlay.mp4' }));
+  it('invokes the lambda transport (not deps.runpod), re-hosts the output into R2, marks the job complete with {video: <r2 url>}, and records a cost row', async () => {
+    const invokeImpl = jest.fn(async () => ({ overlayRenderedUrl: 'https://s3.us-east-1.amazonaws.com/remotionlambda-useast1-55dp29f3ln/renders/abc123/out.mp4' }));
     const fetchImpl = jest.fn(async () => fakeRes(200, {}));
+    const r2FetchImpl = jest.fn(async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0), headers: { get: () => 'video/mp4' } }));
+    const r2PutImpl = jest.fn(async () => {});
     const step = stepWithBuilder((() => ({ clipUrl: 'https://pub.example/f1_merge.mp4', textManifest: '{}' })) as CatalogEntry['builder']);
 
-    await expect(runStep(lambdaDeps(invokeImpl, fetchImpl), 'win_test', step, 5)).resolves.toBeUndefined();
+    await expect(runStep(lambdaDeps(invokeImpl, fetchImpl, { fetchImpl: r2FetchImpl, putImpl: r2PutImpl }), 'win_test', step, 5)).resolves.toBeUndefined();
     expect(invokeImpl).toHaveBeenCalledWith('QM-remotion-overlay', 'us-east-1', {
       clipUrl: 'https://pub.example/f1_merge.mp4',
       textManifest: '{}',
     });
+    // downloaded from Remotion's own S3 URL, re-uploaded to R2 under a
+    // project/frame-scoped key — never left pointing at Remotion's bucket.
+    expect(r2FetchImpl).toHaveBeenCalledWith('https://s3.us-east-1.amazonaws.com/remotionlambda-useast1-55dp29f3ln/renders/abc123/out.mp4');
+    expect(r2PutImpl).toHaveBeenCalledWith(expect.anything(), 'remotion-overlay/p/f1.mp4', expect.any(Buffer), 'video/mp4');
     // `video`, not `overlayRenderedUrl` — matches runpodOutUrl()'s key list (runpod/output.ts).
     expect(jobsRepo.markTerminal).toHaveBeenCalledWith(expect.anything(), 900, {
       status: 'complete',
-      output: { video: 'https://pub.example/f1_overlay.mp4' },
+      output: { video: 'https://pub-bce4924e66d944668be30268ccf4492c.r2.dev/remotion-overlay/p/f1.mp4' },
     });
     expect(stepsRepo.incrementStepCounters).toHaveBeenCalledWith(expect.anything(), 'win_test', 16, 'job_completed');
     // no RunPod /run or /health call for a lambda-sourced step
@@ -378,11 +397,26 @@ describe('agents/generator.ts submitOne() — source: "lambda" dispatch (2026-09
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('a frame with no textManifest (builder returns __passthrough) completes immediately with the original clip, never invoking lambda', async () => {
+  it('fails (or retries) the job when persisting the lambda output to R2 fails, without completing on Remotion\'s ephemeral URL', async () => {
+    const invokeImpl = jest.fn(async () => ({ overlayRenderedUrl: 'https://s3.us-east-1.amazonaws.com/remotionlambda-useast1-55dp29f3ln/renders/abc123/out.mp4' }));
+    const r2PutImpl = jest.fn(async () => {
+      throw new Error('R2 AccessDenied');
+    });
+    const step = stepWithBuilder((() => ({ clipUrl: 'https://pub.example/f1_merge.mp4', textManifest: '{}' })) as CatalogEntry['builder']);
+
+    await expect(runStep(lambdaDeps(invokeImpl, jest.fn(), { putImpl: r2PutImpl }), 'win_test', step, 5)).resolves.toBeUndefined();
+    expect(jobsRepo.markFailedOrRetry).toHaveBeenCalledWith(expect.anything(), 900, { error: 'R2 AccessDenied' }, FAST_CFG.maxAttempts);
+    // never marked complete with the ephemeral Remotion URL
+    expect(jobsRepo.markTerminal).not.toHaveBeenCalledWith(expect.anything(), 900, expect.objectContaining({ status: 'complete' }));
+  });
+
+  it('a frame with no textManifest (builder returns __passthrough) completes immediately with the original clip, never invoking lambda or r2', async () => {
     const invokeImpl = jest.fn();
+    const r2PutImpl = jest.fn();
     const step = stepWithBuilder((() => ({ __passthrough: true, clipUrl: 'https://pub.example/f1_merge.mp4' })) as CatalogEntry['builder']);
 
-    await expect(runStep(lambdaDeps(invokeImpl), 'win_test', step, 5)).resolves.toBeUndefined();
+    await expect(runStep(lambdaDeps(invokeImpl, jest.fn(), { putImpl: r2PutImpl }), 'win_test', step, 5)).resolves.toBeUndefined();
+    expect(r2PutImpl).not.toHaveBeenCalled();
     expect(invokeImpl).not.toHaveBeenCalled();
     expect(jobsRepo.markTerminal).toHaveBeenCalledWith(expect.anything(), 900, {
       status: 'complete',

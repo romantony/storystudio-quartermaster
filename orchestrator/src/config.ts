@@ -153,6 +153,23 @@ const ConfigSchema = z.object({
   // perfectly linear in wall time) — right order of magnitude, correctable
   // later from real job_costs data.
   lambdaRenderRateUsdS: numeric(0.000127).pipe(z.number().positive()),
+
+  // ── R2 persistence for step 16's Lambda output (src/r2/client.ts) ──────
+  // Remotion Lambda's own output lives on ITS S3 bucket, not QM's — same
+  // "external providers return ephemeral delivery URLs" risk the top-level
+  // repo's src/shared/persistExternalAsset.ts exists for (real incident,
+  // 2026-08-17: 103/122 shots lost to dead replicate.delivery links). This
+  // orchestrator's whole ecosystem already stores permanent output in R2
+  // (postprod-lite etc.), so step 16 re-hosts there instead of AWS S3 — same
+  // bucket/account every other QM service already writes to. Account/bucket/
+  // public-URL defaults are that shared, non-secret `e2e-storystudio`
+  // config (orchestrator/containers/media.md); access key/secret have no
+  // default, same as replicateApiToken above.
+  r2AccountId: z.string().default('620baa808df08b1a30d448989365f7dd'),
+  r2Bucket: z.string().default('e2e-storystudio'),
+  r2PublicUrl: z.string().url().default('https://pub-bce4924e66d944668be30268ccf4492c.r2.dev'),
+  r2AccessKeyId: z.string().optional(),
+  r2SecretAccessKey: z.string().optional(),
 });
 
 export type Config = Readonly<z.infer<typeof ConfigSchema>>;
@@ -213,6 +230,11 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   remotionLambdaFunctionName: 'REMOTION_LAMBDA_FUNCTION_NAME',
   remotionLambdaRegion: 'REMOTION_LAMBDA_REGION',
   lambdaRenderRateUsdS: 'LAMBDA_RENDER_RATE_USD_S',
+  r2AccountId: 'R2_ACCOUNT_ID',
+  r2Bucket: 'R2_BUCKET_NAME',
+  r2PublicUrl: 'R2_PUBLIC_URL',
+  r2AccessKeyId: 'R2_ACCESS_KEY_ID',
+  r2SecretAccessKey: 'R2_SECRET_ACCESS_KEY',
 };
 
 /**

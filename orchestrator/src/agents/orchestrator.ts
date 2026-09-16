@@ -77,6 +77,13 @@ async function runCohort(deps: DriverDeps, cohortId: string): Promise<boolean> {
       functionName: deps.cfg.remotionLambdaFunctionName,
       region: deps.cfg.remotionLambdaRegion,
     },
+    r2: {
+      accountId: deps.cfg.r2AccountId,
+      bucket: deps.cfg.r2Bucket,
+      publicUrl: deps.cfg.r2PublicUrl,
+      accessKeyId: deps.cfg.r2AccessKeyId ?? '',
+      secretAccessKey: deps.cfg.r2SecretAccessKey ?? '',
+    },
   };
   const qualityDeps: QualityDeps = {
     pool: deps.pool,

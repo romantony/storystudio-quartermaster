@@ -82,6 +82,13 @@ export async function runAssembler(deps: AssemblerDeps, cohortId: string): Promi
       functionName: deps.cfg.remotionLambdaFunctionName,
       region: deps.cfg.remotionLambdaRegion,
     },
+    r2: {
+      accountId: deps.cfg.r2AccountId,
+      bucket: deps.cfg.r2Bucket,
+      publicUrl: deps.cfg.r2PublicUrl,
+      accessKeyId: deps.cfg.r2AccessKeyId ?? '',
+      secretAccessKey: deps.cfg.r2SecretAccessKey ?? '',
+    },
   };
 
   const firstStep = tailSteps[0];
