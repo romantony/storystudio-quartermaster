@@ -1,13 +1,10 @@
 /**
  * Unit tests for agents/fleet.ts's allocate()/release()/emergencyDrain() —
- * rewritten 2026-09-17 (twice) for the fixed-pool model (see fleet.ts's
- * header comment): allocate()/emergencyDrain() still PATCH workersMax (to
- * the fixed pod count / to 0 respectively — never an uncapped demand
- * figure), but release() no longer PATCHes back to 0 between steps, since
- * the AWS live path's own provisioner independently owns scaling these
- * shared endpoints to 0 when idle. Fixture RunpodClient (same mocked-fetch
- * convention as runpod-client.test.ts) + a fake pg pool — no real Postgres
- * or RunPod needed.
+ * rewritten 2026-09-17 for the fixed-pool model (see fleet.ts's header
+ * comment): these functions no longer PATCH workersMax at all, only record
+ * endpoint_state bookkeeping for watchdog.ts. Fixture RunpodClient (same
+ * mocked-fetch convention as runpod-client.test.ts) + a fake pg pool — no
+ * real Postgres or RunPod needed.
  */
 import { RunpodClient } from '../src/runpod/client';
 import { allocate, release, emergencyDrain, FleetStallError, type FleetDeps } from '../src/agents/fleet';
@@ -60,7 +57,7 @@ const STEP: CatalogEntry & { workers: number } = {
 const FLEET_CFG = { fleetLive: true };
 
 describe('agents/fleet.ts allocate() — fixed pool (2026-09-17)', () => {
-  it('PATCHes workersMax to the fixed pod count (idempotent, or a real raise if the live path released it to 0)', async () => {
+  it('never PATCHes workersMax — the pool is fixed, only endpoint_state is recorded', async () => {
     const fetchImpl = quietFetch();
     const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
     const pool = fakePool();
@@ -68,26 +65,13 @@ describe('agents/fleet.ts allocate() — fixed pool (2026-09-17)', () => {
 
     await allocate(deps, 'win_test', STEP);
 
-    const calls = patchCalls(fetchImpl);
-    expect(calls).toHaveLength(1);
-    expect(JSON.parse(calls[0][1].body as string)).toEqual({ workersMax: STEP.workers });
+    expect(patchCalls(fetchImpl)).toEqual([]);
     // upsertHeld's INSERT ... ON CONFLICT — asserted loosely on the values,
     // not exact SQL text, so a harmless query-shape refactor doesn't break this.
     const insertCall = (pool.query as jest.Mock).mock.calls.find(([, params]: [string, unknown[]]) =>
       params?.includes(STEP.endpointId),
     );
     expect(insertCall).toBeDefined();
-  });
-
-  it('is a no-op in shadow mode (fleetLive: false) — no PATCH sent', async () => {
-    const fetchImpl = quietFetch();
-    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
-    const pool = fakePool();
-    const deps: FleetDeps = { pool, runpod, cfg: { fleetLive: false } };
-
-    await allocate(deps, 'win_test', STEP);
-
-    expect(patchCalls(fetchImpl)).toEqual([]);
   });
 
   it('calls runpod.health() exactly once for the reachability probe — not a poll loop', async () => {
@@ -103,11 +87,8 @@ describe('agents/fleet.ts allocate() — fixed pool (2026-09-17)', () => {
     expect(ownHealthCalls).toHaveLength(1);
   });
 
-  it('throws FleetStallError("unreachable") when the reachability probe fails, after the PATCH has already gone out', async () => {
-    const fetchImpl = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      if (init?.method === 'PATCH') return fakeRes(200, {}); // the PATCH itself must succeed
-      return fakeRes(500, 'boom'); // every GET (the reachability probe) fails
-    });
+  it('throws FleetStallError("unreachable") when the reachability probe fails, no PATCH attempted', async () => {
+    const fetchImpl = jest.fn(async () => fakeRes(500, 'boom'));
     const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
     const pool = fakePool();
     const deps: FleetDeps = { pool, runpod, cfg: FLEET_CFG };
@@ -115,7 +96,7 @@ describe('agents/fleet.ts allocate() — fixed pool (2026-09-17)', () => {
     const err = await allocate(deps, 'win_test', STEP).catch((e) => e);
     expect(err).toBeInstanceOf(FleetStallError);
     expect(err.reason).toBe('unreachable');
-    expect(patchCalls(fetchImpl)).toHaveLength(1);
+    expect(patchCalls(fetchImpl)).toEqual([]);
   });
 });
 
@@ -198,38 +179,12 @@ describe('agents/fleet.ts release() — M4 drain precondition (unchanged by the 
   });
 });
 
-describe('agents/fleet.ts emergencyDrain() — driver failure-path backstop (2026-09-11 incident, restored 2026-09-17)', () => {
-  it('PATCHes workersMax:0 and clears the endpoint_state claim, no gating and no drain-confirmation wait', async () => {
-    const fetchImpl = jest.fn(async () => fakeRes(200, {}));
+describe('agents/fleet.ts emergencyDrain() — fixed pool (2026-09-17)', () => {
+  it('never calls RunPod — just clears the endpoint_state claim', async () => {
+    const fetchImpl = jest.fn();
     const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
     const pool = fakePool();
     const deps: FleetDeps = { pool, runpod, cfg: FLEET_CFG };
-
-    await emergencyDrain(deps, 'e165se4r3eo5hp');
-
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toContain('/rest.runpod.io/');
-    expect(JSON.parse(init.body as string)).toEqual({ workersMin: 0, workersMax: 0 });
-    const clearCall = (pool.query as jest.Mock).mock.calls.find(([, params]: [string, unknown[]]) =>
-      params?.includes('e165se4r3eo5hp'),
-    );
-    expect(clearCall).toBeDefined();
-  });
-
-  it('never throws, even when the PATCH itself fails — must not mask the original driver error', async () => {
-    const fetchImpl = jest.fn(async () => fakeRes(500, { error: 'boom' }));
-    const runpod = new RunpodClient({ ...CFG, runpodMaxRetries: 0 }, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
-    const pool = fakePool();
-    const deps: FleetDeps = { pool, runpod, cfg: FLEET_CFG };
-
-    await expect(emergencyDrain(deps, 'e165se4r3eo5hp')).resolves.toBeUndefined();
-  });
-
-  it('is a no-op in shadow mode (fleetLive: false) — no PATCH sent, claim still cleared', async () => {
-    const fetchImpl = jest.fn(async () => fakeRes(200, {}));
-    const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
-    const pool = fakePool();
-    const deps: FleetDeps = { pool, runpod, cfg: { fleetLive: false } };
 
     await emergencyDrain(deps, 'e165se4r3eo5hp');
 
@@ -238,5 +193,13 @@ describe('agents/fleet.ts emergencyDrain() — driver failure-path backstop (202
       params?.includes('e165se4r3eo5hp'),
     );
     expect(clearCall).toBeDefined();
+  });
+
+  it('never throws, even when clearing the claim fails — must not mask the original driver error', async () => {
+    const runpod = new RunpodClient(CFG, { fetchImpl: jest.fn(), sleepImpl: jest.fn(async () => {}) });
+    const pool = { query: jest.fn(async () => { throw new Error('db down'); }) } as unknown as FleetDeps['pool'];
+    const deps: FleetDeps = { pool, runpod, cfg: FLEET_CFG };
+
+    await expect(emergencyDrain(deps, 'e165se4r3eo5hp')).resolves.toBeUndefined();
   });
 });

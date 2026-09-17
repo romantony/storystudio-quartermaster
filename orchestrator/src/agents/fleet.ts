@@ -1,45 +1,40 @@
 /**
- * Fleet controller (impl plan §6.3, revised 2026-09-17 twice). The ONLY
- * module permitted to change an endpoint's worker counts — enforced
- * structurally by __tests__/fleet-import-boundary.test.ts, not just this
- * comment.
+ * Fleet controller (impl plan §6.3, revised 2026-09-17 three times — see
+ * git history for the full back-and-forth). The ONLY module permitted to
+ * change an endpoint's worker counts — enforced structurally by
+ * __tests__/fleet-import-boundary.test.ts, not just this comment.
  *
- * FIXED POOLS (2026-09-17): each endpoint has one agreed pod count
- * (src/shared/fleet.ts's FLEET, re-synced against the real dashboard) —
- * this orchestrator never asks for more than that number, and never
- * deliberately asks for less. That's the fix for a real capacity incident
- * the same day: allocate() used to PATCH workersMax up to an UNCAPPED
- * per-cohort demand figure (up to cfg.workersHead, 25) and release() PATCHed
- * it back to 0 between every step — colliding with a genuinely shared,
- * hard 40-worker account-wide RunPod quota (also drawn on by a completely
- * different product's endpoints on the same account) and, once, leaving a
- * manually-raised endpoint orphaned for hours mid-incident.
- * `steps/catalog.ts`'s `maxWorkers` (sourced from the same FLEET numbers)
- * now caps `agents/planner.ts`'s `workersTarget` so `step.workers` here IS
- * always exactly that fixed number, never an inflated demand figure — so
- * allocate()'s PATCH is idempotent in the normal case, not a scale-up.
+ * TRUE HANDS-OFF FIXED POOLS (2026-09-17, final): this orchestrator NEVER
+ * PATCHes workersMax, under any circumstance — not on allocate, not on
+ * release, not on a driver failure. Each endpoint's pod count is set once,
+ * externally (the RunPod dashboard, matching src/shared/fleet.ts's FLEET
+ * numbers), and stays exactly where a human puts it.
  *
- * release() does NOT PATCH back to 0, and never did as of the first
- * 2026-09-17 revision — corrected same day: these 5 endpoints are also
- * actively managed by the AWS Lambda live path's own provisioner
+ * This is a deliberate operator decision, made with a known, accepted
+ * tradeoff already demonstrated live the same day: these 5 endpoints are
+ * also independently managed by the AWS Lambda live path's own provisioner
  * (src/shared/fleet.ts: "Idle floor is 0 (true scale-to-zero)... Pre-warm
- * raises workers only on admission"), which legitimately scales them to 0
- * on its own whenever no live-path project is currently active — entirely
- * independent of this orchestrator. A first cut removed allocate()'s PATCH
- * entirely, assuming the fixed value would just sit there; it doesn't — the
- * live path's own release cycle zeroed all 5 within the hour, and the next
- * cohort's jobs failed instantly (`not_run`, nothing to dispatch to) because
- * this orchestrator had given up its own ability to raise them back. So:
- * allocate() re-PATCHes up to the fixed number every time (harmless no-op
- * if the live path already left it there, a real and necessary raise if the
- * live path had released it to 0) — that IS "never asking for more than the
- * agreed number," not a contradiction of "fixed pools." Only release()
- * dropping it back to 0 between every step was the actual problem this
- * whole revision set out to fix, and that part stays removed.
+ * raises workers only on admission"), which releases them to 0 on its own
+ * whenever no live-path project is active. An earlier revision of this file
+ * re-PATCHed the fixed number back up right before this orchestrator needed
+ * it, specifically to survive that — removing it reopens the exact failure
+ * that fix closed: a cohort whose step lands on an endpoint the live path
+ * has since idled to 0 will fail that step with nothing to dispatch to
+ * (`GeneratorStallError('warm_timeout')` once generator.ts's warm-check
+ * times out, or a downstream "no resolved URL" cascade if some jobs still
+ * squeak through). The operator has chosen to own keeping pod counts
+ * topped up manually (via the dashboard) rather than have this code do it.
  *
- * `endpoint_state` bookkeeping (upsertHeld/clearHeld) stays regardless:
- * watchdog.ts still needs to know which step currently considers itself the
- * legitimate user of an endpoint, independent of the ceiling's real value.
+ * `steps/catalog.ts`'s `maxWorkers` (sourced from the same FLEET numbers)
+ * still caps `agents/planner.ts`'s `workersTarget` at each endpoint's fixed
+ * pod count, so this orchestrator never even TRIES to dispatch more
+ * concurrent jobs than the pool is meant to serve, independent of whatever
+ * the real ceiling happens to be at the moment.
+ *
+ * `endpoint_state` bookkeeping (upsertHeld/clearHeld) stays: watchdog.ts
+ * still needs to know which step currently considers itself the legitimate
+ * user of an endpoint, entirely independent of whether the ceiling itself
+ * ever changes.
  *
  * M0.5's original design called for a DynamoDB lease written here, read by
  * the AWS Lambda live-path provisioner. M3 confirmed that's unnecessary:
@@ -79,37 +74,29 @@ export interface FleetDeps {
 }
 
 /**
- * PATCHes workersMax up to `step.workers` — which is always the endpoint's
- * fixed pod count (catalog.ts's `maxWorkers` caps planner.ts's
- * workersTarget at exactly that number, never more), so this is idempotent
- * in the normal case, not a scale-up. It's still necessary, not dead code:
- * the AWS live path's own provisioner independently releases these same
- * endpoints to 0 when idle (see this file's header comment) — without this
- * PATCH, a cohort starting after that release has nothing to dispatch to.
- * workersMin stays 0, always (see the 2026-09-10 incident note in git
- * history) — RunPod's own QUEUE_DELAY scaler grows the REAL running worker
- * count within this ceiling based on actual queue depth, not to a raised
- * ceiling alone.
+ * Records this step as the endpoint's legitimate current claim — no RunPod
+ * call, ever (see this file's header comment). `step.workers` (planner.ts's
+ * workersTarget, already capped by catalog.ts's `maxWorkers` at the
+ * endpoint's fixed pod count) is recorded purely for endpoint_state/
+ * watchdog visibility. If the real pod count has drifted from this value
+ * (most commonly: the AWS live path released it to 0 since an operator last
+ * set it), that's an operator/dashboard concern — this function does not
+ * detect or correct it.
  */
 export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogEntry & { workers: number }): Promise<void> {
-  const { pool, runpod, cfg } = deps;
+  const { pool, runpod } = deps;
 
   await updateStepStatus(pool, cohortId, step.seq, 'scaling');
 
-  if (cfg.fleetLive) {
-    await runpod.patchWorkers(step.endpointId, { workersMax: step.workers });
-    log().info({ endpointId: step.endpointId, workers: step.workers }, 'fleet: patched workersMax to the fixed pod count (live)');
-  } else {
-    log().info(
-      { endpointId: step.endpointId, workers: step.workers },
-      `fleet: SHADOW — would PATCH ${step.endpointId} workersMax -> ${step.workers} (the fixed pod count)`,
-    );
-  }
+  log().info(
+    { endpointId: step.endpointId, workers: step.workers },
+    "fleet: using fixed pod pool (no workersMax PATCH, ever — see this file's header comment)",
+  );
 
-  // Record the claim right after the PATCH, before anything else — a real
-  // worker could start appearing the moment RunPod sees the ceiling and a
-  // job lands in its queue; watchdog.ts must never see that without a
-  // matching claim on record.
+  // Record the claim before the reachability probe — a real worker could
+  // already be serving this endpoint's fixed pool the moment a job lands in
+  // its queue; watchdog.ts must never see that without a matching claim on
+  // record.
   await upsertHeld(pool, step.endpointId, {
     cohortId,
     stepSeq: step.seq,
@@ -120,10 +107,10 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
 
   // One cheap reachability probe, NOT a poll-until-ready loop — catches a
   // typo'd/deleted endpointId immediately rather than minutes into
-  // generation. Must not gate on ready/running counts; the fixed pool's
-  // real worker count is RunPod's own QUEUE_DELAY scaler's business, and
-  // generator.ts's cold-start-stall detection (GeneratorStallError) owns
-  // waiting for real readiness, non-blockingly.
+  // generation. Must not gate on ready/running counts; the pool's real
+  // worker count is entirely outside this orchestrator's control now.
+  // generator.ts's cold-start-stall detection (GeneratorStallError) is what
+  // notices if the real pod count was left at 0 and nothing ever comes up.
   try {
     await runpod.health(step.endpointId);
   } catch (err) {
@@ -139,32 +126,14 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
 }
 
 /**
- * Best-effort backstop used only by the driver's failure path
- * (orchestrator.ts) — a bare `workersMax:0` PATCH plus a claim clear, none
- * of release()'s gating. Real incident, 2026-09-11: allocate() PATCHed
- * workersMax up, the very next call failed, and the driver returned without
- * ever compensating, leaving the just-raised workers to bill unmanaged for
- * 2+ hours. Restored 2026-09-17 (same day it was briefly removed): allocate()
- * PATCHing up is real again — idempotent in the common case, but a genuine
- * raise whenever the AWS live path had already released the endpoint to 0
- * (see allocate()'s header comment) — so the crash-between-raise-and-release
- * window this exists for is real again too. Never throws — a failure here
- * is logged and swallowed so it cannot mask the original error that
- * triggered it; WATCHDOG_AUTODRAIN is the remaining backstop if this PATCH
- * itself fails or the orchestrator process dies before reaching it.
+ * Clears this step's endpoint_state claim — no RunPod call, ever (see this
+ * file's header comment). Kept as a distinct function (rather than inlined
+ * at each orchestrator.ts call site) because it's the one thing every
+ * driver exit path, including failures, needs to do so watchdog.ts stops
+ * treating this step as the endpoint's legitimate current owner. Never
+ * throws.
  */
 export async function emergencyDrain(deps: FleetDeps, endpointId: string): Promise<void> {
-  if (deps.cfg.fleetLive) {
-    try {
-      await deps.runpod.patchWorkers(endpointId, { workersMin: 0, workersMax: 0 });
-      log().error({ endpointId }, 'fleet: EMERGENCY DRAIN — step failed after allocate(), PATCHing workersMax -> 0 to stop billing');
-    } catch (err) {
-      log().error(
-        { endpointId, err },
-        'fleet: emergency drain PATCH itself failed — endpoint may still be billing; WATCHDOG_AUTODRAIN is the remaining backstop',
-      );
-    }
-  }
   try {
     await clearHeld(deps.pool, endpointId);
   } catch (err) {
@@ -206,10 +175,10 @@ export async function release(deps: FleetDeps, cohortId: string, step: CatalogEn
  * Auxiliary endpoints (2026-09-15): a gated step's model-switch fallbacks can
  * submit to endpoints other than the step's own (Flux on qwen-image-gen while
  * step 0 runs on qwen-image-edit; postprod-lite `normalize` while step 3 runs
- * on wan2-i2v — steps/catalog.ts `auxiliaryEndpoints`). Same fixed-pool
- * reasoning as allocate() above: the aux endpoint may be one of the shared
- * FLEET endpoints the AWS live path also scales to 0 on its own, so this
- * still PATCHes up to `aux.workers` (idempotent when already there).
+ * on wan2-i2v — steps/catalog.ts `auxiliaryEndpoints`). Same true-hands-off
+ * policy as allocate() above: no ceiling PATCH, ever — this just records the
+ * claim so the watchdog sees fallback usage as owned, and runStep() keeps it
+ * fresh.
  */
 export async function allocateAuxiliary(
   deps: FleetDeps,
@@ -217,12 +186,7 @@ export async function allocateAuxiliary(
   stepSeq: number,
   aux: { endpointId: string; workers: number },
 ): Promise<void> {
-  if (deps.cfg.fleetLive) {
-    await deps.runpod.patchWorkers(aux.endpointId, { workersMax: aux.workers });
-    log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: auxiliary endpoint patched to its fixed pod count (live)');
-  } else {
-    log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: SHADOW — would patch auxiliary endpoint to its fixed pod count');
-  }
+  log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: auxiliary endpoint claim recorded (fixed pool, no PATCH)');
   await upsertHeld(deps.pool, aux.endpointId, { cohortId, stepSeq, workersMax: aux.workers, workersMin: 0, workersReady: 0 });
 }
 
