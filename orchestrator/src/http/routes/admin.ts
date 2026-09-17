@@ -17,7 +17,7 @@ import type { RunpodClient } from '../../runpod/client';
 import { log } from '../../telemetry/log';
 import { FLEET } from '../../fleet-registry';
 import { cohortSummary } from '../../agents/orchestrator';
-import { assetCounts, projectCounts, costTotal, costByProject, listFailedProjects } from '../../db/repo/admin-stats';
+import { assetCounts, projectCounts, costTotal, costByProject, listFailedProjects, listAlerts } from '../../db/repo/admin-stats';
 import { validateRework, driveRework, ReworkError } from '../../agents/rework';
 import { DASHBOARD_HTML } from './dashboard-html';
 
@@ -72,12 +72,13 @@ export async function adminRoutes(
   });
 
   app.get('/v1/admin/dashboard/stats', async () => {
-    const [assets, projects, total, byProject, failedProjects] = await Promise.all([
+    const [assets, projects, total, byProject, failedProjects, alerts] = await Promise.all([
       assetCounts(opts.pool),
       projectCounts(opts.pool),
       costTotal(opts.pool),
       costByProject(opts.pool),
       listFailedProjects(opts.pool),
+      listAlerts(opts.pool),
     ]);
     return {
       assets,
@@ -89,6 +90,7 @@ export async function adminRoutes(
         byProject,
       },
       failedProjects,
+      alerts,
     };
   });
 

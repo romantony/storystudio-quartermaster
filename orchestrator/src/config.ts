@@ -131,6 +131,15 @@ const ConfigSchema = z.object({
   orphanGraceMs: numeric(600_000).pipe(z.number().int().positive()),
   watchdogAlertWebhookUrl: z.string().url().optional(), // unset = log-only, no-op
 
+  // ── diagnostics (read-only Sonnet assistant, 2026-09-17) ──────────────
+  // Fires only on an existing failure signal (watchdog orphan, a project
+  // finalizing failed/partial, a generator stall timeout) — never a poll.
+  // Same env var / adapter pattern as src/adapters/anthropic.ts (the 4lang
+  // translation Lambda adapter) — one Anthropic account, two call sites.
+  // Unset = the whole feature is a no-op (mirrors watchdogAlertWebhookUrl).
+  anthropicApiKey: z.string().optional(),
+  anthropicModel: z.string().default('claude-sonnet-5'),
+
   // ── quality gates (impl plan §6.5 / M4) ───────────────────────────────
   // Replicate-hosted VLM, ported from the AWS-side dialogue-basic-qa-agent
   // (image_evaluator.py/video_evaluator.py/llm_client.py/config.py) — same
@@ -263,6 +272,8 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   watchdogAutodrain: 'WATCHDOG_AUTODRAIN',
   orphanGraceMs: 'ORPHAN_GRACE_MS',
   watchdogAlertWebhookUrl: 'WATCHDOG_ALERT_WEBHOOK_URL',
+  anthropicApiKey: 'ANTHROPIC_API_KEY',
+  anthropicModel: 'ANTHROPIC_MODEL',
   replicateApiToken: 'REPLICATE_API_TOKEN',
   replicateApiBase: 'REPLICATE_API_BASE',
   replicateVisionModel: 'REPLICATE_VISION_MODEL',

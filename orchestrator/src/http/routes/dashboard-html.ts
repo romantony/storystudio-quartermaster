@@ -36,6 +36,11 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   .status-tag { padding: 2px 6px; border-radius: 4px; font-size: 11px; }
   .status-failed { background: #3b1d1d; color: #f87171; }
   .status-partial { background: #3b2e1d; color: #fbbf24; }
+  .sev-tag { padding: 2px 6px; border-radius: 4px; font-size: 11px; text-transform: uppercase; }
+  .sev-critical { background: #3b1d1d; color: #f87171; }
+  .sev-warning { background: #3b2e1d; color: #fbbf24; }
+  .sev-info { background: #1d2a3b; color: #60a5fa; }
+  .alert-msg { color: #c9ccd1; }
 </style>
 </head>
 <body>
@@ -62,6 +67,12 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   <section>
     <h2>Failed / partial projects</h2>
     <table id="failedTable"><thead><tr><th>Project</th><th>Status</th><th>Tier</th><th>Failed jobs</th><th>Finished</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>Diagnostic alerts</h2>
+    <div class="note">Read-only Sonnet diagnosis, fired on an existing failure signal (watchdog orphan, project failed/partial). Never takes action itself.</div>
+    <table id="alertsTable"><thead><tr><th>When</th><th>Severity</th><th>Trigger</th><th>Project / endpoint</th><th>Diagnosis</th></tr></thead><tbody></tbody></table>
   </section>
 </div>
 
@@ -128,7 +139,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   }
 
   function render(data) {
-    var assets = data.assets, projects = data.projects, cost = data.cost, failed = data.failedProjects;
+    var assets = data.assets, projects = data.projects, cost = data.cost, failed = data.failedProjects, alerts = data.alerts || [];
 
     var cardsHtml = '';
     cardsHtml += card(assets.generated, 'Assets generated', 'ok');
@@ -156,6 +167,17 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         '</tr>';
     }).join('');
     document.querySelector('#failedTable tbody').innerHTML = failedRows || '<tr><td colspan="6">No failed/partial projects.</td></tr>';
+
+    var alertRows = alerts.map(function (a) {
+      return '<tr>' +
+        '<td>' + fmtDate(a.createdAt) + '</td>' +
+        '<td><span class="sev-tag sev-' + esc(a.severity) + '">' + esc(a.severity) + '</span></td>' +
+        '<td>' + esc(a.trigger) + '</td>' +
+        '<td>' + esc(a.projectId || a.endpointId || '—') + '</td>' +
+        '<td class="alert-msg">' + esc(a.message) + '</td>' +
+        '</tr>';
+    }).join('');
+    document.querySelector('#alertsTable tbody').innerHTML = alertRows || '<tr><td colspan="5">No diagnostic alerts.</td></tr>';
 
     Array.prototype.forEach.call(document.querySelectorAll('.reworkBtn'), function (btn) {
       btn.addEventListener('click', function () {

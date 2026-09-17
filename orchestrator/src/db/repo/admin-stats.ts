@@ -98,3 +98,46 @@ export async function listFailedProjects(db: Queryable, limit = 50): Promise<Fai
     failedJobs: Number(r.failed_jobs),
   }));
 }
+
+export interface DiagnosticAlertRow {
+  id: number;
+  createdAt: Date;
+  severity: string;
+  trigger: string;
+  projectId: string | null;
+  cohortId: string | null;
+  endpointId: string | null;
+  message: string;
+}
+
+/** Sonnet's own diagnoses (src/diagnostics/diagnose.ts), newest first, for the
+ * dashboard's Alerts section. Never includes `signals` (the raw snapshot) —
+ * that's for log/DB inspection, not the summary view. */
+export async function listAlerts(db: Queryable, limit = 50): Promise<DiagnosticAlertRow[]> {
+  const { rows } = await db.query<{
+    id: number;
+    created_at: Date;
+    severity: string;
+    trigger: string;
+    project_id: string | null;
+    cohort_id: string | null;
+    endpoint_id: string | null;
+    message: string;
+  }>(
+    `SELECT id, created_at, severity, trigger, project_id, cohort_id, endpoint_id, message
+       FROM diagnostic_alerts
+      ORDER BY created_at DESC
+      LIMIT $1`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    createdAt: r.created_at,
+    severity: r.severity,
+    trigger: r.trigger,
+    projectId: r.project_id,
+    cohortId: r.cohort_id,
+    endpointId: r.endpoint_id,
+    message: r.message,
+  }));
+}

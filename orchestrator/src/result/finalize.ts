@@ -20,13 +20,17 @@
  */
 import type { Pool } from 'pg';
 import type { Config } from '../config';
+import type { RunpodClient } from '../runpod/client';
 import { log } from '../telemetry/log';
 import { buildResult, loadResultFacts } from './assemble';
 import { deliverCallback, type CallbackAttempt } from './callback';
+import { runDiagnostic } from '../diagnostics/diagnose';
 
 export interface FinalizeDeps {
   pool: Pool;
   cfg: Config;
+  /** Optional — only used to enrich a diagnostic alert with live endpoint health, never required for finalization itself. */
+  runpod?: RunpodClient;
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
 }
@@ -63,6 +67,17 @@ export async function finalizeCohort(deps: FinalizeDeps, cohortId: string, outco
       [p.id, result, result.status, p.callback_url ? 'pending' : 'skipped'],
     );
     log().info({ cohortId, projectId: p.id, status: result.status, errors: result.errors.length }, 'finalize: result assembled');
+    if (result.status !== 'completed') {
+      void runDiagnostic(
+        { pool: deps.pool, runpod: deps.runpod, cfg: deps.cfg },
+        {
+          trigger: result.status === 'failed' ? 'project_failed' : 'project_partial',
+          projectId: p.id,
+          cohortId,
+          facts: { status: result.status, errors: result.errors, errorsTotal: result.errorsTotal },
+        },
+      );
+    }
     if (p.callback_url) deliveries.push({ projectId: p.id, requestId: p.request_id, url: p.callback_url, body: result });
   }
 

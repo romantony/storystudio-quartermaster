@@ -50,6 +50,8 @@ import { RunpodClient } from './runpod/client';
 import { FLEET, type FleetEndpoint } from './fleet-registry';
 import { STEP_CATALOG } from './steps/catalog';
 import { getState } from './db/repo/endpoint-state';
+import { runDiagnostic } from './diagnostics/diagnose';
+import type { Config } from './config';
 
 /** Unique FleetEndpoints for every endpoint a catalogued step actually uses —
  * built from the catalog itself, not filtered from FLEET (see this file's
@@ -86,7 +88,13 @@ async function alert(
 export async function checkOnce(
   runpod: RunpodClient,
   pool: ReturnType<typeof getPool>,
-  cfg: { orphanGraceMs: number; watchdogAutodrain: boolean; watchdogAlertWebhookUrl?: string },
+  cfg: {
+    orphanGraceMs: number;
+    watchdogAutodrain: boolean;
+    watchdogAlertWebhookUrl?: string;
+    anthropicApiKey?: Config['anthropicApiKey'];
+    anthropicModel?: Config['anthropicModel'];
+  },
   endpoints: readonly FleetEndpoint[] = watchedEndpoints(),
 ): Promise<void> {
   for (const endpoint of endpoints) {
@@ -107,12 +115,17 @@ export async function checkOnce(
     const orphaned = state?.heldByStep == null || staleMs > cfg.orphanGraceMs;
     if (!orphaned) continue;
 
-    await alert(cfg.watchdogAlertWebhookUrl, {
+    const orphanFacts = {
       endpointId: endpoint.endpointId,
       realWorkers,
       heldByStep: state?.heldByStep ?? null,
       orphanForMs: Number.isFinite(staleMs) ? staleMs : -1,
-    });
+    };
+    await alert(cfg.watchdogAlertWebhookUrl, orphanFacts);
+    void runDiagnostic(
+      { pool, runpod, cfg: { anthropicApiKey: cfg.anthropicApiKey, anthropicModel: cfg.anthropicModel } },
+      { trigger: 'watchdog_orphan', endpointId: endpoint.endpointId, facts: orphanFacts },
+    );
 
     if (cfg.watchdogAutodrain && staleMs > cfg.orphanGraceMs) {
       log().error({ endpointId: endpoint.endpointId }, 'watchdog: WATCHDOG_AUTODRAIN=true, draining orphaned endpoint');

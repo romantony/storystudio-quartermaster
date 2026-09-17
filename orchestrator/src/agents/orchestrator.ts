@@ -52,7 +52,7 @@ export async function driveCohort(deps: DriverDeps, cohortId: string): Promise<v
     outcome = (await runCohort(deps, cohortId)) ? 'completed' : 'stopped';
   } finally {
     try {
-      await finalizeCohort({ pool: deps.pool, cfg: deps.cfg }, cohortId, outcome);
+      await finalizeCohort({ pool: deps.pool, cfg: deps.cfg, runpod: deps.runpod }, cohortId, outcome);
     } catch (err) {
       log().error({ cohortId, outcome, err }, 'driver: finalize failed');
     }
