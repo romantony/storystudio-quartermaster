@@ -21,10 +21,19 @@ describe('askSonnet', () => {
     expect(diagnosis).toEqual({ severity: 'critical', message: 'account-wide RunPod issue' });
   });
 
-  it('falls back to a warning with the raw text when Sonnet does not return valid JSON', async () => {
+  it('forces critical (never silently downgrades) when Sonnet does not return valid JSON', async () => {
     const fetchImpl = jest.fn(async () => fakeRes(200, { content: [{ type: 'text', text: 'not json' }] }));
     const diagnosis = await askSonnet({ anthropicApiKey: 'k' }, { trigger: 'project_failed', triggeredAt: 'now', facts: {} }, fetchImpl as unknown as typeof fetch);
-    expect(diagnosis).toEqual({ severity: 'warning', message: 'not json' });
+    expect(diagnosis.severity).toBe('critical');
+    expect(diagnosis.message).toContain('not json');
+  });
+
+  it('salvages the real severity from truncated JSON instead of defaulting', async () => {
+    const truncated = '{"severity":"warning","message":"looks isolated, endpoint recovered on its o';
+    const fetchImpl = jest.fn(async () => fakeRes(200, { content: [{ type: 'text', text: truncated }], stop_reason: 'max_tokens' }));
+    const diagnosis = await askSonnet({ anthropicApiKey: 'k' }, { trigger: 'watchdog_orphan', triggeredAt: 'now', facts: {} }, fetchImpl as unknown as typeof fetch);
+    expect(diagnosis.severity).toBe('warning');
+    expect(diagnosis.message).toContain('truncated at max_tokens');
   });
 
   it('throws on an Anthropic API error', async () => {

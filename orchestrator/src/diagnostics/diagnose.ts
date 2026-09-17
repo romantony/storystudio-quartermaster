@@ -91,12 +91,20 @@ export async function askSonnet(
     },
     body: JSON.stringify({
       model: cfg.anthropicModel ?? 'claude-sonnet-5',
-      max_tokens: 512,
+      // 512 was found live (2026-09-17) to truncate a real "critical" diagnosis
+      // mid-JSON, which silently downgraded it to "warning" via the fallback
+      // below — a genuinely dangerous failure mode for an alerting feature.
+      // 1536 gives a 2-4 sentence message plenty of headroom.
+      max_tokens: 1536,
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: JSON.stringify(snapshot) }],
     }),
   });
-  const body = (await res.json()) as { content?: Array<{ type?: string; text?: string }>; error?: { message?: string } };
+  const body = (await res.json()) as {
+    content?: Array<{ type?: string; text?: string }>;
+    error?: { message?: string };
+    stop_reason?: string;
+  };
   if (!res.ok || body.error) {
     throw new Error(`Anthropic error: ${body.error?.message ?? res.status}`);
   }
@@ -106,9 +114,16 @@ export async function askSonnet(
     const parsed = JSON.parse(text) as Partial<Diagnosis>;
     if (parsed.severity && parsed.message) return { severity: parsed.severity as Diagnosis['severity'], message: parsed.message };
   } catch {
-    // fall through — treat the raw text as the message rather than dropping a real diagnosis
+    // fall through
   }
-  return { severity: 'warning', message: text };
+  // Malformed or truncated JSON: never silently default to "warning" — a
+  // truncated "critical" response downgraded to "warning" is worse than no
+  // parsed severity at all. Salvage a severity by regex if one is visible in
+  // the raw text; otherwise force "critical" so a broken diagnosis still
+  // surfaces loudly rather than getting buried.
+  const salvaged = /"severity"\s*:\s*"(info|warning|critical)"/.exec(text)?.[1] as Diagnosis['severity'] | undefined;
+  const note = body.stop_reason === 'max_tokens' ? ' [response truncated at max_tokens]' : ' [unparsed response]';
+  return { severity: salvaged ?? 'critical', message: text + note };
 }
 
 export async function runDiagnostic(
