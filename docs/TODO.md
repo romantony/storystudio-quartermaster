@@ -2,6 +2,51 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## 2026-09-18 — follow-ups from the diagnostics assistant + fixed-pod policy session (2026-09-17)
+
+Context: memory `qm-orchestrator-diagnostics-and-fixed-pods-20260917` (full saga — 3 fixed-pod
+policy reversals, absolute final rule, live-verified clean test). Stabilization bar for UAT (user's
+own words): "once we run the test and once we get the projects videos generated without any error
+we move it for UAT."
+
+1. **Run the stability test again, more than once.** `qm-stability-test-20260917-01` finalized
+   `completed`, 9/9 jobs, zero `diagnostic_alerts`, real final video
+   (`.../storystudio/video/20260917164121_..._concat.mp4`, 11.25s) — the first fully clean,
+   unassisted run since today's fixed-pod work landed. One run is a data point, not a pattern (it
+   even included one legitimate quality-gate rework cycle that resolved correctly, not a truly
+   "nothing went wrong" run). Repeat before treating the UAT bar as met.
+2. **Before every test run: check + re-set the 5 shared endpoints' `workersMax`.** Per the absolute
+   fixed-pod policy (nothing in the orchestrator ever touches `workersMax` anymore — verified by a
+   full-codebase audit, watchdog autodrain included), these drift to 0 on their own between test
+   runs (the AWS live path's independent provisioner, confirmed live multiple times same session).
+   Values: Flux-TTS-ANIM=5, qwen-image-gen=4, qwen-image-edit=4, wan2-i2v=6, BGM-S2T=2. The 3
+   orchestrator-only endpoints (PostProd-Lite=4, DreamX-Refine=2, MM-Audio-A40=2) should NOT drift on
+   their own now that watchdog autodrain is disabled — worth confirming that holds over a longer
+   gap, not just the same session it was fixed in.
+3. **`js76a6d9k3eze1t30xyrrkrwt58eghfj__a1` is still not fixed** — 3 rework attempts today
+   (`repair1`/`repair2`/`repair3`) all failed for different real reasons (capacity/PATCH bug ×2,
+   then a RunPod job-404 on 2 of 5 frames), project still `partial`. Retry (`repair4`) now that the
+   fixed-pod policy and a clean test run are both confirmed working — but note `validateRework()`
+   re-attempts all 5 originally-failed frames from scratch each time, not just the ones that failed
+   last attempt.
+4. **Decide whether `src/shared/fleet.ts`'s corrected numbers need a `cdk deploy`.** Committed
+   (`75aae8a`) but the AWS Lambda live path won't see the re-synced worker counts
+   (flux-tts-s2t 8→5, qwen-image-gen 6→4, wan2-i2v 10→6, bgm-s2t 4→2) until a separate deploy, which
+   was never run this session (explicitly out of scope — "update the VPS" only). Given the live path
+   is slated for eventual decommission, decide if this is worth deploying now or can wait.
+5. *(Optional, low priority)* Clean up today's test/synthetic projects (`qm-stability-test-20260917-01`,
+   `js76a6d9k3eze1t30xyrrkrwt58eghfj__a1__repair1/2/3`) if cluttering the dashboard — same
+   leave-parked convention as prior sessions.
+
+**Carried forward, still unresolved, from 2026-09-17's list below** (unaffected by today's fixed-pod
+work — different subsystems): #2 (`warmTimeoutMs` stall-detection redesign — still undecided), #4
+(dispatch ramp never verified at full 35-job scale), #5 (`repo.integration.test.ts` flakiness), #6
+(`prepareCohort()` re-running in full on every resume), #7 (webhook/requeue race hardening), #8
+(confirm StoryStudio's other 2026-09-16 retries landed). Item #1 below (RunPod capacity backlog root
+cause) is superseded — today's session found the real mechanism: a shared RunPod account with both
+the AWS live path's independent provisioner AND a completely different product's endpoints
+(storystudio-unified's 3D pipeline), not a RunPod-side outage.
+
 ## 2026-09-17 — follow-ups from the admin dashboard + RunPod capacity incident (2026-09-16)
 
 Context: `docs/qm-orchestrator-session-2026-09-16-admin-dashboard-and-incidents.md` +
