@@ -138,7 +138,7 @@ describe('watchdog checkOnce', () => {
     errorSpy.mockRestore();
   });
 
-  it('auto-drains only when watchdogAutodrain=true AND the grace period has elapsed', async () => {
+  it('never auto-drains even with watchdogAutodrain=true and the grace period elapsed — disabled 2026-09-17, absolute policy: the VPS never changes workersMax', async () => {
     const fetchImpl = jest.fn(async () => fakeRes(200, fixture('health.json')));
     const runpod = new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) });
     const staleObservedAt = new Date(Date.now() - WATCHDOG_CFG.orphanGraceMs - 60_000);
@@ -146,11 +146,12 @@ describe('watchdog checkOnce', () => {
 
     await checkOnce(runpod, pool, { ...WATCHDOG_CFG, watchdogAutodrain: true }, [ENDPOINT]);
 
-    // health() + patchWorkers() both go through fetchImpl — expect a second
-    // call whose URL hits the management PATCH endpoint.
+    // No patchWorkers call, ever, regardless of watchdogAutodrain — see
+    // this file's checkOnce() comment. An admin maintains workersMax via
+    // the RunPod dashboard now, not this code.
     const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
     const patchCall = calls.find(([url]) => url.includes('/rest.runpod.io/'));
-    expect(patchCall).toBeDefined();
+    expect(patchCall).toBeUndefined();
   });
 
   it('does NOT auto-drain when watchdogAutodrain=false, even with a stale claim', async () => {

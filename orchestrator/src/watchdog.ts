@@ -127,7 +127,15 @@ export async function checkOnce(
       { trigger: 'watchdog_orphan', endpointId: endpoint.endpointId, facts: orphanFacts },
     );
 
-    if (cfg.watchdogAutodrain && staleMs > cfg.orphanGraceMs) {
+    // Disabled 2026-09-17, absolute policy: the VPS never changes workersMax,
+    // under any circumstance — an admin maintains it via the RunPod
+    // dashboard. This was previously the one remaining `patchWorkers` call
+    // anywhere in this codebase outside agents/fleet.ts (itself already
+    // PATCH-free by the same policy — see its header comment); left
+    // deliberately intact but unreachable rather than deleted, so the
+    // WATCHDOG_AUTODRAIN config flag stays legible as "what this used to do"
+    // for anyone reading the config, without being able to fire.
+    if (false && cfg.watchdogAutodrain && staleMs > cfg.orphanGraceMs) {
       log().error({ endpointId: endpoint.endpointId }, 'watchdog: WATCHDOG_AUTODRAIN=true, draining orphaned endpoint');
       await runpod.patchWorkers(endpoint.endpointId, { workersMin: 0, workersMax: 0 });
     }
