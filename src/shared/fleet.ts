@@ -95,7 +95,15 @@ export const FLEET: FleetEndpoint[] = [
   // Workers deployed", Flux-TTS-ANIM 0/8 running, 0 idle) — real pod count
   // dropped since the 2026-08-04 10→12 raise; keep this matched to the
   // dashboard, not the last-known-good direction.
-  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 8 },
+  // Re-synced against the dashboard 2026-09-17 (account-wide capacity
+  // incident + orchestrator fixed-pool migration — see
+  // orchestrator/src/agents/fleet.ts's header comment): Flux-TTS-ANIM=5
+  // (was 8). This account's 40-worker cap is now confirmed shared with a
+  // completely different product's endpoints on the same RunPod account
+  // (storystudio-unified's 3D pipeline: Blender-headless/Hunyuan-3D/
+  // Trellis2/3d-rigging-skintokens, ~11 workers) — keep re-checking this
+  // against the live dashboard, not just this file's own history.
+  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 5 },
   // Raised 0→2 (2026-07-21): now the primary rung for image.explainer.t2i
   // (explainer/educational/advertisement/documentary/product-promotion T2I —
   // see background.json), replacing the retired ernie-image endpoint. No
@@ -105,19 +113,19 @@ export const FLEET: FleetEndpoint[] = [
   // ("39/40 Workers deployed", qwen-image-gen 0/6 running, 3 idle) — this
   // number predates the routing fix and may need another real look now that
   // demand here is materially higher.
-  { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 6 },
-  // Unchanged at 4 (2026-08-11): re-confirmed against the dashboard ("39/40
-  // Workers deployed", qwen-image-edit 0/4 running, 0 idle).
+  // Lowered 6→4 (2026-09-17, re-synced against the dashboard — see
+  // FLUX_TTS_S2T's entry above for the incident context).
+  { counterKey: QWEN_IMAGE_GEN,  endpointId: 'e165se4r3eo5hp', workers: 4 },
+  // Unchanged at 4 (re-confirmed against the dashboard 2026-09-17, same as
+  // 2026-08-11).
   { counterKey: QWEN_IMAGE_EDIT, endpointId: 'oxwx8o879qwtla', workers: 4 },
   // Keep this number matched to the real pod count: a prior mismatch (4
   // claimed vs 3 real) silently failed 13+ of 17 frames in a live premium
   // run (2026-07-05) because QM's own concurrency gate (endpointWorkers())
   // let jobs submit believing there was room, when they actually queued
-  // invisibly behind RunPod's real workers. Lowered 12→10 (2026-08-11):
-  // re-synced against the dashboard ("39/40 Workers deployed",
-  // Wan2-14b-fp8-RTX6000ADA 0/10 running, 10 idle) — real pod count dropped
-  // since the 2026-08-04 8→12 raise.
-  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 10 },
+  // invisibly behind RunPod's real workers. Lowered 10→6 (2026-09-17,
+  // re-synced against the dashboard — see FLUX_TTS_S2T's entry above).
+  { counterKey: WAN2_I2V,        endpointId: 'nd7wloyvj09xwy', workers: 6 },
   // bgm-s2t (ENDPOINT_ROLE=audio) — ACE-Step BGM + Whisper SRT, shared by
   // Basic + Premium. Off the per-frame hot path in terms of call volume
   // (~1 BGM call/project), but fourLang's TranscribeAudioFourLang fires up
@@ -129,7 +137,9 @@ export const FLEET: FleetEndpoint[] = [
   // through the 2026-08-04 30→40 cap raise (dashboard confirmed BGM-S2T
   // 0/4 running, 4 idle — unchanged). Shares the flux2-TTS-S2T-Bgm network
   // volume with flux-tts-s2t (each endpoint loads only its own models).
-  { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 4 },
+  // Lowered 4→2 (2026-09-17, re-synced against the dashboard — see
+  // FLUX_TTS_S2T's entry above).
+  { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 2 },
   // MeiGen-MultiTalk (~/multitalk repo) — primary rung for Dialogue Premium
   // monologue/dialogue video-gen (video.dialoguePremium.monologue/.dialogue
   // in background.json); RunComfy InfiniteTalk is the fallback when this

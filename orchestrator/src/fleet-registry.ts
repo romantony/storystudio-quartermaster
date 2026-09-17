@@ -22,16 +22,16 @@ export interface FleetEndpoint {
  * step 5); it does not own them.
  */
 export const FLEET: readonly FleetEndpoint[] = [
-  { counterKey: "runpod:flux-tts-s2t", endpointId: "rnqxi6c0mlq517", workers: 8 },
-  { counterKey: "runpod:qwen-image-gen", endpointId: "e165se4r3eo5hp", workers: 6 },
+  { counterKey: "runpod:flux-tts-s2t", endpointId: "rnqxi6c0mlq517", workers: 5 },
+  { counterKey: "runpod:qwen-image-gen", endpointId: "e165se4r3eo5hp", workers: 4 },
   { counterKey: "runpod:qwen-image-edit", endpointId: "oxwx8o879qwtla", workers: 4 },
-  { counterKey: "runpod:wan2-i2v", endpointId: "nd7wloyvj09xwy", workers: 10 },
-  { counterKey: "runpod:bgm-s2t", endpointId: "6apg6j7suzuezw", workers: 4 },
+  { counterKey: "runpod:wan2-i2v", endpointId: "nd7wloyvj09xwy", workers: 6 },
+  { counterKey: "runpod:bgm-s2t", endpointId: "6apg6j7suzuezw", workers: 2 },
   { counterKey: "runpod:multitalk", endpointId: "mt6vmstwzw0evp", workers: 2 },
 ] as const;
 
 /** Sum of the pooled worker counts (spec §5.2's "FLEET sums to"). */
-export const FLEET_TOTAL = 34;
+export const FLEET_TOTAL = 23;
 
 /** Look up one endpoint's pooled worker count (0 if not in the pool). */
 export function pooledWorkers(counterKey: string): number {

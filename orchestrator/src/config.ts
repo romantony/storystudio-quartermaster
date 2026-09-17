@@ -76,7 +76,10 @@ const ConfigSchema = z.object({
   // clean home instead of racing the boundary.
   windowCutoffMinutes: numeric(15).pipe(z.number().int().nonnegative()),
   workersHead: numeric(25).pipe(z.number().int().positive()),
-  workersTail: numeric(10).pipe(z.number().int().positive()),
+  // Lowered 10→4 (2026-09-17, fixed-pool migration — see agents/fleet.ts's
+  // header comment): postprod-lite's real dashboard pod count is 4, so this
+  // now matches it exactly instead of over-dispatching by more than double.
+  workersTail: numeric(4).pipe(z.number().int().positive()),
   // 2026-09-16: lets the bulk/generation dispatch loop submit up to this
   // many MORE jobs than workersHead's real worker count, so they sit queued
   // inside RunPod itself rather than waiting on our own next poll tick — no

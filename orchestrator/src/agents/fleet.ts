@@ -1,20 +1,40 @@
 /**
- * Fleet controller (impl plan §6.3). The ONLY module permitted to change an
- * endpoint's worker counts — enforced structurally by
+ * Fleet controller (impl plan §6.3, revised 2026-09-17). The ONLY module
+ * permitted to change an endpoint's worker counts — enforced structurally by
  * __tests__/fleet-import-boundary.test.ts, not just this comment.
  *
- * Shadow mode (`cfg.fleetLive === false`, the default): does everything
- * except the two `patchWorkers` calls, logging what it would have sent. A
- * single reachability probe (not a poll-until-ready loop — see allocate())
- * and the cap assertion happen for real regardless — M2's acceptance run
- * hand-scales one endpoint's real worker count so this real verification
- * has something real to observe (see the M2 plan's decision 5).
+ * FIXED POOLS (2026-09-17): every endpoint's `workersMax` is now a static
+ * pod count, matched to the real RunPod dashboard and never PATCHed by this
+ * module — src/shared/fleet.ts's FLEET already documented this as the
+ * intended model for the AWS live path ("a *static* allocation, never
+ * dynamically reshuffled"); this orchestrator's own allocate()/release()
+ * had diverged from that, PATCHing workersMax up per step and back to 0
+ * between steps. That divergence is what a live capacity incident
+ * (2026-09-17) traced back to real problems: the account's real 40-worker
+ * quota is shared with a completely different product's endpoints on the
+ * same RunPod account, so this orchestrator raising and dropping its own
+ * ceilings repeatedly collided with that shared, external demand
+ * (`cap_breach`) and, worse, a manual dashboard change made mid-incident
+ * left a real orphaned worker pool for hours. None of that is fixable by
+ * scaling faster or smarter — the fix is to stop moving the ceiling at all.
+ * `steps/catalog.ts`'s `maxWorkers` (sourced from the same FLEET numbers)
+ * now caps `agents/planner.ts`'s `workersTarget` at each endpoint's real
+ * fixed pod count, so this orchestrator never even TRIES to dispatch more
+ * concurrent jobs than the pool can serve — RunPod's own QUEUE_DELAY
+ * scaler still grows/shrinks the REAL running worker count within that
+ * fixed ceiling based on actual queue depth (workersMin stays 0, so an
+ * idle pool still costs nothing — see the 2026-09-10 incident note below).
+ *
+ * `endpoint_state` bookkeeping (upsertHeld/clearHeld) stays: watchdog.ts
+ * still needs to know which step currently considers itself the legitimate
+ * user of an endpoint, entirely independent of whether the ceiling itself
+ * ever changes.
  *
  * M0.5's original design called for a DynamoDB lease written here, read by
  * the AWS Lambda live-path provisioner. M3 confirmed that's unnecessary:
  * MCP-originated traffic (this orchestrator's entire load) never touches
  * that Lambda, so there's no cross-system datastore to coordinate through.
- * `endpoint_state` (already in `001_init.sql`, unwired until now) is the
+ * `endpoint_state` (already in `001_init.sql`, unwired until M3) is the
  * Postgres-only stand-in — legible only to this orchestrator's own
  * watchdog (`watchdog.ts`), not to anything on the AWS side.
  */
@@ -22,13 +42,12 @@ import type { Pool } from 'pg';
 import type { Config } from '../config';
 import type { RunpodClient } from '../runpod/client';
 import type { CatalogEntry } from '../steps/catalog';
-import { FLEET } from '../fleet-registry';
 import { log } from '../telemetry/log';
 import { updateStepStatus } from '../db/repo/steps';
 import { upsertHeld, clearHeld } from '../db/repo/endpoint-state';
 import { countUngated, countInFlightForGatedStep } from '../db/repo/quality';
 
-export type StallReason = 'unreachable' | 'cap_breach' | 'drain_timeout' | 'ungated_on_drain';
+export type StallReason = 'unreachable' | 'ungated_on_drain';
 
 export class FleetStallError extends Error {
   constructor(
@@ -45,84 +64,31 @@ export interface FleetDeps {
   runpod: RunpodClient;
   // warmTimeoutMs moved to generator.ts's GeneratorDeps — allocate() no
   // longer polls for readiness, so it has no use for it here.
-  cfg: Pick<Config, 'fleetLive' | 'drainTimeoutMs' | 'accountCap' | 'liveReserveWorkers'>;
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function pollUntil(
-  check: () => Promise<boolean>,
-  opts: { everyMs: number; timeoutMs: number },
-): Promise<boolean> {
-  const deadline = Date.now() + opts.timeoutMs;
-  for (;;) {
-    if (await check()) return true;
-    if (Date.now() >= deadline) return false;
-    await sleep(opts.everyMs);
-  }
+  cfg: Pick<Config, 'fleetLive'>;
 }
 
 /**
- * Reads every other endpoint's real, currently-observed worker draw from
- * RunPod directly (not their configured `workersMax` — see the note on
- * `ready + running` below) — impl plan §6.3 step 4: raising to N while
- * others hold workers does not error, it caps silently. This is the real
- * read that catches that before it happens invisibly.
+ * Records this step as the endpoint's legitimate current claim — no RunPod
+ * call. `step.workers` (planner.ts's workersTarget, already capped by
+ * catalog.ts's `maxWorkers` at the endpoint's real fixed pod count) is
+ * recorded purely for endpoint_state/watchdog visibility, not sent to
+ * RunPod: the pool's actual `workersMax` was fixed ahead of time and this
+ * orchestrator never changes it.
  */
-async function sumWorkersMaxExcept(deps: FleetDeps, endpointId: string, others: string[]): Promise<number> {
-  let sum = 0;
-  for (const id of others) {
-    if (id === endpointId) continue;
-    try {
-      const h = await deps.runpod.health(id);
-      // health() reports live worker counts, not the configured max — used
-      // here as the best real signal available without a second REST call
-      // per endpoint. workers.ready + workers.running approximates the
-      // account-wide draw this assertion cares about.
-      sum += (h.workers.ready ?? 0) + (h.workers.running ?? 0);
-    } catch (err) {
-      log().warn({ endpointId: id, err }, 'fleet: could not read sibling endpoint health for cap assertion');
-    }
-  }
-  return sum;
-}
-
 export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogEntry & { workers: number }): Promise<void> {
-  const { pool, runpod, cfg } = deps;
+  const { pool, runpod } = deps;
 
   await updateStepStatus(pool, cohortId, step.seq, 'scaling');
 
-  // Only workersMax ever moves. workersMin stays 0, always, everywhere in
-  // this codebase. A real live test (2026-09-10) found the opposite design
-  // (workersMin == workersMax == target, "active workers") can get stuck
-  // mid-cold-start indefinitely while billing the whole time — 5 real
-  // workers ran for the full 8-minute warmTimeoutMs and never reported
-  // ready, with zero job throughput. RunPod's own QUEUE_DELAY scaler grows
-  // real capacity in response to actually-queued jobs, not to a raised
-  // ceiling alone and not reliably to a raised floor either — every manual
-  // /run submission this session against a workersMin=0 endpoint (postprod-
-  // lite, BGM-S2T) scaled up and completed reliably. So allocate() no longer
-  // waits for real readiness before handing off — it raises the ceiling,
-  // does a cheap reachability check, and lets the generator start
-  // submitting immediately; generator.ts's runStep() owns cold-start-stall
-  // detection now, non-blockingly, without the billing cost (see its
-  // GeneratorStallError).
-  if (cfg.fleetLive) {
-    await runpod.patchWorkers(step.endpointId, { workersMax: step.workers });
-    log().info({ endpointId: step.endpointId, workers: step.workers }, 'fleet: patched workersMax (live)');
-  } else {
-    log().info(
-      { endpointId: step.endpointId, workers: step.workers },
-      `fleet: SHADOW — would PATCH ${step.endpointId} workersMax -> ${step.workers} (workersMin stays 0)`,
-    );
-  }
+  log().info(
+    { endpointId: step.endpointId, workers: step.workers },
+    'fleet: using fixed pod pool (no workersMax PATCH — see this file\'s header comment)',
+  );
 
-  // Record the claim right after the PATCH, before anything else — a real
-  // worker could start appearing the moment RunPod sees the raised ceiling
-  // and a job lands in its queue; watchdog.ts must never see that without a
-  // matching claim on record.
+  // Record the claim before the reachability probe — a real worker could
+  // already be serving this endpoint's fixed, always-present pool the
+  // moment a job lands in its queue; watchdog.ts must never see that
+  // without a matching claim on record.
   await upsertHeld(pool, step.endpointId, {
     cohortId,
     stepSeq: step.seq,
@@ -133,8 +99,10 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
 
   // One cheap reachability probe, NOT a poll-until-ready loop — catches a
   // typo'd/deleted endpointId immediately rather than minutes into
-  // generation. Must not gate on ready/running counts; that's exactly what
-  // this function is no longer allowed to wait on.
+  // generation. Must not gate on ready/running counts; the fixed pool's
+  // real worker count is RunPod's own QUEUE_DELAY scaler's business, and
+  // generator.ts's cold-start-stall detection (GeneratorStallError) owns
+  // waiting for real readiness, non-blockingly.
   try {
     await runpod.health(step.endpointId);
   } catch (err) {
@@ -145,47 +113,36 @@ export async function allocate(deps: FleetDeps, cohortId: string, step: CatalogE
     });
   }
 
-  const otherEndpointIds = FLEET.map((e) => e.endpointId).filter((id) => id !== step.endpointId);
-  const others = await sumWorkersMaxExcept(deps, step.endpointId, otherEndpointIds);
-  if (others > cfg.accountCap - step.workers) {
-    await updateStepStatus(pool, cohortId, step.seq, 'stalled');
-    throw new FleetStallError('cap_breach', { others, accountCap: cfg.accountCap, requested: step.workers });
-  }
-
   await updateStepStatus(pool, cohortId, step.seq, 'ready');
-  log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step ready (ceiling raised, generator may submit)');
+  log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step ready (fixed pool, generator may submit)');
 }
 
 /**
- * Best-effort backstop used only by the driver's failure path
- * (orchestrator.ts) — a bare `workersMax:0` PATCH with none of release()'s
- * gating (no ungated-quality check, no poll-until-confirmed-drained wait).
- * Real incident, 2026-09-11: allocate() PATCHed workersMax up, then the
- * very next call (submitOne's /run) failed on a transient RunPod race
- * (see generator.ts's ENDPOINT_PAUSED retry — that closes the race itself;
- * this is what stops the bleed on whatever failure gets through anyway).
- * The driver logged the failure and returned without ever compensating,
- * leaving the just-raised workers to bill unmanaged for 2+ hours until a
- * human found and manually drained them. Never throws — a failure here is
- * logged and swallowed so it cannot mask the original error that triggered
- * it; WATCHDOG_AUTODRAIN is the remaining backstop if this PATCH itself
- * fails or the orchestrator process dies before reaching it.
+ * Clears this step's endpoint_state claim — no RunPod call. Kept as a
+ * distinct function (rather than inlined at each orchestrator.ts call site)
+ * because it's the one thing every driver exit path, including failures,
+ * needs to do so watchdog.ts stops treating this step as the endpoint's
+ * legitimate current owner. Never throws.
+ *
+ * Named for what it now does, not what it used to (a real
+ * `workersMax:0` PATCH, removed 2026-09-17 along with allocate()'s PATCH —
+ * see this file's header comment). There is nothing left to "drain": the
+ * pool's ceiling was never raised in the first place, so RunPod's own
+ * QUEUE_DELAY scaler and idleTimeout already own bringing the real running
+ * count back toward 0 once nothing is queued, at no cost (workersMin stays
+ * 0 — see the 2026-09-10 incident note in allocate()'s old header, kept in
+ * git history).
  */
 export async function emergencyDrain(deps: FleetDeps, endpointId: string): Promise<void> {
-  if (!deps.cfg.fleetLive) return;
   try {
-    await deps.runpod.patchWorkers(endpointId, { workersMin: 0, workersMax: 0 });
-    log().error({ endpointId }, 'fleet: EMERGENCY DRAIN — step failed after allocate(), PATCHing workersMax -> 0 to stop billing');
+    await clearHeld(deps.pool, endpointId);
   } catch (err) {
-    log().error(
-      { endpointId, err },
-      'fleet: emergency drain PATCH itself failed — endpoint may still be billing; WATCHDOG_AUTODRAIN is the remaining backstop',
-    );
+    log().error({ endpointId, err }, 'fleet: clearing endpoint_state claim failed — watchdog will see a stale claim until it expires');
   }
 }
 
 export async function release(deps: FleetDeps, cohortId: string, step: CatalogEntry): Promise<void> {
-  const { pool, runpod, cfg } = deps;
+  const { pool } = deps;
 
   // §6.5: "jobs_ungated must return empty before the fleet controller is
   // allowed to drain" — the ONLY coupling between the quality agent and
@@ -196,10 +153,8 @@ export async function release(deps: FleetDeps, cohortId: string, step: CatalogEn
   // evaluates it) and meaningless noise for ungated ones. In the normal
   // gated path this never fires — the driver already awaits gateStep()
   // before calling release() — this is defense-in-depth against a driver
-  // bug, same spirit as the cap assertion below. An ungated drain is worse
-  // than the drain-timeout stall already below it: that one is a cost bug
-  // ($19/window billing), this one is a correctness bug (a caller receives
-  // an unevaluated or mid-rework asset as final).
+  // bug: releasing this step's claim while an asset is unevaluated or
+  // mid-rework would let a caller receive it as final.
   if (step.gate === 'image' || step.gate === 'motion') {
     const ungated = await countUngated(pool, cohortId, step.seq);
     const inFlight = await countInFlightForGatedStep(pool, cohortId, step.seq);
@@ -211,45 +166,19 @@ export async function release(deps: FleetDeps, cohortId: string, step: CatalogEn
 
   await updateStepStatus(pool, cohortId, step.seq, 'draining');
 
-  if (cfg.fleetLive) {
-    await runpod.patchWorkers(step.endpointId, { workersMin: 0, workersMax: 0 });
-    log().info({ endpointId: step.endpointId }, 'fleet: patched workers to 0 (live)');
-  } else {
-    log().info({ endpointId: step.endpointId }, `fleet: SHADOW — would PATCH ${step.endpointId} min/max -> 0`);
-  }
-
-  const drained = await pollUntil(
-    async () => {
-      const h = await runpod.health(step.endpointId);
-      return (h.workers.running ?? 0) === 0 && (h.workers.ready ?? 0) === 0;
-    },
-    { everyMs: 5_000, timeoutMs: cfg.drainTimeoutMs },
-  );
-  if (!drained) {
-    await updateStepStatus(pool, cohortId, step.seq, 'stalled');
-    // §6.3: "ALERT LOUDLY — this one costs $19/window." A stuck drain leaves
-    // an endpoint billing with nothing in front of it. Deliberately NOT
-    // clearing endpoint_state here — the claim staying present with a
-    // recent observed_at is correct: real workers genuinely are still this
-    // step's responsibility, not an orphan of some other cause.
-    log().error({ endpointId: step.endpointId, cohortId, seq: step.seq }, 'fleet: DRAIN TIMEOUT — endpoint may still be billing active workers');
-    throw new FleetStallError('drain_timeout', { endpointId: step.endpointId });
-  }
-
   await clearHeld(pool, step.endpointId);
   await updateStepStatus(pool, cohortId, step.seq, 'complete', { finishedAt: new Date() });
-  log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step drained and complete');
+  log().info({ endpointId: step.endpointId, seq: step.seq }, 'fleet: step complete, claim cleared (fixed pool untouched)');
 }
 
 /**
  * Auxiliary endpoints (2026-09-15): a gated step's model-switch fallbacks can
  * submit to endpoints other than the step's own (Flux on qwen-image-gen while
  * step 0 runs on qwen-image-edit; postprod-lite `normalize` while step 3 runs
- * on wan2-i2v — steps/catalog.ts `auxiliaryEndpoints`). The driver raises a
- * small workersMax ceiling on each for the duration of the step. Only the
- * ceiling moves (workersMin stays 0, same as allocate()), so an unused
- * auxiliary costs nothing; the claim is recorded so the watchdog sees
- * fallback workers as owned, and runStep() keeps it fresh.
+ * on wan2-i2v — steps/catalog.ts `auxiliaryEndpoints`). Fixed pools
+ * (2026-09-17): no ceiling PATCH here either — the aux endpoint's pool is
+ * already sized for its own real demand; this just records the claim so the
+ * watchdog sees fallback usage as owned, and runStep() keeps it fresh.
  */
 export async function allocateAuxiliary(
   deps: FleetDeps,
@@ -257,23 +186,18 @@ export async function allocateAuxiliary(
   stepSeq: number,
   aux: { endpointId: string; workers: number },
 ): Promise<void> {
-  if (deps.cfg.fleetLive) {
-    await deps.runpod.patchWorkers(aux.endpointId, { workersMax: aux.workers });
-    log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: auxiliary endpoint ceiling raised (live)');
-  } else {
-    log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: SHADOW — would raise auxiliary endpoint ceiling');
-  }
+  log().info({ endpointId: aux.endpointId, workers: aux.workers, stepSeq }, 'fleet: auxiliary endpoint claim recorded (fixed pool, no PATCH)');
   await upsertHeld(deps.pool, aux.endpointId, { cohortId, stepSeq, workersMax: aux.workers, workersMin: 0, workersReady: 0 });
 }
 
-/** Drops an auxiliary endpoint back to 0 and clears its claim. Never throws —
- * it runs on every driver exit path, including failures. */
+/** Clears an auxiliary endpoint's claim — no RunPod call, see
+ * emergencyDrain()'s header comment for why. Never throws — it runs on
+ * every driver exit path, including failures. */
 export async function releaseAuxiliary(deps: FleetDeps, endpointId: string): Promise<void> {
   try {
-    if (deps.cfg.fleetLive) await deps.runpod.patchWorkers(endpointId, { workersMin: 0, workersMax: 0 });
     await clearHeld(deps.pool, endpointId);
-    log().info({ endpointId }, 'fleet: auxiliary endpoint released');
+    log().info({ endpointId }, 'fleet: auxiliary endpoint claim cleared');
   } catch (err) {
-    log().error({ endpointId, err }, 'fleet: auxiliary release failed — watchdog autodrain is the backstop');
+    log().error({ endpointId, err }, 'fleet: auxiliary claim clear failed — watchdog will see a stale claim until it expires');
   }
 }

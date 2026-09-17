@@ -16,7 +16,7 @@ describe('loadConfig', () => {
     expect(cfg.nodeEnv).toBe('development');
     expect(cfg.windowCron).toBe('0 0,6,12,18 * * *');
     expect(cfg.workersHead).toBe(25);
-    expect(cfg.workersTail).toBe(10);
+    expect(cfg.workersTail).toBe(4); // postprod-lite's real fixed pool (2026-09-17, was 10)
     expect(cfg.liveReserveWorkers).toBe(8);
     expect(cfg.accountCap).toBe(40);
     expect(cfg.fleetLive).toBe(false);

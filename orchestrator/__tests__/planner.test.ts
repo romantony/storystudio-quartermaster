@@ -382,7 +382,9 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     const reqWithBgm = { ...req, bgmPrompt: 'cinematic orchestral, warm and reflective, no vocals' };
     const { steps, jobs } = _internal.buildStepsAndJobs([bgmEntry], reqWithBgm, 'proj_1', 25);
     expect(steps).toEqual([
-      { seq: 5, name: 'bgm', endpointId: bgmEntry.endpointId, workersTarget: 25, gate: null, drainAfter: true, dependsOn: [], jobTotal: 1 },
+      // workersTarget capped at 2, bgm-s2t's fixed pod count (catalog.ts's
+      // maxWorkers, 2026-09-17) — not the raw cfg.workersHead of 25.
+      { seq: 5, name: 'bgm', endpointId: bgmEntry.endpointId, workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 1 },
     ]);
     const bgmJobs = jobs.filter((j) => j.stepSeq === 5);
     expect(bgmJobs).toHaveLength(1);
@@ -424,10 +426,11 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     const upscaleFrameEntry = catalogEntry(14)!;
     const sfxEntry = catalogEntry(15)!;
 
-    it('is bulk, capped at 4 workers, and depends on 14 when upscale is planned (3 collapsed)', () => {
+    it('is bulk, capped at 2 workers, and depends on 14 when upscale is planned (3 collapsed)', () => {
       const { steps } = _internal.buildStepsAndJobs([animationEntry, upscaleFrameEntry, sfxEntry], req, 'proj_1', 25);
       expect(sfxEntry.scope).toBe('bulk');
-      expect(steps.find((s) => s.seq === 15)).toMatchObject({ workersTarget: 4, dependsOn: [14], jobTotal: 3 });
+      // MMAudio's real pool is 2 (2026-09-17 dashboard re-sync, was 4).
+      expect(steps.find((s) => s.seq === 15)).toMatchObject({ workersTarget: 2, dependsOn: [14], jobTotal: 3 });
     });
 
     it('depends on 3 directly when upscale is not planned', () => {
@@ -467,12 +470,15 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     const animationEntry = catalogEntry(3)!;
     const upscaleFrameEntry = catalogEntry(14)!;
 
-    it('is a bulk per-frame step capped at the endpoint\'s 3 workers, not cfg.workersHead', () => {
+    it('is a bulk per-frame step capped at the endpoint\'s 2 workers, not cfg.workersHead', () => {
       const { steps, jobs } = _internal.buildStepsAndJobs([animationEntry, upscaleFrameEntry], req, 'proj_1', 25);
       const step = steps.find((s) => s.seq === 14)!;
       expect(upscaleFrameEntry.scope).toBe('bulk');
-      expect(step).toMatchObject({ workersTarget: 3, dependsOn: [3], jobTotal: 3 });
-      expect(steps.find((s) => s.seq === 3)!.workersTarget).toBe(25); // uncapped steps unchanged
+      // DreamX's real pool is 2 (2026-09-17 dashboard re-sync, was 3).
+      expect(step).toMatchObject({ workersTarget: 2, dependsOn: [3], jobTotal: 3 });
+      // wan2-i2v also has its own maxWorkers now (fixed pod pool, 2026-09-17)
+      // — capped at 6, its real pod count, not the raw cfg.workersHead of 25.
+      expect(steps.find((s) => s.seq === 3)!.workersTarget).toBe(6);
       expect(jobs.filter((j) => j.stepSeq === 14).every((j) => j.depsRemaining === 1)).toBe(true);
     });
 

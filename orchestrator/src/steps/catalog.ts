@@ -44,6 +44,16 @@ function endpointFor(counterKey: string): string {
   return entry.endpointId;
 }
 
+/** Fixed pod count for a FLEET endpoint (2026-09-17), used as `maxWorkers` so
+ * agents/planner.ts's workersTarget never exceeds the endpoint's real,
+ * static pool — see agents/fleet.ts's header comment for why this replaced
+ * dynamically PATCHing workersMax per step. */
+function maxWorkersFor(counterKey: string): number {
+  const entry = FLEET.find((e) => e.counterKey === counterKey);
+  if (!entry) throw new Error(`fleet-registry.ts has no entry for ${counterKey}`);
+  return entry.workers;
+}
+
 /** Image model switch: FLUX.2 klein 4B on qwen-image-gen (steps 0 and 1). */
 const FLUX_IMAGE_FALLBACK = (): FallbackRoute => ({
   provider: 'runpod',
@@ -155,6 +165,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     gate: 'image', // same gate as seq 1 — quality.ts keys off `gate`, not seq
     dependsOn: [],
     scope: 'bulk',
+    maxWorkers: maxWorkersFor('runpod:qwen-image-edit'), // fixed pod pool — see agents/fleet.ts
     builder: buildImageEditInput,
     fallbacks: { 'flux-4b': FLUX_IMAGE_FALLBACK() },
   },
@@ -165,6 +176,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     gate: 'image', // §6.5's image gate — M4
     dependsOn: [],
     scope: 'bulk',
+    maxWorkers: maxWorkersFor('runpod:qwen-image-gen'), // fixed pod pool — see agents/fleet.ts
     builder: buildImageInput,
     // Same endpoint as the step itself, so no auxiliary allocation — but a
     // worker that already loaded Qwen may OOM loading Flux too
@@ -179,6 +191,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     gate: null,
     dependsOn: [],
     scope: 'bulk',
+    maxWorkers: maxWorkersFor('runpod:flux-tts-s2t'), // fixed pod pool — see agents/fleet.ts
     builder: buildTtsInput,
   },
   {
@@ -186,6 +199,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     name: 'animation',
     endpointId: endpointFor('runpod:wan2-i2v'),
     gate: 'motion', // §6.5's motion gate — M4
+    maxWorkers: maxWorkersFor('runpod:wan2-i2v'), // fixed pod pool — see agents/fleet.ts
     // [0,1]: whichever image step actually ran (mutually exclusive). [2]:
     // added 2026-09-12 — i2v's duration_s must track TTS's ACTUAL generated
     // audio length, not the caller's pre-estimated frame.durationS (the two
@@ -220,6 +234,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     gate: null,
     dependsOn: [],
     scope: 'bulk',
+    maxWorkers: maxWorkersFor('runpod:bgm-s2t'), // fixed pod pool — see agents/fleet.ts
     singleJobPerProject: true,
     builder: buildBgmInput,
   },
@@ -377,7 +392,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     gate: null,
     dependsOn: [3],
     scope: 'bulk',
-    maxWorkers: 3, // endpoint's real pool — see CatalogEntry.maxWorkers
+    maxWorkers: 2, // endpoint's real pool (2026-09-17 dashboard re-sync, was 3) — see CatalogEntry.maxWorkers
     builder: buildUpscaleFrameInput,
   },
   {
@@ -392,7 +407,7 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     gate: null,
     dependsOn: [14, 3],
     scope: 'bulk',
-    maxWorkers: 4, // endpoint's real pool
+    maxWorkers: 2, // endpoint's real pool (2026-09-17 dashboard re-sync, was 4)
     builder: buildSfxInput,
   },
 ] as const;
