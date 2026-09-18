@@ -2,6 +2,33 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## 2026-09-18 — BUG: 9:16 projects are delivered as 1920x1080 (Remotion step crops them)
+
+Found on the first fully clean full-project run (`js7efef-rerun2-20260918`, a real StoryStudio
+9:16 explainer, 74/74 jobs green). The delivered video is **1920x1080 landscape**, with the
+subject's head cropped off. Measured through the chain on one frame:
+
+| step | output |
+|---|---|
+| 3 i2v | 464x832 (portrait, correct) |
+| 6 merge | 464x832 |
+| 7 remove-silence | 464x832 |
+| **16 remotion-overlay** | **1920x1080** ← the crop happens here |
+
+`src/handlers/remotion-overlay.ts` calls `renderMediaOnLambda({composition: COMPOSITION_ID,
+inputProps: manifest, ...})` with **no `forceWidth`/`forceHeight`**, so every render uses whatever
+dimensions StoryStudio's `FrameOverlay` composition declares — evidently 1920x1080 — regardless of
+the project. The manifest does carry `aspectRatio: "9:16"`, and the request carries
+`resolution: "1080x1920"`; neither reaches the renderer.
+
+Affects every 9:16 project with `options.textOverlay` on. 16:9 projects are unaffected, which is
+why earlier cohorts looked fine.
+
+Likely fix: parse `request.resolution` (or the manifest's `aspectRatio`) and pass
+`forceWidth`/`forceHeight` to `renderMediaOnLambda`. Needs checking against StoryStudio's
+composition first — if `FrameOverlay` positions text against a fixed 1920x1080 canvas, forcing the
+dimensions may reflow the overlays, so this wants a visual check on one frame before it ships.
+
 ## 2026-09-18 — seed control: DONE, live-verified. Residue below.
 
 Items 1-3 below are complete: worker image built + pushed, workers recycled by the operator, seed
