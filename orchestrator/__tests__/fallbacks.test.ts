@@ -64,6 +64,16 @@ describe('fallback payload builders', () => {
     expect(() => buildReplicateWanInput(ctx())).toThrow(/no resolved image URL/);
   });
 
+  it('carries the harness seed across the model switch, so the fallback attempt changes the MODEL and nothing else', () => {
+    const out = buildReplicateWanInput({
+      job: { ...job, seed: 16384 },
+      resolvedDeps: { 0: { url: 'https://r2/f13.png' } },
+      projectId: 'proj',
+      frameId: 'f13',
+    } as BuildContext);
+    expect(out.seed).toBe(16384);
+  });
+
   it('normalize: crop the 832x480 Replicate clip to the pod-native 832x464 at 16 fps', () => {
     expect(buildNormalizeInput('https://replicate.delivery/x.mp4', { projectId: 'proj', frameId: 'f13' })).toEqual({
       mode: 'normalize',

@@ -159,10 +159,14 @@ animated clip; the clips are joined in array order.
 | `motionPrompt` | string | no | How the still is animated: one camera move plus the subject's movement (see 2.6). |
 | `audioPrompt` | string | no | SFX/ambience description, used when `options.sfx` is true. Without it, an ambience prompt is derived from `imagePrompt`. |
 | `referenceImageUrl` | URL | if `options.referenceImage` | The character reference image. Required on **every** frame when `referenceImage` is true. |
-| `shot` | object | no | Structured shot description for the prompt harness. Optional; the orchestrator derives one when absent. |
+| `shot` | object | no | Structured shot description for the prompt harness. Optional; the orchestrator derives one when absent. **Recommended** — see `storystudio-narration-premium-prompt-generation.md` for the schema and the LLM prompt that produces it. |
 | `textManifest` | object | no | Accepted, not used yet. |
 
 ### 2.6 Prompt guidance
+
+> The structured alternative to this section is `frames[].shot` — a shot contract that the harness
+> compiles both prompts from, with these rules enforced rather than advised. See
+> **`storystudio-narration-premium-prompt-generation.md`**.
 
 The animation model (Wan 2.2, 4-step) animates a single still image. Failures from the first
 production run came almost entirely from prompts it can't execute:

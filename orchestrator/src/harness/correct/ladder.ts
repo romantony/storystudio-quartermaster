@@ -5,7 +5,9 @@
  * the guardrail whose corrective list handles it and applies the first
  * measure not already tried on this job — a contract edit + recompile, a
  * model-switch route, the GPT-5 mini regenerate tool, or (every measure
- * exhausted) a plain reseed, which is what the 2026-08-14 sampling-variance
+ * exhausted) a reseed — a step along the harness seed bank
+ * (profiles/inference.ts), not a resubmit that hopes the worker's own RNG
+ * lands somewhere else — which is what the 2026-08-14 sampling-variance
  * finding (qm-video-conformity-prompt-testing) says is actually worth
  * trying first for a camera move that simply didn't execute.
  *
@@ -31,6 +33,7 @@ import type { CorrectiveMeasure, Domain, Guardrail, Violation } from '../guardra
 import type { ReplicateDeps } from '../../quality/replicate';
 import { regeneratePrompt } from '../tool/regenerate';
 import { signatureToGuardrailId } from '../learn/signatures';
+import { seedForAttempt } from '../profiles/inference';
 import { log } from '../../telemetry/log';
 
 export interface LadderContext {
@@ -49,6 +52,10 @@ export interface LadderContext {
   /** Measure keys already tried for THIS job (reuses jobs.tried_rungs, same
    * text[] column applyRework already appends to). */
   triedMeasures: string[];
+  /** Identity + attempt number the next seed is derived from
+   * (harness/profiles/inference.ts). Video domain only; omitted for image,
+   * whose endpoints this build doesn't seed. */
+  seedKey?: { projectId: string; frameId: string | null; attempt: number };
 }
 
 export interface LadderOutcome {
@@ -60,6 +67,10 @@ export interface LadderOutcome {
   route?: string;
   guardrailId?: string;
   crossDomainFixDeferred?: boolean;
+  /** Set by every `reseed` outcome: the next seed from the bank, guaranteed
+   * different from this attempt's. Patched onto jobs.input.seed by
+   * quality-bridge.ts. */
+  seed?: number;
 }
 
 function measureKey(measure: CorrectiveMeasure): string {
@@ -72,6 +83,13 @@ function measureKey(measure: CorrectiveMeasure): string {
 
 function compile(domain: Domain, contract: ShotContract, aspectRatio?: string): string {
   return domain === 'image' ? compileImagePrompt(contract, { aspectRatio }) : compileMotionPrompt(contract);
+}
+
+/** The seed the NEXT attempt runs on. `attempt` is the one that just failed,
+ * so +1 steps one place along the bank. */
+function nextSeed(ctx: LadderContext): number | undefined {
+  if (!ctx.seedKey) return undefined;
+  return seedForAttempt(ctx.seedKey.projectId, ctx.seedKey.frameId, ctx.seedKey.attempt + 1);
 }
 
 export async function runLadder(ctx: LadderContext): Promise<LadderOutcome> {
@@ -96,7 +114,7 @@ export async function runLadder(ctx: LadderContext): Promise<LadderOutcome> {
     });
     return regen
       ? { contract: ctx.contract, prompt: regen, measure: 'regenerate:uncovered' }
-      : { contract: ctx.contract, prompt: ctx.currentPrompt, measure: 'reseed:uncovered' };
+      : { contract: ctx.contract, prompt: ctx.currentPrompt, measure: 'reseed:uncovered', seed: nextSeed(ctx) };
   }
 
   const dummyViolation: Violation = { guardrailId: guardrail.id, severity: guardrail.severity, fixTarget: guardrail.fixTarget, message: guardrail.instruction };
@@ -145,7 +163,7 @@ export async function runLadder(ctx: LadderContext): Promise<LadderOutcome> {
     }
 
     if (measure.type === 'reseed') {
-      return { contract: ctx.contract, prompt: ctx.currentPrompt, measure: key, guardrailId: guardrail.id };
+      return { contract: ctx.contract, prompt: ctx.currentPrompt, measure: key, guardrailId: guardrail.id, seed: nextSeed(ctx) };
     }
 
     if (measure.type === 'split_shot') {
@@ -157,5 +175,5 @@ export async function runLadder(ctx: LadderContext): Promise<LadderOutcome> {
   // Every corrective for this guardrail already tried this job — reseed as
   // the last resort (sampling variance can still fix it; see
   // qm-video-conformity-prompt-testing's 2026-08-14 finding).
-  return { contract: ctx.contract, prompt: ctx.currentPrompt, measure: 'reseed:exhausted', guardrailId: guardrail.id };
+  return { contract: ctx.contract, prompt: ctx.currentPrompt, measure: 'reseed:exhausted', guardrailId: guardrail.id, seed: nextSeed(ctx) };
 }

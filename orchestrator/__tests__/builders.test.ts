@@ -202,6 +202,14 @@ describe('buildI2vInput (step 3)', () => {
     expect(out.duration_s).toBe(7); // ceil(6.4), clamped into [3,7]
   });
 
+  it('sends the harness seed when the frame has one, and omits it entirely when it does not', () => {
+    const deps = { resolvedDeps: { 1: { url: 'https://pub.example/x.png' } } };
+    expect(buildI2vInput(ctx({ ...deps, job: { ...baseJob, seed: 78291 } })).seed).toBe(78291);
+    // No seed = the worker's own -1 default (fresh RNG), exactly as before
+    // the harness existed — 'lint' mode must not change what is generated.
+    expect(buildI2vInput(ctx(deps))).not.toHaveProperty('seed');
+  });
+
   it('falls back to the caller\'s durationS when tts has no resolved durationS (defensive; should not happen once step 2 is a real dependency)', () => {
     const out = buildI2vInput(
       ctx({

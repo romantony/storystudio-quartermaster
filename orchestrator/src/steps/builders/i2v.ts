@@ -28,6 +28,7 @@
  * to `ctx.job.durationS` only if resolvedDeps somehow lacks it (defensive;
  * should not happen once the catalog dependency is in place).
  */
+import { WAN22_LIGHTNING_I2V_480P_V1 as PROFILE } from '../../harness/profiles/inference';
 import type { BuildContext, PayloadBuilder } from './types';
 
 const IMAGE_EDIT_STEP_SEQ = 0;
@@ -45,9 +46,12 @@ export const buildI2vInput: PayloadBuilder = (ctx: BuildContext): Record<string,
   return {
     image: imageUrl,
     prompt: ctx.job.motionPrompt ?? '',
-    resolution: '480p',
-    duration_s: Math.min(7, Math.max(3, Math.ceil(actualTtsDurationS ?? ctx.job.durationS))),
-    sample_steps: 4,
+    resolution: PROFILE.resolution,
+    duration_s: Math.min(PROFILE.maxDurationS, Math.max(PROFILE.minDurationS, Math.ceil(actualTtsDurationS ?? ctx.job.durationS))),
+    sample_steps: PROFILE.sendable.sampleSteps,
+    // Omitted entirely when the harness is off — the worker's own default
+    // (-1) then means "fresh RNG", exactly as before.
+    ...(typeof ctx.job.seed === 'number' ? { seed: ctx.job.seed } : {}),
     ...attribution,
   };
 };

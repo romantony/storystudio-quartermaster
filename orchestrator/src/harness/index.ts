@@ -95,6 +95,7 @@ async function prepareProject(
     try {
       const output = await prepareFrame(deps, {
         frameId: frame.frameId,
+        projectId,
         imagePrompt: frame.imagePrompt,
         motionPrompt: frame.motionPrompt,
         narration: frame.narration,
@@ -119,6 +120,10 @@ async function prepareProject(
       if (mode === 'enforce') {
         imagePatch.imagePrompt = output.imagePrompt;
         motionPatch.motionPrompt = output.motionPrompt;
+        // Enforce only: a seed changes the sample, and 'lint' is defined as
+        // recording the harness's opinion without altering what is generated.
+        motionPatch.seed = output.seed;
+        motionPatch.inferenceProfile = output.inferenceProfile;
       } else {
         imagePatch.harnessImagePrompt = output.imagePrompt;
         motionPatch.harnessMotionPrompt = output.motionPrompt;
@@ -159,6 +164,7 @@ export async function lintRequest(deps: PrepareFrameDeps, req: OrchestratorReque
   for (const frame of req.frames) {
     const output = await prepareFrame(deps, {
       frameId: frame.frameId,
+      projectId: req.projectId,
       imagePrompt: frame.imagePrompt,
       motionPrompt: frame.motionPrompt,
       narration: frame.narration,

@@ -97,6 +97,16 @@ export interface FrameJobInput {
    * stay live) for offline comparison — never read by any builder. */
   harnessImagePrompt?: string;
   harnessMotionPrompt?: string;
+  /** Sampler seed for this frame's video attempt, from the harness seed bank
+   * (harness/profiles/inference.ts). Assigned at plan time and stepped by
+   * the corrective ladder's `reseed` measure, so a retry is guaranteed a
+   * different sample and an identical request reproduces an identical clip.
+   * Absent = the harness was off; the worker then picks its own (-1). */
+  seed?: number;
+  /** Versioned inference-profile id the clip was generated under
+   * (harness/profiles/inference.ts) — recorded so a finding is attributable
+   * to an exact sampler configuration. */
+  inferenceProfile?: string;
   /** Set when the contract's transformation is 'state_change' (V-ACT-02) —
    * this beat genuinely needs two frames on a 4-step model. Report-only:
    * the orchestrator still submits a best-effort single-frame prompt (a

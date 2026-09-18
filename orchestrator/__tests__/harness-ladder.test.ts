@@ -10,6 +10,7 @@ import { runImageLadder } from '../src/harness/correct/image-ladder';
 import { seedGuardrails } from '../src/harness/guardrails/store';
 import { applyEdit } from '../src/harness/correct/edits';
 import { compileMotionPrompt } from '../src/harness/compile/motion';
+import { seedForAttempt } from '../src/harness/profiles/inference';
 import { validContract } from './helpers/harness-fixtures';
 
 jest.mock('../src/quality/replicate', () => ({
@@ -133,6 +134,41 @@ describe('runVideoLadder', () => {
     });
     expect(outcome.measure).toBe('reseed:uncovered');
     expect(outcome.prompt).toBe('the current prompt');
+  });
+
+  it('a reseed outcome carries the NEXT bank seed, so the retry is a different sample by construction', async () => {
+    (replicateModule.runReplicateText as jest.Mock).mockRejectedValue(new Error('network down'));
+    const seedKey = { projectId: 'proj_8812', frameId: 'f_001', attempt: 1 };
+    const outcome = await runVideoLadder({
+      profile: 'wan2-lightning',
+      contract: validContract(),
+      currentPrompt: 'the current prompt',
+      signature: 'video.uncovered.temporal_drift',
+      guardrails: VIDEO_GUARDRAILS,
+      regenerateDeps: replicateDeps,
+      regenerateCfg,
+      targetModelLabel: 'Wan 2.2 Lightning',
+      triedMeasures: [],
+      seedKey,
+    });
+    expect(outcome.seed).toBe(seedForAttempt(seedKey.projectId, seedKey.frameId, seedKey.attempt + 1));
+    expect(outcome.seed).not.toBe(seedForAttempt(seedKey.projectId, seedKey.frameId, seedKey.attempt));
+  });
+
+  it('omits the seed when no seedKey is supplied (image domain — those endpoints are unseeded here)', async () => {
+    (replicateModule.runReplicateText as jest.Mock).mockRejectedValue(new Error('network down'));
+    const outcome = await runVideoLadder({
+      profile: 'wan2-lightning',
+      contract: validContract(),
+      currentPrompt: 'the current prompt',
+      signature: 'video.uncovered.temporal_drift',
+      guardrails: VIDEO_GUARDRAILS,
+      regenerateDeps: replicateDeps,
+      regenerateCfg,
+      targetModelLabel: 'Wan 2.2 Lightning',
+      triedMeasures: [],
+    });
+    expect(outcome.seed).toBeUndefined();
   });
 });
 

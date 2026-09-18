@@ -65,6 +65,11 @@ export const buildReplicateWanInput: PayloadBuilder = (ctx: BuildContext): Recor
     num_frames: wanFallbackFrames(ctx.resolvedDeps[TTS_STEP_SEQ]?.durationS, ctx.job.durationS),
     frames_per_second: WAN_FALLBACK_FPS,
     go_fast: true,
+    // Same harness seed the primary rung used (harness/profiles/inference.ts).
+    // Carried across the model switch so a fallback attempt is a change of
+    // MODEL and nothing else — otherwise a pass/fail here says nothing about
+    // which of the two variables moved.
+    ...(typeof ctx.job.seed === 'number' ? { seed: ctx.job.seed } : {}),
   };
 };
 

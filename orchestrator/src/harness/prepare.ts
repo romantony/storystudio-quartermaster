@@ -28,7 +28,7 @@ import type { Guardrail, Violation } from './guardrails/types';
 import { extractContract } from './tool/extract';
 import { regeneratePrompt } from './tool/regenerate';
 import type { ReplicateDeps } from '../quality/replicate';
-import { profileForRung } from './profiles';
+import { profileForRung, inferenceProfile, seedForAttempt } from './profiles';
 import { insertFinding } from '../db/repo/harness';
 import { log } from '../telemetry/log';
 import type { Pool } from 'pg';
@@ -60,6 +60,10 @@ function normalizeContractForCompile(contract: ShotContract, videoProfile: strin
 
 export interface PrepareFrameInput {
   frameId: string;
+  /** Only used to derive the frame's seed (harness/profiles/inference.ts's
+   * seedForAttempt) — omitted by callers that don't have it, which just
+   * makes the seed a function of frameId alone. */
+  projectId?: string;
   imagePrompt: string;
   motionPrompt?: string;
   narration?: string;
@@ -77,6 +81,12 @@ export interface PrepareFrameOutput {
   imageFallbackRung?: 'flux-4b';
   motionFallbackRung?: 'replicate-wan22-fast';
   splitShot: boolean;
+  /** First-attempt sampler seed for this frame's video job, and the
+   * inference profile it is meant to run under (harness/profiles/
+   * inference.ts). Submitted only in 'enforce' mode — a seed changes the
+   * sample, and 'lint' must not change what is generated. */
+  seed: number;
+  inferenceProfile: string;
   harnessVersion: string;
   harnessError?: string;
   findings: Array<{ domain: 'image' | 'video'; source: 'lint'; signature: string; guardrailId?: string; confidence: 'high' | 'low'; message: string }>;
@@ -101,6 +111,8 @@ export async function prepareFrame(deps: PrepareFrameDeps, input: PrepareFrameIn
   const videoProfileName = profileForRung(input.fallbackRung);
   const videoGuardrails = await loadActiveGuardrails(deps.pool, 'video', videoProfileName);
   const harnessVersion = guardrailSetVersion([...imageGuardrails, ...videoGuardrails]);
+  const seed = seedForAttempt(input.projectId ?? '', input.frameId, 0);
+  const inferenceProfileId = inferenceProfile(videoProfileName).id;
 
   let contract: ShotContract | undefined;
   if (input.shot) {
@@ -124,6 +136,8 @@ export async function prepareFrame(deps: PrepareFrameDeps, input: PrepareFrameIn
       imagePrompt: input.imagePrompt,
       motionPrompt: input.motionPrompt ?? '',
       splitShot: false,
+      seed,
+      inferenceProfile: inferenceProfileId,
       harnessVersion,
       harnessError: 'no contract (caller-supplied shot invalid and extraction failed) — falling back to original prompts',
       findings: [],
@@ -188,6 +202,10 @@ export async function prepareFrame(deps: PrepareFrameDeps, input: PrepareFrameIn
     imageFallbackRung,
     motionFallbackRung,
     splitShot: wasStateChange,
+    seed,
+    // The rung lint just routed to, when it routed — so the recorded profile
+    // matches the endpoint the frame will actually run on.
+    inferenceProfile: motionFallbackRung ? inferenceProfile(profileForRung(motionFallbackRung)).id : inferenceProfileId,
     harnessVersion,
     findings,
   };

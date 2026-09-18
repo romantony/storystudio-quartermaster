@@ -2,6 +2,28 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## 2026-09-18 — seed control for Wan2 4-step (harness inference profile): deploy + live-verify
+
+Built this session (see `docs/storystudio-narration-premium-prompt-generation.md` for the
+StoryStudio-facing half). Code is committed-ready and unit-tested; **nothing is deployed and no
+live clip has been generated with an explicit seed yet.**
+
+1. **Deploy the worker image.** `seed` passthrough was added to
+   `~/wan22-14B-fp8-4steps` (`handler_v2.py` + `model_server.py`, endpoint `nd7wloyvj09xwy`,
+   repo `romantony/storystudio-wan-i2v-4steps`). Not committed, not built, not pushed. Until that
+   image ships, the orchestrator's `seed` field is simply ignored by the pod — harmless, but inert.
+   Remember the `workersStandby` drain-then-restore dance needed to pick up a new image push
+   (memory `qm-postprod-caption-whisper-drift-fix`).
+2. **Live-verify reproducibility**, which is the entire point: same image + same prompt + same seed
+   twice → byte-identical (or visually identical) clip; then one step along the bank → a visibly
+   different sample. Two `/runsync` calls are enough; no cohort needed.
+3. **Then** run a cohort at `promptHarness: 'enforce'` — that is the only mode that submits bank
+   seeds (`lint` deliberately does not, since a seed changes the sample and shadow mode must not).
+   No cohort has run in `enforce` yet at all, so this is also the harness's first real enforce run.
+4. The live AWS path (`src/adapters/runpod.ts`'s `i2v` case) was deliberately left unseeded — it has
+   no harness to derive a seed from, and it's slated for decommissioning. Revisit only if that
+   decommissioning slips.
+
 ## 2026-09-18 — follow-ups from the diagnostics assistant + fixed-pod policy session (2026-09-17)
 
 Context: memory `qm-orchestrator-diagnostics-and-fixed-pods-20260917` (full saga — 3 fixed-pod

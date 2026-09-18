@@ -3,6 +3,7 @@ import { REPLICATE_WAN22_FAST_PROFILE } from './replicate-wan22-fast';
 import type { VideoProfile } from './types';
 
 export * from './types';
+export * from './inference';
 export { WAN2_LIGHTNING_PROFILE, REPLICATE_WAN22_FAST_PROFILE };
 
 const PROFILES: Record<string, VideoProfile> = {

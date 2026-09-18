@@ -17,7 +17,7 @@ import type { GateResult, VideoGateResult } from '../quality/rubric';
 import type { ReplicateDeps } from '../quality/replicate';
 import type { FrameJobInput } from '../steps/builders/types';
 import { loadActiveGuardrails, guardrailSetVersion } from './guardrails/store';
-import { profileForRung } from './profiles';
+import { profileForRung, inferenceProfile } from './profiles';
 import { classifyImageSignature, classifyVideoSignature, signatureToGuardrailId } from './learn/signatures';
 import { runImageLadder } from './correct/image-ladder';
 import { runVideoLadder } from './correct/video-ladder';
@@ -132,6 +132,8 @@ export async function harnessGateOneJob(ctx: HarnessGateInput): Promise<HarnessG
       aspectRatio: ctx.input.aspectRatio,
       examples,
       triedMeasures: ctx.triedRungs,
+      // Video only: the image endpoints aren't seeded in this build.
+      seedKey: domain === 'video' ? { projectId: ctx.projectId, frameId: ctx.frameId, attempt: ctx.attempt } : undefined,
     });
 
     await insertCorrection(ctx.pool, {
@@ -144,7 +146,11 @@ export async function harnessGateOneJob(ctx: HarnessGateInput): Promise<HarnessG
     });
 
     const inputPatch: Record<string, unknown> = { contract: outcome.contract, harnessVersion: guardrailSet };
-    if (outcome.route) inputPatch.fallbackRung = outcome.route;
+    if (outcome.route) {
+      inputPatch.fallbackRung = outcome.route;
+      inputPatch.inferenceProfile = inferenceProfile(profileForRung(outcome.route)).id;
+    }
+    if (typeof outcome.seed === 'number') inputPatch.seed = outcome.seed;
 
     return {
       rework: {
