@@ -331,9 +331,14 @@ Two consequences for prompt writing:
 Each frame gets a seed from a fixed bank, derived deterministically from `projectId` + `frameId`.
 Two properties follow:
 
-- **Reproducible** — re-submitting an identical request reproduces the identical clip.
+- **Reproducible** — re-submitting an identical request reproduces a *visually* identical clip.
+  Not a bit-identical one: measured live, two same-seed runs differed by at most `18/255` in any
+  single pixel (99th percentile `4/255`), which is imperceptible, but they are not byte-equal. The
+  residue is GPU nondeterminism across workers, not the seed failing to take. Don't build anything
+  on byte-equality of outputs.
 - **A retry is guaranteed to sample differently**, because a reseed steps along the bank rather than
-  re-rolling and hoping.
+  re-rolling and hoping. For contrast, two *different* seeds differed by up to `233/255`, with 6% of
+  pixels more than `8/255` apart — about 500× the same-seed residue at the tail.
 
 The effective seed is echoed back by the worker, so even a clip generated before this existed can be
 reproduced after the fact. Nothing for StoryStudio to send; this is listed so the behaviour is

@@ -119,9 +119,16 @@ function fnv1a32(input: string): number {
 
 /**
  * The seed for one frame's Nth video attempt. Deterministic in
- * (projectId, frameId, attempt): re-running an identical request reproduces
- * the identical clip, and attempt N+1 is guaranteed to differ from attempt N
- * rather than merely likely to.
+ * (projectId, frameId, attempt), so attempt N+1 is guaranteed to differ from
+ * attempt N rather than merely likely to.
+ *
+ * Re-running an identical request reproduces a VISUALLY identical clip, not a
+ * bit-identical one — measured live 2026-09-18 on endpoint nd7wloyvj09xwy:
+ * two same-seed runs differed by at most 18/255 in any pixel (p99 = 4/255,
+ * 0.012% of pixels above 8/255), while two different seeds differed by up to
+ * 233/255 (p99 = 85/255, 6% of pixels above 8/255). The residue is GPU/kernel
+ * nondeterminism across workers (the two runs landed on different pods), not
+ * the seed failing to take. Don't build anything on byte-equality of outputs.
  */
 export function seedForAttempt(projectId: string, frameId: string | null, attempt: number): number {
   const entry = fnv1a32(`${projectId}:${frameId ?? ''}`);
