@@ -23,6 +23,38 @@ Operator's design, in their own terms:
 The point is continuous, cross-project GPU saturation instead of today's cohort/window model, where
 a project advances step-by-step and the fleet idles whenever one step is the bottleneck.
 
+### Project compiler agent (operator's spec)
+
+A further agent, sitting above the per-asset ones:
+
+- **Compiles every asset postprod-lite needs to run.**
+- If something is missing, **check its status**. If it is **stuck, cancel the job and resubmit it as
+  rework**.
+- Once all of a project's assets exist, **write a JSON file and trigger the postprod-lite endpoint**.
+- **One request completes all the tail work and returns the final url.**
+
+This is the answer to the fan-in problem raised below — the barrier lives in a dedicated agent that
+waits on a whole project, rather than being smeared across the per-asset tables. Writing a JSON
+*file* rather than an inline payload is also the right call: oversized inline manifests have bitten
+this pipeline twice before (the SFN 256KB DataLimitExceeded incidents).
+
+**Two concrete gaps found while checking this against the worker (2026-09-18):**
+
+1. **The combined mode is not on the endpoint QM uses.** `mode: "postprod"` (merge each clip with
+   its audio → concat → optional upscale → optional caption → optional mix_bgm, one call, returns
+   the final url) exists in `flux4B-Wan2/Flux-klien-4b/handler.py:1858` — but it is gated to
+   `ENDPOINT_ROLE=all` (line 430), and QM's postprod-lite endpoint `n6252hm01qz0xh` runs the
+   separate `postprod-lite/handler.py`, whose modes are only: merge, normalize, concat,
+   remove_silence, transcribe, upscale, caption, mix_bgm, animate. So either port `postprod` into
+   the lite handler, or point the compiler at an `ENDPOINT_ROLE=all` deployment.
+2. **`postprod` does the merge itself**, taking `video_urls[]` + `audio_urls[]` of equal length.
+   That leaves **no slot for the two per-frame steps that currently sit between merge and concat**:
+   remove-silence (step 7) and the Remotion text overlay (step 16, a Lambda, not this worker).
+   Decide one of: (a) the compiler pre-merges and overlays per frame, then calls a "skip-merge"
+   variant that only does concat→caption→bgm; (b) extend `postprod` to accept already-merged clips;
+   (c) drop those steps from the one-shot path for tiers that don't use them. (a) looks cleanest and
+   keeps the Remotion agent independent.
+
 ### Also tomorrow: fix the Remotion overlay aspect-ratio crop
 
 Independent of the re-architecture, and it **will survive it** — the new `postprod-lite` /
@@ -47,10 +79,11 @@ diagnosis in the 2026-09-18 section below; the short version:
 
 ### Open questions to settle before/while building (mine, not the operator's)
 
-- **Fan-in.** Concat, captions and bgm-overlay are per-PROJECT and need *every* frame finished.
-  A pure per-asset pull model has no natural barrier for that. Probably a project-level "all frames
-  at stage N" check the postprod-lite agent evaluates before claiming — needs designing explicitly,
-  it's the one place the flow isn't a straight chain.
+- ~~**Fan-in.**~~ Answered by the project compiler agent above. Remaining detail to pin down: what
+  counts as **"stuck"** (no status change for N minutes? attempts exhausted? a RunPod job that is
+  terminal but whose row never got updated — today's exact deadlock?), and whether "cancel and
+  resubmit as rework" resets the attempt count or continues it. Both need a bound, or a genuinely
+  broken asset resubmits forever.
 - **What happens to `jobs` + the step graph?** Today `steps`/`jobs`/`deps_remaining` and
   `agents/generator.ts`'s `runStep` encode the dependency DAG (005_invariants.sql enforces it).
   Decide: migrate to the new tables, or run both and cut over per tier.
