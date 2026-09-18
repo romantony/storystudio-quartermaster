@@ -44,10 +44,12 @@ export function compileImagePrompt(contract: ShotContract, opts: CompileImageOpt
   const primary = primarySubject(contract);
   const characters = contract.subjects.filter((s) => s.kind === 'character');
   // "alone in frame" is a claim about the WHOLE frame, not just the named
-  // cast, so a crowd scene must not make it — "one Maya, alone in frame" in
-  // "a crowded hallway" is a self-contradicting prompt that fights the shot
-  // the caller actually asked for.
-  const soleFigure = characters.length === 1 && contract.setting.population !== 'crowd';
+  // cast, so it may only be made when the contract says the place is empty.
+  // "one Maya, alone in frame" in "a crowded hallway" — or in a `sparse`
+  // classroom whose own setting clause says "a few people in the distance" —
+  // is a prompt at war with itself. The count is still stated either way
+  // ("one Maya"), so I-COUNT-01 stays satisfied.
+  const soleFigure = characters.length === 1 && contract.setting.population === 'empty';
   const cam = contract.camera;
 
   const needsSide = contract.action.screenDirection !== 'none';

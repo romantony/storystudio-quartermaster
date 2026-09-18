@@ -259,10 +259,12 @@ non-distilled Replicate Wan 2.2 — slower and separately billed, so use it for 
 carry story weight, not as a default.
 
 Moves that expose frame edges (pans, trucks, pull-outs) are where extras spawn — a stranger once
-walked into a push-in on an "unmarked" subway platform. The harness's defence is the only-person
-clause it compiles into every motion prompt, which is why `setting.population` must be honest:
-`empty` is what produces "she is the only person there" in the image prompt. If you are writing a
-non-empty public setting, prefer `static` or `push_in` yourself.
+walked into a push-in on an "unmarked" subway platform. The harness's defence is an explicit
+only-person clause, and it is compiled **only when `setting.population` is `empty`**, because it is
+a factual claim about the shot. So `population` must be honest in both directions: say `empty` and
+you get "she is the only person there"; say `sparse` or `crowd` and the harness will not claim she
+is alone — it would otherwise fight your own image, and the motion QA gate reports the extra people
+as a hallucination. In a non-empty public setting, prefer `static` or `push_in` yourself.
 
 ### Motion levels
 

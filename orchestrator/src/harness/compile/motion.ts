@@ -35,12 +35,15 @@ export function compileMotionPrompt(contract: ShotContract): string {
   // in subjectClause above) — an earlier version did, and pushed several
   // contracts a few words past V-LEN-01's 45-word cap for no gain.
   // The only-person clause is V-HAL-02's defence against extras spawning at
-  // the frame edges, but it is a factual claim about the shot — in a `crowd`
-  // setting it contradicts the image the caller asked for, so it is dropped
-  // there (V-HAL-02 exempts `crowd` for the same reason). `sparse` keeps it:
-  // that is exactly the case the guard exists for.
+  // the frame edges, but it is a factual CLAIM about the shot, so it may only
+  // be made when the contract actually says the place is empty. `sparse`
+  // means "a few people in the distance" and `crowd` means what it says —
+  // asserting she is alone in either fights the image the caller asked for,
+  // and the motion QA gate then reports the other people as a hallucination.
+  // Observed live 2026-09-18 (qm-enforce-seed-20260918-01/f02: a `sparse`
+  // classroom, flagged HALLUCINATION_VISUAL for containing classmates).
   const onlyPerson =
-    contract.setting.population === 'crowd' ? '' : ` ${primary?.id ?? 'the subject'} stays the only person in the scene.`;
+    contract.setting.population === 'empty' ? ` ${primary?.id ?? 'the subject'} stays the only person in the scene.` : '';
   const lockClause = `${primary?.facing ? `${primary.id} keeps ${facingPhrase}; ` : ''}the camera stays ${angleWord(cam.angle)}.${onlyPerson}`;
 
   return [openLead, subjectClause, ambientClause, lockClause]

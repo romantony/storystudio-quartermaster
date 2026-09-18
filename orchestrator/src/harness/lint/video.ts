@@ -160,7 +160,12 @@ export const VIDEO_DETECTORS: Record<string, CheckFn> = {
   },
 
   populationHallucinationGuard(ctx) {
-    if (ctx.contract.setting.population === 'crowd') return null;
+    // Only an `empty` setting may assert emptiness. Demanding the clause for
+    // `sparse` too (as this did) forced the compiler to write a claim the
+    // contract itself contradicts — "a few people in the distance" AND "the
+    // only person in the scene" — which the motion QA gate then reports as a
+    // hallucination when the model faithfully renders those few people.
+    if (ctx.contract.setting.population !== 'empty') return null;
     if (!EXPOSING_MOVE.has(ctx.contract.camera.move)) return null;
     if (/\bonly person\b|\balone\b/i.test(ctx.motionPrompt)) return null;
     return { message: `move "${ctx.contract.camera.move}" exposes frame edges in a ${ctx.contract.setting.population} setting without an only-person clause` };
