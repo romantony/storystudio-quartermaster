@@ -249,8 +249,14 @@ of failure this document exists to prevent.
 | Status | Moves | What the harness does |
 |---|---|---|
 | **Reliable** | `static`, `push_in` | used as-is |
-| **Unreliable** | `pull_out`, `zoom_in`, `zoom_out`, `pan_left`, `pan_right`, `truck_left`, `truck_right`, `tilt_up`, `tilt_down` | allowed, watched; downgraded if it fails QA |
-| **Banned** | `pedestal_up`, `pedestal_down`, `arc`, `tracking`, `handheld` | downgraded to `static`/`push_in` — or, with `essential: true`, routed to the non-distilled Replicate Wan 2.2 instead |
+| **Unreliable** | `pull_out`, `zoom_in`, `zoom_out`, `pan_left`, `pan_right`, `truck_left`, `truck_right`, `tilt_up`, `tilt_down` | **downgraded to `static`/`push_in` at plan time** |
+| **Banned** | `pedestal_up`, `pedestal_down`, `arc`, `tracking`, `handheld` | same — downgraded to `static`/`push_in` |
+
+Be aware of how blunt this is: in practice **only `static` and `push_in` ever reach the 4-step
+model.** Everything else is downgraded before a frame is generated. The single escape hatch is
+`camera.essential: true`, which suppresses the downgrade and instead routes that frame to the
+non-distilled Replicate Wan 2.2 — slower and separately billed, so use it for shots that genuinely
+carry story weight, not as a default.
 
 Moves that expose frame edges (pans, trucks, pull-outs) are where extras spawn — a stranger once
 walked into a push-in on an "unmarked" subway platform. The harness's defence is the only-person
