@@ -179,18 +179,34 @@ export async function stepJobCounts(
  * so a late webhook for the dead RunPod job resolves to no job and no-ops.
  * Returns true when retried; otherwise it falls through to markTerminal().
  */
+/**
+ * The `jobs_attempts_cap` CHECK constraint, mirrored here because it is what
+ * actually bounds the write below.
+ *
+ * INVARIANT: must stay <= the CHECK in migrations/012_attempts_cap.sql.
+ *
+ * Without this clamp a caller-supplied ceiling ABOVE the DB cap doesn't retry
+ * more — it deadlocks. The UPDATE violates the constraint, throws, aborts the
+ * surrounding transaction before the markTerminal() fallback below can run,
+ * and the job is left `submitted` forever, re-failing every reconcile tick
+ * with every dependent job wedged behind it. That is exactly what happened on
+ * 2026-09-18 when maxResourceAttempts (5) exceeded 005's cap of 2.
+ */
+export const JOBS_ATTEMPTS_HARD_CAP = 10;
+
 export async function markFailedOrRetry(
   client: PoolClient,
   jobId: number,
   error: unknown,
   maxAttempts: number,
 ): Promise<boolean> {
+  const ceiling = Math.min(maxAttempts, JOBS_ATTEMPTS_HARD_CAP);
   const { rowCount } = await client.query(
     `UPDATE jobs
         SET status = 'planned', attempts = attempts + 1, runpod_job_id = NULL,
             submitted_at = NULL, completed_at = NULL, error = $2
       WHERE id = $1 AND attempts < $3`,
-    [jobId, error, maxAttempts],
+    [jobId, error, ceiling],
   );
   if ((rowCount ?? 0) > 0) return true;
   await markTerminal(client, jobId, { status: 'failed', error });
