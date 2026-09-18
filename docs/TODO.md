@@ -23,6 +23,28 @@ Operator's design, in their own terms:
 The point is continuous, cross-project GPU saturation instead of today's cohort/window model, where
 a project advances step-by-step and the fleet idles whenever one step is the bottleneck.
 
+### Also tomorrow: fix the Remotion overlay aspect-ratio crop
+
+Independent of the re-architecture, and it **will survive it** — the new `postprod-lite` /
+Remotion generator agent inherits the same defect unless it's fixed at the render call. Full
+diagnosis in the 2026-09-18 section below; the short version:
+
+- Every 9:16 project with `options.textOverlay` is delivered **1920x1080 with the subject's head
+  cropped off**. The chain holds 464x832 through i2v → merge → remove-silence; step 16 is where it
+  breaks.
+- Cause: `src/handlers/remotion-overlay.ts` calls `renderMediaOnLambda({composition, inputProps,
+  …})` with **no `forceWidth`/`forceHeight`**, so the render takes StoryStudio's `FrameOverlay`
+  composition dimensions whatever the project asked for. The request's `resolution`
+  (`"1080x1920"`) and the manifest's `aspectRatio` (`"9:16"`) both reach the handler and are both
+  ignored.
+- Likely fix: parse `request.resolution` and pass `forceWidth`/`forceHeight`.
+- **Check StoryStudio's `FrameOverlay` composition first.** If its text is positioned against a
+  fixed 1920x1080 canvas, forcing the dimensions will reflow or clip the overlays — so render one
+  frame and LOOK at it before shipping. A correct aspect ratio with the hook text half off-screen
+  is not an improvement.
+- Re-run `js7efef-rerun2-20260918` afterwards to confirm end to end; its 10 frames are already
+  generated and every input url is in the DB, so only step 16 onward needs redoing.
+
 ### Open questions to settle before/while building (mine, not the operator's)
 
 - **Fan-in.** Concat, captions and bgm-overlay are per-PROJECT and need *every* frame finished.
