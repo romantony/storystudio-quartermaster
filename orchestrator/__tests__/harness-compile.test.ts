@@ -131,6 +131,34 @@ describe('compile -> lint round trip', () => {
     expect(blockOrFix(lintImage({ contract, imagePrompt }, IMAGE_GUARDRAILS).violations)).toBe(0);
   });
 
+  it('a crowd scene claims neither "alone in frame" nor the only-person clause — they contradict the shot', () => {
+    // Found 2026-09-18 dry-running a real request: "one Maya, alone in frame"
+    // inside "a crowded middle school hallway" is a prompt at war with itself.
+    const crowd = normalize(
+      validContract({ setting: { ...validContract().setting, place: 'a crowded middle school hallway', population: 'crowd' } }),
+    );
+    expect(compileImagePrompt(crowd)).not.toMatch(/alone in frame/);
+    expect(compileMotionPrompt(crowd)).not.toMatch(/only person in the scene/);
+    // and still lints clean without them (V-HAL-02 exempts crowd)
+    expect(blockOrFix(lintVideo({ contract: crowd, motionPrompt: compileMotionPrompt(crowd), imagePrompt: compileImagePrompt(crowd), profile: 'wan2-lightning' }, VIDEO_GUARDRAILS).violations)).toBe(0);
+  });
+
+  it('a sparse scene KEEPS the only-person clause — that is the case V-HAL-02 exists for', () => {
+    const sparse = normalize(
+      validContract({ setting: { ...validContract().setting, place: 'a subway platform', population: 'sparse' }, camera: { ...validContract().camera, move: 'push_in' } }),
+    );
+    expect(compileMotionPrompt(sparse)).toMatch(/only person in the scene/);
+  });
+
+  it('medium motion survives normalization on a profile whose max IS medium', () => {
+    // Regression: downgrade_motion_level used to flatten everything above
+    // `low` unconditionally, disagreeing with V-ACT-03's own motionLevelAllowed.
+    const medium = normalize(validContract({ action: { ...validContract().action, motionLevel: 'medium' } }));
+    expect(medium.action.motionLevel).toBe('medium');
+    const high = normalize(validContract({ action: { ...validContract().action, motionLevel: 'high' } }));
+    expect(high.action.motionLevel).toBe('medium');
+  });
+
   it('word counts stay within the guardrail bands', () => {
     const contract = normalize(validContract());
     const imagePrompt = compileImagePrompt(contract);

@@ -128,8 +128,18 @@ export const EDITS: Record<string, EditFn> = {
     });
   },
 
-  downgrade_motion_level(c) {
-    if (c.action.motionLevel === 'low') return undefined;
+  // Only downgrades a level the PROFILE cannot execute. It used to downgrade
+  // anything above `low` unconditionally, which disagreed with its own
+  // guardrail: V-ACT-03's motionLevelAllowed passes `medium` on
+  // wan2-lightning (maxMotionLevel: 'medium'), but prepare.ts applies this
+  // edit as an unconditional normalization step — so every medium-motion shot
+  // in the product was silently flattened to low before it was ever
+  // generated. Found 2026-09-18 by dry-running a real 2-frame request
+  // through /v1/harness/lint.
+  downgrade_motion_level(c, _v, opts) {
+    const order = { low: 0, medium: 1, high: 2 } as const;
+    const max = videoProfile(opts.profile).maxMotionLevel;
+    if (order[c.action.motionLevel] <= order[max]) return undefined;
     const next = c.action.motionLevel === 'high' ? 'medium' : 'low';
     return withContract(c, (d) => {
       d.action.motionLevel = next;

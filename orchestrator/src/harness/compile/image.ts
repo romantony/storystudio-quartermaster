@@ -15,10 +15,10 @@ const numberWord = (n: number): string => NUMBER_WORDS[n] ?? String(n);
 
 const PUBLIC_PLACE = /\b(street|platform|corridor|hallway|station|subway|plaza|sidewalk|square|alley|lobby|stairwell)\b/i;
 
-function subjectPhrase(s: ShotSubject, isPrimary: boolean, singleCharacter: boolean): string {
+function subjectPhrase(s: ShotSubject, isPrimary: boolean, soleFigure: boolean): string {
   const anchor = s.ref === 'reference_image' ? 'from the reference image' : '';
   if (isPrimary) {
-    const countClause = singleCharacter ? `one ${s.id}, alone in frame` : `${numberWord(s.count)} ${s.id}`;
+    const countClause = soleFigure ? `one ${s.id}, alone in frame` : `${numberWord(s.count)} ${s.id}`;
     const parts = [countClause, anchor, s.pose, s.facing ? undefined : undefined].filter(Boolean);
     return parts.join(' ').trim();
   }
@@ -43,7 +43,11 @@ export interface CompileImageOptions {
 export function compileImagePrompt(contract: ShotContract, opts: CompileImageOptions = {}): string {
   const primary = primarySubject(contract);
   const characters = contract.subjects.filter((s) => s.kind === 'character');
-  const singleCharacter = characters.length === 1;
+  // "alone in frame" is a claim about the WHOLE frame, not just the named
+  // cast, so a crowd scene must not make it — "one Maya, alone in frame" in
+  // "a crowded hallway" is a self-contradicting prompt that fights the shot
+  // the caller actually asked for.
+  const soleFigure = characters.length === 1 && contract.setting.population !== 'crowd';
   const cam = contract.camera;
 
   const needsSide = contract.action.screenDirection !== 'none';
@@ -55,9 +59,9 @@ export function compileImagePrompt(contract: ShotContract, opts: CompileImageOpt
   if (lightingBits.length) lead.push(`${lightingBits.join(', ')}.`);
 
   const subjectSentences: string[] = [];
-  if (primary) subjectSentences.push(`${subjectPhrase(primary, true, singleCharacter)}${primary.pose ? '' : ''}.`.replace(/\s+\./, '.'));
+  if (primary) subjectSentences.push(`${subjectPhrase(primary, true, soleFigure)}${primary.pose ? '' : ''}.`.replace(/\s+\./, '.'));
   for (const s of secondarySubjects(contract)) {
-    subjectSentences.push(`${subjectPhrase(s, false, singleCharacter)}.`);
+    subjectSentences.push(`${subjectPhrase(s, false, soleFigure)}.`);
   }
 
   const settingBits = [contract.setting.place, populationClause(contract), contract.transformation === 'continuation' ? undefined : undefined].filter(
