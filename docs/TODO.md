@@ -2,7 +2,22 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
-## 2026-09-18 — seed control for Wan2 4-step (harness inference profile): deploy + live-verify
+## 2026-09-18 — seed control: DONE, live-verified. Residue below.
+
+Items 1-3 below are complete: worker image built + pushed, workers recycled by the operator, seed
+echo verified, and the first-ever `enforce` cohort (`qm-enforce-seed-20260918-01`) ran 9/9 clean
+with seeds round-tripping. Three compile defects were found and fixed along the way. What remains
+open from that work:
+
+- **f01 motion gate flagged `PROMPT_VISUAL_MISMATCH`**: prompt said "Static camera", the model
+  zoomed in from 0-5 s. Still scored PASS (6.05). Prompt-level camera control on the distilled
+  model remains unreliable — the long-standing finding in `qm-video-conformity-prompt-testing`.
+  Nothing in the harness can fix this; it is a model capability limit, and the reason the camera
+  capability table is as conservative as it is.
+- Items 5 and 6 below (probation-vs-banned, extraction quality) are unchanged and now have live
+  evidence behind them — see the `qm-wan2-lightning-inference-profile-and-seeds` memory.
+
+## (done 2026-09-18) seed control for Wan2 4-step (harness inference profile): deploy + live-verify
 
 Built this session (see `docs/storystudio-narration-premium-prompt-generation.md` for the
 StoryStudio-facing half). Code is committed-ready and unit-tested; **nothing is deployed and no
