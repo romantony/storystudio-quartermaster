@@ -2,6 +2,51 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## 2026-09-19 (NEXT SESSION) — re-architect: per-asset generator agents, table-driven handoff
+
+Operator's design, in their own terms:
+
+1. **A generator agent per asset type**, one each for: `qwen-image-gen`, `qwen-edit`, `wan2-i2v`,
+   `tts`, `animation`, `mmaudio`, `dreamx-refine`, `postprod-lite`.
+2. **A project submitted to the orchestrator is saved to the DB, and every asset it needs is
+   written as a row in that asset's own table.**
+3. **Each generator agent polls its own table** for rows whose status is "not started", picks them
+   up, and **queues them against that serverless endpoint's own pod limit**. On completion it writes
+   back status + the CDN url.
+4. **Handoff is by writing the next table.** The qwen-image-gen / qwen-edit agent knows the next
+   step and writes the CDN url (plus whatever else is needed) into the `wan2-i2v` table against the
+   right project+frame. The wan2 agent picks that up, generates, writes its video CDN url to its own
+   table **and** into the DreamX-refine table. Same chain onward to MMAudio and postprod-lite.
+5. **No dependency on project sequence.** Whenever there is anything queued, every GPU is fully
+   utilised; each finished task pushes the next table along.
+
+The point is continuous, cross-project GPU saturation instead of today's cohort/window model, where
+a project advances step-by-step and the fleet idles whenever one step is the bottleneck.
+
+### Open questions to settle before/while building (mine, not the operator's)
+
+- **Fan-in.** Concat, captions and bgm-overlay are per-PROJECT and need *every* frame finished.
+  A pure per-asset pull model has no natural barrier for that. Probably a project-level "all frames
+  at stage N" check the postprod-lite agent evaluates before claiming — needs designing explicitly,
+  it's the one place the flow isn't a straight chain.
+- **What happens to `jobs` + the step graph?** Today `steps`/`jobs`/`deps_remaining` and
+  `agents/generator.ts`'s `runStep` encode the dependency DAG (005_invariants.sql enforces it).
+  Decide: migrate to the new tables, or run both and cut over per tier.
+- **Quality gates and the rework ladder.** `agents/quality.ts` currently gates per step, and the
+  harness ladder patches `jobs.input` and re-queues. Each generator agent will need its own gate +
+  retry, or a shared one they all call.
+- **The prompt harness** runs once per cohort (`harness/prepareCohort`). With no cohort, it moves to
+  project-submission time — when the asset rows are first written.
+- **Account-wide worker cap.** The 40-worker RunPod account ceiling is global; per-agent pod limits
+  must sum within it, or agents will starve each other. Today `fleet.ts` arbitrates centrally.
+- **`workersMax` stays untouched.** The fixed-pod policy is absolute — agents read pod limits, they
+  never PATCH them (memory `qm-orchestrator-diagnostics-and-fixed-pods-20260917`).
+- **Result callback.** Something must still notice "this project is wholly finished" to fire the
+  §9.6 callback to StoryStudio. That is a project-level condition, not an asset-level one.
+- **Retries/attempts.** Today's cap lives in `jobs.attempts` + the `jobs_attempts_cap` CHECK (see
+  today's deadlock, migration 012). Each new table needs the same bound, and the same lesson:
+  the app-side ceiling must never exceed the DB CHECK.
+
 ## 2026-09-18 — BUG: 9:16 projects are delivered as 1920x1080 (Remotion step crops them)
 
 Found on the first fully clean full-project run (`js7efef-rerun2-20260918`, a real StoryStudio
