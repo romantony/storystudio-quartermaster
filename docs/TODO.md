@@ -55,6 +55,40 @@ this pipeline twice before (the SFN 256KB DataLimitExceeded incidents).
    (c) drop those steps from the one-shot path for tiers that don't use them. (a) looks cleanest and
    keeps the Remotion agent independent.
 
+### Also tomorrow: postprod-lite stays on RunPod, but two cheap wins
+
+**Decision (2026-09-18): do NOT move postprod-lite to Lambda/ECS.** It costs ~$0.02/project, and
+moving it to AWS reverses the orchestrator's whole direction (the Lambda live path is slated for
+decommissioning) while adding a second system to operate — right as the compiler agent is being
+built on the premise that *one* endpoint completes the tail and returns the final url. Lambda is a
+poor fit specifically: a 15-min ceiling and ephemeral-storage limits are fine for a 44-second video
+and not for a 36-frame project.
+
+The real problem is **A40 contention, not money**. Six of eight endpoints are A40 (Flux-TTS 5,
+qwen-gen 4, qwen-edit 4, BGM 2, MM-Audio 2, **PostProd-Lite 4**), and qwen-image-gen sat 3-of-4
+throttled on 2026-09-18. PostProd-Lite holds 4 A40s to run what is mostly ffmpeg.
+
+Measured on run 2 (`js7efef-rerun2-20260918`), 24 postprod-lite jobs / 94 GPU-seconds total:
+`caption` 17s is the only genuinely GPU work; merge + remove_silence + concat + mix_bgm + normalize
+= **77s (82%) is pure ffmpeg**; `upscale` was 0s (unused — `upscaleEngine` defaults to `dreamx`, a
+separate endpoint).
+
+1. **Make `load_models()` lazy per mode.** `postprod-lite/handler.py:796` calls it at handler entry,
+   *before* the mode dispatch at 806, so every worker loads Whisper large-v3-turbo (fp16) **and**
+   Real-ESRGAN onto the GPU no matter what the job is — a 2.8-second merge waits behind both on cold
+   start. Load Whisper only for `transcribe`/`caption`, ESRGAN only for `upscale`. ~10 lines, and
+   the biggest latency win available on this endpoint.
+2. **Drop PostProd-Lite standby from 4 to 1-2.** Its jobs are short and bursty (94 GPU-seconds
+   across an entire 10-frame project), so 4 warm A40s is over-provisioned; this hands 2-3 A40s back
+   to the endpoints that are actually throttling. **Operator action** — endpoint config is
+   dashboard-only under the fixed-pod policy, no code may PATCH it.
+
+Revisit ECS (Fargate, not Lambda) only if the tail becomes the bottleneck — many concurrent
+projects, or long-form where concat/caption dominate. The pattern already exists
+(`qm-concat-and-trim`, `shorts-longform`). The clean split then is ffmpeg modes on Fargate with a
+small GPU endpoint retained for Whisper + ESRGAN — but note that breaks "one request completes the
+tail", so the compiler agent would need to change with it.
+
 ### Also tomorrow: fix the Remotion overlay aspect-ratio crop
 
 Independent of the re-architecture, and it **will survive it** — the new `postprod-lite` /
