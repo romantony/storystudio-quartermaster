@@ -298,7 +298,11 @@ export async function applyAssetSuccess(
       handoffs,
       // Leaves `quality_status` NULL so the QA agent picks it up. It does NOT
       // defer the handoff above — QA gates assembly, not the chain.
-      spec.gate !== null,
+      //
+      // A QA-exempt product (explainer/educational, plan.qaExempt) skips the
+      // queue entirely: its frames are a deterministic Remotion composition,
+      // so there is nothing to judge and nothing worth delaying assembly for.
+      spec.gate !== null && !(plan?.qaExempt ?? false),
     );
     await client.query('COMMIT');
     log().info(

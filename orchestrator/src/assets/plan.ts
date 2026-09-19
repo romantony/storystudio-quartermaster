@@ -47,8 +47,25 @@ export interface AssetPlan {
   motionKind: AssetKind | null;
   /** What the compiler tells the one-shot to do after the per-frame work. */
   tail: TailSteps;
+  /**
+   * This product's frames are not quality-gated AT ALL (operator, 2026-09-19).
+   *
+   * Explainer and educational videos are a deterministic Remotion composition
+   * over a background: there is no diffusion sampler to misbehave, so neither
+   * the VLM tier nor the free local checks have anything to catch that is
+   * worth delaying assembly for. Gated kinds complete as `ungated`, never
+   * enter the QA queue, and the project verdict is `bypassed` — so the
+   * compiler can assemble the moment generation finishes.
+   *
+   * Decided at submission and persisted with the plan, so a later deploy or
+   * product rename cannot change the rules under a project already running.
+   */
+  qaExempt: boolean;
   frameCount: number;
 }
+
+/** Products whose frames Remotion renders deterministically. */
+export const QA_EXEMPT_PRODUCTS = /\b(explainer|educational|education)\b/i;
 
 /** The `steps` block of the manifest — flags on one call, not a call chain.
  * `upscale` is Real-ESRGAN on the finished video and is normally false: with
@@ -128,6 +145,7 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
       upscale: o.upscale && o.upscaleEngine === 'realesrgan',
       bgm: o.bgm,
     },
+    qaExempt: QA_EXEMPT_PRODUCTS.test(req.product ?? ''),
     frameCount: req.frames.length,
   };
 }

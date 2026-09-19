@@ -528,6 +528,16 @@ describe('gateOneAsset', () => {
     expect(assetsRepo.resetDescendants).not.toHaveBeenCalled();
   });
 
+  it('releases a QA-exempt product\u2019s asset without judging it', async () => {
+    const d2 = deps({ ffmpeg: stubFfmpeg({ raw: Buffer.alloc(32 * 32 * 3, 7) }) });
+    // Deliberately a BLANK image: even a defect the local tier would catch is
+    // not judged, because the product is not diffused.
+    const outcome = await gateOneAsset(d2, row(), { ...PLAN, qaExempt: true });
+    expect(outcome).toBe('pass');
+    expect(assetsRepo.gateAssetSkipped).toHaveBeenCalled();
+    expect(assetsRepo.gateAssetRework).not.toHaveBeenCalled();
+  });
+
   it('releases without judging when gating is switched off', async () => {
     const d = deps({ cfg: { ...deps().cfg, assetQa: 'off' } });
     const outcome = await gateOneAsset(d, row(), PLAN);
@@ -601,6 +611,13 @@ describe('refreshProjectQa', () => {
     expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('failed');
     const [, , , detail] = (pipelineRepo.setProjectQa as jest.Mock).mock.calls[0];
     expect(detail.exhausted).toBe(1);
+  });
+
+  it('bypasses an explainer or educational project without looking at any asset', async () => {
+    const exempt = { ...PLAN, qaExempt: true };
+    expect(await refreshProjectQa(d(), 'proj_1', exempt)).toBe('bypassed');
+    // Never even queries the asset rows — there is nothing to judge.
+    expect(assetsRepo.projectGateState).not.toHaveBeenCalled();
   });
 
   it('bypasses when gating is switched off', async () => {

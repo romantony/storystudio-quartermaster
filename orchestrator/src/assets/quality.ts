@@ -254,7 +254,9 @@ export async function gateOneAsset(
     }
   };
 
-  if (!gate || deps.cfg.assetQa === 'off' || !row.assetUrl) return release('pass', null);
+  // No gate, gating off, nothing to judge, or a QA-exempt product: release
+  // it unjudged and let the chain carry on.
+  if (!gate || deps.cfg.assetQa === 'off' || plan.qaExempt || !row.assetUrl) return release('pass', null);
 
   const input = row.input as FrameJobInput;
   const local =
@@ -366,6 +368,10 @@ export async function refreshProjectQa(
   plan: AssetPlan,
   opts: { sampledOut?: boolean } = {},
 ): Promise<ProjectQaStatus> {
+  if (plan.qaExempt) {
+    await setProjectQa(deps.pool, projectId, 'bypassed', { reason: 'product is rendered by Remotion, not diffused' });
+    return 'bypassed';
+  }
   const gatedKinds = plan.frameKinds.filter((k) => assetSpec(k).gate !== null);
   if (deps.cfg.assetQa === 'off' || gatedKinds.length === 0) {
     await setProjectQa(deps.pool, projectId, 'bypassed', { reason: deps.cfg.assetQa === 'off' ? 'gating disabled' : 'no gated kinds' });

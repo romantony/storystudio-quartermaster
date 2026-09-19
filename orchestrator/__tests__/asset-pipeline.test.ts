@@ -230,6 +230,26 @@ describe('the remotion agent', () => {
   });
 });
 
+describe('QA exemption by product', () => {
+  it('exempts explainer and educational products from the gate entirely', () => {
+    for (const product of ['explainer', 'Educational', 'education']) {
+      expect(compilePlan(request({ product })).qaExempt).toBe(true);
+    }
+  });
+
+  it('does not exempt an ordinary product', () => {
+    expect(compilePlan(request({ product: 'documentary' })).qaExempt).toBe(false);
+    expect(compilePlan(request({ product: 'sci-fi' })).qaExempt).toBe(false);
+  });
+
+  it('is decided by the product, not by whether the project has a text overlay', () => {
+    // A sci-fi project with captions still has diffusion-generated frames
+    // worth checking; an explainer without them still does not.
+    expect(compilePlan(withOptions({ textOverlay: true })).qaExempt).toBe(false);
+    expect(compilePlan(request({ product: 'explainer' })).qaExempt).toBe(true);
+  });
+});
+
 describe('handoff edges', () => {
   it('are the requires graph read backwards — no agent names its own successor', () => {
     const plan = compilePlan(withOptions({ upscale: true, upscaleEngine: 'dreamx' }));
