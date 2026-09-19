@@ -23,6 +23,13 @@ RUN npx tsc -p tsconfig.json \
 # ---- runtime: prod deps only ----
 FROM node:20-bookworm-slim AS runtime
 ENV NODE_ENV=production
+# ffmpeg/ffprobe: the asset pipeline's LOCAL quality tier (src/quality/local.ts)
+# decodes a tiny thumbnail strip from each generated image/clip and measures it
+# in process — blank frames, frozen clips, wrong aspect ratios. No model, no
+# GPU, no API. This is the only reason the image needs it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund \

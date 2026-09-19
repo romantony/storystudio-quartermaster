@@ -233,6 +233,50 @@ const ConfigSchema = z.object({
   r2PublicUrl: z.string().url().default('https://pub-bce4924e66d944668be30268ccf4492c.r2.dev'),
   r2AccessKeyId: z.string().optional(),
   r2SecretAccessKey: z.string().optional(),
+
+  // ── asset pipeline (src/assets/, migration 013) ────────────────────────
+  // Which model a request is executed under. 'cohort' is the window/step
+  // graph that has run every live project to date and stays the default —
+  // flipping this is the rollout switch for the per-asset generator agents,
+  // nothing else changes. 'assets' routes POST /v1/requests to
+  // assets/submit.ts and starts the eight agents plus the project compiler.
+  pipelineMode: z.enum(['cohort', 'assets']).default('cohort'),
+  // How often each generator agent polls its own table. Short on purpose:
+  // the whole point of the model is that a finished asset releases the next
+  // one immediately, and a tick with nothing to do is two indexed queries.
+  assetTickMs: numeric(5_000).pipe(z.number().int().positive()),
+  // How often the project compiler sweeps live projects. Longer than an
+  // agent tick — it is a fan-in check and a repair pass, not a dispatcher.
+  compilerTickMs: numeric(30_000).pipe(z.number().int().positive()),
+  // Most an agent will dispatch in one tick, on top of its endpoint's pod
+  // ceiling. Keeps a 74-frame project from bursting an endpoint's whole
+  // queue in one go right as it comes out of a drift-to-zero (the
+  // dispatch-ramp lesson of 2026-09-16).
+  assetDispatchBatchSize: numeric(4).pipe(z.number().int().positive()),
+  // How long a submitted asset may go without news before the reconcile
+  // scan polls RunPod for it. The webhook is the fast path; this is the
+  // fallback for one that never arrives.
+  assetReconcileAfterMs: numeric(60_000).pipe(z.number().int().positive()),
+  // Quality gating for the gated generation kinds (src/assets/quality.ts).
+  // 'full'   (default) local structural checks on EVERY asset, plus the
+  //          Replicate VLM semantic score on a sampled fraction of them.
+  // 'local'  structural checks only — free, no API. What 'full' degrades to
+  //          when REPLICATE_API_TOKEN is unset.
+  // 'off'    no gate — a completed asset hands off immediately.
+  assetQa: z.enum(['off', 'local', 'full']).default('full'),
+  assetQaBatchSize: numeric(8).pipe(z.number().int().positive()),
+  assetQaTickMs: numeric(10_000).pipe(z.number().int().positive()),
+  // What fraction of assets get the PAID VLM check. The free local tier always
+  // runs at 100%; this is only the Replicate call. 0.3 today; the target is
+  // 0.1 once the prompt harness describes movement and direction well enough
+  // that the remaining failures are predictable. 0 disables the VLM tier
+  // without turning the local one off.
+  assetQaSampleRate: numeric(0.3).pipe(z.number().min(0).max(1)),
+  // Multipliers on the rate. A shot that asks for movement and direction is
+  // where a VLM earns its keep; a static portrait rarely surprises anyone.
+  // At rate 0.3 these give ~75% and ~12% respectively.
+  assetQaMotionWeight: numeric(2.5).pipe(z.number().positive()),
+  assetQaStaticWeight: numeric(0.4).pipe(z.number().min(0)),
 });
 
 export type Config = Readonly<z.infer<typeof ConfigSchema>>;
@@ -307,6 +351,17 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   r2PublicUrl: 'R2_PUBLIC_URL',
   r2AccessKeyId: 'R2_ACCESS_KEY_ID',
   r2SecretAccessKey: 'R2_SECRET_ACCESS_KEY',
+  pipelineMode: 'ORCH_PIPELINE_MODE',
+  assetTickMs: 'ORCH_ASSET_TICK_MS',
+  compilerTickMs: 'ORCH_COMPILER_TICK_MS',
+  assetDispatchBatchSize: 'ORCH_ASSET_DISPATCH_BATCH_SIZE',
+  assetReconcileAfterMs: 'ORCH_ASSET_RECONCILE_AFTER_MS',
+  assetQa: 'ORCH_ASSET_QA',
+  assetQaBatchSize: 'ORCH_ASSET_QA_BATCH_SIZE',
+  assetQaTickMs: 'ORCH_ASSET_QA_TICK_MS',
+  assetQaSampleRate: 'ORCH_ASSET_QA_SAMPLE_RATE',
+  assetQaMotionWeight: 'ORCH_ASSET_QA_MOTION_WEIGHT',
+  assetQaStaticWeight: 'ORCH_ASSET_QA_STATIC_WEIGHT',
 };
 
 /**

@@ -96,10 +96,23 @@ Full field tables: `flux4B-Wan2-storystudio/Flux-klien-4b/postprod-lite/API.md`.
   decision (M2). (Wiring `caption` to accept pre-computed `chunks` instead of
   re-running Whisper is a small follow-up, noted in the API.md's known
   limitations, if step 9's output should be reused instead of re-transcribed.)
-- **There is no `postprod` mode on this image** — unlike the pod2 image, steps
-  stay as separate calls by construction (matches the orchestrator's own
-  step-12 assembly-gate design anyway; no manual/fallback batch path exists
-  here, use the separate per-mode calls).
+- **`postprod` — the whole project in one call (added 2026-09-19).** The note
+  that used to sit here ("there is no `postprod` mode on this image") is no
+  longer true: the lite handler now has one, built for the orchestrator's
+  asset pipeline. `{mode: "postprod", manifest_url}` runs per frame
+  `[animate still] -> merge narration (+SFX) -> [remove silence]`, then
+  `concat -> [upscale] -> [burn captions] -> [mix bgm]`, and returns one final
+  url. **Every intermediate stays on the pod's local disk** — nothing is
+  uploaded until the final video exists — so one pod processes one project and
+  concurrent projects cannot mix assets. Full manifest and response shape:
+  `postprod-lite/API.md` §10 and `orchestrator/src/assets/README.md`.
+- **Model loading is per mode (2026-09-19).** `load_models()` used to run at
+  handler entry, before the mode was read, so every worker pulled Whisper
+  large-v3-turbo *and* Real-ESRGAN onto the GPU for a 2.8-second merge. Now
+  Whisper loads only for `transcribe`/`caption`/a captioning `postprod`, and
+  Real-ESRGAN only for `upscale`/`merge(upscale)`/`animate(upscale_source)`.
+  In the asset pipeline only Whisper is ever loaded: frames are upscaled on
+  the DreamX endpoint before they reach here.
 - **`bgm_prompt` (on-the-fly ACE-Step BGM generation) is not supported** on
   this image — call `bgm-s2t`'s `bgm` mode first and pass the resulting URL as
   `bgm_url`.

@@ -47,12 +47,16 @@ function toProject(row: {
  * Insert a new project, or return the existing one if `requestId` was already
  * seen (§10.1's Request-level idempotency). `wasNew` tells the caller whether
  * to actually run the planner or just re-return the prior acknowledgement.
+ *
+ * `cohortId` is nullable: the asset pipeline (assets/submit.ts) has no
+ * cohorts at all. `projects.cohort_id` has always allowed NULL — that path is
+ * simply its first real user.
  */
 export async function insertProject(
   db: Queryable,
   input: {
     id: string;
-    cohortId: string;
+    cohortId: string | null;
     requestId: string;
     tier: string;
     language: string;

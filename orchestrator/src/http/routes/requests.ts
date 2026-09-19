@@ -4,7 +4,11 @@
  * request, not six hours later), then kicks off the driver in the
  * background and returns the §9.2 acknowledgement immediately.
  *
- * Forks on `cfg.schedulingMode` (2026-09-16, default 'project' — today's
+ * Forks first on `cfg.pipelineMode` (2026-09-19, default 'cohort'):
+ * 'assets' hands the request to assets/submit.ts instead, which writes one
+ * row per asset and returns — see src/assets/README.md.
+ *
+ * Then forks on `cfg.schedulingMode` (2026-09-16, default 'project' — today's
  * exact behavior, unchanged): 'batch' mode still validates synchronously
  * (same fail-fast guarantee — validateRequest() covers both zod shape and
  * the business-rule checks) but queues instead of planning+driving —
@@ -20,6 +24,7 @@ import { plan, validateRequest, PlanValidationError } from '../../agents/planner
 import { driveCohort } from '../../agents/orchestrator';
 import { enqueueRequest } from '../../db/repo/request-outbox';
 import { windowBounds } from '../../db/repo/cohorts';
+import { submitToAssetPipeline } from '../../assets/submit';
 
 export async function requestsRoutes(
   app: FastifyInstance,
@@ -33,6 +38,18 @@ export async function requestsRoutes(
     }
 
     try {
+      if (opts.cfg.pipelineMode === 'assets') {
+        // The per-asset generator model (2026-09-19). No cohort, no window,
+        // no driver kicked off here: submission writes every asset the
+        // project needs into that asset's own table, and the eight agents
+        // already polling those tables pick them up on their next tick.
+        // Checked before schedulingMode because that switch is about WHEN a
+        // cohort is planned, which this model has no equivalent of.
+        const ack = await submitToAssetPipeline(opts.pool, opts.cfg, req.body);
+        reply.code(202);
+        return ack;
+      }
+
       if (opts.cfg.schedulingMode === 'batch') {
         // Same fail-fast guarantee as 'project' mode — a malformed request
         // is rejected here, at submission time, never left to fail hours

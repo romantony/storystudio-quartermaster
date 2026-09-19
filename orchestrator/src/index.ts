@@ -18,6 +18,10 @@ import { createLogger, setLogger } from './telemetry/log';
 import { RunpodClient } from './runpod/client';
 import { driveCohort } from './agents/orchestrator';
 import { runBatchWindow } from './agents/batch-window';
+import { ASSET_KINDS } from './assets/kinds';
+import { startAssetAgents } from './assets/agent';
+import { startCompiler } from './assets/compiler';
+import { startAssetQa } from './assets/quality';
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -45,6 +49,67 @@ async function main(): Promise<void> {
     );
   }
 
+  // ORCH_PIPELINE_MODE=assets (2026-09-19): the eight per-asset generator
+  // agents plus the project compiler above them. Started only in that mode —
+  // in 'cohort' mode their tables are empty and every tick would be pure
+  // overhead. Nothing here is a cron: each agent runs its own short interval
+  // and picks up whatever is queued, across every project at once.
+  let assetAgents: { stop(): void } | undefined;
+  let assetQa: { stop(): void } | undefined;
+  let compiler: { stop(): void } | undefined;
+  if (cfg.pipelineMode === 'assets') {
+    const r2 = {
+      accountId: cfg.r2AccountId,
+      bucket: cfg.r2Bucket,
+      publicUrl: cfg.r2PublicUrl,
+      accessKeyId: cfg.r2AccessKeyId ?? '',
+      secretAccessKey: cfg.r2SecretAccessKey ?? '',
+    };
+    const assetDeps = {
+      pool: getPool(),
+      runpod,
+      cfg,
+      publicBaseUrl: cfg.publicBaseUrl,
+      webhookSecret: cfg.webhookSecret,
+      // The `remotion` agent's transports — the one non-RunPod kind.
+      lambda: { functionName: cfg.remotionLambdaFunctionName, region: cfg.remotionLambdaRegion },
+      r2,
+    };
+    assetAgents = startAssetAgents(assetDeps, ASSET_KINDS, cfg.assetTickMs);
+    // Always started, even at ORCH_ASSET_QA=off: a gated kind's completion
+    // defers its handoff unconditionally (assets/agent.ts), so something has
+    // to release it. With gating off that release is immediate and unjudged.
+    assetQa = startAssetQa(
+      {
+        pool: getPool(),
+        cfg,
+        replicate: cfg.replicateApiToken
+          ? {
+              apiToken: cfg.replicateApiToken,
+              apiBase: cfg.replicateApiBase,
+              visionModel: cfg.replicateVisionModel,
+              visionModelFallback: cfg.replicateVisionModelFallback,
+              pollIntervalMs: cfg.replicatePollIntervalMs,
+              maxPollAttempts: cfg.replicateMaxPollAttempts,
+              timeoutMs: cfg.replicateTimeoutMs,
+            }
+          : undefined,
+      },
+      ASSET_KINDS,
+      cfg.assetQaTickMs,
+    );
+    compiler = startCompiler(
+      {
+        pool: getPool(),
+        runpod,
+        cfg,
+        r2,
+      },
+      cfg.compilerTickMs,
+    );
+    logger.info({ kinds: ASSET_KINDS.length, qa: cfg.assetQa }, 'asset pipeline active');
+  }
+
   // ORCH_SCHEDULING_MODE=batch's window-close trigger. Fires at every
   // windowCron boundary regardless of mode — runBatchWindow()'s own first
   // line is the real gate, so this stays a harmless no-op while the mode is
@@ -62,6 +127,9 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'shutting down');
     try {
       batchWindowTask.stop();
+      assetAgents?.stop();
+      assetQa?.stop();
+      compiler?.stop();
       await app.close();
       await closePool();
       logger.info('shutdown complete');

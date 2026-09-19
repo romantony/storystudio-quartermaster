@@ -57,3 +57,20 @@ export async function persistToR2(deps: R2Transport, url: string, key: string): 
 
   return `${deps.publicUrl.replace(/\/$/, '')}/${key}`;
 }
+
+/**
+ * Uploads a document this process generated (rather than re-hosting one from
+ * a URL, which is what persistToR2 does) and returns its permanent public
+ * URL. The project compiler's tail manifest is written with it — a file, not
+ * an inline payload, so an oversized manifest can never blow a request-size
+ * limit the way this pipeline's inline manifests twice did.
+ *
+ * Same throw-don't-degrade contract as persistToR2: a compiler that cannot
+ * write its manifest has not compiled the project.
+ */
+export async function putJsonToR2(deps: R2Transport, key: string, value: unknown): Promise<string> {
+  const body = Buffer.from(JSON.stringify(value, null, 2), 'utf8');
+  const put = deps.putImpl ?? defaultPut;
+  await put(deps, key, body, 'application/json');
+  return `${deps.publicUrl.replace(/\/$/, '')}/${key}`;
+}

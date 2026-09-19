@@ -39,6 +39,9 @@ const FrameSchema = z
     // Sound description for step 15 (MMAudio): SFX, ambience, environmental
     // sound. Falls back to a prompt built from imagePrompt (builders/sfx.ts).
     audioPrompt: z.string().min(1).optional(),
+    // Ken Burns move for options.motionEngine === 'animate'
+    // (steps/builders/animate.ts). Ignored by the Wan2 path.
+    animateEffect: z.string().min(1).optional(),
     // Educational/explainer on-screen text (options.textOverlay, step 16 —
     // steps/builders/remotion-overlay.ts). Reuses StoryStudio's own,
     // already-existing `FrameRenderManifest` shape verbatim (confirmed
@@ -88,6 +91,12 @@ const OptionsSchema = z
     // postprod-lite's Real-ESRGAN on the whole concat video. Mutually
     // exclusive — see STEP_TOPOLOGY.
     upscaleEngine: z.enum(['dreamx', 'realesrgan']).default('dreamx'),
+    // Which model animates each frame: 'wan2' = Wan2 i2v on the GPU pool,
+    // 'animate' = postprod-lite's Ken Burns pass over the still. Read ONLY
+    // by the asset pipeline (assets/plan.ts); the cohort step graph always
+    // plans seq 3, so a request that sets this while ORCH_PIPELINE_MODE is
+    // 'cohort' is accepted and ignored.
+    motionEngine: z.enum(['wan2', 'animate']).default('wan2'),
     // Per-frame MMAudio SFX (step 15), mixed under the narration at merge.
     // Off by default — MMAudio's weights are non-commercial (CC-BY-NC-4.0).
     sfx: z.boolean().default(false),
@@ -347,6 +356,7 @@ function buildStepsAndJobs(
         upscaleFrames: catalogued.some((cc) => cc.seq === 14) || undefined,
         sfx: catalogued.some((cc) => cc.seq === 15) || undefined,
         textManifest: frame.textManifest,
+        animateEffect: frame.animateEffect,
       };
       jobs.push({
         projectId,

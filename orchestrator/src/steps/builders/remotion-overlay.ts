@@ -37,14 +37,20 @@
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
-const REMOVE_SILENCE_STEP_SEQ = 7;
-const MERGE_STEP_SEQ = 6;
+/**
+ * The clip to overlay, most-processed first. 7/6 are the cohort path's
+ * remove-silence and merge outputs; 15/14/3 are the asset pipeline's, where
+ * per-frame merge happens inside the postprod-lite one-shot AFTER this step,
+ * so the overlay goes onto the silent clip instead (assets/plan.ts). Ordered,
+ * so the cohort path resolves exactly as it always did.
+ */
+const CLIP_SOURCE_SEQS = [7, 6, 15, 14, 3];
 
 export const buildRemotionOverlayInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
-  const dep = ctx.resolvedDeps[REMOVE_SILENCE_STEP_SEQ]?.url ? ctx.resolvedDeps[REMOVE_SILENCE_STEP_SEQ] : ctx.resolvedDeps[MERGE_STEP_SEQ];
+  const dep = CLIP_SOURCE_SEQS.map((seq) => ctx.resolvedDeps[seq]).find((d) => d?.url);
   const clipUrl = dep?.url;
   if (!clipUrl) {
-    throw new Error(`remotion-overlay builder: no resolved merge/remove-silence video URL for frame ${ctx.frameId ?? '(none)'}`);
+    throw new Error(`remotion-overlay builder: no resolved source clip URL for frame ${ctx.frameId ?? '(none)'}`);
   }
   if (!ctx.job.textManifest) {
     return { __passthrough: true, clipUrl };

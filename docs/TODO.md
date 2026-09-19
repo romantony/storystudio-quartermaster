@@ -4,6 +4,108 @@ Running list of planned/queued work not yet in progress. Add a target date range
 
 ## 2026-09-19 (NEXT SESSION) — re-architect: per-asset generator agents, table-driven handoff
 
+> **BUILT 2026-09-19** — the per-asset generator agents, the project compiler
+> and the one-shot tail are implemented in `orchestrator/src/assets/` +
+> migration `013_asset_pipeline.sql`, behind `ORCH_PIPELINE_MODE` (default
+> `cohort`, so nothing live changed), plus the worker-side `postprod` mode in
+> `~/flux4B-Wan2/Flux-klien-4b/postprod-lite/handler.py`. Architecture,
+> operating notes and the known gaps: `orchestrator/src/assets/README.md`.
+> **Not yet done:** rebuild + push the postprod-lite image, apply migration 013
+> on the VPS, and run a real project through `ORCH_PIPELINE_MODE=assets`.
+> Nothing is committed.
+>
+> Decisions taken while building, against the open questions below:
+> - **Gap #1 (no `postprod` mode on the lite image) is CLOSED** — the mode was
+>   built into `postprod-lite/handler.py` rather than worked around. One call
+>   per project: `[animate still] -> merge -> [remove silence]` per frame, then
+>   `concat -> [upscale] -> [burn captions] -> [mix bgm]`. Every intermediate
+>   stays on the pod's local disk; only the final url is returned, which is
+>   what keeps concurrent projects from mixing assets.
+> - **Gap #2 (no slot for the per-frame steps between merge and concat)** is
+>   moot: merge and remove-silence are inside the one-shot, per frame.
+> - **Lazy model loading is DONE** and narrower than planned: only Whisper is
+>   ever loaded in this pipeline (word-level timings for the caption burn).
+>   Real-ESRGAN is never touched — DreamX upscales frame by frame upstream, so
+>   the whole-video `upscale` step is off in every default path.
+> - **No `animation` agent.** Ken Burns is something postprod-lite does during
+>   assembly, so `options.motionEngine: 'animate'` plans no motion asset at all
+>   — for narration-basic the per-frame chain is just image + TTS.
+> - **A `bgm` agent WAS added** (9 kinds, not 8): project-scoped, runnable from
+>   submission, so the track is ready before assembly instead of being
+>   generated on the fly. Its url goes into the manifest.
+> - **"Stuck"** = `submitted` with no status change for longer than the kind's
+>   own `stuckAfterMs` (10 min for the fast endpoints, 25 for wan2/DreamX, 60
+>   for a whole-project tail). Rework **continues** the attempt count and adds
+>   a separate `reworks` budget (max 3).
+> - **`jobs`/the step graph stays** exactly as it is. The two models run side
+>   by side, selected per process by `ORCH_PIPELINE_MODE`; nothing was migrated.
+> - **Contract note:** `assets.frames[].mergedClipUrl` in the §9.6 callback is
+>   always null in this mode — per-frame merged clips are never hosted. Every
+>   other frame URL is unchanged.
+> - **Remotion text overlay** still has no agent; the unused `stage`/`stages`
+>   columns on `assets` are kept for it.
+>
+> **Follow-up, same day** (operator corrections):
+> - **Per-frame clips ARE hosted.** The one-shot uploads each finished clip and
+>   returns `frames[].url`, while concat reads the local file it uploaded from —
+>   so the clip crosses the network once, outbound, and `mergedClipUrl` in the
+>   §9.6 callback is populated as before. (The earlier "nothing is uploaded
+>   until the end" was an over-optimization that dropped a real deliverable.)
+> - **Quality gating added** (migration `014_asset_quality.sql`,
+>   `src/assets/quality.ts`, `src/quality/local.ts`) for `qwen-image-gen`,
+>   `qwen-edit` and `wan2-i2v`. A gated kind's completion no longer hands off
+>   until a verdict lands, so a rejected still never costs a Wan2 job.
+>   - **Local tier, default on**: ffmpeg decodes a 32x32 thumbnail strip and the
+>     statistics are computed in process — blank frames, **frozen clips**, wrong
+>     aspect ratio, truncated files, clips that don't match their narration. No
+>     model, no API, no GPU, no cost. This closes the "frozen camera" gap that
+>     `qm-video-conformity-prompt-testing` left open.
+>   - **VLM tier, opt-in** (`ORCH_ASSET_QA=full`): the existing rubric via
+>     Replicate. It genuinely cannot run locally — the VPS has no GPU and the
+>     fleet has no self-hosted VLM.
+>   - A rejection patches the SAME row: **reseed** for structural defects,
+>     **prompt rewrite** only for what a VLM saw, nothing for an aspect mismatch
+>     (regenerating cannot fix it). Capped at 4 quality attempts, then accepted
+>     flagged.
+>   - **Unmeasured thresholds:** `minFrameDelta` 1.0 and `minStddev` 4 were
+>     picked from first principles. Calibrate them against real known-good and
+>     known-frozen Wan2 clips before trusting them — a false FROZEN wastes a GPU
+>     job. This is the first thing to do when the pipeline runs live.
+> - The orchestrator image now installs **ffmpeg** (the local QA tier's only
+>   dependency).
+>
+> **Second follow-up, same day** (operator corrections):
+> - **VLM QA is on by default** (`ORCH_ASSET_QA=full`) and **sampled**, not
+>   100%. The free local tier still runs on every gated asset; only the paid
+>   Replicate call is sampled (`quality/sampling.ts`):
+>   - `ORCH_ASSET_QA_SAMPLE_RATE=0.3` today, **0.1 is the target** once the
+>     prompt harness describes movement and direction well enough.
+>   - **Explainer/educational products are never sampled** — Remotion renders
+>     them deterministically, so there is nothing for a VLM to catch.
+>   - Movement and direction raise the odds: salience from the harness's
+>     `ShotContract` (`motionLevel`, `camera.move`, `screenDirection`,
+>     `transformation`) when there is one, a lexicon when there isn't. At rate
+>     0.3 a movement-heavy shot is checked ~52%, a static one ~15%.
+>   - Weights apply to the **odds**, not the probability, so the configured
+>     rate means what it says and `rate=1` really is everything. (Multiplying
+>     the probability directly overshot the headline rate by ~45% and left
+>     `rate=1` skipping 60% of static shots — caught by a test.)
+>   - The draw is a hash of (project, frame, kind), so a retry cannot flip a
+>     decision and the sample is reproducible.
+> - **Remotion generator agent added** (migration `015_asset_remotion.sql`):
+>   `options.textOverlay` plans a `remotion` asset per frame, rendered through
+>   the existing `QM-remotion-overlay` **Lambda** — the pipeline's only
+>   non-RunPod agent. Output is re-hosted into R2, the url goes in its own
+>   table, and the handoff releases the next step like any other kind. It runs
+>   **before** the tail (the overlay goes onto the silent clip; the one-shot
+>   then merges narration into it) because merge/trim/concat are all inside one
+>   postprod-lite call now. A frame with no `textManifest` passes through.
+>   - **Untested combination:** `remotion` + `mmaudio`. The overlay renders over
+>     a clip carrying an SFX track that the tail then lifts back off
+>     (`sfxFromVideo`). Fails loudly if Remotion drops the audio, but nobody has
+>     run it.
+
+
 Operator's design, in their own terms:
 
 1. **A generator agent per asset type**, one each for: `qwen-image-gen`, `qwen-edit`, `wan2-i2v`,

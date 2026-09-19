@@ -476,7 +476,7 @@ describe('buildRemotionOverlayInput (step 16, source: lambda — sits between re
 
   it('throws when neither step 6 nor step 7 resolved a video URL', () => {
     expect(() => buildRemotionOverlayInput(ctx({ job: { ...baseJob, textManifest }, resolvedDeps: {} }))).toThrow(
-      /no resolved merge\/remove-silence video URL/,
+      /no resolved source clip URL/,
     );
   });
 

@@ -114,6 +114,12 @@ export interface FrameJobInput {
    * surfaces this flag in the §9.6 result callback for the caller to act on. */
   splitShot?: boolean;
 
+  /** `animation` asset only (options.motionEngine === 'animate'): which Ken
+   * Burns move postprod-lite applies — zoom_in (default) | zoom_out |
+   * pan_left | pan_right; anything else drifts diagonally. See
+   * steps/builders/animate.ts. */
+  animateEffect?: string;
+
   /** Educational/explainer on-screen text (options.textOverlay,
    * steps/builders/remotion-overlay.ts). StoryStudio's own
    * `FrameRenderManifest` shape (fps/durationInFrames/background/camera/

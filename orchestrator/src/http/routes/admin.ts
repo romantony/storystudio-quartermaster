@@ -20,6 +20,9 @@ import { cohortSummary } from '../../agents/orchestrator';
 import { assetCounts, projectCounts, costTotal, costByProject, listFailedProjects, listAlerts } from '../../db/repo/admin-stats';
 import { validateRework, driveRework, ReworkError } from '../../agents/rework';
 import { DASHBOARD_HTML } from './dashboard-html';
+import { ASSET_KINDS, ASSET_SPECS } from '../../assets/kinds';
+import { queueDepths, listProjectAssets, projectAssetCounts } from '../../db/repo/assets';
+import { listLivePipelineProjects, getPipelineProject } from '../../db/repo/pipeline';
 
 export async function adminRoutes(
   app: FastifyInstance,
@@ -60,6 +63,68 @@ export async function adminRoutes(
       }),
     );
     return { fleet: rows };
+  });
+
+  // ── asset pipeline (ORCH_PIPELINE_MODE=assets) ────────────────────────
+  // The one number that says whether the model is doing its job: for each
+  // asset type, how much is queued versus how much is actually on its
+  // endpoint. Queued work sitting behind an endpoint with idle pods is the
+  // failure this architecture exists to prevent, and it is invisible without
+  // this. Empty in 'cohort' mode, where the asset tables have no rows.
+  app.get('/v1/assets', async () => {
+    const [depths, live] = await Promise.all([queueDepths(opts.pool), listLivePipelineProjects(opts.pool)]);
+    return {
+      pipelineMode: opts.cfg.pipelineMode,
+      queues: ASSET_KINDS.map((kind) => {
+        const spec = ASSET_SPECS[kind];
+        const d = depths.find((x) => x.kind === kind);
+        return {
+          kind,
+          table: spec.table,
+          endpointId: spec.endpointId,
+          pods: spec.maxInFlight,
+          pending: d?.pending ?? 0,
+          submitted: d?.submitted ?? 0,
+        };
+      }),
+      projects: live.map((p) => ({
+        projectId: p.projectId,
+        status: p.status,
+        expectedAssets: p.expectedAssets,
+        tailStage: p.tailStage,
+        attempts: p.attempts,
+        startedAt: p.startedAt,
+        updatedAt: p.updatedAt,
+      })),
+    };
+  });
+
+  app.get<{ Params: { id: string } }>('/v1/assets/:id', async (req, reply) => {
+    const rows = await listProjectAssets(opts.pool, req.params.id);
+    if (rows.length === 0) {
+      reply.code(404);
+      return { error: 'no assets for that project' };
+    }
+    const pp = await getPipelineProject(opts.pool, req.params.id);
+    return {
+      project: pp ?? null,
+      counts: await projectAssetCounts(opts.pool, req.params.id),
+      assets: rows.map((r) => ({
+        kind: r.kind,
+        frameId: r.frameId,
+        seq: r.seq,
+        status: r.status,
+        stage: r.stage,
+        attempts: r.attempts,
+        reworks: r.reworks,
+        assetUrl: r.assetUrl,
+        // What this row is still waiting on — the first thing you want when
+        // a project is stuck.
+        waitingOn: r.requiredInputs.filter((k) => !r.sources[k]),
+        updatedAt: r.updatedAt,
+        error: r.error,
+      })),
+    };
   });
 
   app.get<{ Params: { id: string } }>('/v1/cohorts/:id', async (req, reply) => {
