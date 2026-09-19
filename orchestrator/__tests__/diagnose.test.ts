@@ -56,6 +56,17 @@ describe('askSonnet', () => {
     const input = (create.body as { input: Record<string, unknown> }).input;
     expect(JSON.parse(input.prompt as string).facts).toEqual({ orphanForMs: 12 });
     expect(input.system_prompt).toContain('read-only diagnostic assistant');
+    // The system facts are load-bearing, not decoration: without the billing
+    // line the model's first real diagnosis (2026-09-19, endpoint
+    // w0h49vn1pn0r87) told on-call an orphaned worker was "billing idly",
+    // which is false — idle and ready workers cost nothing — and would have
+    // sent someone chasing a cost leak that does not exist.
+    expect(input.system_prompt).toContain('RunPod bills only for workers ACTIVELY RUNNING A JOB');
+    expect(input.system_prompt).toContain('NEVER describe an idle, ready or orphaned worker as billing');
+    // Worker counts are admin-managed from the dashboard (the fixed-pod
+    // policy), so "terminate the worker" is not a remedy this assistant may
+    // suggest.
+    expect(input.system_prompt).toContain('Do not recommend scaling, draining or terminating workers');
     // 1536, not 512: a live run in 2026-09-17 truncated a real "critical"
     // diagnosis mid-JSON at the smaller ceiling.
     expect(input.max_tokens).toBe(1536);
