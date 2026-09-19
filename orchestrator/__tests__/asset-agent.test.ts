@@ -256,7 +256,13 @@ describe('completion', () => {
     // Operator's call (2026-09-19): downstream generation starts at once and
     // the verdict lands in parallel. What the verdict gates is ASSEMBLY — the
     // compiler will not compile until every gated asset has one.
-    expect(gated).toBe(false);
+    //
+    // `gated: true` means ONLY "leave quality_status NULL so the QA agent
+    // queues it". Conflating it with "defer the handoff" deadlocked a live
+    // project: every asset completed 'ungated', the QA queue stayed empty and
+    // the project verdict never left 'pending'. The handoff below is what
+    // proves the two are now separate.
+    expect(gated).toBe(true);
     expect(handoffs.map((h: { kind: string }) => h.kind)).toEqual(['wan2-i2v']);
     expect(costsRepo.recordAssetCost).toHaveBeenCalledWith(
       expect.anything(),
@@ -264,7 +270,7 @@ describe('completion', () => {
     );
   });
 
-  it('hands off immediately for an UNGATED kind', async () => {
+  it('marks an UNGATED kind judged at completion, so it never enters the QA queue', async () => {
     const poolLike = fakePool({ successRow: { asset_kind: 'tts', endpoint_id: ASSET_SPECS.tts.endpointId } });
     const outcome = await applyAssetSuccess(deps(jest.fn(), poolLike), 101, 'tts', {
       audio: 'https://cdn/f1.mp3',

@@ -296,8 +296,9 @@ export async function applyAssetSuccess(
       { id: assetId, kind, projectId: row.project_id, frameId: row.frame_id, seq: row.seq },
       { output, assetUrl: url, durationS },
       handoffs,
-      // `gated` here means "defer the handoff", which nothing does any more.
-      false,
+      // Leaves `quality_status` NULL so the QA agent picks it up. It does NOT
+      // defer the handoff above — QA gates assembly, not the chain.
+      spec.gate !== null,
     );
     await client.query('COMMIT');
     log().info(

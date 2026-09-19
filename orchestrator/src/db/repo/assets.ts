@@ -227,10 +227,18 @@ export async function completeAsset(
   row: Pick<AssetRow, 'id' | 'kind' | 'projectId' | 'frameId' | 'seq'>,
   result: { output: unknown; assetUrl: string; durationS?: number },
   handoffs: HandoffTarget[],
-  /** A gated kind completes WITHOUT handing off: `quality_status` stays NULL
-   * (the QA agent's queue) and only a passing verdict calls
-   * `gateAssetPass()` to release the downstream rows. Animating a rejected
-   * still is the exact waste gating exists to prevent. */
+  /**
+   * Whether this kind has a QA gate. It controls ONE thing: whether
+   * `quality_status` is left NULL, which is the QA agent's queue
+   * (`listUngatedAssets`). It does NOT control the handoff — QA is
+   * non-blocking, so downstream generation starts either way.
+   *
+   * Those two meanings were conflated once and it deadlocked a live project
+   * (2026-09-19): making QA non-blocking turned this flag off entirely, so
+   * every asset completed as 'ungated', nothing ever entered the QA queue,
+   * the project-level verdict never left 'pending', and the compiler waited
+   * forever on a gate that could never clear.
+   */
   gated = false,
 ): Promise<void> {
   await client.query(
@@ -240,7 +248,7 @@ export async function completeAsset(
       WHERE asset_kind = $2 AND id = $1`,
     [row.id, row.kind, result.output, result.assetUrl, result.durationS ?? null, gated ? null : 'ungated'],
   );
-  if (gated) return;
+  // Always — a gated kind's verdict gates ASSEMBLY, never the chain.
   await writeHandoffs(client, row, { url: result.assetUrl, durationS: result.durationS }, handoffs);
 }
 

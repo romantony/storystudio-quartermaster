@@ -46,7 +46,7 @@ import { log } from '../telemetry/log';
 import { assetSpec, type AssetKind } from './kinds';
 import { resolveHandoffs } from './agent';
 import type { AssetPlan } from './plan';
-import { getPipelineProject, setProjectQa, type ProjectQaStatus } from '../db/repo/pipeline';
+import { getPipelineProject, listLivePipelineProjects, setProjectQa, type ProjectQaStatus } from '../db/repo/pipeline';
 import { getProject } from '../db/repo/projects';
 import {
   gateAssetPass,
@@ -429,7 +429,6 @@ export async function runAssetQaTick(deps: AssetQualityDeps, kind: AssetKind): P
       log().error({ assetId: row.id, kind, err }, 'asset-qa: gating one asset crashed');
     }
   }
-  // One recompute per project, after its assets are judged — never per asset.
   for (const projectId of touched) {
     try {
       const plan = (await getPipelineProject(deps.pool, projectId))?.plan;
@@ -442,6 +441,26 @@ export async function runAssetQaTick(deps: AssetQualityDeps, kind: AssetKind): P
   return summary;
 }
 
+/**
+ * Recompute the project verdict for EVERY live project, judged or not.
+ *
+ * Refreshing only projects whose assets were judged this tick is not enough:
+ * a project can reach "generation finished, nothing left to judge" without
+ * any asset passing through the QA queue on that tick, and then its verdict
+ * sits at its `pending` default forever while the compiler waits on it. That
+ * deadlocked a live project on 2026-09-19. The verdict is derived from the
+ * rows, so recomputing it unconditionally is cheap and cannot be stale.
+ */
+export async function refreshLiveProjects(deps: AssetQualityDeps): Promise<void> {
+  for (const pp of await listLivePipelineProjects(deps.pool)) {
+    try {
+      await refreshProjectQa(deps, pp.projectId, pp.plan);
+    } catch (err) {
+      log().error({ projectId: pp.projectId, err }, 'asset-qa: failed to refresh a live project verdict');
+    }
+  }
+}
+
 export function startAssetQa(deps: AssetQualityDeps, kinds: readonly AssetKind[], intervalMs: number): { stop(): void } {
   const gated = kinds.filter((k) => assetSpec(k).gate !== null);
   let running = false;
@@ -449,6 +468,7 @@ export function startAssetQa(deps: AssetQualityDeps, kinds: readonly AssetKind[]
     if (running) return;
     running = true;
     void Promise.all(gated.map((k) => runAssetQaTick(deps, k)))
+      .then(() => refreshLiveProjects(deps))
       .catch((err) => log().error({ err }, 'asset-qa: tick crashed'))
       .finally(() => {
         running = false;
