@@ -358,65 +358,86 @@ describe('completion', () => {
 });
 
 describe('request timeouts', () => {
-  it('cancels and resubmits a request that outran its kind\u2019s timeout', async () => {
-    const spec = ASSET_SPECS['qwen-image-gen'];
-    const submittedAt = new Date(Date.now() - (spec.timeoutMs as number) - 5_000);
-    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
-      row({ id: 300, status: 'submitted', providerJobId: 'rp-wedged', submittedAt }),
-    ]);
-    (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
-    const fetchImpl = jest.fn(async () => fakeRes(200, { id: 'rp-wedged', status: 'CANCELLED' }));
+  // The budget is GENERATION time, not wall clock. Measured live 2026-09-19
+  // with only 18 frames: wan2-i2v's worst job was 199.3s queued + 100.2s
+  // executing = 299.5s against a 300s budget. Counting the queue would have
+  // cancelled a healthy job — and under 111 frames against 4 pods it would
+  // cancel nearly all of them, forever.
+  function statusFetch(body: Record<string, unknown>) {
+    return jest.fn(async (url: string) => {
+      if (url.includes('/cancel/')) return fakeRes(200, { status: 'CANCELLED' });
+      return fakeRes(200, body);
+    });
+  }
 
-    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'qwen-image-gen');
-
-    expect(summary.timedOut).toBe(1);
-    // Cancelled on the provider first, then requeued.
-    expect((fetchImpl.mock.calls[0] as unknown as string[])[0]).toContain('/cancel/rp-wedged');
-    expect(assetsRepo.reworkAsset).toHaveBeenCalledWith(
-      expect.anything(), 300, 'qwen-image-gen', expect.objectContaining({ reason: 'timeout' }),
-    );
-  });
-
-  it('resubmits even when the provider refuses the cancel', async () => {
-    const spec = ASSET_SPECS.tts;
-    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
-      row({ id: 301, kind: 'tts', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-gone', submittedAt: new Date(Date.now() - (spec.timeoutMs as number) - 1_000) }),
-    ]);
-    (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
-    // A 404 on cancel is the common case — the job was already gone.
-    const fetchImpl = jest.fn(async () => fakeRes(404, { error: 'job not found' }));
-
-    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'tts');
-
-    expect(summary.timedOut).toBe(1);
-    expect(assetsRepo.reworkAsset).toHaveBeenCalled();
-  });
-
-  it('leaves a request that is still inside its budget alone', async () => {
+  it('does NOT time out a job that is only sitting in the queue', async () => {
     const spec = ASSET_SPECS['wan2-i2v'];
-    // 4 minutes into a 5-minute budget: poll it, do not cancel it.
     (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
-      row({ id: 302, kind: 'wan2-i2v', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-running', submittedAt: new Date(Date.now() - 240_000) }),
+      row({ id: 310, kind: 'wan2-i2v', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-queued',
+            submittedAt: new Date(Date.now() - (spec.timeoutMs as number) - 60_000) }),
     ]);
-    const fetchImpl = jest.fn(async () => fakeRes(200, { id: 'rp-running', status: 'IN_PROGRESS' }));
+    const fetchImpl = statusFetch({ id: 'rp-queued', status: 'IN_QUEUE' });
 
     const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'wan2-i2v');
 
     expect(summary.timedOut).toBe(0);
     expect(assetsRepo.reworkAsset).not.toHaveBeenCalled();
-    expect((fetchImpl.mock.calls[0] as unknown as string[])[0]).toContain('/status/rp-running');
+  });
+
+  it('subtracts RunPod\u2019s own queue time before judging the budget', async () => {
+    const spec = ASSET_SPECS['wan2-i2v'];
+    // 290s outstanding, of which 250s was queue: only 40s of generation.
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ id: 311, kind: 'wan2-i2v', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-running',
+            submittedAt: new Date(Date.now() - 290_000) }),
+    ]);
+    const fetchImpl = statusFetch({ id: 'rp-running', status: 'IN_PROGRESS', delayTime: 250_000 });
+
+    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'wan2-i2v');
+
+    expect(summary.timedOut).toBe(0);
+    expect(assetsRepo.reworkAsset).not.toHaveBeenCalled();
+  });
+
+  it('cancels and resubmits when GENERATION outruns the budget', async () => {
+    const spec = ASSET_SPECS['qwen-image-gen'];
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ id: 312, status: 'submitted', providerJobId: 'rp-wedged',
+            submittedAt: new Date(Date.now() - (spec.timeoutMs as number) - 30_000) }),
+    ]);
+    (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
+    const fetchImpl = statusFetch({ id: 'rp-wedged', status: 'IN_PROGRESS', delayTime: 5_000 });
+
+    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'qwen-image-gen');
+
+    expect(summary.timedOut).toBe(1);
+    const urls = fetchImpl.mock.calls.map((c) => (c as unknown as string[])[0]);
+    expect(urls.some((u) => u.includes('/cancel/rp-wedged'))).toBe(true);
+    expect(assetsRepo.reworkAsset).toHaveBeenCalledWith(
+      expect.anything(), 312, 'qwen-image-gen', expect.objectContaining({ reason: 'timeout' }),
+    );
+  });
+
+  it('eventually recovers a job that never leaves the queue at all', async () => {
+    const spec = ASSET_SPECS.tts;
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ id: 313, kind: 'tts', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-stuck',
+            submittedAt: new Date(Date.now() - (spec.timeoutMs as number) * 25) }),
+    ]);
+    (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
+    const fetchImpl = statusFetch({ id: 'rp-stuck', status: 'IN_QUEUE' });
+
+    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'tts');
+
+    expect(summary.timedOut).toBe(1);
   });
 
   it('exempts remotion from timeouts and cancellation entirely', () => {
-    // A synchronous Lambda invoke has no provider-side job to outlive or to
-    // cancel (operator, 2026-09-19). Orphan recovery still applies.
     expect(ASSET_SPECS.remotion.timeoutMs).toBeNull();
     expect(ASSET_SPECS.remotion.cancelOnTimeout).toBe(false);
   });
 
   it('times postprod-lite out at the pod\u2019s own limit, without cancelling', () => {
-    // The pod enforces 900s itself, so by the time this fires the request is
-    // already over — a cancel could only fail.
     expect(ASSET_SPECS['postprod-lite'].timeoutMs).toBe(900_000);
     expect(ASSET_SPECS['postprod-lite'].cancelOnTimeout).toBe(false);
   });
@@ -426,7 +447,6 @@ describe('request timeouts', () => {
   });
 
   it('carries the operator\u2019s timeout budgets', () => {
-    // 150s covers a cold qwen pod (~120s) with headroom; Wan2 gets 300s.
     expect(ASSET_SPECS['qwen-image-gen'].timeoutMs).toBe(150_000);
     expect(ASSET_SPECS['qwen-edit'].timeoutMs).toBe(150_000);
     expect(ASSET_SPECS.tts.timeoutMs).toBe(150_000);

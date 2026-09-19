@@ -117,6 +117,12 @@ const ENDPOINT_PAUSED_MAX_ATTEMPTS = 8;
  * design; this only recovers rows nobody is awaiting any more. */
 const LAMBDA_ORPHAN_RECOVERY_MS = 600_000;
 
+/** How many generation budgets a job may sit purely QUEUED before it is
+ * treated as never going to run. Deliberately large: a deep queue is normal
+ * and healthy under load — 111 frames against 4 pods is minutes of honest
+ * waiting — and requeuing only sends the job to the back of that same queue. */
+const QUEUE_PATIENCE = 20;
+
 function isEndpointPausedRace(err: unknown): boolean {
   return (
     err instanceof RunpodError &&
@@ -483,9 +489,8 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
  * by the same `reworks` budget as any other requeue, so a request that times
  * out forever eventually fails instead of looping.
  */
-async function timeoutAndResubmit(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): Promise<boolean> {
+async function timeoutAndResubmit(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, outstandingMs: number): Promise<boolean> {
   const spec = assetSpec(kind);
-  const outstandingMs = Date.now() - (row.submittedAt?.getTime() ?? Date.now());
 
   if (spec.cancelOnTimeout && row.providerJobId && spec.provider === 'runpod') {
     try {
@@ -520,13 +525,6 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
   let failed = 0;
   let timedOut = 0;
   for (const row of stale) {
-    // Timeout first: if the request has outrun its budget there is nothing to
-    // learn from polling it again. `timeoutMs: null` (remotion) opts out.
-    if (spec.timeoutMs !== null && row.submittedAt && Date.now() - row.submittedAt.getTime() > spec.timeoutMs) {
-      timedOut += 1;
-      if (!(await timeoutAndResubmit(deps, kind, row))) failed += 1;
-      continue;
-    }
     if (spec.provider === 'lambda') {
       // ORPHAN RECOVERY, not a timeout. A Lambda invoke is synchronous, so a
       // row still `submitted` long after it started means the invoking
@@ -549,6 +547,42 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
     if (!row.providerJobId) continue;
     try {
       const res = await deps.runpod.status(spec.endpointId, row.providerJobId);
+
+      // THE TIMEOUT IS A GENERATION BUDGET, NOT A WALL CLOCK.
+      //
+      // Measuring from `submitted_at` counts RunPod's queue wait against the
+      // budget, and the operator's numbers describe generation time (a warm
+      // qwen image ~15s, a cold pod ~120s). Under a deep queue — 111 frames
+      // against 4 pods — a job would be cancelled while merely waiting its
+      // turn, resubmitted to the BACK of that queue, and loop until its
+      // rework budget ran out. Measured live on 2026-09-19 with only 18
+      // frames: wan2-i2v's worst job was 199.3s of queue plus 100.2s of
+      // execution = 299.5s against a 300s budget. Half a second of headroom.
+      //
+      // So: a job still IN_QUEUE is not stuck, it is waiting, and cancelling
+      // it only loses its place. Only execution counts — `delayTime` is
+      // RunPod's own measure of the queue portion and is subtracted when it
+      // reports one.
+      if (spec.timeoutMs !== null && row.submittedAt && res.status !== 'COMPLETED' && !isTerminal(res.status)) {
+        const wallMs = Date.now() - row.submittedAt.getTime();
+        const queueMs = typeof res.delayTime === 'number' ? res.delayTime : 0;
+        const executingMs = Math.max(0, wallMs - queueMs);
+        const queuedOnly = res.status === 'IN_QUEUE';
+
+        if (!queuedOnly && executingMs > spec.timeoutMs) {
+          timedOut += 1;
+          if (!(await timeoutAndResubmit(deps, kind, row, executingMs))) failed += 1;
+          continue;
+        }
+        // A job that never even starts is a different failure: the endpoint
+        // has no capacity at all. Recover it eventually rather than never.
+        if (queuedOnly && wallMs > spec.timeoutMs * QUEUE_PATIENCE) {
+          timedOut += 1;
+          if (!(await timeoutAndResubmit(deps, kind, row, wallMs))) failed += 1;
+          continue;
+        }
+      }
+
       if (res.status === 'COMPLETED') {
         const outcome = await applyAssetSuccess(deps, row.id, kind, res.output, {
           executionMs: res.executionTime ?? null,
