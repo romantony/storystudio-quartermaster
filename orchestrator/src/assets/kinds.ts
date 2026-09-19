@@ -97,8 +97,23 @@ export interface AssetSpec {
    * start: a warm qwen image is ~15s and a cold one ~120s, so 150s covers a
    * cold pod with headroom; Wan2 i2v gets 300s. These are deliberately tight
    * — a timeout costs one duplicate job, a wedged request costs the project.
+   *
+   * `null` means never time out. Only `remotion` uses it: a synchronous
+   * Lambda invoke has no provider-side job to outlive or to cancel, so there
+   * is nothing for a timeout to act on. It is still recovered if the invoking
+   * process dies — see assets/agent.ts's lambda branch, which is orphan
+   * recovery, not a timeout.
    */
-  timeoutMs: number;
+  timeoutMs: number | null;
+  /**
+   * Whether a timeout cancels the provider job before resubmitting.
+   *
+   * False for `postprod-lite`: the pod enforces its own 900s execution limit,
+   * so the request is already over by the time we would ask — cancelling adds
+   * an API call that can only fail. Everywhere else a cancel stops a wedged
+   * job from holding a pod against the endpoint's in-flight budget.
+   */
+  cancelOnTimeout: boolean;
   /** The step seq `steps/builders/*` read this kind's output at. */
   legacySeq: number;
   /** What the completed asset is, for the manifest and the §9.6 result. */
@@ -139,6 +154,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     endpointId: endpointFor('runpod:qwen-image-gen'),
     maxInFlight: podsFor('runpod:qwen-image-gen'),
     timeoutMs: 150_000, // warm ~15s, cold pod ~120s
+    cancelOnTimeout: true,
     legacySeq: 1,
     produces: 'image',
     stages: [],
@@ -153,6 +169,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     endpointId: endpointFor('runpod:qwen-image-edit'),
     maxInFlight: podsFor('runpod:qwen-image-edit'),
     timeoutMs: 150_000, // warm ~15s, cold pod ~120s
+    cancelOnTimeout: true,
     legacySeq: 0,
     produces: 'image',
     stages: [],
@@ -167,6 +184,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     endpointId: endpointFor('runpod:flux-tts-s2t'),
     maxInFlight: podsFor('runpod:flux-tts-s2t'),
     timeoutMs: 150_000, // operator-set
+    cancelOnTimeout: true,
     legacySeq: 2,
     produces: 'audio',
     stages: [],
@@ -183,6 +201,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     // The long pole of the whole pipeline; a cold worker plus a queued
     // 5-second clip is routinely minutes, not seconds.
     timeoutMs: 300_000, // the long pole — a 5s clip on a cold pod
+    cancelOnTimeout: true,
     legacySeq: 3,
     produces: 'video',
     stages: [],
@@ -197,6 +216,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     endpointId: DREAMX_REFINER_ENDPOINT_ID,
     maxInFlight: DREAMX_PODS,
     timeoutMs: 150_000, // operator-set
+    cancelOnTimeout: true,
     legacySeq: 14,
     produces: 'video',
     stages: [],
@@ -211,6 +231,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     endpointId: MMAUDIO_ENDPOINT_ID,
     maxInFlight: MMAUDIO_PODS,
     timeoutMs: 150_000, // operator-set
+    cancelOnTimeout: true,
     legacySeq: 15,
     produces: 'video',
     stages: [],
@@ -239,9 +260,13 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     // Self-imposed: Lambda scales itself, but each render is ~11-17s and
     // costs, so this bounds how many frames are in flight at once.
     maxInFlight: 8,
-    // Not operator-specified. A synchronous Lambda render is ~11-17s/frame;
-    // this is the hang breaker, not a latency budget.
-    timeoutMs: 300_000,
+    // No timeout and no cancellation (operator, 2026-09-19): a synchronous
+    // Lambda invoke has no provider-side job to outlive or to cancel. A row
+    // left `submitted` because the invoking process died is still recovered,
+    // by the lambda branch of assets/agent.ts's reconcile — that is orphan
+    // recovery, not a timeout.
+    timeoutMs: null,
+    cancelOnTimeout: false,
     // The seq the cohort path's overlay output is read at.
     legacySeq: 16,
     produces: 'video',
@@ -263,9 +288,9 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_bgm',
     endpointId: endpointFor('runpod:bgm-s2t'),
     maxInFlight: podsFor('runpod:bgm-s2t'),
-    // Not operator-specified. ACE-Step generates one track for the whole
-    // project, so it is slower than a per-frame asset.
-    timeoutMs: 600_000,
+    // Same as MMAudio (operator, 2026-09-19).
+    timeoutMs: 150_000,
+    cancelOnTimeout: true,
     legacySeq: 5,
     produces: 'audio',
     stages: [],
@@ -289,11 +314,14 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_postprod_lite',
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
     maxInFlight: POSTPROD_LITE_PODS,
-    // A whole project's ffmpeg, not one frame's: minutes of merges plus a
-    // concat plus a Whisper caption pass over the full narration. Measured
-    // 2026-09-19 on a real 10-frame project: 33s execution. An hour is the
-    // hang breaker for a long-form project, not a target.
-    timeoutMs: 60 * 60_000,
+    // 900s, matching the pod's OWN execution limit (operator, 2026-09-19) —
+    // so this fires at the moment the worker has already given up, never
+    // before. Measured 2026-09-19 on a real 10-frame project: 33s.
+    //
+    // No cancel: the pod has already timed the request out by then, so the
+    // call could only fail. Resubmit straight away.
+    timeoutMs: 900_000,
+    cancelOnTimeout: false,
     legacySeq: 6,
     produces: 'video',
     stages: [],

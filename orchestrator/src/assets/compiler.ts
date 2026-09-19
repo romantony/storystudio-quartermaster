@@ -450,10 +450,15 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
   }
 
   // ── generating ────────────────────────────────────────────────────────
-  const state = classifyProjectAssets(pp.plan, frames, rows, Date.now(), // The agent enforces `timeoutMs` per request from `submitted_at`; this is
-    // only the backstop for rows no agent is watching (agent down, process
-    // restarted), so it waits a generous multiple before intervening.
-    (k) => assetSpec(k).timeoutMs * 4);
+  // The agent enforces `timeoutMs` per request from `submitted_at`; this is
+  // only the backstop for rows no agent is watching (agent down, process
+  // restarted), so it waits a generous multiple before intervening.
+  // `timeoutMs: null` (remotion, by design) stays out of the sweep entirely.
+  const stuckAfter = (k: AssetKind): number => {
+    const t = assetSpec(k).timeoutMs;
+    return t === null ? Number.POSITIVE_INFINITY : t * 4;
+  };
+  const state = classifyProjectAssets(pp.plan, frames, rows, Date.now(), stuckAfter);
 
   if (!state.generated) {
     const changed = await repair(deps, pp, state, rows);
@@ -463,6 +468,25 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
       action: changed ? 'repaired' : 'waiting',
       detail: `missing=${state.missing.length} stuck=${state.stuck.length} stranded=${state.strandedBlocked.length} working=${state.inProgress.length}`,
     };
+  }
+
+  // The project-level QA verdict decides whether assembly may start at all
+  // (migration 016). The compiler triggers on `passed` or `bypassed` only.
+  if (pp.qaStatus === 'failed') {
+    await finishPipelineProject(deps.pool, projectId, {
+      status: 'failed',
+      error: { reason: 'quality gate failed for this project', qa: pp.qaDetail },
+    });
+    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null });
+    log().error({ projectId, qa: pp.qaDetail }, 'compiler: project failed its quality gate, not assembling');
+    return { projectId, action: 'failed', detail: 'quality gate failed' };
+  }
+  if (pp.qaStatus !== 'passed' && pp.qaStatus !== 'bypassed') {
+    // Generation is finished but verdicts are still outstanding. The QA agent
+    // writes them within a tick or two; waiting here is the whole point of
+    // "only when the QA gate is clear can the compiler trigger postprod-lite".
+    await touchPipelineProject(deps.pool, projectId);
+    return { projectId, action: 'waiting', detail: `qa ${pp.qaStatus}` };
   }
 
   // Every frame-scoped asset has reached a terminal state. concat needs two

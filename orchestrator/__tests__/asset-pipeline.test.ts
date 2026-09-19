@@ -99,11 +99,16 @@ describe('the registry', () => {
   });
 
   it('gives postprod-lite a timeout sized for a whole project, not one frame', () => {
-    expect(ASSET_SPECS['postprod-lite'].timeoutMs).toBeGreaterThan(ASSET_SPECS['wan2-i2v'].timeoutMs);
+    expect(ASSET_SPECS['postprod-lite'].timeoutMs).toBeGreaterThan(ASSET_SPECS['wan2-i2v'].timeoutMs as number);
   });
 
-  it('every kind has a positive request timeout', () => {
-    for (const kind of ASSET_KINDS) expect(ASSET_SPECS[kind].timeoutMs).toBeGreaterThan(0);
+  it('every kind has a positive timeout, or opts out explicitly', () => {
+    for (const kind of ASSET_KINDS) {
+      const t = ASSET_SPECS[kind].timeoutMs;
+      // null is the deliberate opt-out (remotion), never an oversight.
+      if (t === null) expect(kind).toBe('remotion');
+      else expect(t).toBeGreaterThan(0);
+    }
   });
 });
 

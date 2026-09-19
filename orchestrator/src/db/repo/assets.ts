@@ -589,6 +589,43 @@ export async function listStaleUngated(db: Queryable, projectId: string, olderTh
   return rows.map(toAsset);
 }
 
+/**
+ * The gate state of every gated asset in one project — what the project-level
+ * QA verdict is computed from (migration 016).
+ */
+export async function projectGateState(
+  db: Queryable,
+  projectId: string,
+  gatedKinds: string[],
+): Promise<{ total: number; judged: number; exhausted: number; pendingKinds: string[] }> {
+  if (gatedKinds.length === 0) return { total: 0, judged: 0, exhausted: 0, pendingKinds: [] };
+  const { rows } = await db.query<{ asset_kind: string; status: string; quality_status: string | null; n: string }>(
+    `SELECT asset_kind, status, quality_status, count(*) AS n
+       FROM assets
+      WHERE project_id = $1 AND asset_kind = ANY($2::text[])
+      GROUP BY 1,2,3`,
+    [projectId, gatedKinds],
+  );
+  let total = 0;
+  let judged = 0;
+  let exhausted = 0;
+  const pending = new Set<string>();
+  for (const r of rows) {
+    const n = Number(r.n);
+    // A row that failed generation outright is not the gate's problem — it
+    // drops out of the project the same way it always did.
+    if (r.status === 'failed') continue;
+    total += n;
+    if (r.status === 'complete' && r.quality_status !== null) {
+      judged += n;
+      if (r.quality_status === 'exhausted') exhausted += n;
+    } else {
+      pending.add(r.asset_kind);
+    }
+  }
+  return { total, judged, exhausted, pendingKinds: [...pending] };
+}
+
 /** Per-kind counts for one project — what the compiler reports and the admin
  * dashboard reads. */
 export async function projectAssetCounts(

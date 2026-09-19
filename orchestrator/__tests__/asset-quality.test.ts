@@ -25,7 +25,7 @@ import {
   DEFAULT_LOCAL_THRESHOLDS,
   type FfmpegTransport,
 } from '../src/quality/local';
-import { combineVerdicts, correctedInput, gateOneAsset, runAssetQaTick, type AssetQualityDeps } from '../src/assets/quality';
+import { combineVerdicts, correctedInput, gateOneAsset, refreshProjectQa, runAssetQaTick, type AssetQualityDeps } from '../src/assets/quality';
 import { drawFor, salienceOf, shouldSampleForVlm, weightedProbability, DEFAULT_SAMPLING } from '../src/quality/sampling';
 import { compilePlan } from '../src/assets/plan';
 import { RequestSchema } from '../src/agents/planner';
@@ -440,6 +440,8 @@ describe('gateOneAsset', () => {
     (assetsRepo.gateAssetSkipped as jest.Mock).mockResolvedValue(true);
     (assetsRepo.gateAssetRework as jest.Mock).mockResolvedValue(true);
     (assetsRepo.resetDescendants as jest.Mock).mockResolvedValue(1);
+    (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 2, judged: 2, exhausted: 0, pendingKinds: [] });
+    (pipelineRepo.setProjectQa as jest.Mock).mockResolvedValue(undefined);
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue({ projectId: 'proj_1', plan: PLAN });
     (projectsRepo.getProject as jest.Mock).mockResolvedValue({ id: 'proj_1', request: { product: 'documentary' } });
   });
@@ -565,6 +567,59 @@ describe('correctedInput', () => {
     const { correction, input } = await correctedInput(baseDeps, row(), verdict, 'image');
     expect(correction).toBe('reseed-fallback');
     expect(input.imagePrompt).toBe('a lighthouse at dusk');
+  });
+});
+
+describe('refreshProjectQa', () => {
+  function d(over: Partial<AssetQualityDeps['cfg']> = {}): AssetQualityDeps {
+    return {
+      pool: { query: jest.fn(), connect: jest.fn() } as never,
+      cfg: { assetQa: 'full', assetQaBatchSize: 8, ...over } as AssetQualityDeps['cfg'],
+    };
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (pipelineRepo.setProjectQa as jest.Mock).mockResolvedValue(undefined);
+  });
+
+  it('is pending while any gated asset is unjudged — the compiler must wait', async () => {
+    (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 4, judged: 2, exhausted: 0, pendingKinds: ['wan2-i2v'] });
+    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('pending');
+    const [, , status, detail] = (pipelineRepo.setProjectQa as jest.Mock).mock.calls[0];
+    expect(status).toBe('pending');
+    expect(detail.waitingOn).toEqual(['wan2-i2v']);
+  });
+
+  it('passes once every gated asset is judged and acceptable', async () => {
+    (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 4, judged: 4, exhausted: 0, pendingKinds: [] });
+    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('passed');
+  });
+
+  it('fails the project when an asset exhausted its rework budget and still fails', async () => {
+    (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 4, judged: 4, exhausted: 1, pendingKinds: [] });
+    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('failed');
+    const [, , , detail] = (pipelineRepo.setProjectQa as jest.Mock).mock.calls[0];
+    expect(detail.exhausted).toBe(1);
+  });
+
+  it('bypasses when gating is switched off', async () => {
+    expect(await refreshProjectQa(d({ assetQa: 'off' }), 'proj_1', PLAN)).toBe('bypassed');
+    expect(assetsRepo.projectGateState).not.toHaveBeenCalled();
+  });
+
+  it('bypasses when no gated asset survived generation', async () => {
+    (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 0, judged: 0, exhausted: 0, pendingKinds: [] });
+    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('bypassed');
+  });
+
+  it('re-opens a passed project when a rework leaves work unjudged again', async () => {
+    (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 4, judged: 4, exhausted: 0, pendingKinds: [] });
+    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('passed');
+    // A rework cleared one verdict: recomputed from the rows, so it cannot
+    // stay stale at 'passed'.
+    (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 4, judged: 3, exhausted: 0, pendingKinds: ['qwen-image-gen'] });
+    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('pending');
   });
 });
 

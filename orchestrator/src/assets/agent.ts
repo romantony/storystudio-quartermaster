@@ -112,6 +112,11 @@ async function defaultSleep(ms: number): Promise<void> {
 
 const ENDPOINT_PAUSED_MAX_ATTEMPTS = 8;
 
+/** How long a synchronous Lambda row may sit `submitted` before it is treated
+ * as orphaned by a dead process. Not a timeout — `remotion` has none by
+ * design; this only recovers rows nobody is awaiting any more. */
+const LAMBDA_ORPHAN_RECOVERY_MS = 600_000;
+
 function isEndpointPausedRace(err: unknown): boolean {
   return (
     err instanceof RunpodError &&
@@ -482,7 +487,7 @@ async function timeoutAndResubmit(deps: AssetAgentDeps, kind: AssetKind, row: As
   const spec = assetSpec(kind);
   const outstandingMs = Date.now() - (row.submittedAt?.getTime() ?? Date.now());
 
-  if (row.providerJobId && spec.provider === 'runpod') {
+  if (spec.cancelOnTimeout && row.providerJobId && spec.provider === 'runpod') {
     try {
       await deps.runpod.cancel(spec.endpointId, row.providerJobId);
     } catch (err) {
@@ -516,17 +521,24 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
   let timedOut = 0;
   for (const row of stale) {
     // Timeout first: if the request has outrun its budget there is nothing to
-    // learn from polling it again.
-    if (row.submittedAt && Date.now() - row.submittedAt.getTime() > spec.timeoutMs) {
+    // learn from polling it again. `timeoutMs: null` (remotion) opts out.
+    if (spec.timeoutMs !== null && row.submittedAt && Date.now() - row.submittedAt.getTime() > spec.timeoutMs) {
       timedOut += 1;
       if (!(await timeoutAndResubmit(deps, kind, row))) failed += 1;
       continue;
     }
     if (spec.provider === 'lambda') {
-      // A Lambda invoke is synchronous: a row still `submitted` past the
-      // reconcile window means this process died mid-render, and there is no
-      // job id to ask anyone about. Requeue it — the render is deterministic,
-      // so a second one produces the same frame.
+      // ORPHAN RECOVERY, not a timeout. A Lambda invoke is synchronous, so a
+      // row still `submitted` long after it started means the invoking
+      // process died mid-render — there is no job id to ask anyone about and
+      // nothing to cancel. Requeue it; the render is deterministic, so a
+      // second one produces the same frame.
+      //
+      // The window is generous on purpose: reconcile's own 60s would requeue
+      // a render that is merely slow (measured ~11-17s/frame, but a heavy
+      // frame could exceed it) and pay for it twice.
+      const startedAt = row.submittedAt?.getTime() ?? 0;
+      if (Date.now() - startedAt < LAMBDA_ORPHAN_RECOVERY_MS) continue;
       const outcome = await applyAssetFailure(deps, row.id, kind, {
         provider: 'lambda',
         error: 'no completion recorded — the invoking process probably died mid-render',

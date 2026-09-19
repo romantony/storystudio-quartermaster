@@ -46,13 +46,14 @@ import { log } from '../telemetry/log';
 import { assetSpec, type AssetKind } from './kinds';
 import { resolveHandoffs } from './agent';
 import type { AssetPlan } from './plan';
-import { getPipelineProject } from '../db/repo/pipeline';
+import { getPipelineProject, setProjectQa, type ProjectQaStatus } from '../db/repo/pipeline';
 import { getProject } from '../db/repo/projects';
 import {
   gateAssetPass,
   gateAssetRework,
   gateAssetSkipped,
   listUngatedAssets,
+  projectGateState,
   resetDescendants,
   ASSET_QUALITY_ATTEMPTS_HARD_CAP,
   type AssetRow,
@@ -347,6 +348,51 @@ export async function gateOneAsset(
   return 'rework';
 }
 
+/**
+ * The project-level verdict the compiler reads (migration 016). Recomputed
+ * from the asset rows after every gate decision rather than accumulated, so
+ * it can never drift from them — and so a rework correctly re-opens a project
+ * that had already passed.
+ *
+ *   bypassed  nothing to judge: gating off, no gated kinds in the plan, or a
+ *             product Remotion renders deterministically
+ *   pending   verdicts still outstanding
+ *   failed    a gated asset exhausted its rework budget and is still bad
+ *   passed    every gated asset judged and acceptable
+ */
+export async function refreshProjectQa(
+  deps: AssetQualityDeps,
+  projectId: string,
+  plan: AssetPlan,
+  opts: { sampledOut?: boolean } = {},
+): Promise<ProjectQaStatus> {
+  const gatedKinds = plan.frameKinds.filter((k) => assetSpec(k).gate !== null);
+  if (deps.cfg.assetQa === 'off' || gatedKinds.length === 0) {
+    await setProjectQa(deps.pool, projectId, 'bypassed', { reason: deps.cfg.assetQa === 'off' ? 'gating disabled' : 'no gated kinds' });
+    return 'bypassed';
+  }
+
+  const st = await projectGateState(deps.pool, projectId, gatedKinds);
+  if (st.total === 0) {
+    await setProjectQa(deps.pool, projectId, 'bypassed', { reason: 'no gated assets survived generation' });
+    return 'bypassed';
+  }
+  if (st.judged < st.total) {
+    await setProjectQa(deps.pool, projectId, 'pending', { judged: st.judged, total: st.total, waitingOn: st.pendingKinds });
+    return 'pending';
+  }
+  if (st.exhausted > 0) {
+    await setProjectQa(deps.pool, projectId, 'failed', {
+      reason: 'assets exhausted their rework budget and still fail the gate',
+      exhausted: st.exhausted,
+      total: st.total,
+    });
+    return 'failed';
+  }
+  await setProjectQa(deps.pool, projectId, 'passed', { judged: st.judged, total: st.total, ...(opts.sampledOut ? { note: 'some assets not VLM-sampled' } : {}) });
+  return 'passed';
+}
+
 export interface QaTickSummary {
   kind: AssetKind;
   judged: number;
@@ -359,6 +405,7 @@ export interface QaTickSummary {
 export async function runAssetQaTick(deps: AssetQualityDeps, kind: AssetKind): Promise<QaTickSummary> {
   const summary: QaTickSummary = { kind, judged: 0, passed: 0, reworked: 0, exhausted: 0 };
   const rows = await listUngatedAssets(deps.pool, kind, deps.cfg.assetQaBatchSize);
+  const touched = new Set<string>();
   for (const row of rows) {
     try {
       const plan = (await getPipelineProject(deps.pool, row.projectId))?.plan;
@@ -375,10 +422,20 @@ export async function runAssetQaTick(deps: AssetQualityDeps, kind: AssetKind): P
       if (outcome === 'pass') summary.passed += 1;
       if (outcome === 'rework') summary.reworked += 1;
       if (outcome === 'exhausted') summary.exhausted += 1;
+      touched.add(row.projectId);
     } catch (err) {
       // One unjudgeable asset must never stop the queue; it stays ungated and
       // comes round again next tick.
       log().error({ assetId: row.id, kind, err }, 'asset-qa: gating one asset crashed');
+    }
+  }
+  // One recompute per project, after its assets are judged — never per asset.
+  for (const projectId of touched) {
+    try {
+      const plan = (await getPipelineProject(deps.pool, projectId))?.plan;
+      if (plan) await refreshProjectQa(deps, projectId, plan);
+    } catch (err) {
+      log().error({ projectId, err }, 'asset-qa: failed to refresh the project verdict');
     }
   }
   if (summary.judged > 0) log().info(summary, 'asset-qa: tick');

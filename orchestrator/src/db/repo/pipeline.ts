@@ -13,9 +13,15 @@ type Queryable = Pick<Pool | PoolClient, 'query'>;
 
 export type PipelineStatus = 'generating' | 'assembling' | 'completed' | 'partial' | 'failed';
 
+/** The project-level QA verdict (migration 016). The compiler assembles on
+ * `passed` or `bypassed` only; `failed` is terminal. */
+export type ProjectQaStatus = 'pending' | 'passed' | 'bypassed' | 'failed';
+
 export interface PipelineProject {
   projectId: string;
   status: PipelineStatus;
+  qaStatus: ProjectQaStatus;
+  qaDetail: unknown;
   plan: AssetPlan;
   expectedAssets: number;
   manifest: unknown;
@@ -31,15 +37,17 @@ export interface PipelineProject {
   updatedAt: Date;
 }
 
-const COLUMNS = `project_id, status, plan, expected_assets, manifest, manifest_url, tail_stage,
-                 tail_job_id, final_url, attempts, last_error, started_at, assembling_at,
-                 completed_at, updated_at`;
+const COLUMNS = `project_id, status, qa_status, qa_detail, plan, expected_assets, manifest,
+                 manifest_url, tail_stage, tail_job_id, final_url, attempts, last_error,
+                 started_at, assembling_at, completed_at, updated_at`;
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 function toPipeline(row: any): PipelineProject {
   return {
     projectId: row.project_id,
     status: row.status,
+    qaStatus: row.qa_status ?? 'pending',
+    qaDetail: row.qa_detail ?? {},
     plan: row.plan,
     expectedAssets: row.expected_assets,
     manifest: row.manifest,
@@ -146,6 +154,27 @@ export async function returnToGenerating(db: Queryable, projectId: string, error
             last_error = $2, updated_at = now()
       WHERE project_id = $1`,
     [projectId, error],
+  );
+}
+
+/**
+ * The QA agent's project-level verdict. Written on every gate decision, so an
+ * operator can answer "why has this not assembled" from the table rather than
+ * the logs. Only ever moves away from a terminal value to re-open: a rework
+ * puts a passed project back to `pending`, which is correct — it has
+ * unjudged work again.
+ */
+export async function setProjectQa(
+  db: Queryable,
+  projectId: string,
+  qaStatus: ProjectQaStatus,
+  detail: unknown,
+): Promise<void> {
+  await db.query(
+    `UPDATE pipeline_projects
+        SET qa_status = $2, qa_detail = $3, updated_at = now()
+      WHERE project_id = $1 AND (qa_status IS DISTINCT FROM $2 OR qa_detail IS DISTINCT FROM $3::jsonb)`,
+    [projectId, qaStatus, JSON.stringify(detail ?? {})],
   );
 }
 

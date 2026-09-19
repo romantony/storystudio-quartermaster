@@ -122,6 +122,11 @@ function pipelineRow(plan: ReturnType<typeof compilePlan>, over: Record<string, 
   return {
     projectId: 'proj_1',
     status: 'generating',
+    // The compiler assembles on 'passed' or 'bypassed' only (migration 016);
+    // the QA agent writes it. Default the fixture to a cleared gate so each
+    // test exercises what it is actually about.
+    qaStatus: 'passed',
+    qaDetail: {},
     plan,
     manifest: null,
     manifestUrl: null,
@@ -195,7 +200,7 @@ describe('while generating', () => {
     // watching; the agent enforces the real timeout itself. Measured from
     // submitted_at, never updated_at — polling touches updated_at, so a clock
     // based on it could never age (real bug, 2026-09-19).
-    const stale = new Date(Date.now() - ASSET_SPECS['wan2-i2v'].timeoutMs * 5);
+    const stale = new Date(Date.now() - (ASSET_SPECS['wan2-i2v'].timeoutMs as number) * 5);
     const rows = generatedProject(request()).map((r) =>
       r.kind === 'wan2-i2v' && r.frameId === 'f1'
         ? assetRow({ ...r, status: 'submitted', providerJobId: 'rp-wedged', submittedAt: stale, updatedAt: new Date() })
@@ -263,6 +268,54 @@ describe('while generating', () => {
     expect(assetsRepo.insertAssets).toHaveBeenCalledWith(
       expect.anything(), [expect.objectContaining({ kind: 'tts', frameId: 'f2', seq: 1 })],
     );
+  });
+});
+
+describe('the project quality gate', () => {
+  it('will not arm the tail while the project verdict is still pending', async () => {
+    const plan = compilePlan(request());
+    (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan, { qaStatus: 'pending' }));
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
+
+    const res = await compileProject(deps(), 'proj_1');
+
+    expect(res.action).toBe('waiting');
+    expect(res.detail).toBe('qa pending');
+    expect(assetsRepo.armProjectAsset).not.toHaveBeenCalled();
+  });
+
+  it('assembles on a bypassed verdict, same as passed', async () => {
+    const plan = compilePlan(request());
+    let manifest: unknown = null;
+    (assetsRepo.armProjectAsset as jest.Mock).mockResolvedValue(true);
+    (pipelineRepo.beginAssembly as jest.Mock).mockImplementation(async (_c: unknown, _p: string, m: unknown) => { manifest = m; return true; });
+    (pipelineRepo.getPipelineProject as jest.Mock).mockImplementation(async () =>
+      manifest
+        ? pipelineRow(plan, { status: 'assembling', manifest, qaStatus: 'bypassed', attempts: 1 })
+        : pipelineRow(plan, { qaStatus: 'bypassed' }));
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
+
+    const res = await compileProject(deps(), 'proj_1');
+    expect(res.action).toBe('armed');
+  });
+
+  it('finishes the project rather than hanging when the gate failed', async () => {
+    const plan = compilePlan(request());
+    (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(
+      pipelineRow(plan, { qaStatus: 'failed', qaDetail: { exhausted: 2 } }),
+    );
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
+
+    const res = await compileProject(deps(), 'proj_1');
+
+    expect(res.action).toBe('failed');
+    expect(res.detail).toBe('quality gate failed');
+    // Terminal, not a wait: a project that can never clear its gate must not
+    // sit in `generating` forever.
+    expect(pipelineRepo.finishPipelineProject).toHaveBeenCalledWith(
+      expect.anything(), 'proj_1', expect.objectContaining({ status: 'failed' }),
+    );
+    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(expect.anything(), 'proj_1', { status: 'failed', finalUrl: null });
   });
 });
 

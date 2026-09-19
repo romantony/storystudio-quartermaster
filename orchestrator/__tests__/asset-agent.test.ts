@@ -360,7 +360,7 @@ describe('completion', () => {
 describe('request timeouts', () => {
   it('cancels and resubmits a request that outran its kind\u2019s timeout', async () => {
     const spec = ASSET_SPECS['qwen-image-gen'];
-    const submittedAt = new Date(Date.now() - spec.timeoutMs - 5_000);
+    const submittedAt = new Date(Date.now() - (spec.timeoutMs as number) - 5_000);
     (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
       row({ id: 300, status: 'submitted', providerJobId: 'rp-wedged', submittedAt }),
     ]);
@@ -380,7 +380,7 @@ describe('request timeouts', () => {
   it('resubmits even when the provider refuses the cancel', async () => {
     const spec = ASSET_SPECS.tts;
     (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
-      row({ id: 301, kind: 'tts', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-gone', submittedAt: new Date(Date.now() - spec.timeoutMs - 1_000) }),
+      row({ id: 301, kind: 'tts', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-gone', submittedAt: new Date(Date.now() - (spec.timeoutMs as number) - 1_000) }),
     ]);
     (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
     // A 404 on cancel is the common case — the job was already gone.
@@ -405,6 +405,24 @@ describe('request timeouts', () => {
     expect(summary.timedOut).toBe(0);
     expect(assetsRepo.reworkAsset).not.toHaveBeenCalled();
     expect((fetchImpl.mock.calls[0] as unknown as string[])[0]).toContain('/status/rp-running');
+  });
+
+  it('exempts remotion from timeouts and cancellation entirely', () => {
+    // A synchronous Lambda invoke has no provider-side job to outlive or to
+    // cancel (operator, 2026-09-19). Orphan recovery still applies.
+    expect(ASSET_SPECS.remotion.timeoutMs).toBeNull();
+    expect(ASSET_SPECS.remotion.cancelOnTimeout).toBe(false);
+  });
+
+  it('times postprod-lite out at the pod\u2019s own limit, without cancelling', () => {
+    // The pod enforces 900s itself, so by the time this fires the request is
+    // already over — a cancel could only fail.
+    expect(ASSET_SPECS['postprod-lite'].timeoutMs).toBe(900_000);
+    expect(ASSET_SPECS['postprod-lite'].cancelOnTimeout).toBe(false);
+  });
+
+  it('gives bgm the same budget as mmaudio', () => {
+    expect(ASSET_SPECS.bgm.timeoutMs).toBe(ASSET_SPECS.mmaudio.timeoutMs);
   });
 
   it('carries the operator\u2019s timeout budgets', () => {
