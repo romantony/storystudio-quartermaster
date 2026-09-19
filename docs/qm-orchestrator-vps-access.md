@@ -48,10 +48,25 @@ Everything is Docker Compose under `/opt/qm-orchestrator/`:
 ```
 /opt/qm-orchestrator/
 ├── .env                 # PGUSER/PGPASSWORD/PGDATABASE, ORCH_INGEST_TOKEN, ORCH_WEBHOOK_SECRET  (chmod 600, not in git)
-├── docker-compose.yml
-├── caddy/Caddyfile
+├── docker-compose.yml   # copy of orchestrator/deploy/docker-compose.yml — see §3
+├── caddy/Caddyfile      # STILL box-only, not in git
 └── repo/                # full monorepo clone (git remote = public GitHub)
 ```
+
+**`docker-compose.yml` is version-controlled as of 2026-09-19** — the canonical
+copy is `orchestrator/deploy/docker-compose.yml`, and the file on the box is a
+copy of it. It is not symlinked out of `repo/` because its relative paths
+(`./repo/orchestrator`, `./caddy/Caddyfile`) resolve against the directory the
+file sits in.
+
+Why it matters: the compose file decides which env vars each container can
+see, so a key added to `src/config.ts` does nothing until it is forwarded here.
+That cost a real outage on 2026-09-19 — the diagnostic assistant moved from the
+Anthropic API to Replicate, the `watchdog` service was still forwarding only
+`ANTHROPIC_API_KEY`, and the feature hit its "no token = off" gate and went
+silent with no error and no log line.
+
+`caddy/Caddyfile` has the same loss risk and is **not** in git yet.
 
 | Service | Image | Ports | Notes |
 |---|---|---|---|
@@ -71,11 +86,25 @@ The orchestrator image is built on the box from the checked-out repo. Migrations
 ```sh
 cd /opt/qm-orchestrator
 git -C repo pull
-docker compose build orchestrator
+
+# Compose drift check — empty output means the box matches the repo. If it
+# differs, the repo is canonical: copy it into place before building, or the
+# containers run with an env set nobody reviewed.
+diff docker-compose.yml repo/orchestrator/deploy/docker-compose.yml \
+  || cp repo/orchestrator/deploy/docker-compose.yml docker-compose.yml
+
+docker compose build orchestrator watchdog                           # both share the image
 docker compose run --rm orchestrator node dist/db/migrate.js up      # apply any new migrations
-docker compose up -d orchestrator                                    # roll the service
+docker compose up -d orchestrator watchdog                           # roll both services
 curl -s https://orchestrator.ai-storystudio.com/v1/health && echo
 ```
+
+Take a dump before applying migrations (§5) — they are the only irreversible
+step here.
+
+**Adding a config key** is a two-part change: `src/config.ts` AND the relevant
+service's `environment:` block in `orchestrator/deploy/docker-compose.yml`.
+Miss the second and the process silently uses the default.
 
 Migration runner (`node dist/db/migrate.js …`), always via `docker compose run --rm orchestrator`:
 

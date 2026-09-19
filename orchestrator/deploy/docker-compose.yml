@@ -1,0 +1,124 @@
+# The VPS's Docker Compose stack, verbatim.
+#
+# CANONICAL COPY. The live file is /opt/qm-orchestrator/docker-compose.yml on
+# orchestrator.ai-storystudio.com; this is the version-controlled original and
+# the two must be kept identical — see docs/qm-orchestrator-vps-access.md §3
+# for the copy-into-place step and the drift check.
+#
+# It lived only on the box until 2026-09-19, which cost a real outage: the
+# diagnostic assistant was switched from the Anthropic API to Replicate, and
+# the watchdog service here was still passing only ANTHROPIC_API_KEY. The
+# feature hit its "no token = off" gate and went silent — no error, no log
+# line, indistinguishable from working. Anything this file does not forward is
+# invisible to the process, so adding a config key to src/config.ts is only
+# half the change.
+#
+# NO SECRETS HERE. Every value is a ${VAR} reference resolved from
+# /opt/qm-orchestrator/.env (chmod 600, never in git). Keep it that way.
+#
+# Relative paths (./repo/orchestrator, ./caddy/Caddyfile) resolve against the
+# directory the file sits in, which is why the live copy stays at
+# /opt/qm-orchestrator/ rather than being symlinked out of the checkout.
+
+name: qm-orchestrator
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PGUSER}
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_DB: ${PGDATABASE}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${PGUSER} -d $${PGDATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  orchestrator:
+    build: { context: ./repo/orchestrator }
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://${PGUSER}:${PGPASSWORD}@db:5432/${PGDATABASE}
+      ORCH_INGEST_TOKEN: ${ORCH_INGEST_TOKEN}
+      ORCH_WEBHOOK_SECRET: ${ORCH_WEBHOOK_SECRET}
+      ORCH_ADMIN_TOKEN: ${ORCH_ADMIN_TOKEN}
+      ORCH_PUBLIC_BASE_URL: ${ORCH_PUBLIC_BASE_URL}
+      RUNPOD_API_KEY: ${RUNPOD_API_KEY}
+      ORCH_WORKERS_HEAD: ${ORCH_WORKERS_HEAD}
+      ORCH_WORKERS_TAIL: ${ORCH_WORKERS_TAIL}
+      ORCH_FLEET_LIVE: ${ORCH_FLEET_LIVE}
+      REPLICATE_API_TOKEN: ${REPLICATE_API_TOKEN}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY}
+      ORCH_SCHEDULING_MODE: ${ORCH_SCHEDULING_MODE}
+      ORCH_WINDOW_CUTOFF_MINUTES: ${ORCH_WINDOW_CUTOFF_MINUTES}
+      # Diagnostic assistant (src/diagnostics/diagnose.ts) — result/finalize.ts
+      # triggers it too, not just the watchdog.
+      ORCH_DIAGNOSTICS_MODEL: ${ORCH_DIAGNOSTICS_MODEL:-anthropic/claude-sonnet-5}
+      ORCH_DIAGNOSTICS_EFFORT: ${ORCH_DIAGNOSTICS_EFFORT:-low}
+      # Asset pipeline (src/assets/, migrations 013-015). Defaults reproduce
+      # today's behaviour exactly: 'cohort' keeps the window/step-graph model,
+      # and the per-asset agents never start. Flipping ORCH_PIPELINE_MODE in
+      # .env is the whole rollout switch — but only because it is forwarded
+      # here. See orchestrator/src/assets/README.md.
+      ORCH_PIPELINE_MODE: ${ORCH_PIPELINE_MODE:-cohort}
+      ORCH_ASSET_TICK_MS: ${ORCH_ASSET_TICK_MS:-5000}
+      ORCH_COMPILER_TICK_MS: ${ORCH_COMPILER_TICK_MS:-30000}
+      ORCH_ASSET_DISPATCH_BATCH_SIZE: ${ORCH_ASSET_DISPATCH_BATCH_SIZE:-4}
+      ORCH_ASSET_RECONCILE_AFTER_MS: ${ORCH_ASSET_RECONCILE_AFTER_MS:-60000}
+      # Quality gate. The free local (ffmpeg) tier runs on every gated asset;
+      # the sample rate applies only to the paid Replicate VLM call.
+      ORCH_ASSET_QA: ${ORCH_ASSET_QA:-full}
+      ORCH_ASSET_QA_TICK_MS: ${ORCH_ASSET_QA_TICK_MS:-10000}
+      ORCH_ASSET_QA_BATCH_SIZE: ${ORCH_ASSET_QA_BATCH_SIZE:-8}
+      ORCH_ASSET_QA_SAMPLE_RATE: ${ORCH_ASSET_QA_SAMPLE_RATE:-0.3}
+      ORCH_ASSET_QA_MOTION_WEIGHT: ${ORCH_ASSET_QA_MOTION_WEIGHT:-2.5}
+      ORCH_ASSET_QA_STATIC_WEIGHT: ${ORCH_ASSET_QA_STATIC_WEIGHT:-0.4}
+      # The `remotion` agent invokes this Lambda directly (the one non-RunPod
+      # agent); credentials come from AWS_* above.
+      REMOTION_LAMBDA_FUNCTION_NAME: ${REMOTION_LAMBDA_FUNCTION_NAME:-QM-remotion-overlay}
+      REMOTION_LAMBDA_REGION: ${REMOTION_LAMBDA_REGION:-us-east-1}
+    expose: ["8080"]
+    ports: ["127.0.0.1:8080:8080"]
+  watchdog:
+    build: { context: ./repo/orchestrator }
+    command: ["node", "dist/watchdog.js"]
+    restart: unless-stopped
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://${PGUSER}:${PGPASSWORD}@db:5432/${PGDATABASE}
+      ORCH_INGEST_TOKEN: ${ORCH_INGEST_TOKEN}
+      ORCH_WEBHOOK_SECRET: ${ORCH_WEBHOOK_SECRET}
+      ORCH_ADMIN_TOKEN: ${ORCH_ADMIN_TOKEN}
+      ORCH_PUBLIC_BASE_URL: ${ORCH_PUBLIC_BASE_URL}
+      RUNPOD_API_KEY: ${RUNPOD_API_KEY}
+      WATCHDOG_AUTODRAIN: ${WATCHDOG_AUTODRAIN}
+      # The read-only diagnostic assistant reaches Sonnet 5 through Replicate
+      # (2026-09-19). Unset REPLICATE_API_TOKEN = the feature is off.
+      REPLICATE_API_TOKEN: ${REPLICATE_API_TOKEN}
+      ORCH_DIAGNOSTICS_MODEL: ${ORCH_DIAGNOSTICS_MODEL:-anthropic/claude-sonnet-5}
+      ORCH_DIAGNOSTICS_EFFORT: ${ORCH_DIAGNOSTICS_EFFORT:-low}
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [orchestrator]
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  pgdata: {}
+  caddy_data: {}
+  caddy_config: {}
