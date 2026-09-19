@@ -114,6 +114,10 @@ services:
     restart: unless-stopped
     depends_on: [orchestrator]
     ports: ["80:80", "443:443"]
+    environment:
+      # Let's Encrypt contact address. Kept out of the Caddyfile because this
+      # repository is public — see deploy/caddy/Caddyfile.
+      ACME_EMAIL: ${ACME_EMAIL}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

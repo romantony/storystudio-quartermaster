@@ -1,0 +1,31 @@
+# Caddy config for orchestrator.ai-storystudio.com — TLS termination and
+# reverse proxy in front of the orchestrator container.
+#
+# CANONICAL COPY. The live file is /opt/qm-orchestrator/caddy/Caddyfile; the
+# two must be kept identical — see docs/qm-orchestrator-vps-access.md §3.
+#
+# The ACME contact address is read from the environment rather than written
+# here: this repository is public, and a contact email in git history is
+# scrapeable and effectively permanent. It is set as ACME_EMAIL in
+# /opt/qm-orchestrator/.env (chmod 600, not in git) and forwarded to the caddy
+# service by orchestrator/deploy/docker-compose.yml. `{$VAR}` is Caddy's own
+# environment placeholder, substituted when the config is parsed.
+#
+# The fallback is load-bearing, not decoration: `email` with no argument is a
+# PARSE ERROR, so a bare `{$ACME_EMAIL}` would take TLS down on the next
+# restart if the .env line were ever missing — a terrible failure mode for the
+# public entrypoint. With a default the config always parses; the real contact
+# still comes from .env. Caught by `caddy validate` on 2026-09-19 before it
+# ever reached a running proxy.
+{
+    email {$ACME_EMAIL:noreply@ai-storystudio.com}
+}
+orchestrator.ai-storystudio.com {
+    reverse_proxy orchestrator:8080
+    encode zstd gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        -Server
+    }
+}

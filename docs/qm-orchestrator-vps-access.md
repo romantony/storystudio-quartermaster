@@ -49,7 +49,7 @@ Everything is Docker Compose under `/opt/qm-orchestrator/`:
 /opt/qm-orchestrator/
 ├── .env                 # PGUSER/PGPASSWORD/PGDATABASE, ORCH_INGEST_TOKEN, ORCH_WEBHOOK_SECRET  (chmod 600, not in git)
 ├── docker-compose.yml   # copy of orchestrator/deploy/docker-compose.yml — see §3
-├── caddy/Caddyfile      # STILL box-only, not in git
+├── caddy/Caddyfile      # copy of orchestrator/deploy/caddy/Caddyfile — see §3
 └── repo/                # full monorepo clone (git remote = public GitHub)
 ```
 
@@ -66,7 +66,14 @@ Anthropic API to Replicate, the `watchdog` service was still forwarding only
 `ANTHROPIC_API_KEY`, and the feature hit its "no token = off" gate and went
 silent with no error and no log line.
 
-`caddy/Caddyfile` has the same loss risk and is **not** in git yet.
+`caddy/Caddyfile` is version-controlled too, at
+`orchestrator/deploy/caddy/Caddyfile`. Its ACME contact address is **not** in
+git — this repository is public, and a contact email in git history is
+scrapeable and permanent — so it reads `{$ACME_EMAIL}` from the environment,
+set in `.env` and forwarded to the caddy service by the compose file. The
+placeholder carries a non-personal default because `email` with no argument is
+a parse error, which would otherwise take TLS down on a restart if that .env
+line ever went missing.
 
 | Service | Image | Ports | Notes |
 |---|---|---|---|
@@ -92,6 +99,12 @@ git -C repo pull
 # containers run with an env set nobody reviewed.
 diff docker-compose.yml repo/orchestrator/deploy/docker-compose.yml \
   || cp repo/orchestrator/deploy/docker-compose.yml docker-compose.yml
+diff caddy/Caddyfile repo/orchestrator/deploy/caddy/Caddyfile \
+  || cp repo/orchestrator/deploy/caddy/Caddyfile caddy/Caddyfile
+
+# Changing the Caddyfile: ALWAYS validate before rolling — a parse error stops
+# Caddy, which is the public entrypoint.
+#   docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 docker compose build orchestrator watchdog                           # both share the image
 docker compose run --rm orchestrator node dist/db/migrate.js up      # apply any new migrations
