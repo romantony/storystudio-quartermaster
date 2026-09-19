@@ -589,9 +589,16 @@ export async function reworkAsset(db: Queryable, id: number, kind: AssetKind, re
  */
 export async function listStaleUngated(db: Queryable, projectId: string, olderThan: Date): Promise<AssetRow[]> {
   const { rows } = await db.query(
+    // GREATEST(completed_at, updated_at), not completed_at alone: the grace
+    // window must measure how long the asset has been WAITING FOR A VERDICT,
+    // not how long ago it was generated. An asset re-queued for QA — by a
+    // rework, or by an operator clearing a verdict — keeps its original
+    // completed_at, so a completed_at clock would treat it as instantly
+    // overdue and release it unjudged. That happened live on 2026-09-19 and
+    // bypassed the gate on a whole project.
     `SELECT ${COLUMNS} FROM assets
       WHERE project_id = $1 AND status = 'complete' AND quality_status IS NULL
-        AND completed_at < $2`,
+        AND GREATEST(completed_at, updated_at) < $2`,
     [projectId, olderThan],
   );
   return rows.map(toAsset);
