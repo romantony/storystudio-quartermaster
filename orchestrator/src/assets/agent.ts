@@ -44,6 +44,7 @@ import {
   failOrRetryAsset,
   listStaleSubmitted,
   markSubmitted,
+  reworkAsset,
   touchAsset,
   PROJECT_SCOPE,
   type AssetRow,
@@ -84,6 +85,8 @@ export interface TickSummary {
   submitted: number;
   completed: number;
   failed: number;
+  /** Requests cancelled and resubmitted for outrunning `timeoutMs`. */
+  timedOut: number;
   inFlight: number;
   skippedNoRoom: boolean;
 }
@@ -267,22 +270,28 @@ export async function applyAssetSuccess(
       return 'advanced';
     }
 
-    // A gated kind completes WITHOUT handing off: assets/quality.ts judges it
-    // first and only a passing verdict releases the downstream rows. Spending
-    // a Wan2 job on a rejected still is the waste gating exists to prevent.
-    const gated = spec.gate !== null;
-    const handoffs = plan && !gated ? resolveHandoffs(plan, kind, row.input) : [];
+    // QA does NOT gate the handoff (operator's call, 2026-09-19): downstream
+    // generation starts immediately and the quality verdict lands in
+    // parallel. What the verdict gates is ASSEMBLY — assets/compiler.ts will
+    // not compile a project until every gated asset has one.
+    //
+    // The trade is explicit: a rejected still may already have cost a Wan2
+    // job by the time QA rejects it. assets/quality.ts's rework then resets
+    // that frame's descendants so the clip is regenerated from the corrected
+    // image, rather than shipping a clip made from a rejected frame.
+    const handoffs = plan ? resolveHandoffs(plan, kind, row.input) : [];
     await completeAsset(
       client,
       { id: assetId, kind, projectId: row.project_id, frameId: row.frame_id, seq: row.seq },
       { output, assetUrl: url, durationS },
       handoffs,
-      gated,
+      // `gated` here means "defer the handoff", which nothing does any more.
+      false,
     );
     await client.query('COMMIT');
     log().info(
-      { assetId, kind, projectId: row.project_id, frameId: row.frame_id, url, gated, handoff: handoffs.map((h) => h.kind) },
-      gated ? 'asset-agent: complete, awaiting the quality gate' : 'asset-agent: complete, handed off',
+      { assetId, kind, projectId: row.project_id, frameId: row.frame_id, url, handoff: handoffs.map((h) => h.kind) },
+      'asset-agent: complete, handed off',
     );
     return 'completed';
   } catch (err) {
@@ -458,13 +467,61 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
   }
 }
 
-/** The reconcile scan — the fallback for a webhook that never arrived. */
-async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ completed: number; failed: number }> {
+/**
+ * Cancel a request that has outrun its kind's `timeoutMs` and put it back in
+ * the queue. The operator's numbers (2026-09-19) are tight on purpose — 150s
+ * covers a cold qwen pod (~120s) with headroom, 300s covers Wan2 — because a
+ * timeout costs one duplicate job while a wedged request costs the project.
+ *
+ * Cancel first, best-effort: RunPod may have already finished it, lost it, or
+ * never started it, and none of those should stop the resubmission. Bounded
+ * by the same `reworks` budget as any other requeue, so a request that times
+ * out forever eventually fails instead of looping.
+ */
+async function timeoutAndResubmit(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): Promise<boolean> {
+  const spec = assetSpec(kind);
+  const outstandingMs = Date.now() - (row.submittedAt?.getTime() ?? Date.now());
+
+  if (row.providerJobId && spec.provider === 'runpod') {
+    try {
+      await deps.runpod.cancel(spec.endpointId, row.providerJobId);
+    } catch (err) {
+      // Already gone is the common case and exactly what we wanted.
+      log().warn({ assetId: row.id, kind, err }, 'asset-agent: cancel of a timed-out request failed, resubmitting anyway');
+    }
+  }
+
+  const requeued = await reworkAsset(deps.pool, row.id, kind, {
+    reason: 'timeout',
+    outstandingMs,
+    timeoutMs: spec.timeoutMs,
+    providerJobId: row.providerJobId,
+  });
+  log().warn(
+    { assetId: row.id, kind, frameId: row.frameId, outstandingMs, timeoutMs: spec.timeoutMs, requeued },
+    requeued
+      ? 'asset-agent: request timed out, cancelled and resubmitted'
+      : 'asset-agent: request timed out and the rework budget is exhausted, failed',
+  );
+  return requeued;
+}
+
+/** The reconcile scan — the fallback for a webhook that never arrived, and
+ * where each kind's request timeout is enforced. */
+async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ completed: number; failed: number; timedOut: number }> {
   const spec = assetSpec(kind);
   const stale = await listStaleSubmitted(deps.pool, kind, new Date(Date.now() - deps.cfg.assetReconcileAfterMs));
   let completed = 0;
   let failed = 0;
+  let timedOut = 0;
   for (const row of stale) {
+    // Timeout first: if the request has outrun its budget there is nothing to
+    // learn from polling it again.
+    if (row.submittedAt && Date.now() - row.submittedAt.getTime() > spec.timeoutMs) {
+      timedOut += 1;
+      if (!(await timeoutAndResubmit(deps, kind, row))) failed += 1;
+      continue;
+    }
     if (spec.provider === 'lambda') {
       // A Lambda invoke is synchronous: a row still `submitted` past the
       // reconcile window means this process died mid-render, and there is no
@@ -509,7 +566,7 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
       }
     }
   }
-  return { completed, failed };
+  return { completed, failed, timedOut };
 }
 
 /**
@@ -520,7 +577,7 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
  */
 export async function runAssetAgentTick(deps: AssetAgentDeps, kind: AssetKind): Promise<TickSummary> {
   const spec = assetSpec(kind);
-  const { completed, failed } = await reconcile(deps, kind);
+  const { completed, failed, timedOut } = await reconcile(deps, kind);
 
   // The pod limit is per ENDPOINT, not per kind: `animation` and
   // `postprod-lite` are two agents sharing one 4-pod endpoint, and a per-kind
@@ -528,7 +585,7 @@ export async function runAssetAgentTick(deps: AssetAgentDeps, kind: AssetKind): 
   const inFlight = await countInFlightForEndpoint(deps.pool, spec.endpointId);
   const room = Math.min(spec.maxInFlight - inFlight, deps.cfg.assetDispatchBatchSize);
   if (room <= 0) {
-    return { kind, submitted: 0, completed, failed, inFlight, skippedNoRoom: true };
+    return { kind, submitted: 0, completed, failed, timedOut, inFlight, skippedNoRoom: true };
   }
 
   const client = await deps.pool.connect();
@@ -557,10 +614,10 @@ export async function runAssetAgentTick(deps: AssetAgentDeps, kind: AssetKind): 
     }
   }
 
-  if (submitted > 0 || completed > 0 || failed > 0) {
-    log().info({ kind, submitted, completed, failed, inFlight, room }, 'asset-agent: tick');
+  if (submitted > 0 || completed > 0 || failed > 0 || timedOut > 0) {
+    log().info({ kind, submitted, completed, failed, timedOut, inFlight, room }, 'asset-agent: tick');
   }
-  return { kind, submitted, completed, failed, inFlight, skippedNoRoom: false };
+  return { kind, submitted, completed, failed, timedOut, inFlight, skippedNoRoom: false };
 }
 
 export interface RunningAgents {

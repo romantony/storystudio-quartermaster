@@ -141,6 +141,28 @@ export function handoffTargets(plan: AssetPlan, kind: AssetKind): AssetKind[] {
     .map(([target]) => target);
 }
 
+/**
+ * Every frame-scoped kind downstream of `kind`, transitively.
+ *
+ * Needed because QA no longer gates the handoff: by the time a verdict
+ * rejects an image, its clip may already exist — made from the rejected
+ * image. Regenerating the image alone would leave that clip in the manifest
+ * and the gate would be decorative. These are the rows that must be reset
+ * with it.
+ */
+export function descendantsOf(plan: AssetPlan, kind: AssetKind): AssetKind[] {
+  const out = new Set<AssetKind>();
+  const walk = (k: AssetKind): void => {
+    for (const child of handoffTargets(plan, k)) {
+      if (out.has(child)) continue;
+      out.add(child);
+      walk(child);
+    }
+  };
+  walk(kind);
+  return [...out];
+}
+
 /** A row is runnable once every required kind has written into `sources`. */
 export function inputsSatisfied(required: readonly string[], sources: Record<string, unknown>): boolean {
   return required.every((r) => sources[r] !== undefined && sources[r] !== null);

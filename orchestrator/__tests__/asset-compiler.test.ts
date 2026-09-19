@@ -191,10 +191,14 @@ describe('while generating', () => {
   it('cancels a stuck provider job and resubmits it as rework', async () => {
     const plan = compilePlan(request());
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
-    const stale = new Date(Date.now() - 60 * 60_000);
+    // The compiler is the BACKSTOP (timeoutMs * 4) for rows no agent is
+    // watching; the agent enforces the real timeout itself. Measured from
+    // submitted_at, never updated_at — polling touches updated_at, so a clock
+    // based on it could never age (real bug, 2026-09-19).
+    const stale = new Date(Date.now() - ASSET_SPECS['wan2-i2v'].timeoutMs * 5);
     const rows = generatedProject(request()).map((r) =>
       r.kind === 'wan2-i2v' && r.frameId === 'f1'
-        ? assetRow({ ...r, status: 'submitted', providerJobId: 'rp-wedged', updatedAt: stale })
+        ? assetRow({ ...r, status: 'submitted', providerJobId: 'rp-wedged', submittedAt: stale, updatedAt: new Date() })
         : r,
     );
     (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(rows);

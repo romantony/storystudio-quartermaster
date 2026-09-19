@@ -133,10 +133,12 @@ export function classifyProjectAssets(
       return;
     }
     if (row.status === 'complete') {
-      // Complete but unjudged is NOT done. Without this, the last kind in a
-      // frame's chain — which hands off to nothing, so nothing downstream
-      // stays blocked on it — would let the tail be armed with a clip no gate
-      // ever looked at.
+      // Complete but unjudged is NOT done — for ASSEMBLY. The handoff already
+      // happened (QA does not block the next agent, by design), so downstream
+      // generation is already running; what waits here is the compiler. This
+      // is the "only when the QA gate is clear for the project can the
+      // compiler compile" rule, and it is the only thing making the gate
+      // mean anything.
       if (assetSpec(kind).gate !== null && row.qualityStatus === null) inProgress.push(row);
       return;
     }
@@ -149,8 +151,11 @@ export function classifyProjectAssets(
       else inProgress.push(row);
       return;
     }
-    // pending / submitted / cancelled
-    if (row.status === 'submitted' && now - row.updatedAt.getTime() > stuckAfterMs(kind)) stuck.push(row);
+    // pending / submitted / cancelled. Measured from `submitted_at`, not
+    // `updated_at`: polling a running job touches `updated_at`, so a clock
+    // based on it can never age (real bug, 2026-09-19).
+    const outstandingMs = row.submittedAt ? now - row.submittedAt.getTime() : 0;
+    if (row.status === 'submitted' && outstandingMs > stuckAfterMs(kind)) stuck.push(row);
     else inProgress.push(row);
   };
 
@@ -377,7 +382,7 @@ async function repair(deps: CompilerDeps, pp: PipelineProject, state: ProjectAss
     }
     const requeued = await reworkAsset(deps.pool, row.id, row.kind, {
       reason: 'stuck',
-      stalledForMs: Date.now() - row.updatedAt.getTime(),
+      stalledForMs: row.submittedAt ? Date.now() - row.submittedAt.getTime() : null,
       providerJobId: row.providerJobId,
     });
     changed = true;
@@ -439,13 +444,16 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
       return { projectId, action: 'failed', detail: reason };
     }
     // pending / submitted — the postprod-lite agent owns it. Its own
-    // stuckAfterMs brings it back here if the provider job wedges.
+    // its own timeout brings it back here if the provider job wedges.
     await touchPipelineProject(deps.pool, projectId);
     return { projectId, action: 'waiting', detail: `tail ${tailRow.status}` };
   }
 
   // ── generating ────────────────────────────────────────────────────────
-  const state = classifyProjectAssets(pp.plan, frames, rows, Date.now(), (k) => assetSpec(k).stuckAfterMs);
+  const state = classifyProjectAssets(pp.plan, frames, rows, Date.now(), // The agent enforces `timeoutMs` per request from `submitted_at`; this is
+    // only the backstop for rows no agent is watching (agent down, process
+    // restarted), so it waits a generous multiple before intervening.
+    (k) => assetSpec(k).timeoutMs * 4);
 
   if (!state.generated) {
     const changed = await repair(deps, pp, state, rows);

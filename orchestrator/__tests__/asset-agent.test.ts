@@ -243,7 +243,7 @@ describe('dispatch', () => {
 });
 
 describe('completion', () => {
-  it('completes a GATED kind without handing off — the gate releases it later', async () => {
+  it('hands off a GATED kind immediately — QA does not block the chain', async () => {
     const outcome = await applyAssetSuccess(deps(jest.fn()), 101, 'qwen-image-gen', { image: 'https://cdn/f1.png' }, {
       executionMs: 4200,
       delayMs: 100,
@@ -253,10 +253,11 @@ describe('completion', () => {
     const [, rowArg, result, handoffs, gated] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
     expect(rowArg).toMatchObject({ id: 101, kind: 'qwen-image-gen', projectId: 'proj_1', frameId: 'f1' });
     expect(result.assetUrl).toBe('https://cdn/f1.png');
-    // Deferred: spending a Wan2 job on a rejected still is what gating
-    // prevents. assets/quality.ts writes the handoff on a passing verdict.
-    expect(gated).toBe(true);
-    expect(handoffs).toEqual([]);
+    // Operator's call (2026-09-19): downstream generation starts at once and
+    // the verdict lands in parallel. What the verdict gates is ASSEMBLY — the
+    // compiler will not compile until every gated asset has one.
+    expect(gated).toBe(false);
+    expect(handoffs.map((h: { kind: string }) => h.kind)).toEqual(['wan2-i2v']);
     expect(costsRepo.recordAssetCost).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ assetId: 101, executionMs: 4200, delayMs: 100 }),
@@ -353,6 +354,67 @@ describe('completion', () => {
     const [, , result, handoffs] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
     expect(result).toMatchObject({ assetUrl: 'https://cdn/final.mp4', durationS: 44.2 });
     expect(handoffs).toEqual([]);
+  });
+});
+
+describe('request timeouts', () => {
+  it('cancels and resubmits a request that outran its kind\u2019s timeout', async () => {
+    const spec = ASSET_SPECS['qwen-image-gen'];
+    const submittedAt = new Date(Date.now() - spec.timeoutMs - 5_000);
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ id: 300, status: 'submitted', providerJobId: 'rp-wedged', submittedAt }),
+    ]);
+    (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
+    const fetchImpl = jest.fn(async () => fakeRes(200, { id: 'rp-wedged', status: 'CANCELLED' }));
+
+    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'qwen-image-gen');
+
+    expect(summary.timedOut).toBe(1);
+    // Cancelled on the provider first, then requeued.
+    expect((fetchImpl.mock.calls[0] as unknown as string[])[0]).toContain('/cancel/rp-wedged');
+    expect(assetsRepo.reworkAsset).toHaveBeenCalledWith(
+      expect.anything(), 300, 'qwen-image-gen', expect.objectContaining({ reason: 'timeout' }),
+    );
+  });
+
+  it('resubmits even when the provider refuses the cancel', async () => {
+    const spec = ASSET_SPECS.tts;
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ id: 301, kind: 'tts', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-gone', submittedAt: new Date(Date.now() - spec.timeoutMs - 1_000) }),
+    ]);
+    (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
+    // A 404 on cancel is the common case — the job was already gone.
+    const fetchImpl = jest.fn(async () => fakeRes(404, { error: 'job not found' }));
+
+    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'tts');
+
+    expect(summary.timedOut).toBe(1);
+    expect(assetsRepo.reworkAsset).toHaveBeenCalled();
+  });
+
+  it('leaves a request that is still inside its budget alone', async () => {
+    const spec = ASSET_SPECS['wan2-i2v'];
+    // 4 minutes into a 5-minute budget: poll it, do not cancel it.
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ id: 302, kind: 'wan2-i2v', endpointId: spec.endpointId, status: 'submitted', providerJobId: 'rp-running', submittedAt: new Date(Date.now() - 240_000) }),
+    ]);
+    const fetchImpl = jest.fn(async () => fakeRes(200, { id: 'rp-running', status: 'IN_PROGRESS' }));
+
+    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'wan2-i2v');
+
+    expect(summary.timedOut).toBe(0);
+    expect(assetsRepo.reworkAsset).not.toHaveBeenCalled();
+    expect((fetchImpl.mock.calls[0] as unknown as string[])[0]).toContain('/status/rp-running');
+  });
+
+  it('carries the operator\u2019s timeout budgets', () => {
+    // 150s covers a cold qwen pod (~120s) with headroom; Wan2 gets 300s.
+    expect(ASSET_SPECS['qwen-image-gen'].timeoutMs).toBe(150_000);
+    expect(ASSET_SPECS['qwen-edit'].timeoutMs).toBe(150_000);
+    expect(ASSET_SPECS.tts.timeoutMs).toBe(150_000);
+    expect(ASSET_SPECS['dreamx-refine'].timeoutMs).toBe(150_000);
+    expect(ASSET_SPECS.mmaudio.timeoutMs).toBe(150_000);
+    expect(ASSET_SPECS['wan2-i2v'].timeoutMs).toBe(300_000);
   });
 });
 

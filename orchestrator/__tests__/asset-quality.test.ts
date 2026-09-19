@@ -439,6 +439,7 @@ describe('gateOneAsset', () => {
     (assetsRepo.gateAssetPass as jest.Mock).mockResolvedValue(true);
     (assetsRepo.gateAssetSkipped as jest.Mock).mockResolvedValue(true);
     (assetsRepo.gateAssetRework as jest.Mock).mockResolvedValue(true);
+    (assetsRepo.resetDescendants as jest.Mock).mockResolvedValue(1);
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue({ projectId: 'proj_1', plan: PLAN });
     (projectsRepo.getProject as jest.Mock).mockResolvedValue({ id: 'proj_1', request: { product: 'documentary' } });
   });
@@ -503,6 +504,26 @@ describe('gateOneAsset', () => {
     expect(outcome).toBe('rework');
     const [, , , patched] = (assetsRepo.gateAssetRework as jest.Mock).mock.calls[0];
     expect(patched.imagePrompt).toBe('a lighthouse at dusk');
+  });
+
+  it('resets the frame\u2019s downstream assets on rework, so the gate is not decorative', async () => {
+    // QA no longer blocks the handoff, so by the time a verdict rejects this
+    // image its clip may already exist — made from the rejected image.
+    const d = deps({ ffmpeg: stubFfmpeg({ raw: Buffer.alloc(32 * 32 * 3, 7) }) });
+    const outcome = await gateOneAsset(d, row(), PLAN);
+
+    expect(outcome).toBe('rework');
+    const [, projectId, frameId, descendants, from] = (assetsRepo.resetDescendants as jest.Mock).mock.calls[0];
+    expect(projectId).toBe('proj_1');
+    expect(frameId).toBe('f1');
+    // The whole downstream chain for this frame, not just the direct child.
+    expect(descendants).toEqual(['wan2-i2v', 'postprod-lite'].filter((k) => PLAN.frameKinds.includes(k as never)));
+    expect(from).toBe('qwen-image-gen');
+  });
+
+  it('does not reset anything when the asset passes', async () => {
+    await gateOneAsset(deps(), row(), PLAN);
+    expect(assetsRepo.resetDescendants).not.toHaveBeenCalled();
   });
 
   it('releases without judging when gating is switched off', async () => {

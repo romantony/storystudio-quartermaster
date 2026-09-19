@@ -63,7 +63,9 @@ function assetRow(over: Partial<AssetRow> & Pick<AssetRow, 'kind' | 'frameId'>):
     attempts: 1,
     reworks: 0,
     providerJobId: 'rp1',
-    submittedAt: new Date('2026-09-19T10:00:00Z'),
+    // Recent relative to the suite's `now` (12:00Z): staleness is measured
+    // from submitted_at, so a row is only stuck when a test says so.
+    submittedAt: new Date('2026-09-19T11:59:30Z'),
     completedAt: new Date('2026-09-19T10:01:00Z'),
     createdAt: new Date('2026-09-19T09:59:00Z'),
     updatedAt: new Date('2026-09-19T10:01:00Z'),
@@ -96,8 +98,12 @@ describe('the registry', () => {
     expect(projectScoped.sort()).toEqual(['bgm', 'postprod-lite']);
   });
 
-  it('gives postprod-lite a stuck budget sized for a whole project, not one frame', () => {
-    expect(ASSET_SPECS['postprod-lite'].stuckAfterMs).toBeGreaterThanOrEqual(ASSET_SPECS['wan2-i2v'].stuckAfterMs);
+  it('gives postprod-lite a timeout sized for a whole project, not one frame', () => {
+    expect(ASSET_SPECS['postprod-lite'].timeoutMs).toBeGreaterThan(ASSET_SPECS['wan2-i2v'].timeoutMs);
+  });
+
+  it('every kind has a positive request timeout', () => {
+    for (const kind of ASSET_KINDS) expect(ASSET_SPECS[kind].timeoutMs).toBeGreaterThan(0);
   });
 });
 
@@ -327,7 +333,9 @@ describe('classifyProjectAssets', () => {
 
   function fullSet(status: string, p = plan): AssetRow[] {
     return p.frameKinds.flatMap((kind) =>
-      frames.map((f) => assetRow({ kind, frameId: f.frameId, seq: f.seq, status, updatedAt: new Date(now) })),
+      frames.map((f) =>
+        assetRow({ kind, frameId: f.frameId, seq: f.seq, status, updatedAt: new Date(now), submittedAt: new Date(now - 1_000) }),
+      ),
     );
   }
 
@@ -342,7 +350,7 @@ describe('classifyProjectAssets', () => {
     const bgmPlan = compilePlan(withOptions({ bgm: true }, { bgmPrompt: 'p' }));
     const rows = fullSet('complete', bgmPlan);
     // Frames are all done but the project's music is still generating.
-    rows.push(assetRow({ kind: 'bgm', frameId: PROJECT_SCOPE, status: 'submitted', updatedAt: new Date(now) }));
+    rows.push(assetRow({ kind: 'bgm', frameId: PROJECT_SCOPE, status: 'submitted', updatedAt: new Date(now), submittedAt: new Date(now - 1_000) }));
     const state = classifyProjectAssets(bgmPlan, frames, rows, now, stuckAfter);
     expect(state.generated).toBe(false);
     expect(state.inProgress.map((r) => r.kind)).toEqual(['bgm']);
@@ -356,11 +364,14 @@ describe('classifyProjectAssets', () => {
   });
 
   it('calls a submitted row stuck once it is quiet past its kind’s budget, not before', () => {
+    // Measured from submitted_at. `updated_at` is deliberately kept FRESH on
+    // the stuck row: reconcile touches it on every poll, so a clock based on
+    // it could never age — the bug this replaced (2026-09-19).
     const rows = fullSet('complete');
-    rows[0] = assetRow({ ...rows[0], status: 'submitted', updatedAt: new Date(now - 30_000) });
+    rows[0] = assetRow({ ...rows[0], status: 'submitted', submittedAt: new Date(now - 30_000) });
     expect(classifyProjectAssets(plan, frames, rows, now, stuckAfter).stuck).toHaveLength(0);
 
-    rows[0] = assetRow({ ...rows[0], status: 'submitted', updatedAt: new Date(now - 90_000) });
+    rows[0] = assetRow({ ...rows[0], status: 'submitted', submittedAt: new Date(now - 90_000), updatedAt: new Date(now) });
     const state = classifyProjectAssets(plan, frames, rows, now, stuckAfter);
     expect(state.stuck).toHaveLength(1);
     expect(state.generated).toBe(false);

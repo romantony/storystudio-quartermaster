@@ -53,6 +53,7 @@ import {
   gateAssetRework,
   gateAssetSkipped,
   listUngatedAssets,
+  resetDescendants,
   ASSET_QUALITY_ATTEMPTS_HARD_CAP,
   type AssetRow,
 } from '../db/repo/assets';
@@ -74,6 +75,7 @@ import {
 } from '../quality/rubric';
 import { callVisionJson, type ReplicateDeps } from '../quality/replicate';
 import { shouldSampleForVlm, type SampleDecision } from '../quality/sampling';
+import { descendantsOf } from './plan';
 import { rewritePrompt } from '../quality/rewrite';
 import type { FrameJobInput } from '../steps/builders/types';
 
@@ -311,6 +313,20 @@ export async function gateOneAsset(
   const { input: patched, correction } = await correctedInput(deps, row, verdict, gate);
   const requeued = await gateAssetRework(deps.pool, row, { score: verdict.score, issues: verdict.issues }, patched);
   if (!requeued) return 'raced';
+
+  // The handoff already happened — QA does not block the chain — so this
+  // frame's clip may already exist, made from the asset just rejected.
+  // Regenerating only the image would leave that clip in the manifest and
+  // make the gate decorative, so the whole downstream chain for this frame
+  // goes back to `blocked` and regenerates from the corrected input.
+  const descendants = descendantsOf(plan, row.kind);
+  const reset = await resetDescendants(deps.pool, row.projectId, row.frameId, descendants, row.kind);
+  if (reset > 0) {
+    log().warn(
+      { assetId: row.id, kind: row.kind, frameId: row.frameId, reset, descendants },
+      'asset-qa: rework reset this frame\u2019s downstream assets so they regenerate from the corrected input',
+    );
+  }
 
   log().warn(
     {

@@ -87,13 +87,18 @@ export interface AssetSpec {
   /** Endpoint's real pod count. A read-only ceiling; see the file header. */
   maxInFlight: number;
   /**
-   * How long a `submitted` row may go without a status change before the
-   * project compiler calls it stuck and reworks it. Generous relative to the
-   * measured per-mode times (containers/media.md's table, and the 2026-09-18
-   * run-2 numbers) — this is a deadlock breaker, not a latency SLO, and a
-   * false positive costs a duplicate GPU job.
+   * How long ONE request to this endpoint may stay outstanding before the
+   * agent cancels it and resubmits. Measured from `submitted_at`, never from
+   * `updated_at` — polling the provider touches `updated_at`, so a clock
+   * based on it can never age and the timeout would never fire (real bug,
+   * found 2026-09-19).
+   *
+   * Operator's numbers (2026-09-19), from measured generation times plus cold
+   * start: a warm qwen image is ~15s and a cold one ~120s, so 150s covers a
+   * cold pod with headroom; Wan2 i2v gets 300s. These are deliberately tight
+   * — a timeout costs one duplicate job, a wedged request costs the project.
    */
-  stuckAfterMs: number;
+  timeoutMs: number;
   /** The step seq `steps/builders/*` read this kind's output at. */
   legacySeq: number;
   /** What the completed asset is, for the manifest and the §9.6 result. */
@@ -133,7 +138,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_qwen_image_gen',
     endpointId: endpointFor('runpod:qwen-image-gen'),
     maxInFlight: podsFor('runpod:qwen-image-gen'),
-    stuckAfterMs: 10 * 60_000,
+    timeoutMs: 150_000, // warm ~15s, cold pod ~120s
     legacySeq: 1,
     produces: 'image',
     stages: [],
@@ -147,7 +152,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_qwen_edit',
     endpointId: endpointFor('runpod:qwen-image-edit'),
     maxInFlight: podsFor('runpod:qwen-image-edit'),
-    stuckAfterMs: 10 * 60_000,
+    timeoutMs: 150_000, // warm ~15s, cold pod ~120s
     legacySeq: 0,
     produces: 'image',
     stages: [],
@@ -161,7 +166,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_tts',
     endpointId: endpointFor('runpod:flux-tts-s2t'),
     maxInFlight: podsFor('runpod:flux-tts-s2t'),
-    stuckAfterMs: 10 * 60_000,
+    timeoutMs: 150_000, // operator-set
     legacySeq: 2,
     produces: 'audio',
     stages: [],
@@ -177,7 +182,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     maxInFlight: podsFor('runpod:wan2-i2v'),
     // The long pole of the whole pipeline; a cold worker plus a queued
     // 5-second clip is routinely minutes, not seconds.
-    stuckAfterMs: 25 * 60_000,
+    timeoutMs: 300_000, // the long pole — a 5s clip on a cold pod
     legacySeq: 3,
     produces: 'video',
     stages: [],
@@ -191,7 +196,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_dreamx_refine',
     endpointId: DREAMX_REFINER_ENDPOINT_ID,
     maxInFlight: DREAMX_PODS,
-    stuckAfterMs: 25 * 60_000,
+    timeoutMs: 150_000, // operator-set
     legacySeq: 14,
     produces: 'video',
     stages: [],
@@ -205,7 +210,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_mmaudio',
     endpointId: MMAUDIO_ENDPOINT_ID,
     maxInFlight: MMAUDIO_PODS,
-    stuckAfterMs: 15 * 60_000,
+    timeoutMs: 150_000, // operator-set
     legacySeq: 15,
     produces: 'video',
     stages: [],
@@ -234,7 +239,9 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     // Self-imposed: Lambda scales itself, but each render is ~11-17s and
     // costs, so this bounds how many frames are in flight at once.
     maxInFlight: 8,
-    stuckAfterMs: 15 * 60_000,
+    // Not operator-specified. A synchronous Lambda render is ~11-17s/frame;
+    // this is the hang breaker, not a latency budget.
+    timeoutMs: 300_000,
     // The seq the cohort path's overlay output is read at.
     legacySeq: 16,
     produces: 'video',
@@ -256,7 +263,9 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_bgm',
     endpointId: endpointFor('runpod:bgm-s2t'),
     maxInFlight: podsFor('runpod:bgm-s2t'),
-    stuckAfterMs: 20 * 60_000,
+    // Not operator-specified. ACE-Step generates one track for the whole
+    // project, so it is slower than a per-frame asset.
+    timeoutMs: 600_000,
     legacySeq: 5,
     produces: 'audio',
     stages: [],
@@ -281,8 +290,10 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     endpointId: POSTPROD_LITE_ENDPOINT_ID,
     maxInFlight: POSTPROD_LITE_PODS,
     // A whole project's ffmpeg, not one frame's: minutes of merges plus a
-    // concat plus a Whisper caption pass over the full narration.
-    stuckAfterMs: 60 * 60_000,
+    // concat plus a Whisper caption pass over the full narration. Measured
+    // 2026-09-19 on a real 10-frame project: 33s execution. An hour is the
+    // hang breaker for a long-form project, not a target.
+    timeoutMs: 60 * 60_000,
     legacySeq: 6,
     produces: 'video',
     stages: [],

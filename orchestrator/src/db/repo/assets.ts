@@ -338,6 +338,43 @@ export async function gateAssetRework(
   return rows.length > 0;
 }
 
+/**
+ * Reset a frame's downstream rows so they regenerate from a reworked upstream.
+ *
+ * QA does not gate the handoff any more, so a rejected image may already have
+ * produced a clip. Without this the corrected image would be regenerated and
+ * then ignored — the manifest would still carry the clip made from the
+ * rejected frame, and the gate would be decorative.
+ *
+ * Each descendant goes back to `blocked` with its own output and verdict
+ * cleared, and loses the `sources` entries that came from the reset set, so
+ * the chain re-releases it naturally as each upstream completes again. A row
+ * still `submitted` is reset too: its in-flight result is about to be stale,
+ * and the agent's own status re-check makes the late completion a no-op.
+ */
+export async function resetDescendants(
+  db: Queryable,
+  projectId: string,
+  frameId: string,
+  kinds: AssetKind[],
+  from: AssetKind,
+): Promise<number> {
+  if (kinds.length === 0) return 0;
+  const stale = [from, ...kinds];
+  const res = await db.query(
+    `UPDATE assets
+        SET status = 'blocked',
+            sources = sources - $4::text[],
+            asset_url = NULL, output = NULL, duration_s = NULL, error = NULL,
+            provider_job_id = NULL, attempts = 0,
+            quality_status = NULL, quality_score = NULL, quality_issues = '[]'::jsonb,
+            completed_at = NULL, updated_at = now()
+      WHERE project_id = $1 AND frame_id = $2 AND asset_kind = ANY($3::text[])`,
+    [projectId, frameId, kinds, stale],
+  );
+  return res.rowCount ?? 0;
+}
+
 /** The QA agent's work queue: completed assets of this kind nobody has
  * judged yet, oldest first. */
 export async function listUngatedAssets(db: Queryable, kind: AssetKind, limit: number): Promise<AssetRow[]> {
@@ -422,13 +459,23 @@ export async function failOrRetryAsset(
   return false;
 }
 
-/** Rows whose provider job has gone quiet for longer than `olderThan` — the
- * reconcile scan's input, and the compiler's stuck-detection input. */
+/**
+ * Submitted rows the reconcile scan should poll, and the timeout sweep should
+ * judge.
+ *
+ * Ordered and filtered by `submitted_at`, NOT `updated_at`. That distinction
+ * is the whole bug this replaced: `reconcile()` touches `updated_at` every
+ * time it polls a still-running job, so an `updated_at` clock can never age
+ * past one reconcile interval and a timeout measured against it could never
+ * fire. `submitted_at` is when the request actually went to the provider and
+ * is only rewritten by a resubmission — which is exactly the semantics
+ * "how long has this request been outstanding" needs.
+ */
 export async function listStaleSubmitted(db: Queryable, kind: AssetKind, olderThan: Date): Promise<AssetRow[]> {
   const { rows } = await db.query(
     `SELECT ${COLUMNS} FROM assets
-      WHERE asset_kind = $1 AND status = 'submitted' AND updated_at < $2
-      ORDER BY updated_at ASC`,
+      WHERE asset_kind = $1 AND status = 'submitted' AND submitted_at < $2
+      ORDER BY submitted_at ASC`,
     [kind, olderThan],
   );
   return rows.map(toAsset);
