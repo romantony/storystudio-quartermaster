@@ -142,6 +142,19 @@ const ConfigSchema = z.object({
   // Unset = the whole feature is a no-op (mirrors watchdogAlertWebhookUrl).
   anthropicApiKey: z.string().optional(),
   anthropicModel: z.string().default('claude-sonnet-5'),
+  // The read-only diagnostic assistant (diagnostics/diagnose.ts) reaches
+  // Sonnet 5 through REPLICATE, not the Anthropic API — changed 2026-09-19
+  // after the direct account ran out of credit and every diagnostic on the
+  // VPS failed with "Your credit balance is too low". It now rides the same
+  // token/transport the quality gate and prompt rewriter use, so the
+  // orchestrator has one LLM billing relationship, not two.
+  // `replicateApiToken` unset = the feature is off, the same way
+  // watchdogAlertWebhookUrl works.
+  diagnosticsModel: z.string().default('anthropic/claude-sonnet-5'),
+  // 'low' (the model's own default) disables thinking. This is a short,
+  // structured-JSON judgement over a snapshot the orchestrator already
+  // assembled — an alerting path should be fast and cheap, not thoughtful.
+  diagnosticsEffort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('low'),
 
   // ── quality gates (impl plan §6.5 / M4) ───────────────────────────────
   // Replicate-hosted VLM, ported from the AWS-side dialogue-basic-qa-agent
@@ -321,6 +334,8 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   watchdogAlertWebhookUrl: 'WATCHDOG_ALERT_WEBHOOK_URL',
   anthropicApiKey: 'ANTHROPIC_API_KEY',
   anthropicModel: 'ANTHROPIC_MODEL',
+  diagnosticsModel: 'ORCH_DIAGNOSTICS_MODEL',
+  diagnosticsEffort: 'ORCH_DIAGNOSTICS_EFFORT',
   replicateApiToken: 'REPLICATE_API_TOKEN',
   replicateApiBase: 'REPLICATE_API_BASE',
   replicateVisionModel: 'REPLICATE_VISION_MODEL',

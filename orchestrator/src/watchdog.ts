@@ -92,8 +92,16 @@ export async function checkOnce(
     orphanGraceMs: number;
     watchdogAutodrain: boolean;
     watchdogAlertWebhookUrl?: string;
-    anthropicApiKey?: Config['anthropicApiKey'];
-    anthropicModel?: Config['anthropicModel'];
+    // The diagnostic assistant reaches Sonnet 5 through Replicate
+    // (diagnostics/diagnose.ts), not the Anthropic API — same token the
+    // quality gate uses.
+    replicateApiToken?: Config['replicateApiToken'];
+    replicateApiBase?: Config['replicateApiBase'];
+    replicatePollIntervalMs?: Config['replicatePollIntervalMs'];
+    replicateMaxPollAttempts?: Config['replicateMaxPollAttempts'];
+    replicateTimeoutMs?: Config['replicateTimeoutMs'];
+    diagnosticsModel?: Config['diagnosticsModel'];
+    diagnosticsEffort?: Config['diagnosticsEffort'];
   },
   endpoints: readonly FleetEndpoint[] = watchedEndpoints(),
 ): Promise<void> {
@@ -123,7 +131,19 @@ export async function checkOnce(
     };
     await alert(cfg.watchdogAlertWebhookUrl, orphanFacts);
     void runDiagnostic(
-      { pool, runpod, cfg: { anthropicApiKey: cfg.anthropicApiKey, anthropicModel: cfg.anthropicModel } },
+      {
+        pool,
+        runpod,
+        cfg: {
+          replicateApiToken: cfg.replicateApiToken,
+          replicateApiBase: cfg.replicateApiBase,
+          replicatePollIntervalMs: cfg.replicatePollIntervalMs,
+          replicateMaxPollAttempts: cfg.replicateMaxPollAttempts,
+          replicateTimeoutMs: cfg.replicateTimeoutMs,
+          diagnosticsModel: cfg.diagnosticsModel,
+          diagnosticsEffort: cfg.diagnosticsEffort,
+        },
+      },
       { trigger: 'watchdog_orphan', endpointId: endpoint.endpointId, facts: orphanFacts },
     );
 
