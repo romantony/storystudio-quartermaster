@@ -44,9 +44,13 @@ can work on something is working on it.
 | `bgm` | `asset_bgm` | bgm-s2t | project | — | the project's music bed |
 | `postprod-lite` | `asset_postprod_lite` | postprod-lite | project | — | **the finished video** |
 
-`qwen-image-gen`/`qwen-edit` are alternatives chosen by
-`options.referenceImage`. `dreamx-refine`, `mmaudio` and `bgm` are opt-in
-(`options.upscale` + `upscaleEngine: 'dreamx'`, `options.sfx`, `options.bgm`).
+`qwen-image-gen`/`qwen-edit` are alternatives chosen by `options.referenceImage`.
+`mmaudio` and `bgm` are opt-in (`options.sfx`, `options.bgm`). `dreamx-refine`
+runs by default whenever `wan2-i2v` does — it isn't gated by `options.upscale`
+(docs/qm-orchestrator-three-project-run-analysis-2026-09-19.md §6 P1-5:
+Wan2's native 832x464 output needs it regardless of product, so a caller can
+only turn it OFF, by setting `upscaleEngine: 'realesrgan'` for the
+alternative whole-video pass instead).
 
 **There is no `animation` agent.** Ken Burns is something postprod-lite does as
 part of assembly, not a separate generation: `options.motionEngine: 'animate'`

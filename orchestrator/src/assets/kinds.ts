@@ -25,7 +25,13 @@
  * RunPod dashboard.
  */
 import { FLEET } from '../fleet-registry';
-import { POSTPROD_LITE_ENDPOINT_ID, DREAMX_REFINER_ENDPOINT_ID, MMAUDIO_ENDPOINT_ID } from '../steps/tail-endpoints';
+import {
+  POSTPROD_LITE_V2_ENDPOINT_ID,
+  POSTPROD_LITE_V2_PODS,
+  DREAMX_REFINER_ENDPOINT_ID,
+  AUDIO_POOL_ENDPOINT_ID,
+  AUDIO_POOL_PODS,
+} from '../steps/tail-endpoints';
 import { buildImageInput } from '../steps/builders/image';
 import { buildImageEditInput } from '../steps/builders/image-edit';
 import { buildTtsInput } from '../steps/builders/tts';
@@ -33,6 +39,7 @@ import { buildI2vInput } from '../steps/builders/i2v';
 import { buildUpscaleFrameInput } from '../steps/builders/upscale-frame';
 import { buildSfxInput } from '../steps/builders/sfx';
 import { buildBgmInput } from '../steps/builders/bgm';
+import { buildMergeInput } from '../steps/builders/merge';
 import { buildRemotionOverlayInput } from '../steps/builders/remotion-overlay';
 import { buildPostprodInput } from '../steps/builders/postprod';
 import type { PayloadBuilder } from '../steps/builders/types';
@@ -45,6 +52,7 @@ export const ASSET_KINDS = [
   'dreamx-refine',
   'mmaudio',
   'remotion',
+  'merge',
   'bgm',
   'postprod-lite',
 ] as const;
@@ -138,11 +146,14 @@ function podsFor(counterKey: string): number {
 
 /** Endpoints outside src/shared/fleet.ts (steps/tail-endpoints.ts) have no
  * generated pod count, so their real dashboard values are stated here —
- * re-synced 2026-09-17 alongside steps/catalog.ts's `maxWorkers`. */
-const DREAMX_PODS = 2;
-const MMAUDIO_PODS = 2;
-// Project-scoped: this is how many PROJECTS assemble at once, one per pod.
-const POSTPROD_LITE_PODS = 4;
+ * re-synced 2026-09-20 (raised 2->4, operator's call, alongside the
+ * audio-pool cutover: dreamx-refine went from opt-in to mandatory on every
+ * wan2-i2v frame this same session — see plan.ts's `refine` comment — and
+ * 2 pods was not going to keep up). mmaudio's and postprod-lite's own pod
+ * counts moved to tail-endpoints.ts's AUDIO_POOL_PODS/POSTPROD_LITE_V2_PODS
+ * (2026-09-20 pooling/merge-parallelization) — only dreamx-refine still has
+ * its own siloed endpoint. */
+const DREAMX_PODS = 4;
 
 export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
   'qwen-image-gen': {
@@ -181,8 +192,11 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     gate: null,
     scope: 'frame',
     table: 'asset_tts',
-    endpointId: endpointFor('runpod:flux-tts-s2t'),
-    maxInFlight: podsFor('runpod:flux-tts-s2t'),
+    // Same physical endpoint as ever (flux-tts-s2t, rnqxi6c0mlq517) — now
+    // pooled with mmaudio+bgm, repurposed in place (image swapped, workers
+    // raised 5->7, tail-endpoints.ts) rather than moved to a new endpoint.
+    endpointId: AUDIO_POOL_ENDPOINT_ID,
+    maxInFlight: AUDIO_POOL_PODS,
     timeoutMs: 150_000, // operator-set
     cancelOnTimeout: true,
     legacySeq: 2,
@@ -228,8 +242,11 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     gate: null,
     scope: 'frame',
     table: 'asset_mmaudio',
-    endpointId: MMAUDIO_ENDPOINT_ID,
-    maxInFlight: MMAUDIO_PODS,
+    // Pooled onto the ex-TTS-only endpoint, now 7 pods shared with tts+bgm
+    // (tail-endpoints.ts) — was its own siloed 2-pod endpoint, MM-Audio-A40,
+    // decommissioned (scaled to 0) 2026-09-20.
+    endpointId: AUDIO_POOL_ENDPOINT_ID,
+    maxInFlight: AUDIO_POOL_PODS,
     timeoutMs: 150_000, // operator-set
     cancelOnTimeout: true,
     legacySeq: 15,
@@ -273,6 +290,40 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     stages: [],
     build: buildRemotionOverlayInput,
   },
+  merge: {
+    // Frame + narration -> one clip, moved OUT of the postprod-lite one-shot
+    // tail and into its own parallel per-frame agent (2026-09-20 merge-
+    // parallelization — docs/qm-orchestrator-three-project-run-analysis-
+    // 2026-09-19.md's follow-up). Reuses steps/builders/merge.ts VERBATIM —
+    // it already reads exactly the same resolvedDeps seqs (2=tts, 3=wan2-i2v,
+    // 14=dreamx-refine, 15=mmaudio, 16=remotion) this kind's `requires` graph
+    // resolves (assets/plan.ts), because it is the SAME step the cohort
+    // model already calls "merge" at seq 6.
+    //
+    // Only planned when the project has a motion model at all: an
+    // `motionEngine:'animate'` project has no per-frame clip to pre-merge —
+    // Ken Burns only happens inside the tail — so it keeps merging there,
+    // same as before this kind existed.
+    //
+    // Targets postprod-lite-v2's endpoint, not v1's: v1's `_prepare_frame`
+    // has no `preMerged` branch, so it would just re-merge a clip that
+    // already has narration in it — harmless but pointless. `postprod-lite`
+    // below points at the same v2 endpoint for the same reason; they move
+    // together.
+    kind: 'merge',
+    provider: 'runpod',
+    gate: null,
+    scope: 'frame',
+    table: 'asset_merge',
+    endpointId: POSTPROD_LITE_V2_ENDPOINT_ID,
+    maxInFlight: POSTPROD_LITE_V2_PODS,
+    timeoutMs: 150_000, // ffmpeg mux, `-c:v copy` — fast, same budget class as mmaudio/dreamx-refine
+    cancelOnTimeout: true,
+    legacySeq: 6, // the cohort model's own 'merge' step — see steps/catalog.ts seq 6
+    produces: 'video',
+    stages: [],
+    build: buildMergeInput,
+  },
   bgm: {
     // Project-scoped, and the only kind with no per-frame anything: one music
     // bed for the whole video, generated in parallel with every frame's work
@@ -286,8 +337,11 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     gate: null,
     scope: 'project',
     table: 'asset_bgm',
-    endpointId: endpointFor('runpod:bgm-s2t'),
-    maxInFlight: podsFor('runpod:bgm-s2t'),
+    // Pooled onto the ex-TTS-only endpoint, now 7 pods shared with tts+mmaudio
+    // (tail-endpoints.ts) — was its own siloed 2-pod endpoint, BGM-S2T,
+    // decommissioned (scaled to 0) 2026-09-20.
+    endpointId: AUDIO_POOL_ENDPOINT_ID,
+    maxInFlight: AUDIO_POOL_PODS,
     // Same as MMAudio (operator, 2026-09-19).
     timeoutMs: 150_000,
     cancelOnTimeout: true,
@@ -312,8 +366,11 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     gate: null,
     scope: 'project',
     table: 'asset_postprod_lite',
-    endpointId: POSTPROD_LITE_ENDPOINT_ID,
-    maxInFlight: POSTPROD_LITE_PODS,
+    // v2, not v1 (tail-endpoints.ts) — v1 is untouched and still live; v2 has
+    // the concat-normalize/bgm-loop/av-assert fixes and understands a
+    // `merge`-produced `preMerged` clip.
+    endpointId: POSTPROD_LITE_V2_ENDPOINT_ID,
+    maxInFlight: POSTPROD_LITE_V2_PODS,
     // 900s, matching the pod's OWN execution limit (operator, 2026-09-19) —
     // so this fires at the moment the worker has already given up, never
     // before. Measured 2026-09-19 on a real 10-frame project: 33s.

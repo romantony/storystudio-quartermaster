@@ -103,7 +103,15 @@ export const FLEET: FleetEndpoint[] = [
   // (storystudio-unified's 3D pipeline: Blender-headless/Hunyuan-3D/
   // Trellis2/3d-rigging-skintokens, ~11 workers) — keep re-checking this
   // against the live dashboard, not just this file's own history.
-  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 5 },
+  //
+  // Re-synced again 2026-09-20: 5->7, operator repurposed this endpoint in
+  // place as the pooled TTS+MMAudio+BGM target (orchestrator's audio-pool
+  // image — see orchestrator/src/steps/tail-endpoints.ts's
+  // AUDIO_POOL_ENDPOINT_ID) and scaled MM-Audio-A40/BGM-S2T to 0 in the same
+  // move. If the AWS live path still sends traffic to this endpoint id, it
+  // now hits the pooled image too — its 'tts'/'voice_clone_prompt' modes are
+  // unchanged, but this is worth confirming, not assuming.
+  { counterKey: FLUX_TTS_S2T,    endpointId: 'rnqxi6c0mlq517', workers: 7 },
   // Raised 0→2 (2026-07-21): now the primary rung for image.explainer.t2i
   // (explainer/educational/advertisement/documentary/product-promotion T2I —
   // see background.json), replacing the retired ernie-image endpoint. No

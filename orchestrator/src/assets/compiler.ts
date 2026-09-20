@@ -245,11 +245,24 @@ export function manifestFrame(
 
   if (source) {
     entry.videoUrl = source;
-    // MMAudio's output carries the SFX already muxed in, so the worker lifts
-    // the SFX layer off the clip's own audio rather than being handed a
-    // separate track — same `sfx_from_video` contract the cohort path's merge
-    // builder uses.
+    // `mmaudio` was clipKind()'s top pick, and its output (SFX already muxed
+    // in) fed straight into the one-shot's own merge via sfx_from_video,
+    // before the `merge` kind existed (2026-09-20). Now `merge` is planned
+    // unconditionally whenever there's a motion model at all (plan.ts), so
+    // it always outranks `mmaudio` in clipKind()'s precedence — this branch
+    // is consequently unreachable today, but kept (rather than deleted) as
+    // the fallback for a project whose plan somehow lacks `merge` while
+    // still having `mmaudio`, which nothing currently constructs but nothing
+    // forbids either.
     if (clip === 'mmaudio') entry.sfxFromVideo = true;
+    // `merge`'s own output already has narration (and sfx, if any) mixed in
+    // — buildMergeInput (steps/builders/merge.ts) passes the same
+    // sfx_from_video flag through to ITS merge call, so the work this branch
+    // used to hand off to the one-shot now happens inside `merge` instead.
+    // postprod-lite-v2's tail downloads the result and skips straight to
+    // concat. v1 has no preMerged branch and would just harmlessly re-merge,
+    // but `merge` only ever targets v2 (kinds.ts).
+    if (clip === 'merge') entry.preMerged = true;
   } else {
     const image = url(plan.imageKind);
     if (!image) throw new Error(`frame ${frame.frameId}: no still to animate`);

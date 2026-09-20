@@ -338,7 +338,10 @@ describe('arming the tail', () => {
 
     const m = armedManifest()!;
     expect(m.frames.map((f) => f.frameId)).toEqual(['f1', 'f2']);
-    expect(m.frames[0]).toMatchObject({ videoUrl: 'https://cdn/wan2-i2v-f1.mp4', audioUrl: 'https://cdn/tts-f1.mp4' });
+    // merge is on by default now, ahead of dreamx-refine/wan2-i2v in the
+    // chain — its output (narration mixed in) is the frame's clip.
+    expect(m.frames[0]).toMatchObject({ videoUrl: 'https://cdn/merge-f1.mp4', audioUrl: 'https://cdn/tts-f1.mp4' });
+    expect(m.frames[0].preMerged).toBe(true);
     expect(m.droppedFrames).toEqual([]);
   });
 

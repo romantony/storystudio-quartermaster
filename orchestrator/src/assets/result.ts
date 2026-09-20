@@ -92,6 +92,7 @@ export function buildAssetResult(facts: AssetResultFacts): QmResult {
       narrationAudioUrl: tts?.assetUrl ?? null,
       narrationDurationS: tts?.durationS ?? null,
       clipUrl:
+        urlOf(rows, 'merge', f.frameId) ??
         urlOf(rows, 'mmaudio', f.frameId) ??
         urlOf(rows, 'dreamx-refine', f.frameId) ??
         (plan.motionKind ? urlOf(rows, plan.motionKind, f.frameId) : null),
@@ -189,6 +190,7 @@ function legacySeqOf(kind: string): number {
     'wan2-i2v': 3,
     bgm: 5,
     'postprod-lite': 6,
+    merge: 6,
     'dreamx-refine': 14,
     mmaudio: 15,
   };

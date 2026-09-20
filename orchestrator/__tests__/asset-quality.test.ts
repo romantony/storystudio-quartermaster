@@ -519,7 +519,11 @@ describe('gateOneAsset', () => {
     expect(projectId).toBe('proj_1');
     expect(frameId).toBe('f1');
     // The whole downstream chain for this frame, not just the direct child.
-    expect(descendants).toEqual(['wan2-i2v', 'postprod-lite'].filter((k) => PLAN.frameKinds.includes(k as never)));
+    // dreamx-refine and merge are both on by default now, between wan2-i2v
+    // and postprod-lite.
+    expect(descendants).toEqual(
+      ['wan2-i2v', 'dreamx-refine', 'merge', 'postprod-lite'].filter((k) => PLAN.frameKinds.includes(k as never)),
+    );
     expect(from).toBe('qwen-image-gen');
   });
 

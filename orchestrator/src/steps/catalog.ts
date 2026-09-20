@@ -20,7 +20,7 @@
  * reasoning. agents/orchestrator.ts's driveCohort() branches on this field.
  */
 import { FLEET } from '../fleet-registry';
-import { POSTPROD_LITE_ENDPOINT_ID, DREAMX_REFINER_ENDPOINT_ID, MMAUDIO_ENDPOINT_ID } from './tail-endpoints';
+import { POSTPROD_LITE_ENDPOINT_ID, DREAMX_REFINER_ENDPOINT_ID, AUDIO_POOL_ENDPOINT_ID } from './tail-endpoints';
 import { buildImageInput } from './builders/image';
 import { buildImageEditInput } from './builders/image-edit';
 import { buildTtsInput } from './builders/tts';
@@ -400,14 +400,28 @@ export const STEP_CATALOG: readonly CatalogEntry[] = [
     // merge (6), per the requested frame flow. Bulk, like 14: seq 15 sorts
     // after 14 in driveCohort()'s bulk loop, and every bulk step finishes
     // before the assembler starts merge. Non-commercial weights — see
-    // tail-endpoints.ts's MMAUDIO_ENDPOINT_ID.
+    // tail-endpoints.ts's AUDIO_POOL_ENDPOINT_ID.
+    //
+    // STALE (2026-09-20): MM-Audio-A40 (this step's own dedicated endpoint)
+    // was decommissioned and mmaudio pooled onto the ex-TTS-only endpoint,
+    // now shared with this catalog's OWN 'tts' step above (endpointFor/
+    // maxWorkersFor('runpod:flux-tts-s2t'), still reading 5 workers from
+    // fleet-registry.ts — also stale, it's 7 now). Repointed here just to
+    // keep this compiling and not dispatch into a 0-worker dead endpoint;
+    // maxWorkers below no longer represents a real per-endpoint ceiling for
+    // either step, and this catalog has no equivalent of the asset model's
+    // countInFlightForEndpoint (db/repo/assets.ts) to pool them correctly.
+    // Only matters if ORCH_PIPELINE_MODE=cohort is still live somewhere
+    // (default in config.ts, unconfirmed on the actual VPS) — needs a real
+    // fix (or shared/fleet.ts's own worker count corrected to 7) before
+    // trusting cohort-mode SFX/TTS concurrency again.
     seq: 15,
     name: 'sfx',
-    endpointId: MMAUDIO_ENDPOINT_ID,
+    endpointId: AUDIO_POOL_ENDPOINT_ID,
     gate: null,
     dependsOn: [14, 3],
     scope: 'bulk',
-    maxWorkers: 2, // endpoint's real pool (2026-09-17 dashboard re-sync, was 4)
+    maxWorkers: 2, // stale — see comment above
     builder: buildSfxInput,
   },
 ] as const;

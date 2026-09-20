@@ -96,7 +96,16 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
   const o = req.options;
   const imageKind: AssetKind = o.referenceImage ? 'qwen-edit' : 'qwen-image-gen';
   const motionKind: AssetKind | null = o.motionEngine === 'animate' ? null : 'wan2-i2v';
-  const refine = motionKind && o.upscale && o.upscaleEngine === 'dreamx' ? ('dreamx-refine' as const) : undefined;
+  // DreamX-refine is Wan2's upscale: whatever wan2-i2v generates (native
+  // 832x464) needs it to reach a deliverable resolution, independent of
+  // `options.upscale` (docs/qm-orchestrator-three-project-run-analysis-
+  // 2026-09-19.md §3/§6 P1-5 — resolved 2026-09-20: educational/explainer's
+  // "no DreamX" design assumed Remotion covers every frame at 1080p, but
+  // real coverage was ~15%; the other ~85% shipped native 832x464, upscaled
+  // ~2.3x by nothing but the final concat, visibly soft). `upscaleEngine:
+  // 'realesrgan'` is still the caller's opt-in alternative (a whole-video
+  // pass instead of DreamX's per-frame one) via `tail.upscale` below.
+  const refine = motionKind && o.upscaleEngine === 'dreamx' ? ('dreamx-refine' as const) : undefined;
   const sfx = motionKind && o.sfx ? ('mmaudio' as const) : undefined;
 
   const requires: Record<string, AssetKind[]> = {
@@ -121,6 +130,20 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
   // there is no clip yet, and the overlay is skipped.
   const overlay = o.textOverlay && motionKind ? ('remotion' as const) : undefined;
   if (overlay) requires[overlay] = [sfx ?? refine ?? (motionKind as AssetKind)];
+
+  // Merge (clip + narration -> one clip) moved OUT of the postprod-lite
+  // one-shot tail into its own parallel per-frame agent (2026-09-20 —
+  // docs/qm-orchestrator-three-project-run-analysis-2026-09-19.md's merge-
+  // parallelization follow-up): it used to run serially, one frame at a
+  // time, inside ONE pod, only after every other per-frame asset was
+  // already done. It needs only this frame's clip and its narration, same
+  // as wan2-i2v/dreamx-refine/mmaudio already run in parallel across pods
+  // DURING generation. Only when there's a clip to merge at all — an
+  // `motionEngine:'animate'` project has none yet (Ken Burns happens inside
+  // the tail itself), so those keep merging there, same as before this
+  // kind existed.
+  const merge = motionKind ? ('merge' as const) : undefined;
+  if (merge) requires[merge] = [overlay ?? sfx ?? refine ?? (motionKind as AssetKind), 'tts'];
 
   const frameKinds = Object.keys(requires) as AssetKind[];
   const kinds: AssetKind[] = [...frameKinds, 'postprod-lite'];
@@ -229,7 +252,7 @@ export function expectedAssetCount(plan: AssetPlan): number {
  * processed first, the same precedence steps/builders/merge.ts applies. */
 export function clipKind(plan: AssetPlan): AssetKind | null {
   if (!plan.motionKind) return null;
-  for (const k of ['remotion', 'mmaudio', 'dreamx-refine'] as const) {
+  for (const k of ['merge', 'remotion', 'mmaudio', 'dreamx-refine'] as const) {
     if (plan.frameKinds.includes(k)) return k;
   }
   return plan.motionKind;

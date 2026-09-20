@@ -280,7 +280,8 @@ describe('completion', () => {
     expect(outcome).toBe('completed');
     const [, , , handoffs, gated] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
     expect(gated).toBe(false);
-    expect(handoffs.map((h: { kind: string }) => h.kind)).toEqual(['wan2-i2v']);
+    // tts feeds both wan2-i2v (real clip length) and merge (the narration).
+    expect(handoffs.map((h: { kind: string }) => h.kind).sort()).toEqual(['merge', 'wan2-i2v']);
   });
 
   it('refuses a COMPLETED whose output carries a worker error string', async () => {

@@ -42,6 +42,12 @@ export interface ManifestFrame {
    * muxed in: the worker extracts that track and mixes it under the narration
    * instead of taking a separate SFX file. */
   sfxFromVideo?: boolean;
+  /** True when `videoUrl` is the `merge` agent's own output (2026-09-20):
+   * narration (and sfx, if planned) is already mixed in, so postprod-lite-v2
+   * downloads it and skips straight to concat instead of merging again. Only
+   * ever set when postprod-lite-v2 is the tail target (v1 has no branch for
+   * it and would just harmlessly redo the merge). */
+  preMerged?: boolean;
   animate?: { effect: string; fps: number };
 }
 

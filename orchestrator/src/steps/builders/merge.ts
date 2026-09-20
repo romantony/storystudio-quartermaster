@@ -20,6 +20,20 @@
  * tells postprod-lite to use that mp4's own audio as the SFX layer under the
  * narration — requires the 2026-09-15 postprod-lite image. The standalone
  * SFX mp3 is not used.
+ *
+ * Step 16 (Remotion text overlay) added 2026-09-20 for the asset pipeline's
+ * new `merge` kind (assets/kinds.ts): there, `merge` can sit downstream of
+ * `remotion` (assets/plan.ts's chain ends [...overlay, sfx, refine,
+ * motionKind]), unlike the cohort model where remotion runs AFTER merge —
+ * see steps/builders/remotion-overlay.ts's own header. No planned-but-
+ * missing guard needed the way upscale/sfx above have one: the asset
+ * model's handoff never runs this builder until every kind in `requires`
+ * has WRITTEN a url (assets/plan.ts's `inputsSatisfied`), and the remotion
+ * agent itself always completes a row — with the original clip passed
+ * through unchanged when a frame has no textManifest, never left missing —
+ * so resolvedDeps[16] is populated whenever remotion was planned, by the
+ * time this builder can even run. Harmless no-op for the cohort model,
+ * where this seq is never populated before merge.
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
@@ -27,6 +41,7 @@ const TTS_STEP_SEQ = 2;
 const ANIMATION_STEP_SEQ = 3;
 const UPSCALE_FRAME_STEP_SEQ = 14;
 const SFX_STEP_SEQ = 15;
+const REMOTION_STEP_SEQ = 16;
 
 export const buildMergeInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
   const attribution: Record<string, unknown> = { project_id: ctx.projectId };
@@ -53,7 +68,11 @@ export const buildMergeInput: PayloadBuilder = (ctx: BuildContext): Record<strin
   if (sfxVideoUrl && /\.(mp3|wav|flac|m4a|aac)(\?|$)/i.test(sfxVideoUrl)) {
     throw new Error(`merge builder: sfx output for frame ${ctx.frameId ?? '(none)'} is audio-only (${sfxVideoUrl}), expected MMAudio's mp4`);
   }
-  const videoUrl = sfxVideoUrl ?? ctx.resolvedDeps[UPSCALE_FRAME_STEP_SEQ]?.url ?? ctx.resolvedDeps[ANIMATION_STEP_SEQ]?.url;
+  const videoUrl =
+    ctx.resolvedDeps[REMOTION_STEP_SEQ]?.url ??
+    sfxVideoUrl ??
+    ctx.resolvedDeps[UPSCALE_FRAME_STEP_SEQ]?.url ??
+    ctx.resolvedDeps[ANIMATION_STEP_SEQ]?.url;
   if (!videoUrl) {
     throw new Error(`merge builder: no resolved animation video URL for frame ${ctx.frameId ?? '(none)'}`);
   }
