@@ -143,7 +143,21 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
   // the tail itself), so those keep merging there, same as before this
   // kind existed.
   const merge = motionKind ? ('merge' as const) : undefined;
-  if (merge) requires[merge] = [overlay ?? sfx ?? refine ?? (motionKind as AssetKind), 'tts'];
+  if (merge) {
+    requires[merge] = [overlay ?? sfx ?? refine ?? (motionKind as AssetKind), 'tts'];
+    // steps/builders/merge.ts's no-silent-degrade guard checks
+    // resolvedDeps[14] (dreamx-refine) directly whenever upscaleFrames is
+    // set — mirroring the cohort model, where step 6 depends on step 14
+    // directly no matter what else sits between them. This chain's `requires`
+    // is single-hop, so when overlay or sfx sits between refine and merge,
+    // merge never lists refine as a direct requirement and toResolvedDeps()
+    // never gets seq 14 populated for it — even though refine already
+    // completed. Confirmed live 2026-09-30: a project with sfx + the (now
+    // mandatory) refine failed every merge with "upscale was planned but no
+    // resolved upscaled video URL", despite dreamx-refine having a real url
+    // for every frame. List it explicitly so its handoff also writes here.
+    if (refine && !requires[merge].includes(refine)) requires[merge].push(refine);
+  }
 
   const frameKinds = Object.keys(requires) as AssetKind[];
   const kinds: AssetKind[] = [...frameKinds, 'postprod-lite'];

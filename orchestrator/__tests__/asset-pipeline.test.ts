@@ -160,7 +160,12 @@ describe('compilePlan', () => {
     const plan = compilePlan(withOptions({ upscale: true, upscaleEngine: 'dreamx', sfx: true }));
     expect(plan.requires['dreamx-refine']).toEqual(['wan2-i2v']);
     expect(plan.requires['mmaudio']).toEqual(['dreamx-refine']);
-    expect(plan.requires['merge']).toEqual(['mmaudio', 'tts']);
+    // merge also lists dreamx-refine directly (not just mmaudio), mirroring
+    // the cohort model's step 6, which depends on step 14 directly no matter
+    // what else sits between them — otherwise merge's own `sources` never
+    // receives dreamx-refine's url via handoff (2026-09-30 e2e finding: a
+    // real project with sfx+refine together failed every merge as a result).
+    expect(plan.requires['merge']).toEqual(['mmaudio', 'tts', 'dreamx-refine']);
     // The frame's finished clip is the most-processed one — merge, now that
     // it runs downstream of everything else per-frame.
     expect(clipKind(plan)).toBe('merge');
@@ -212,12 +217,15 @@ describe('the remotion agent', () => {
     // it is the frame's TRULY final per-frame artifact (narration mixed in).
     const plain = compilePlan(withOptions({ textOverlay: true }));
     expect(plain.requires['remotion']).toEqual(['dreamx-refine']);
-    expect(plain.requires['merge']).toEqual(['remotion', 'tts']);
+    // merge also lists dreamx-refine directly, same reasoning as the sfx
+    // case above — remotion sitting between refine and merge would otherwise
+    // leave merge's own resolvedDeps[14] empty.
+    expect(plain.requires['merge']).toEqual(['remotion', 'tts', 'dreamx-refine']);
     expect(clipKind(plain)).toBe('merge');
 
     const full = compilePlan(withOptions({ textOverlay: true, upscale: true, upscaleEngine: 'dreamx', sfx: true }));
     expect(full.requires['remotion']).toEqual(['mmaudio']);
-    expect(full.requires['merge']).toEqual(['remotion', 'tts']);
+    expect(full.requires['merge']).toEqual(['remotion', 'tts', 'dreamx-refine']);
     expect(clipKind(full)).toBe('merge');
   });
 
