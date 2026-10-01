@@ -100,6 +100,40 @@ maybeDescribe('asset pipeline repo (integration)', () => {
     return { projectId, req, plan };
   }
 
+  it('claimPending round-robins across projects, fresh attempts before requeues', async () => {
+    // Three projects submitted in order, a big one first. A claim of 3 must
+    // take one row from each, not three from the first.
+    const big = await seedAssets({
+      frames: Array.from({ length: 4 }, (_, i) => ({ frameId: `f${i + 1}`, imagePrompt: 'a', narration: 'n', durationS: 4 })),
+    });
+    const b = await seedAssets();
+    const c = await seedAssets();
+
+    // Claim everything and look only at our own projects, so rows other tests
+    // left pending in the shared table cannot change the answer.
+    const mine = new Set([big.projectId, b.projectId, c.projectId]);
+    const own = async (): Promise<Awaited<ReturnType<typeof claimPending>>> =>
+      (await claimPending(pool as never, 'qwen-image-gen', 1000)).filter((r) => mine.has(r.projectId));
+
+    const first = await own();
+    // Round 1 (the first three rows) takes one row from each project, the
+    // earliest-submitted project leading it; the big project's extra rows
+    // only follow once the small ones are exhausted.
+    expect(first.slice(0, 3).map((r) => r.projectId)).toEqual([big.projectId, b.projectId, c.projectId]);
+    expect(first.slice(3, 6).map((r) => r.projectId)).toEqual([big.projectId, b.projectId, c.projectId]);
+    expect(first.slice(6).map((r) => r.projectId)).toEqual([big.projectId, big.projectId]);
+
+    // A requeued row (attempts > 0) comes after every fresh one, whichever project it is in.
+    await pool.query(
+      `UPDATE assets SET attempts = 1 WHERE asset_kind = 'qwen-image-gen' AND project_id = $1 AND frame_id = 'f1'`,
+      [big.projectId],
+    );
+    const next = await own();
+    const last = next[next.length - 1];
+    expect(last?.projectId).toBe(big.projectId);
+    expect(last?.frameId).toBe('f1');
+  });
+
   it('writes every asset into its own partition, chain heads runnable and the rest blocked', async () => {
     const { projectId, plan } = await seedAssets();
     const rows = await listProjectAssets(pool, projectId);

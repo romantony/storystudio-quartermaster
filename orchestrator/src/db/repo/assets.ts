@@ -152,22 +152,49 @@ export async function insertAssets(db: Queryable, rows: NewAsset[]): Promise<num
  * written in the same transaction — a lock released with nothing to show for
  * it is not a claim.
  *
- * ORDER BY attempts first: a requeued row only comes back round once no fresh
- * attempt is left unclaimed for this kind, so one poisoned asset cannot crowd
- * out first attempts across every other project (the rule the cohort path
- * adopted on 2026-09-16).
+ * Ordering, in priority:
+ *  1. `attempts` first: a requeued row only comes back round once no fresh
+ *     attempt is left unclaimed for this kind, so one poisoned asset cannot
+ *     crowd out first attempts across every other project (the rule the cohort
+ *     path adopted on 2026-09-16).
+ *  2. Round-robin across projects: within an attempts tier, each project's
+ *     Nth pending row ranks together, so with three projects queued a claim of
+ *     3 takes one row from each instead of three from whichever was submitted
+ *     first. Ties break on the project's oldest pending row, so the earliest
+ *     submission still leads each round, then by seq within the project.
+ *
+ * The ranking happens in a subquery (window functions cannot sit under FOR
+ * UPDATE); the lock is then taken on just those rows. A row another agent has
+ * locked is skipped, so a claim can return fewer than `limit` — the next tick
+ * fills the gap.
  */
 export async function claimPending(client: PoolClient, kind: AssetKind, limit: number): Promise<AssetRow[]> {
   if (limit <= 0) return [];
-  const { rows } = await client.query(
-    `SELECT ${COLUMNS} FROM assets
-      WHERE asset_kind = $1 AND status = 'pending'
-      ORDER BY attempts ASC, created_at ASC, seq ASC
-      LIMIT $2
-      FOR UPDATE SKIP LOCKED`,
+  const { rows: ranked } = await client.query<{ id: string }>(
+    `SELECT id FROM (
+       SELECT id, attempts, seq,
+              row_number() OVER (PARTITION BY project_id, attempts ORDER BY created_at ASC, seq ASC) AS rr,
+              min(created_at) OVER (PARTITION BY project_id) AS project_first
+         FROM assets
+        WHERE asset_kind = $1 AND status = 'pending'
+     ) ranked
+     ORDER BY attempts ASC, rr ASC, project_first ASC, seq ASC
+     LIMIT $2`,
     [kind, limit],
   );
-  return rows.map(toAsset);
+  if (ranked.length === 0) return [];
+  const ids = ranked.map((r) => r.id);
+  const { rows } = await client.query(
+    `SELECT ${COLUMNS} FROM assets
+      WHERE asset_kind = $1 AND status = 'pending' AND id = ANY($2)
+      FOR UPDATE SKIP LOCKED`,
+    [kind, ids],
+  );
+  // The lock query returns in no particular order; restore the round-robin one.
+  const position = new Map(ids.map((id, i) => [String(id), i]));
+  return rows
+    .map(toAsset)
+    .sort((x, y) => (position.get(String(x.id)) ?? 0) - (position.get(String(y.id)) ?? 0));
 }
 
 /** How many jobs this ENDPOINT is holding, across every kind that shares it.
