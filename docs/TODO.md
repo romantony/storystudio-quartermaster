@@ -2,7 +2,196 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
-## 2026-09-19 (NEXT SESSION) — re-architect: per-asset generator agents, table-driven handoff
+## 2026-09-21 (NEXT SESSION) — finish the audio-pool cutover, then live-verify everything together
+
+Yesterday (2026-09-20) fixed every P0/P1 item from the three-project run
+analysis (see the DONE section right below) and built two new things on top:
+merge-parallelization and TTS+MMAudio+BGM pooling. Both shipped, but the
+session ended mid-verification — **start here**:
+
+- [ ] **`audio-pool` endpoint (`rnqxi6c0mlq517`, ex-Flux-TTS-ANIM) — confirm
+      actually healthy, not just fixed-on-paper.** Root cause found and fixed
+      live (`3296956`, flux4B-Wan2-storystudio): every worker was crash-looping
+      on `from diffusers import AceStepPipeline` -> `ImportError: cannot
+      import name 'resolve_revision' from 'huggingface_hub'` — the
+      `huggingface_hub>=1.23.0` floor was satisfied by versions that predate
+      `resolve_revision` (added in 1.26.0), while `diffusers` installs
+      unpinned from git HEAD. Bumped to `>=1.26.0`, confirmed via RunPod's own
+      release notes, rebuilt, pushed. **But**: right as the session ended, a
+      fresh test job still sat `IN_QUEUE` with the endpoint flapping between
+      `0 throttled` (healthy-looking) and `4 throttled` again — could be a
+      slow rolling restart still landing (old and new workers mixed), or a
+      second, different issue. Re-run the same smoke test first:
+      ```
+      curl -X POST https://api.runpod.ai/v2/rnqxi6c0mlq517/run \
+        -H 'Content-Type: application/json' -H "Authorization: Bearer $RUNPOD_API_KEY" \
+        -d '{"input":{"mode":"tts","engine":"kokoro","text":"test","voice":"af_heart"}}'
+      ```
+      then poll `/status/<id>` and `/health`. If it's still not dispatching
+      despite idle/ready workers shown, pull fresh dashboard logs the same way
+      as before (Serverless -> endpoint -> Logs -> download) rather than
+      guessing again from the API alone — that's what actually found the real
+      bug last time.
+- [x] **`postprod-lite-v2` (`n6252hm01qz0xh`) — already confirmed working**
+      live (a real `merge` job completed in 13s, real output at a real R2 URL)
+      — no further action, just noting it so tomorrow doesn't re-doubt it.
+- [ ] **Once audio-pool is confirmed healthy: run one real StoryStudio
+      project end-to-end** through the orchestrator and watch it exercise, for
+      the first time together: the new `merge` asset kind (parallel per-frame
+      merge), the pooled audio-pool endpoint (tts+mmaudio+bgm all landing on
+      one 7-pod endpoint), postprod-lite-v2's `preMerged` consumption, the
+      normalized concat, the real BGM loop, and the A/V duration-parity
+      assertion. Nothing has exercised the full chain together yet — every
+      piece so far is either a unit-level RunPod smoke test or a code
+      review, not a live project.
+- [ ] **Cohort pipeline (`ORCH_PIPELINE_MODE=cohort`) staleness — confirm
+      whether it's actually dead before spending more time on it.**
+      `steps/catalog.ts`'s own seq-15 MMAudio step and seq-2 tts step now
+      both point at the same repurposed 7-pod endpoint with no
+      `countInFlightForEndpoint`-style pooling between them (that mechanism
+      only exists in the asset model) — `maxWorkers: 2` on sfx and the stale
+      `fleet-registry.ts` count on tts are just wrong now. Only matters if
+      cohort mode still runs live traffic anywhere; if it's confirmed fully
+      superseded by the asset pipeline, this whole class of staleness can be
+      deleted instead of chased.
+- [ ] Minor: `docs/qm-orchestrator-three-project-run-analysis-2026-09-19.md`
+      is still untracked in git — commit it if it's meant to stay as a
+      permanent record (it's the source doc the whole 09-20 session's fixes
+      trace back to).
+
+### Also learned 2026-09-20, worth remembering going in
+
+- **This dev machine's local disk is chronically near-full** (hit 96-100%
+  twice in one session from ordinary `docker build`/`docker pull` of the
+  ~8-10GB CUDA/torch images this project uses). Always `df -h /` before a
+  local build or pull; prefer letting GitHub Actions build+push instead of
+  building locally when the image is this size class. `docker builder prune
+  -af` recovers build cache safely; never touch the other ~80GB of tagged
+  images without asking first — they're this account's real deployment
+  history (postprod-lite version tags, wan2, dreamx-creator, etc.), not
+  reclaimable junk.
+- **A RunPod endpoint's worker health API (`/health`) reporting
+  `idle`/`ready` workers does NOT mean jobs are actually being dispatched.**
+  Saw workers cycle through idle/ready/throttled for 20+ minutes while three
+  separate test jobs sat `IN_QUEUE` the whole time, across cancels and
+  resubmits. The only reliable diagnostic was the dashboard's own per-worker
+  logs (user pulled a `.txt` export) — the health endpoint alone would have
+  kept pointing at a disk/capacity/dispatch theory that was wrong.
+
+## 2026-09-20 (DONE — see docs/qm-orchestrator-three-project-run-analysis-2026-09-19.md for the original findings) — fix the assembly defects found by the three-project live run
+
+Full analysis, measurements and cost breakdown:
+`docs/qm-orchestrator-three-project-run-analysis-2026-09-19.md`.
+
+The 2026-09-19 run put three real StoryStudio projects through the per-asset
+pipeline concurrently. **Generation was flawless** — 1,126 assets, zero
+failures, zero dropped frames, no timeouts, 4.7–4.8x parallelism. **Two of the
+three delivered videos are unusable**, entirely because of assembly.
+
+Nothing below is a generation-agent bug. Do not go looking there.
+
+### P0 — correctness (blocks delivering educational/explainer at all)
+
+- [x] **Normalise clips before concat.** DONE 2026-09-20: `_concat_local()`
+      in the new `postprod-lite-v2` image probes every clip and normalizes to
+      the largest-area clip's own resolution + the highest fps present before
+      the concat demuxer ever sees them. Smoke-tested with a synthetic
+      1920x1080@30 + 832x464@16 mix: drift went 0.37s -> 0.03s. Live-verified
+      2026-09-20 on the repurposed `n6252hm01qz0xh` endpoint (real `merge` job,
+      13s, real output). Old `postprod-lite` (v1) is untouched and still has
+      the bug — nothing routes to it for new work any more.
+- [x] **Assert A/V duration parity in the tail before upload.** DONE
+      2026-09-20: `_assert_av_duration_parity()` in postprod-lite-v2, >1s
+      drift fails the project loudly instead of shipping it. Verified it
+      actually fires on a reproduced desync.
+- [ ] Re-run #3 and #1 through the tail once both land, and verify parity.
+      **Still not done** — the fix shipped and was smoke-tested with
+      synthetic/other clips, but the actual two broken videos from this run
+      were never re-assembled through the fixed tail. Their per-frame clips
+      are still hosted and intact per the original analysis, so this is
+      reassembly only, not regeneration.
+
+### P1 — quality
+
+- [ ] **Resolve Remotion coverage with StoryStudio.** Still open — this is a
+      StoryStudio-side question (is ~15% `textManifest` coverage intentional
+      or a bug upstream), not something fixable from the orchestrator side.
+      Only **17/95** (#3) and **16/111** (#1) frames carried a `textManifest`
+      and got a real render; the rest took `invokeLambdaRow()`'s
+      `__passthrough` branch. If every frame is meant to be Remotion-rendered,
+      that removes the format mixing at source and makes the concat-normalize
+      fix above a belt-and-braces safety net rather than the load-bearing fix.
+      The passthrough itself is deliberate (its comment: a mixed project would
+      otherwise "drop the uncaptioned ones out of the chain entirely") — the
+      design anticipated mixed projects, the concat did not.
+- [x] **Loop/pad BGM to video length.** DONE 2026-09-20: `_mix_bgm_local()`
+      in postprod-lite-v2 now uses `aloop=loop=-1` + `atrim` in the filter
+      graph itself (trimmed to the real probed video length), replacing
+      `-stream_loop -1` — measured live that the old approach didn't survive
+      combination with `-filter_complex`/`amix` past the bgm track's own
+      length. Verified: bgm mixed under a video 5x its own length still had
+      real audio (not silence) at the tail.
+- [x] **Decide the 832x464 path.** RESOLVED 2026-09-20, differently than
+      expected: rather than deciding per-project whether passthrough frames
+      need an upscale, `dreamx-refine` is now unconditional on every
+      `wan2-i2v` frame regardless of product/Remotion coverage (`plan.ts`) —
+      so a passthrough frame is never left at native 832x464 any more,
+      independent of how the Remotion-coverage question above gets answered.
+      Related: the 2026-09-18 9:16 crop bug below is the same family of
+      "what resolution is authoritative" question — consider together.
+
+### P2 — robustness and throughput
+
+- [ ] **Raise `qwen-image-gen` 150s -> 240s.** Max observed execution 139.6s:
+      **7% headroom**. A cold pod plus variance tips it into a false timeout,
+      which costs a cancel + full resubmit.
+- [ ] **Raise `dreamx-refine` timeout 150s -> 300s.** Still open — max
+      observed 127.8s (15% headroom), and this is now a bigger deal than when
+      written: `dreamx-refine` went from opt-in to mandatory on every
+      wan2-i2v frame 2026-09-20 (`plan.ts`), so its timeout margin gets
+      exercised far more often. Do not confuse with the pod *count*, which
+      **was** raised 2026-09-20 (2->4, `DREAMX_PODS` in `kinds.ts`, matching
+      the live dashboard) — that's capacity, this is per-job timeout, still
+      at 150s.
+- [ ] **Guard the postprod tail budget.** Partially addressed as a side
+      effect of the 2026-09-20 merge-parallelization work (per-frame merge
+      moved out of the tail into its own parallel agent, so the tail itself
+      does less per frame now), but the ~5.4s/frame scaling was never
+      directly re-measured after that change, and the 900s pod ceiling logic
+      itself is untouched. Re-measure on the first real post-cutover project
+      before assuming this is fixed.
+- [ ] **Let the Lambda path use all 8 slots.** `remotion` is capped at 4
+      concurrent by `assetDispatchBatchSize`, and `agent.ts` blocks the whole
+      tick on the `Promise.all` batch. 16 of 60 saturation samples showed
+      remotion idle with work queued, streaks up to 90s.
+- [ ] **Allow queue depth of pods+1** on RunPod endpoints. `maxInFlight`
+      equals the pod count exactly, so no job is ever queued at RunPod and a
+      freed worker idles until the next tick. Queued jobs are unbilled — this
+      is free throughput. (The other 7 starved samples were all single-sample
+      refill lag from exactly this.)
+
+### Cost baseline established by this run (for reference)
+
+| path | per frame | dominant cost |
+|---|---:|---|
+| educational / explainer | **$0.024–0.025** | wan2-i2v ~72% |
+| narration-premium | **$0.0538** | wan2 38% + **dreamx 37%** |
+
+Three-project total **$6.03**. Premium is 2.2x per frame and it is entirely
+DreamX. Nothing except Wan2 is worth optimising on the non-premium paths.
+Assembly is 3–5% of project cost.
+
+### Do not re-litigate
+
+- The QA exemption for explainer/educational works (`qa_status: bypassed` on
+  both, no VLM spend, no gate stalls). Leave it.
+- #3's QA sampling numbers (49 of 95 images judged against a 30% target) are
+  **contaminated** — the exemption was deployed mid-flight and #3's plan was
+  patched to `qaExempt` while it ran. Do not read a sampling rate off it.
+- Retries are not a problem: 10 assets total across all three projects, all on
+  Maya, all resolved on attempt 2.
+
+## 2026-09-19 (DONE — built, deployed and run live; see the 09-21 section above) — re-architect: per-asset generator agents, table-driven handoff
 
 > **BUILT 2026-09-19** — the per-asset generator agents, the project compiler
 > and the one-shot tail are implemented in `orchestrator/src/assets/` +
