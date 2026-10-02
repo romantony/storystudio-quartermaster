@@ -1,13 +1,12 @@
 /**
  * Tests for the project compiler's tick — the fan-in decision, the repair
- * pass, arming the one-shot tail, and collecting its result.
+ * pass, arming the SFN tail, and collecting its result.
  *
  * The repo layer is mocked (its SQL is covered against a real Postgres in
  * asset-repo.integration.test.ts). What is under test is the agent's
- * judgement: when it waits, when it reworks, what manifest it hands the
- * worker, and that it never calls postprod-lite itself — arming the
- * project-scoped row is what puts the dispatch under the endpoint's pod
- * limit, which is what makes "one pod, one project" true.
+ * judgement: when it waits, when it reworks, what manifest it hands the tail,
+ * and that it never starts the execution itself — arming the project-scoped
+ * `sfn-tail` row is what puts the start under the kind's concurrency ceiling.
  */
 import { RunpodClient } from '../src/runpod/client';
 import { compileProject, type CompilerDeps } from '../src/assets/compiler';
@@ -92,8 +91,7 @@ function assetRow(over: Partial<AssetRow> & Pick<AssetRow, 'kind' | 'frameId'>):
 function generatedProject(req: OrchestratorRequest, options: Record<string, unknown> = {}): AssetRow[] {
   const plan = compilePlan(request(options));
   const rows = plan.frameKinds.flatMap((kind) => req.frames.map((f) => assetRow({ kind, frameId: f.frameId })));
-  rows.push(assetRow({ kind: 'postprod-lite', frameId: PROJECT_SCOPE, status: 'blocked', assetUrl: null }));
-  if (plan.kinds.includes('bgm')) rows.push(assetRow({ kind: 'bgm', frameId: PROJECT_SCOPE, assetUrl: 'https://cdn/bgm.mp3' }));
+  rows.push(assetRow({ kind: 'sfn-tail', frameId: PROJECT_SCOPE, status: 'blocked', assetUrl: null }));
   return rows;
 }
 
@@ -105,6 +103,9 @@ function fakeRes(status: number, body: unknown) {
   } as unknown as Response;
 }
 
+/** What the compiler wrote to R2 as the tail manifest, in order. */
+const uploads: Array<{ key: string; body: unknown }> = [];
+
 function deps(fetchImpl: jest.Mock = jest.fn()): CompilerDeps {
   const pool = {
     connect: jest.fn(async () => ({ query: jest.fn(async () => ({ rows: [], rowCount: 0 })), release: jest.fn() })),
@@ -115,6 +116,18 @@ function deps(fetchImpl: jest.Mock = jest.fn()): CompilerDeps {
     runpod: new RunpodClient(RUNPOD_CFG, { fetchImpl: fetchImpl as unknown as typeof fetch, sleepImpl: async () => undefined }),
     cfg: { workerRateUsdS: 0.00021 } as unknown as CompilerDeps['cfg'],
     sleepImpl: async () => undefined,
+    // The SFN tail needs a manifest FILE (no inline fallback — Step Functions
+    // caps its input at 256KB), so every test that reaches arming needs R2.
+    r2: {
+      accountId: 'a',
+      bucket: 'b',
+      publicUrl: 'https://cdn',
+      accessKeyId: 'k',
+      secretAccessKey: 's',
+      putImpl: async (_t, key, body) => {
+        uploads.push({ key, body: JSON.parse(body.toString('utf8')) });
+      },
+    },
   };
 }
 
@@ -139,14 +152,14 @@ function pipelineRow(plan: ReturnType<typeof compilePlan>, over: Record<string, 
   };
 }
 
-/** The manifest the compiler handed to armProjectAsset on this tick. */
+/** The manifest the compiler uploaded for this tick (the tail reads it by URL). */
 function armedManifest(): TailManifest | undefined {
-  const call = (assetsRepo.armProjectAsset as jest.Mock).mock.calls[0];
-  return call?.[3]?.manifest;
+  return uploads[uploads.length - 1]?.body as TailManifest | undefined;
 }
 
 beforeEach(() => {
   jest.clearAllMocks();
+  uploads.length = 0;
   (projectsRepo.getProject as jest.Mock).mockResolvedValue({
     id: 'proj_1', requestId: 'req_1', request: request(), callbackUrl: 'https://convex.example/api/qm/result',
   });
@@ -175,22 +188,6 @@ describe('while generating', () => {
     expect(res.action).toBe('waiting');
     expect(assetsRepo.armProjectAsset).not.toHaveBeenCalled();
     expect(pipelineRepo.touchPipelineProject).toHaveBeenCalled();
-  });
-
-  it('waits for the project’s bgm track before arming the tail', async () => {
-    const req = request({ bgm: true }, { bgmPrompt: 'soft piano' });
-    const plan = compilePlan(req);
-    (projectsRepo.getProject as jest.Mock).mockResolvedValue({ id: 'proj_1', requestId: 'req_1', request: req, callbackUrl: null });
-    (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
-    const rows = generatedProject(req, { bgm: true }).map((r) =>
-      r.kind === 'bgm' ? assetRow({ ...r, status: 'submitted', assetUrl: null }) : r,
-    );
-    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(rows);
-
-    const res = await compileProject(deps(), 'proj_1');
-
-    expect(res.action).toBe('waiting');
-    expect(assetsRepo.armProjectAsset).not.toHaveBeenCalled();
   });
 
   it('cancels a stuck provider job and resubmits it as rework', async () => {
@@ -320,7 +317,7 @@ describe('the project quality gate', () => {
 });
 
 describe('arming the tail', () => {
-  it('compiles the manifest and arms the tail row — it never calls postprod-lite itself', async () => {
+  it('compiles the manifest and arms the tail row — it never starts the execution itself', async () => {
     const plan = compilePlan(request());
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
     (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
@@ -329,57 +326,75 @@ describe('arming the tail', () => {
     const res = await compileProject(deps(fetchImpl), 'proj_1');
 
     expect(res.action).toBe('armed');
-    // The dispatch belongs to the postprod-lite agent, under its pod limit.
+    // The start belongs to the sfn-tail agent, under its concurrency ceiling.
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(pipelineRepo.beginAssembly).toHaveBeenCalled();
     expect(assetsRepo.armProjectAsset).toHaveBeenCalledWith(
-      expect.anything(), 'proj_1', 'postprod-lite', expect.objectContaining({ frameId: PROJECT_SCOPE }),
+      expect.anything(), 'proj_1', 'sfn-tail', expect.objectContaining({ frameId: PROJECT_SCOPE }),
     );
 
     const m = armedManifest()!;
     expect(m.frames.map((f) => f.frameId)).toEqual(['f1', 'f2']);
-    // merge is on by default now, ahead of dreamx-refine/wan2-i2v in the
-    // chain — its output (narration mixed in) is the frame's clip.
-    expect(m.frames[0]).toMatchObject({ videoUrl: 'https://cdn/merge-f1.mp4', audioUrl: 'https://cdn/tts-f1.mp4' });
-    expect(m.frames[0].preMerged).toBe(true);
+    // The frame's clip is wan2-i2v's own output (no dreamx-refine, no merge
+    // agent any more); the narration travels alongside it for the tail to mix.
+    expect(m.frames[0]).toMatchObject({ videoUrl: 'https://cdn/wan2-i2v-f1.mp4', audioUrl: 'https://cdn/tts-f1.mp4' });
     expect(m.droppedFrames).toEqual([]);
   });
 
-  it('writes the manifest as a file when R2 is configured, and arms with the url', async () => {
-    const plan = compilePlan(request());
+  it('arms with the manifest URL and the options the state machine branches on — never an inline manifest', async () => {
+    const req = request({ bgm: true, removeSilence: true, burnCaptions: true, sfx: true }, { bgmPrompt: 'soft piano' });
+    const plan = compilePlan(req);
+    (projectsRepo.getProject as jest.Mock).mockResolvedValue({ id: 'proj_1', requestId: 'req_1', request: req, callbackUrl: null });
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
-    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(
+      generatedProject(req, { bgm: true, removeSilence: true, burnCaptions: true, sfx: true }),
+    );
 
-    const put = jest.fn(async () => undefined);
-    const d = deps();
-    d.r2 = { accountId: 'a', bucket: 'b', publicUrl: 'https://cdn', accessKeyId: 'k', secretAccessKey: 's', putImpl: put };
-
-    const res = await compileProject(d, 'proj_1');
+    const res = await compileProject(deps(), 'proj_1');
 
     expect(res.action).toBe('armed');
-    expect(put).toHaveBeenCalled();
+    expect(uploads).toHaveLength(1);
     const armed = (assetsRepo.armProjectAsset as jest.Mock).mock.calls[0][3];
     expect(armed.manifestUrl).toMatch(/^https:\/\/cdn\/pipeline-manifests\/proj_1\//);
     expect(armed.manifest).toBeUndefined();
+    expect(armed).toMatchObject({
+      aspectRatio: '9:16',
+      language: 'en',
+      options: { removeSilence: true, captions: true, bgm: true, bgmPrompt: 'soft piano', sfx: true },
+      totalDurationS: 9,
+    });
   });
 
-  it('falls back to an inline manifest when the upload fails', async () => {
+  it('does NOT claim assembly when the manifest cannot be written — there is nothing to hand over', async () => {
     const plan = compilePlan(request());
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
     (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
 
     const d = deps();
-    d.r2 = {
-      accountId: 'a', bucket: 'b', publicUrl: 'https://cdn', accessKeyId: 'k', secretAccessKey: 's',
-      putImpl: async () => { throw new Error('R2 down'); },
-    };
+    d.r2 = { ...(d.r2 as NonNullable<typeof d.r2>), putImpl: async () => { throw new Error('R2 down'); } };
 
     const res = await compileProject(d, 'proj_1');
-    expect(res.action).toBe('armed');
-    expect(armedManifest()).toBeDefined();
+
+    expect(res.action).toBe('waiting');
+    expect(res.detail).toBe('manifest upload failed');
+    expect(pipelineRepo.beginAssembly).not.toHaveBeenCalled();
+    expect(assetsRepo.armProjectAsset).not.toHaveBeenCalled();
   });
 
-  it('carries the bgm track and the tail flags into the manifest', async () => {
+  it('does not claim assembly when R2 is not configured at all', async () => {
+    const plan = compilePlan(request());
+    (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
+
+    const d = deps();
+    d.r2 = undefined;
+    const res = await compileProject(d, 'proj_1');
+
+    expect(res.action).toBe('waiting');
+    expect(pipelineRepo.beginAssembly).not.toHaveBeenCalled();
+  });
+
+  it('carries the tail flags and the bgm PROMPT (not a track) into the manifest', async () => {
     const req = request({ bgm: true, removeSilence: true, burnCaptions: true }, { bgmPrompt: 'soft piano' });
     const plan = compilePlan(req);
     (projectsRepo.getProject as jest.Mock).mockResolvedValue({ id: 'proj_1', requestId: 'req_1', request: req, callbackUrl: null });
@@ -391,8 +406,8 @@ describe('arming the tail', () => {
     await compileProject(deps(), 'proj_1');
 
     const m = armedManifest()!;
-    expect(m.steps).toEqual({ removeSilence: true, burnCaptions: true, upscale: false });
-    expect(m.bgm).toEqual({ url: 'https://cdn/bgm.mp3', volume: 0.15 });
+    expect(m.steps).toEqual({ removeSilence: true, burnCaptions: true });
+    expect(m.bgm).toEqual({ prompt: 'soft piano', volume: 0.15 });
     expect(m.captions).toBeDefined();
   });
 
@@ -477,19 +492,19 @@ describe('collecting the tail', () => {
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(
       pipelineRow(plan, { status: 'assembling', manifest, attempts: 1, ...over }),
     );
-    const rows = generatedProject(request()).filter((r) => r.kind !== 'postprod-lite');
-    rows.push(assetRow({ kind: 'postprod-lite', frameId: PROJECT_SCOPE, status: 'submitted', assetUrl: null, ...tail }));
+    const rows = generatedProject(request()).filter((r) => r.kind !== 'sfn-tail');
+    rows.push(assetRow({ kind: 'sfn-tail', frameId: PROJECT_SCOPE, status: 'submitted', assetUrl: null, ...tail }));
     (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(rows);
   }
 
-  it('waits while the postprod-lite agent still holds the job', async () => {
+  it('waits while the sfn-tail agent still holds the job', async () => {
     assembling();
     const res = await compileProject(deps(), 'proj_1');
     expect(res.action).toBe('waiting');
     expect(pipelineRepo.finishPipelineProject).not.toHaveBeenCalled();
   });
 
-  it('finishes the project on the final url the one-shot returned', async () => {
+  it('finishes the project on the final url the tail returned', async () => {
     assembling({}, { status: 'complete', assetUrl: 'https://cdn/final.mp4', durationS: 44.2 });
     const res = await compileProject(deps(), 'proj_1');
 

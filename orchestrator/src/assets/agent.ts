@@ -54,6 +54,13 @@ import { recordAssetCost } from '../db/repo/asset-costs';
 import type { FrameJobInput } from '../steps/builders/types';
 import { invokeRemotionOverlay, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
 import { persistToR2, type R2Transport } from '../r2/client';
+import {
+  describeTailExecution,
+  executionName,
+  startTailExecution,
+  stopTailExecution,
+  type SfnTransport,
+} from '../aws/sfn';
 
 export interface AssetAgentDeps {
   pool: Pool;
@@ -78,6 +85,9 @@ export interface AssetAgentDeps {
    * problem that cost 103/122 shots to expired replicate.delivery links on
    * 2026-08-17. Required alongside `lambda`. */
   r2?: R2Transport;
+  /** AWS Step Functions transport for the `sfn-tail` kind. Without it such a
+   * row fails at submission with a clear error. */
+  sfn?: SfnTransport;
 }
 
 export interface TickSummary {
@@ -454,6 +464,22 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
       return true;
     }
 
+    if (spec.provider === 'sfn') {
+      // One StartExecution — a fast call, so it stays inside the claim
+      // transaction exactly like a RunPod submission: the execution ARN is
+      // written in the same commit, so a crash can never leave an execution
+      // running with no row pointing at it. (And a replayed start under the
+      // same deterministic name adopts the running execution — aws/sfn.ts.)
+      if (!deps.sfn) throw new Error(`${kind} is provider:'sfn' but no sfn transport is configured`);
+      const manifestUrl = (payload as { manifestUrl?: string }).manifestUrl as string;
+      const name = executionName(row.projectId, row.attempts + 1, manifestUrl);
+      const executionArn = await startTailExecution(deps.sfn, name, payload);
+      await markSubmitted(client, row.id, kind, executionArn);
+      await client.query('COMMIT');
+      log().info({ assetId: row.id, kind, projectId: row.projectId, executionArn }, 'asset-agent: tail execution started');
+      return true;
+    }
+
     const webhookUrl = `${deps.publicBaseUrl}/v1/webhooks/asset/${assetWebhookToken(deps.webhookSecret, row.id)}`;
     const res = await runWithPausedRetry(deps, row.id, spec.endpointId, () =>
       deps.runpod.run(spec.endpointId, payload, webhookUrl),
@@ -506,6 +532,14 @@ async function timeoutAndResubmit(deps: AssetAgentDeps, kind: AssetKind, row: As
     }
   }
 
+  if (spec.cancelOnTimeout && row.providerJobId && spec.provider === 'sfn' && deps.sfn) {
+    try {
+      await stopTailExecution(deps.sfn, row.providerJobId, `orchestrator timeout after ${Math.round(outstandingMs / 1000)}s`);
+    } catch (err) {
+      log().warn({ assetId: row.id, kind, err }, 'asset-agent: stop of a timed-out execution failed, resubmitting anyway');
+    }
+  }
+
   const requeued = await reworkAsset(deps.pool, row.id, kind, {
     reason: 'timeout',
     outstandingMs,
@@ -519,6 +553,73 @@ async function timeoutAndResubmit(deps: AssetAgentDeps, kind: AssetKind, row: As
       : 'asset-agent: request timed out and the rework budget is exhausted, failed',
   );
   return requeued;
+}
+
+/**
+ * One `sfn-tail` row, polled. Step Functions has no webhook here, so this poll
+ * IS the completion path (the VPS's public webhook surface is not widened for
+ * it). A RUNNING execution past the kind's wall-clock budget is stopped and the
+ * row requeued; every terminal state maps onto the same success/failure paths
+ * a RunPod job uses, so retries, the attempts cap and the compiler's recompile
+ * behave identically.
+ */
+async function reconcileSfnRow(
+  deps: AssetAgentDeps,
+  kind: AssetKind,
+  row: AssetRow,
+): Promise<'completed' | 'failed' | 'timed-out' | 'timed-out-failed' | 'running' | 'error'> {
+  const spec = assetSpec(kind);
+  if (!deps.sfn) {
+    log().warn({ assetId: row.id, kind }, 'asset-agent: sfn row submitted but no sfn transport configured, cannot poll');
+    return 'error';
+  }
+  try {
+    const exec = await describeTailExecution(deps.sfn, row.providerJobId as string);
+
+    if (exec.status === 'RUNNING' || exec.status === 'PENDING_REDRIVE') {
+      const wallMs = row.submittedAt ? Date.now() - row.submittedAt.getTime() : 0;
+      if (spec.timeoutMs !== null && wallMs > spec.timeoutMs) {
+        const ok = await timeoutAndResubmit(deps, kind, row, wallMs);
+        return ok ? 'timed-out' : 'timed-out-failed';
+      }
+      await touchAsset(deps.pool, row.id, kind);
+      return 'running';
+    }
+
+    if (exec.status === 'SUCCEEDED') {
+      const out = (exec.output ?? {}) as {
+        videoUrl?: string;
+        durationSec?: number;
+        error?: string;
+        frames?: Array<{ frameId?: string; url?: string }>;
+      };
+      // `video` + `duration_s` so runpodOutUrl()/outputDuration() resolve it
+      // like every other video-producing kind. No billing record: an
+      // execution has no worker-seconds rate; per-execution cost is tracked
+      // from the state machine's own duration, not here.
+      const result = await applyAssetSuccess(deps, row.id, kind, {
+        ...(out.error ? { error: out.error } : {}),
+        video: out.videoUrl,
+        duration_s: out.durationSec,
+        // Each frame's hosted merged clip, for the §9.6 result's mergedClipUrl.
+        frames: out.frames,
+        executionArn: row.providerJobId,
+      });
+      if (result === 'failed') return 'failed';
+      return result === 'completed' || result === 'advanced' ? 'completed' : 'running';
+    }
+
+    // FAILED | TIMED_OUT | ABORTED
+    const result = await applyAssetFailure(deps, row.id, kind, {
+      provider: 'sfn',
+      status: exec.status,
+      error: [exec.error, exec.cause].filter(Boolean).join(': ').slice(0, 500) || exec.status,
+    });
+    return result === 'failed' ? 'failed' : 'running';
+  } catch (err) {
+    log().warn({ assetId: row.id, kind, err }, 'asset-agent: execution status check failed, will retry next tick');
+    return 'error';
+  }
 }
 
 /** The reconcile scan — the fallback for a webhook that never arrived, and
@@ -550,6 +651,17 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
       continue;
     }
     if (!row.providerJobId) continue;
+    if (spec.provider === 'sfn') {
+      const outcome = await reconcileSfnRow(deps, kind, row);
+      if (outcome === 'completed') completed += 1;
+      else if (outcome === 'failed') failed += 1;
+      else if (outcome === 'timed-out') timedOut += 1;
+      else if (outcome === 'timed-out-failed') {
+        timedOut += 1;
+        failed += 1;
+      }
+      continue;
+    }
     try {
       const res = await deps.runpod.status(spec.endpointId, row.providerJobId);
 

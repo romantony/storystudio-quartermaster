@@ -1,4 +1,14 @@
 /**
+ * COHORT-MODEL CONSTANTS ONLY, as of 2026-10-02. The asset pipeline
+ * (assets/kinds.ts, ORCH_PIPELINE_MODE=assets) no longer reads anything in this
+ * file: its assembly tail is a Step Functions execution (src/aws/sfn.ts) and its
+ * RunPod endpoints come from fleet-registry.ts. PostProd-Lite, DreamX-Refine
+ * and the pooled audio endpoint's multi-kind role below are all retired (0
+ * pods / back to TTS-only on the dashboard), so every "workers" figure and
+ * "live" claim in the comments here is HISTORICAL. Kept because the cohort
+ * model's steps/catalog.ts and agents/rework.ts still import the ids; delete
+ * with them once cohort mode is confirmed dead.
+ *
  * Orchestrator-only endpoint ids for the assembly tail (steps 6+) — NOT
  * auto-generated, unlike fleet-registry.ts. These endpoints are never shared
  * with the AWS live path (that's the whole point of M1: postprod-lite was

@@ -74,7 +74,14 @@ async function main(): Promise<void> {
       // The `remotion` agent's transports — the one non-RunPod kind.
       lambda: { functionName: cfg.remotionLambdaFunctionName, region: cfg.remotionLambdaRegion },
       r2,
+      // The `sfn-tail` agent's transport: starts + polls the assembly tail.
+      sfn: cfg.sfnTailStateMachineArn
+        ? { stateMachineArn: cfg.sfnTailStateMachineArn, region: cfg.sfnTailRegion }
+        : undefined,
     };
+    if (!cfg.sfnTailStateMachineArn) {
+      logger.warn('SFN_TAIL_STATE_MACHINE_ARN is not set — projects will generate assets but their tail cannot start');
+    }
     assetAgents = startAssetAgents(assetDeps, ASSET_KINDS, cfg.assetTickMs);
     // Always started, even at ORCH_ASSET_QA=off: a gated kind's completion
     // defers its handoff unconditionally (assets/agent.ts), so something has

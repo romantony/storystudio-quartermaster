@@ -221,6 +221,16 @@ const ConfigSchema = z.object({
   // config — the VPS box needs `lambda:InvokeFunction` on this function.
   remotionLambdaFunctionName: z.string().default('QM-remotion-overlay'),
   remotionLambdaRegion: z.string().default('us-east-1'),
+
+  // ── The assembly tail (assets/kinds.ts's `sfn-tail`, src/aws/sfn.ts) ─────
+  // ARN of the Step Functions state machine the compiler hands a finished
+  // project's asset references to. Empty = no tail: an armed `sfn-tail` row
+  // then fails at submission with a clear error instead of hanging. The VPS
+  // credential needs states:StartExecution/DescribeExecution/StopExecution on
+  // this one ARN and nothing else. Like every key here it does NOTHING until
+  // deploy/docker-compose.yml forwards it.
+  sfnTailStateMachineArn: z.string().default(''),
+  sfnTailRegion: z.string().default('us-east-1'),
   // Same "clearly-labeled estimate, not a measurement" precedent as
   // qualityVlmCostUsd above: Lambda's job_costs row is computed the same
   // way as RunPod's (execution_ms * rate), but this rate is derived from
@@ -360,6 +370,8 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   callbackTimeoutMs: 'ORCH_CALLBACK_TIMEOUT_MS',
   remotionLambdaFunctionName: 'REMOTION_LAMBDA_FUNCTION_NAME',
   remotionLambdaRegion: 'REMOTION_LAMBDA_REGION',
+  sfnTailStateMachineArn: 'SFN_TAIL_STATE_MACHINE_ARN',
+  sfnTailRegion: 'SFN_TAIL_REGION',
   lambdaRenderRateUsdS: 'LAMBDA_RENDER_RATE_USD_S',
   r2AccountId: 'R2_ACCOUNT_ID',
   r2Bucket: 'R2_BUCKET_NAME',

@@ -384,9 +384,9 @@ describe('buildStepsAndJobs (pure step/job construction — singleJobPerProject 
     const reqWithBgm = { ...req, bgmPrompt: 'cinematic orchestral, warm and reflective, no vocals' };
     const { steps, jobs } = _internal.buildStepsAndJobs([bgmEntry], reqWithBgm, 'proj_1', 25);
     expect(steps).toEqual([
-      // workersTarget capped at 2, bgm-s2t's fixed pod count (catalog.ts's
-      // maxWorkers, 2026-09-17) — not the raw cfg.workersHead of 25.
-      { seq: 5, name: 'bgm', endpointId: bgmEntry.endpointId, workersTarget: 2, gate: null, drainAfter: true, dependsOn: [], jobTotal: 1 },
+      // workersTarget capped at 3, bgm-s2t's fixed pod count (catalog.ts's
+      // maxWorkers, re-synced 2026-10-02) — not the raw cfg.workersHead of 25.
+      { seq: 5, name: 'bgm', endpointId: bgmEntry.endpointId, workersTarget: 3, gate: null, drainAfter: true, dependsOn: [], jobTotal: 1 },
     ]);
     const bgmJobs = jobs.filter((j) => j.stepSeq === 5);
     expect(bgmJobs).toHaveLength(1);

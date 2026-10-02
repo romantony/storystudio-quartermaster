@@ -1,8 +1,8 @@
 /**
  * Pure-logic tests for the per-asset generator model (2026-09-19): the plan it
  * compiles from a request, the fan-out of rows that plan produces, the
- * compiler's completeness judgement, the tail manifest handed to
- * postprod-lite's one-shot, and the §9.6 result.
+ * compiler's completeness judgement, the tail manifest the SFN/ECS tail reads,
+ * and the §9.6 result.
  *
  * Everything here is deliberately DB-free — each of these is a pure function
  * precisely so the decisions that matter (what depends on what, what counts
@@ -14,7 +14,7 @@ import { buildAssetRows } from '../src/assets/submit';
 import { classifyProjectAssets, describeDrop, manifestFrame } from '../src/assets/compiler';
 import { buildManifest, MANIFEST_VERSION } from '../src/assets/manifest';
 import { buildAssetResult } from '../src/assets/result';
-import { buildPostprodInput, INLINE_MANIFEST_MAX_BYTES } from '../src/steps/builders/postprod';
+import { buildSfnTailInput } from '../src/steps/builders/sfn-tail';
 import { ASSET_KINDS, ASSET_SPECS, totalInFlightCeiling, type AssetKind } from '../src/assets/kinds';
 import { PROJECT_SCOPE, type AssetRow } from '../src/db/repo/assets';
 import { RequestSchema, type OrchestratorRequest } from '../src/agents/planner';
@@ -79,27 +79,54 @@ describe('the registry', () => {
     for (const kind of ASSET_KINDS) {
       const spec = ASSET_SPECS[kind];
       expect(spec.kind).toBe(kind);
-      // RunPod ids are bare; the one Lambda-backed kind carries a sentinel.
-      expect(spec.endpointId).toMatch(spec.provider === 'lambda' ? /^lambda:/ : /^[a-z0-9]+$/);
+      // RunPod ids are bare; Lambda- and Step-Functions-backed kinds carry a sentinel.
+      const expected =
+        spec.provider === 'lambda' ? /^lambda:/ : spec.provider === 'sfn' ? /^aws-sfn:/ : /^[a-z0-9]+$/;
+      expect(spec.endpointId).toMatch(expected);
       expect(tables.has(spec.table)).toBe(false);
       tables.add(spec.table);
     }
     expect(tables.size).toBe(ASSET_KINDS.length);
   });
 
-  it('keeps the sum of per-endpoint in-flight ceilings inside the RunPod account cap', () => {
+  it('keeps the sum of per-endpoint RunPod in-flight ceilings inside the account cap', () => {
     // The whole point of a per-endpoint (not per-kind) budget: every agent
-    // saturating at once must still fit in the 40-worker account.
-    expect(totalInFlightCeiling()).toBeLessThanOrEqual(40);
+    // saturating at once must still fit in the 40-worker account. The
+    // sentinel kinds (lambda, sfn) hold no worker, so they sit outside it.
+    const runpodOnly = new Map<string, number>();
+    for (const spec of Object.values(ASSET_SPECS)) {
+      if (spec.provider !== 'runpod') continue;
+      runpodOnly.set(spec.endpointId, Math.max(runpodOnly.get(spec.endpointId) ?? 0, spec.maxInFlight));
+    }
+    const total = [...runpodOnly.values()].reduce((a, b) => a + b, 0);
+    expect(total).toBeLessThanOrEqual(40);
+    // The 11 workers of the 3D pipeline share the account (2026-10-02).
+    expect(total + 11).toBeLessThanOrEqual(40);
   });
 
-  it('scopes bgm and postprod-lite to the project, everything else to a frame', () => {
+  it('scopes only the SFN tail to the project, everything else to a frame', () => {
     const projectScoped = ASSET_KINDS.filter((k) => ASSET_SPECS[k].scope === 'project');
-    expect(projectScoped.sort()).toEqual(['bgm', 'postprod-lite']);
+    expect(projectScoped).toEqual(['sfn-tail']);
   });
 
-  it('gives postprod-lite a timeout sized for a whole project, not one frame', () => {
-    expect(ASSET_SPECS['postprod-lite'].timeoutMs).toBeGreaterThan(ASSET_SPECS['wan2-i2v'].timeoutMs as number);
+  it('retired the kinds whose work moved into the tail', () => {
+    for (const gone of ['dreamx-refine', 'merge', 'bgm', 'postprod-lite']) {
+      expect(ASSET_KINDS as readonly string[]).not.toContain(gone);
+    }
+  });
+
+  it('points every RunPod kind at the endpoint the dashboard shows for it', () => {
+    expect(ASSET_SPECS.tts.endpointId).toBe('rnqxi6c0mlq517');
+    expect(ASSET_SPECS.tts.maxInFlight).toBe(7);
+    expect(ASSET_SPECS.mmaudio.endpointId).toBe('nzkcsef9t2iv7s');
+    expect(ASSET_SPECS.mmaudio.maxInFlight).toBe(5);
+    expect(ASSET_SPECS['wan2-i2v'].maxInFlight).toBe(6);
+  });
+
+  it('gives sfn-tail a timeout sized for a whole project, not one frame', () => {
+    expect(ASSET_SPECS['sfn-tail'].timeoutMs).toBeGreaterThan(ASSET_SPECS['wan2-i2v'].timeoutMs as number);
+    expect(ASSET_SPECS['sfn-tail'].provider).toBe('sfn');
+    expect(ASSET_SPECS['sfn-tail'].cancelOnTimeout).toBe(true);
   });
 
   it('every kind has a positive timeout, or opts out explicitly', () => {
@@ -113,28 +140,34 @@ describe('the registry', () => {
 });
 
 describe('compilePlan', () => {
-  it('builds the default chain: image -> motion -> dreamx-refine, with tts feeding motion and the tail', () => {
-    // dreamx-refine is on by default whenever wan2-i2v runs (docs/
-    // qm-orchestrator-three-project-run-analysis-2026-09-19.md §6 P1-5):
-    // Wan2's native 832x464 output needs it, independent of options.upscale.
+  it('builds the default chain: image + tts -> motion, then the SFN tail', () => {
+    // No dreamx-refine, no merge, no bgm kind (2026-10-02): upscaling and the
+    // clip+narration mix happen in the tail, BGM is generated by it.
     const plan = compilePlan(request());
-    expect(plan.frameKinds.sort()).toEqual(['dreamx-refine', 'merge', 'qwen-image-gen', 'tts', 'wan2-i2v']);
-    expect(plan.kinds).toContain('postprod-lite');
+    expect(plan.frameKinds.sort()).toEqual(['qwen-image-gen', 'tts', 'wan2-i2v']);
+    expect(plan.kinds).toContain('sfn-tail');
     expect(plan.requires['qwen-image-gen']).toEqual([]);
     expect(plan.requires['tts']).toEqual([]);
     expect(plan.requires['wan2-i2v']).toEqual(['qwen-image-gen', 'tts']);
-    expect(plan.requires['dreamx-refine']).toEqual(['wan2-i2v']);
-    expect(plan.requires['merge']).toEqual(['dreamx-refine', 'tts']);
     // The tail is NOT in the handoff graph — the compiler arms it.
-    expect(plan.requires['postprod-lite']).toBeUndefined();
+    expect(plan.requires['sfn-tail']).toBeUndefined();
+    expect(clipKind(plan)).toBe('wan2-i2v');
   });
 
-  it('drops dreamx-refine only when the caller opts into the whole-video Real-ESRGAN pass instead', () => {
-    const plan = compilePlan(withOptions({ upscaleEngine: 'realesrgan' }));
-    expect(plan.frameKinds).not.toContain('dreamx-refine');
-    expect(plan.tail.upscale).toBe(false); // still needs options.upscale:true to actually run
-    const armed = compilePlan(withOptions({ upscale: true, upscaleEngine: 'realesrgan' }));
-    expect(armed.tail.upscale).toBe(true);
+  it('never plans the retired kinds, whatever the upscale options say', () => {
+    const variants: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [{}, {}],
+      [{ upscale: true }, {}],
+      [{ upscaleEngine: 'realesrgan' }, {}],
+      [{ upscale: true, upscaleEngine: 'dreamx' }, {}],
+      [{ bgm: true }, { bgmPrompt: 'p' }],
+    ];
+    for (const [o, extra] of variants) {
+      const plan = compilePlan(withOptions(o, extra));
+      for (const gone of ['dreamx-refine', 'merge', 'bgm', 'postprod-lite']) {
+        expect(plan.kinds as string[]).not.toContain(gone);
+      }
+    }
   });
 
   it('plans no motion asset at all for motionEngine=animate — the tail Ken Burns the still', () => {
@@ -156,48 +189,27 @@ describe('compilePlan', () => {
     expect(plan.requires['wan2-i2v']).toEqual(['qwen-edit', 'tts']);
   });
 
-  it('inserts dreamx-refine, mmaudio and merge into the chain in order when both are on', () => {
-    const plan = compilePlan(withOptions({ upscale: true, upscaleEngine: 'dreamx', sfx: true }));
-    expect(plan.requires['dreamx-refine']).toEqual(['wan2-i2v']);
-    expect(plan.requires['mmaudio']).toEqual(['dreamx-refine']);
-    // merge also lists dreamx-refine directly (not just mmaudio), mirroring
-    // the cohort model's step 6, which depends on step 14 directly no matter
-    // what else sits between them — otherwise merge's own `sources` never
-    // receives dreamx-refine's url via handoff (2026-09-30 e2e finding: a
-    // real project with sfx+refine together failed every merge as a result).
-    expect(plan.requires['merge']).toEqual(['mmaudio', 'tts', 'dreamx-refine']);
-    // The frame's finished clip is the most-processed one — merge, now that
-    // it runs downstream of everything else per-frame.
-    expect(clipKind(plan)).toBe('merge');
+  it('runs mmaudio right after the motion clip when sfx is on', () => {
+    const plan = compilePlan(withOptions({ sfx: true }));
+    expect(plan.requires['mmaudio']).toEqual(['wan2-i2v']);
+    // The frame's finished clip is the most-processed one.
+    expect(clipKind(plan)).toBe('mmaudio');
   });
 
-  it('never plans a per-frame refiner or SFX when there is no motion model to refine', () => {
-    const plan = compilePlan(withOptions({ motionEngine: 'animate', upscale: true, upscaleEngine: 'dreamx', sfx: true }));
-    expect(plan.frameKinds).not.toContain('dreamx-refine');
+  it('never plans SFX when there is no motion model for it to follow', () => {
+    const plan = compilePlan(withOptions({ motionEngine: 'animate', sfx: true }));
     expect(plan.frameKinds).not.toContain('mmaudio');
   });
 
-  it('adds the bgm agent, project-scoped, when options.bgm is on', () => {
+  it('records bgm as a tail flag, not a kind', () => {
     const plan = compilePlan(withOptions({ bgm: true }));
-    expect(plan.kinds).toContain('bgm');
-    expect(plan.frameKinds).not.toContain('bgm');
+    expect(plan.kinds as string[]).not.toContain('bgm');
     expect(plan.tail.bgm).toBe(true);
   });
 
-  it('turns the tail steps into flags on one call, not a chain', () => {
+  it('turns the tail steps into flags on one execution, not a chain', () => {
     const plan = compilePlan(withOptions({ removeSilence: true, burnCaptions: true, bgm: true }));
-    expect(plan.tail).toEqual({ removeSilence: true, burnCaptions: true, upscale: false, bgm: true, textOverlay: false });
-  });
-
-  it('leaves whole-video upscale off when DreamX already upscaled each frame', () => {
-    const dreamx = compilePlan(withOptions({ upscale: true, upscaleEngine: 'dreamx' }));
-    expect(dreamx.tail.upscale).toBe(false);
-    expect(dreamx.frameKinds).toContain('dreamx-refine');
-
-    // Only an explicit realesrgan request turns the whole-video pass on.
-    const esrgan = compilePlan(withOptions({ upscale: true, upscaleEngine: 'realesrgan' }));
-    expect(esrgan.tail.upscale).toBe(true);
-    expect(esrgan.frameKinds).not.toContain('dreamx-refine');
+    expect(plan.tail).toEqual({ removeSilence: true, burnCaptions: true, bgm: true, textOverlay: false });
   });
 });
 
@@ -206,35 +218,26 @@ describe('the remotion agent', () => {
     expect(compilePlan(request()).frameKinds).not.toContain('remotion');
     expect(compilePlan(withOptions({ textOverlay: true })).frameKinds).toContain('remotion');
     // No motion model means no clip yet — the still is animated inside the
-    // one-shot, well after this would have run.
+    // tail, well after this would have run.
     expect(compilePlan(withOptions({ textOverlay: true, motionEngine: 'animate' })).frameKinds).not.toContain('remotion');
   });
 
   it('renders over the most-processed clip and becomes the frame\u2019s clip', () => {
-    // dreamx-refine is on by default (upscaleEngine defaults to 'dreamx'), so
-    // even a "plain" textOverlay request already has it ahead of remotion.
-    // merge is on by default too, and always outranks remotion in clipKind \u2014
-    // it is the frame's TRULY final per-frame artifact (narration mixed in).
     const plain = compilePlan(withOptions({ textOverlay: true }));
-    expect(plain.requires['remotion']).toEqual(['dreamx-refine']);
-    // merge also lists dreamx-refine directly, same reasoning as the sfx
-    // case above — remotion sitting between refine and merge would otherwise
-    // leave merge's own resolvedDeps[14] empty.
-    expect(plain.requires['merge']).toEqual(['remotion', 'tts', 'dreamx-refine']);
-    expect(clipKind(plain)).toBe('merge');
+    expect(plain.requires['remotion']).toEqual(['wan2-i2v']);
+    expect(clipKind(plain)).toBe('remotion');
 
-    const full = compilePlan(withOptions({ textOverlay: true, upscale: true, upscaleEngine: 'dreamx', sfx: true }));
-    expect(full.requires['remotion']).toEqual(['mmaudio']);
-    expect(full.requires['merge']).toEqual(['remotion', 'tts', 'dreamx-refine']);
-    expect(clipKind(full)).toBe('merge');
+    const withSfx = compilePlan(withOptions({ textOverlay: true, sfx: true }));
+    expect(withSfx.requires['remotion']).toEqual(['mmaudio']);
+    expect(clipKind(withSfx)).toBe('remotion');
   });
 
   it('dispatches via Lambda, not RunPod', () => {
     expect(ASSET_SPECS.remotion.provider).toBe('lambda');
     expect(ASSET_SPECS.remotion.endpointId).toBe('lambda:qm-remotion-overlay');
     expect(ASSET_SPECS.remotion.gate).toBeNull();
-    // Every other kind stays on RunPod.
-    for (const k of ASSET_KINDS.filter((x) => x !== 'remotion')) {
+    // Every other kind stays on RunPod, except the SFN tail.
+    for (const k of ASSET_KINDS.filter((x) => x !== 'remotion' && x !== 'sfn-tail')) {
       expect(ASSET_SPECS[k].provider).toBe('runpod');
     }
   });
@@ -251,15 +254,11 @@ describe('the remotion agent', () => {
           assetRow({ kind: 'tts', frameId: 'f1', assetUrl: 'https://cdn/f1.mp3' }),
           assetRow({ kind: 'wan2-i2v', frameId: 'f1', assetUrl: 'https://cdn/raw.mp4' }),
           assetRow({ kind: 'remotion', frameId: 'f1', assetUrl: 'https://cdn/overlaid.mp4' }),
-          // merge runs on the overlaid clip, not the raw one — its own url
-          // is what actually reaches the manifest now (preMerged).
-          assetRow({ kind: 'merge', frameId: 'f1', assetUrl: 'https://cdn/merged.mp4' }),
         ],
       },
       request(),
     );
-    expect(entry.videoUrl).toBe('https://cdn/merged.mp4');
-    expect(entry.preMerged).toBe(true);
+    expect(entry.videoUrl).toBe('https://cdn/overlaid.mp4');
   });
 });
 
@@ -285,15 +284,15 @@ describe('QA exemption by product', () => {
 
 describe('handoff edges', () => {
   it('are the requires graph read backwards — no agent names its own successor', () => {
-    const plan = compilePlan(withOptions({ upscale: true, upscaleEngine: 'dreamx' }));
+    const plan = compilePlan(withOptions({ sfx: true }));
     expect(handoffTargets(plan, 'qwen-image-gen')).toEqual(['wan2-i2v']);
-    // tts feeds both wan2-i2v (real clip length) and merge (the narration).
-    expect(handoffTargets(plan, 'tts')).toEqual(['wan2-i2v', 'merge']);
-    expect(handoffTargets(plan, 'wan2-i2v')).toEqual(['dreamx-refine']);
-    expect(handoffTargets(plan, 'dreamx-refine')).toEqual(['merge']);
+    // tts feeds only wan2-i2v now (real clip length); the narration itself is
+    // mixed in by the tail, which reads it from the manifest.
+    expect(handoffTargets(plan, 'tts')).toEqual(['wan2-i2v']);
+    expect(handoffTargets(plan, 'wan2-i2v')).toEqual(['mmaudio']);
     // The end of the per-frame chain hands off to nothing — the compiler
     // takes over from there.
-    expect(handoffTargets(plan, 'merge')).toEqual([]);
+    expect(handoffTargets(plan, 'mmaudio')).toEqual([]);
   });
 
   it('never hands off to a project-scoped kind', () => {
@@ -335,42 +334,34 @@ describe('toResolvedDeps', () => {
 });
 
 describe('buildAssetRows', () => {
-  it('writes one row per (frame kind, frame) plus one per project-scoped kind', () => {
+  it('writes one row per (frame kind, frame) plus the one tail row', () => {
     const req = withOptions({ bgm: true }, { bgmPrompt: 'soft piano' });
     const plan = compilePlan(req);
     const rows = buildAssetRows(req, plan);
 
     expect(rows).toHaveLength(expectedAssetCount(plan));
-    expect(rows).toHaveLength(5 * 2 + 2); // image/tts/motion/dreamx-refine/merge per frame + bgm + tail
+    expect(rows).toHaveLength(3 * 2 + 1); // image/tts/motion per frame + the SFN tail
 
     const projectRows = rows.filter((r) => r.frameId === PROJECT_SCOPE);
-    expect(projectRows.map((r) => r.kind).sort()).toEqual(['bgm', 'postprod-lite']);
+    expect(projectRows.map((r) => r.kind)).toEqual(['sfn-tail']);
   });
 
-  it('starts only the chain heads and bgm runnable; the tail waits for the compiler', () => {
-    const req = withOptions({ bgm: true }, { bgmPrompt: 'soft piano' });
-    const rows = buildAssetRows(req, compilePlan(req));
-    const runnable = rows.filter((r) => r.requiredInputs.length === 0).map((r) => r.kind);
-    // bgm has nothing to wait for, so it generates in parallel from submission.
-    expect(runnable).toContain('bgm');
-    // The tail has no `requires` either — but it is created `blocked` and only
-    // the compiler arms it. That distinction lives in insertAssets/armProjectAsset,
-    // and is covered against a real database in asset-repo.integration.test.ts.
-    expect(rows.find((r) => r.kind === 'postprod-lite')!.requiredInputs).toEqual([]);
+  it('starts the tail blocked: the compiler arms it with the manifest', () => {
+    const rows = buildAssetRows(request(), compilePlan(request()));
+    const tail = rows.find((r) => r.kind === 'sfn-tail')!;
+    expect(tail.requiredInputs).toEqual([]);
+    expect(tail.initialStatus).toBe('blocked');
+    // The chain heads stay runnable from submission.
+    const runnable = rows.filter((r) => r.kind !== 'sfn-tail' && r.requiredInputs.length === 0).map((r) => r.kind);
+    expect(runnable.sort()).toEqual(['qwen-image-gen', 'qwen-image-gen', 'tts', 'tts']);
   });
 
-  it('carries the bgm prompt and the project total duration onto the bgm row', () => {
-    const req = withOptions({ bgm: true }, { bgmPrompt: 'soft piano' });
-    const bgm = buildAssetRows(req, compilePlan(req)).find((r) => r.kind === 'bgm')!;
-    expect(bgm.input).toMatchObject({ bgmPrompt: 'soft piano', totalDurationS: 9 });
-  });
-
-  it('stamps the no-silent-degrade flags so merge can tell "not requested" from "missing"', () => {
-    const req = withOptions({ upscale: true, upscaleEngine: 'dreamx', sfx: true });
+  it('stamps the sfx flag so "not requested" stays distinguishable from "missing"', () => {
+    const req = withOptions({ sfx: true });
     const rows = buildAssetRows(req, compilePlan(req));
     const motion = rows.find((r) => r.kind === 'wan2-i2v')!;
-    expect((motion.input as { upscaleFrames?: boolean }).upscaleFrames).toBe(true);
     expect((motion.input as { sfx?: boolean }).sfx).toBe(true);
+    expect((motion.input as { upscaleFrames?: boolean }).upscaleFrames).toBeUndefined();
   });
 
   it('gives each row its own kind’s endpoint', () => {
@@ -404,16 +395,6 @@ describe('classifyProjectAssets', () => {
     expect(state.generated).toBe(true);
     expect(state.readyFrames).toHaveLength(2);
     expect(state.droppedFrames).toHaveLength(0);
-  });
-
-  it('waits for the bgm track too, since the tail needs it', () => {
-    const bgmPlan = compilePlan(withOptions({ bgm: true }, { bgmPrompt: 'p' }));
-    const rows = fullSet('complete', bgmPlan);
-    // Frames are all done but the project's music is still generating.
-    rows.push(assetRow({ kind: 'bgm', frameId: PROJECT_SCOPE, status: 'submitted', updatedAt: new Date(now), submittedAt: new Date(now - 1_000) }));
-    const state = classifyProjectAssets(bgmPlan, frames, rows, now, stuckAfter);
-    expect(state.generated).toBe(false);
-    expect(state.inProgress.map((r) => r.kind)).toEqual(['bgm']);
   });
 
   it('reports a row the plan expects but that does not exist', () => {
@@ -480,11 +461,7 @@ describe('manifestFrame', () => {
         rows: [
           assetRow({ kind: 'qwen-image-gen', frameId: 'f1', assetUrl: 'https://cdn/f1.png' }),
           assetRow({ kind: 'tts', frameId: 'f1', assetUrl: 'https://cdn/f1.mp3', durationS: 5.4 }),
-          assetRow({ kind: 'wan2-i2v', frameId: 'f1', assetUrl: 'https://cdn/raw.mp4' }),
-          assetRow({ kind: 'dreamx-refine', frameId: 'f1', assetUrl: 'https://cdn/refined.mp4' }),
-          // merge is on by default now — its output (narration mixed in)
-          // is the frame's clip, not the silent dreamx-refine output.
-          assetRow({ kind: 'merge', frameId: 'f1', assetUrl: 'https://cdn/f1.mp4' }),
+          assetRow({ kind: 'wan2-i2v', frameId: 'f1', assetUrl: 'https://cdn/f1.mp4' }),
         ],
       },
       req,
@@ -492,42 +469,10 @@ describe('manifestFrame', () => {
     expect(entry).toMatchObject({ frameId: 'f1', videoUrl: 'https://cdn/f1.mp4', audioUrl: 'https://cdn/f1.mp3', durationS: 5.4 });
     expect(entry.imageUrl).toBeUndefined();
     expect(entry.sfxFromVideo).toBeUndefined();
-    expect(entry.preMerged).toBe(true);
   });
 
-  it('merge carries the sfx-muxed clip through to the manifest as preMerged, not sfxFromVideo', () => {
-    // merge is on by default whenever there's a motion model (plan.ts), so
-    // it always outranks mmaudio in clipKind() — buildMergeInput passes the
-    // same sfx_from_video flag through to merge's OWN RunPod call instead
-    // (steps/builders/merge.ts), so by the time this reaches the manifest,
-    // sfx is already mixed into merge's output.
+  it('flags sfxFromVideo when SFX is planned, so the tail mixes the clip\u2019s own track under the narration', () => {
     const plan = compilePlan(withOptions({ sfx: true }));
-    const entry = manifestFrame(
-      plan,
-      {
-        frameId: 'f1',
-        seq: 0,
-        rows: [
-          assetRow({ kind: 'qwen-image-gen', frameId: 'f1', assetUrl: 'https://cdn/f1.png' }),
-          assetRow({ kind: 'tts', frameId: 'f1', assetUrl: 'https://cdn/f1.mp3' }),
-          assetRow({ kind: 'wan2-i2v', frameId: 'f1', assetUrl: 'https://cdn/raw.mp4' }),
-          assetRow({ kind: 'dreamx-refine', frameId: 'f1', assetUrl: 'https://cdn/refined.mp4' }),
-          assetRow({ kind: 'mmaudio', frameId: 'f1', assetUrl: 'https://cdn/sfx.mp4' }),
-          assetRow({ kind: 'merge', frameId: 'f1', assetUrl: 'https://cdn/merged.mp4' }),
-        ],
-      },
-      req,
-    );
-    expect(entry.videoUrl).toBe('https://cdn/merged.mp4');
-    expect(entry.preMerged).toBe(true);
-    expect(entry.sfxFromVideo).toBeUndefined();
-  });
-
-  it('sfxFromVideo is the defensive fallback for a plan that has mmaudio but, unusually, no merge', () => {
-    // Nothing in compilePlan constructs this today (merge is unconditional
-    // whenever motionKind is set — plan.ts) — this pins the fallback branch
-    // compiler.ts keeps for a plan shaped some other way.
-    const plan = { ...compilePlan(withOptions({ sfx: true })), frameKinds: ['qwen-image-gen', 'tts', 'wan2-i2v', 'mmaudio'] as never };
     const entry = manifestFrame(
       plan,
       {
@@ -543,6 +488,27 @@ describe('manifestFrame', () => {
       req,
     );
     expect(entry.videoUrl).toBe('https://cdn/sfx.mp4');
+    expect(entry.sfxFromVideo).toBe(true);
+  });
+
+  it('keeps sfxFromVideo when a Remotion overlay was rendered over the SFX clip', () => {
+    const plan = compilePlan(withOptions({ sfx: true, textOverlay: true }));
+    const entry = manifestFrame(
+      plan,
+      {
+        frameId: 'f1',
+        seq: 0,
+        rows: [
+          assetRow({ kind: 'qwen-image-gen', frameId: 'f1', assetUrl: 'https://cdn/f1.png' }),
+          assetRow({ kind: 'tts', frameId: 'f1', assetUrl: 'https://cdn/f1.mp3' }),
+          assetRow({ kind: 'wan2-i2v', frameId: 'f1', assetUrl: 'https://cdn/raw.mp4' }),
+          assetRow({ kind: 'mmaudio', frameId: 'f1', assetUrl: 'https://cdn/sfx.mp4' }),
+          assetRow({ kind: 'remotion', frameId: 'f1', assetUrl: 'https://cdn/overlaid.mp4' }),
+        ],
+      },
+      req,
+    );
+    expect(entry.videoUrl).toBe('https://cdn/overlaid.mp4');
     expect(entry.sfxFromVideo).toBe(true);
   });
 
@@ -579,7 +545,7 @@ describe('manifestFrame', () => {
 describe('buildManifest', () => {
   const req = request();
 
-  function manifest(plan = compilePlan(req), bgmUrl?: string) {
+  function manifest(plan = compilePlan(req), bgmPrompt?: string) {
     return buildManifest({
       projectId: 'proj_1',
       requestId: 'req_1',
@@ -597,7 +563,7 @@ describe('buildManifest', () => {
         { frameId: 'f1', seq: 0, videoUrl: 'https://cdn/1.mp4', audioUrl: 'https://cdn/1.mp3', durationS: 5, narration: 'one' },
       ],
       droppedFrames: [{ frameId: 'f3', reason: 'wan2-i2v: failed' }],
-      bgmUrl,
+      bgmPrompt,
       compiledAt: new Date('2026-09-19T12:00:00Z'),
     });
   }
@@ -611,44 +577,58 @@ describe('buildManifest', () => {
   });
 
   it('carries the tail as flags, with captions only when they are burned', () => {
-    expect(manifest().steps).toEqual({ removeSilence: false, burnCaptions: false, upscale: false });
+    expect(manifest().steps).toEqual({ removeSilence: false, burnCaptions: false });
     expect(manifest().captions).toBeUndefined();
 
     const captioned = manifest(compilePlan(withOptions({ burnCaptions: true, removeSilence: true })));
-    expect(captioned.steps).toEqual({ removeSilence: true, burnCaptions: true, upscale: false });
+    expect(captioned.steps).toEqual({ removeSilence: true, burnCaptions: true });
     expect(captioned.captions).toMatchObject({ wordsPerGroup: 3, position: 'bottom' });
   });
 
-  it('includes the bgm block only when the track actually exists', () => {
+  it('includes the bgm block only when there is a prompt to generate from', () => {
     const plan = compilePlan(withOptions({ bgm: true }, { bgmPrompt: 'p' }));
     expect(manifest(plan).bgm).toBeUndefined();
-    expect(manifest(plan, 'https://cdn/bgm.mp3').bgm).toEqual({ url: 'https://cdn/bgm.mp3', volume: 0.15 });
+    // The tail generates the music; the manifest carries the PROMPT, not a url.
+    expect(manifest(plan, 'soft piano').bgm).toEqual({ prompt: 'soft piano', volume: 0.15 });
+    expect(manifest(compilePlan(req), 'soft piano').bgm).toBeUndefined(); // options.bgm is off
   });
 });
 
-describe('buildPostprodInput', () => {
+describe('buildSfnTailInput', () => {
   const ctx = { job: {}, resolvedDeps: {}, projectId: 'proj_1', frameId: null } as never;
+  const row = {
+    manifestUrl: 'https://cdn/m.json',
+    aspectRatio: '9:16',
+    language: 'hi',
+    options: { removeSilence: true, captions: true, bgm: true, bgmPrompt: 'soft piano', sfx: false },
+    totalDurationS: 9,
+  };
 
-  it('sends the manifest URL when the compiler wrote a file', () => {
-    expect(
-      buildPostprodInput({ ...(ctx as object), job: { manifestUrl: 'https://cdn/m.json' } } as never),
-    ).toEqual({ mode: 'postprod', manifest_url: 'https://cdn/m.json', project_id: 'proj_1' });
+  it('sends references only: the manifest URL, the language, the options the state machine branches on, an output prefix', () => {
+    expect(buildSfnTailInput({ ...(ctx as object), job: row } as never)).toEqual({
+      projectId: 'proj_1',
+      manifestUrl: 'https://cdn/m.json',
+      aspectRatio: '9:16',
+      language: 'hi',
+      options: row.options,
+      totalDurationS: 9,
+      outputPrefix: 'projects/proj_1/tail/',
+    });
   });
 
-  it('falls back to an inline manifest when R2 was unavailable', () => {
-    const payload = buildPostprodInput({ ...(ctx as object), job: { manifest: { version: 2, frames: [] } } } as never);
-    expect(payload).toMatchObject({ mode: 'postprod', project_id: 'proj_1' });
-    expect(payload.manifest).toEqual({ version: 2, frames: [] });
+  it('never carries an inline manifest — Step Functions caps its input at 256KB', () => {
+    const payload = buildSfnTailInput({ ...(ctx as object), job: { ...row, manifest: { frames: [1, 2, 3] } } } as never);
+    expect(payload).not.toHaveProperty('manifest');
+    expect(JSON.stringify(payload).length).toBeLessThan(1_000);
   });
 
-  it('refuses an oversized inline manifest rather than repeating the 256KB incidents', () => {
-    const huge = { frames: Array.from({ length: 5000 }, (_, i) => ({ frameId: `f${i}`, videoUrl: 'https://cdn/x'.padEnd(120, 'y') })) };
-    expect(JSON.stringify(huge).length).toBeGreaterThan(INLINE_MANIFEST_MAX_BYTES);
-    expect(() => buildPostprodInput({ ...(ctx as object), job: { manifest: huge } } as never)).toThrow(/configure R2/);
+  it('refuses a row with no manifestUrl rather than starting a tail with nothing to assemble', () => {
+    expect(() => buildSfnTailInput({ ...(ctx as object), job: { aspectRatio: '9:16' } } as never)).toThrow(/no manifestUrl/);
+    expect(() => buildSfnTailInput({ ...(ctx as object), job: { manifest: { frames: [] }, aspectRatio: '9:16' } } as never)).toThrow(/configure R2/);
   });
 
-  it('refuses a row that has no manifest at all', () => {
-    expect(() => buildPostprodInput({ ...(ctx as object), job: {} } as never)).toThrow(/no manifest/);
+  it('refuses a row with no aspect ratio', () => {
+    expect(() => buildSfnTailInput({ ...(ctx as object), job: { manifestUrl: 'https://cdn/m.json' } } as never)).toThrow(/no aspectRatio/);
   });
 });
 
@@ -660,13 +640,15 @@ describe('buildAssetResult', () => {
     const rows: AssetRow[] = [
       assetRow({ kind: 'qwen-image-gen', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.png' }),
       assetRow({ kind: 'tts', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.mp3', durationS: 5.4 }),
-      assetRow({ kind: 'wan2-i2v', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/raw.mp4' }),
-      // dreamx-refine and merge are both on by default now — they're in
-      // plan.frameKinds, so the frame isn't "completed" without them, and
-      // merge (the most-processed) is the frame's clipUrl.
-      assetRow({ kind: 'dreamx-refine', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/refined.mp4' }),
-      assetRow({ kind: 'merge', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.mp4' }),
-      assetRow({ kind: 'postprod-lite', frameId: PROJECT_SCOPE, assetUrl: 'https://cdn/final.mp4', durationS: 9.3 }),
+      assetRow({ kind: 'wan2-i2v', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.mp4' }),
+      assetRow({
+        kind: 'sfn-tail',
+        frameId: PROJECT_SCOPE,
+        assetUrl: 'https://cdn/final.mp4',
+        durationS: 9.3,
+        // The state machine reports each frame's hosted merged clip.
+        output: { frames: [{ frameId: 'f1', url: 'https://cdn/f1-merged.mp4' }] },
+      }),
       assetRow({ kind: 'qwen-image-gen', frameId: 'f2', seq: 1, status: 'failed', assetUrl: null, error: { error: 'CUDA out of memory' } }),
     ];
 
@@ -691,20 +673,39 @@ describe('buildAssetResult', () => {
       narrationAudioUrl: 'https://cdn/f1.mp3',
       narrationDurationS: 5.4,
       clipUrl: 'https://cdn/f1.mp4',
+      mergedClipUrl: 'https://cdn/f1-merged.mp4',
     });
-    // Always null here: the one-shot keeps per-frame merged clips on the
-    // worker's local disk and uploads only the final video.
-    expect(result.assets.frames[0].mergedClipUrl).toBeNull();
     expect(result.assets.frames[1]).toMatchObject({ frameId: 'f2', status: 'failed', imageUrl: null });
     expect(result.errors[0].reason).toContain('CUDA out of memory');
     expect(result.metrics.gpuCostUsd).toBe(0.09);
   });
 
-  it('prefers the most-processed clip for a frame’s clipUrl', () => {
-    const sfxPlan = compilePlan(withOptions({ upscale: true, upscaleEngine: 'dreamx', sfx: true }));
+  it('leaves mergedClipUrl null when the tail reported no per-frame clips', () => {
     const rows: AssetRow[] = [
+      assetRow({ kind: 'qwen-image-gen', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.png' }),
+      assetRow({ kind: 'tts', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.mp3' }),
+      assetRow({ kind: 'wan2-i2v', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.mp4' }),
+      assetRow({ kind: 'sfn-tail', frameId: PROJECT_SCOPE, assetUrl: 'https://cdn/final.mp4', output: { video: 'https://cdn/final.mp4' } }),
+    ];
+    const result = buildAssetResult({
+      project: { id: 'proj_1', requestId: 'req_1', createdAt: new Date(), request: req },
+      plan,
+      rows,
+      status: 'completed',
+      finalUrl: 'https://cdn/final.mp4',
+      finalDurationS: null,
+      gpuCostUsd: null,
+      startedAt: new Date(),
+    });
+    expect(result.assets.frames[0].mergedClipUrl).toBeNull();
+  });
+
+  it('prefers the most-processed clip for a frame’s clipUrl', () => {
+    const sfxPlan = compilePlan(withOptions({ sfx: true }));
+    const rows: AssetRow[] = [
+      assetRow({ kind: 'qwen-image-gen', frameId: 'f1', assetUrl: 'https://cdn/f1.png' }),
+      assetRow({ kind: 'tts', frameId: 'f1', assetUrl: 'https://cdn/f1.mp3' }),
       assetRow({ kind: 'wan2-i2v', frameId: 'f1', assetUrl: 'https://cdn/raw.mp4' }),
-      assetRow({ kind: 'dreamx-refine', frameId: 'f1', assetUrl: 'https://cdn/hi.mp4' }),
       assetRow({ kind: 'mmaudio', frameId: 'f1', assetUrl: 'https://cdn/sfx.mp4' }),
     ];
     const result = buildAssetResult({

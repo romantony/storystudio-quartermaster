@@ -36,9 +36,10 @@ import type { OrchestratorRequest } from '../agents/planner';
  * `buildStepsAndJobs()` is.
  *
  * Frame-scoped kinds get one row per frame, released by the per-frame handoff.
- * Project-scoped kinds get exactly one row at `frame_id = '*'`: `bgm`, which
- * has no per-frame input and so is runnable immediately, and `postprod-lite`,
- * which stays `blocked` until the compiler arms it with the manifest. */
+ * The one project-scoped kind, `sfn-tail`, gets exactly one row at
+ * `frame_id = '*'`. It stays `blocked` until the compiler arms it with the
+ * manifest. (BGM is no longer a row of its own: the tail generates it, on
+ * BGM-S2T, to the assembled video's real length.) */
 export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAsset[] {
   const rows: NewAsset[] = [];
 
@@ -50,24 +51,14 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
       frameId: PROJECT_SCOPE,
       seq: 0,
       endpointId: spec.endpointId,
-      // `bgm` has nothing to wait for; `postprod-lite` waits for the whole
-      // project, which no `requires` list can express — the compiler arms it.
-      // A sentinel keeps it out of the "blocked with nothing outstanding"
-      // invariant and out of releaseSatisfiedBlocked()'s reach.
+      // The tail waits for the WHOLE project, which no `requires` list can
+      // express, so it starts blocked and the compiler arms it with the
+      // manifest. A sentinel (empty list) keeps it out of the "blocked with
+      // nothing outstanding" invariant and out of releaseSatisfiedBlocked()'s
+      // reach.
       requiredInputs: [],
-      // `bgm` is runnable from submission — it waits for nothing. The tail
-      // waits for the WHOLE project, which no `requires` list can express,
-      // so it starts blocked and the compiler arms it with the manifest.
-      initialStatus: kind === 'postprod-lite' ? 'blocked' : 'pending',
-      input:
-        kind === 'bgm'
-          ? {
-              // builders/bgm.ts reads both off ctx.job, exactly as the cohort
-              // path's singleJobPerProject bgm job does.
-              bgmPrompt: req.bgmPrompt,
-              totalDurationS: req.frames.reduce((sum, f) => sum + f.durationS, 0),
-            }
-          : {},
+      initialStatus: 'blocked',
+      input: {},
       stage: null,
       stages: [],
     });
@@ -96,10 +87,9 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         voiceInstruct: req.voiceInstruct,
         voiceLanguage: req.voiceLanguage,
         cloneArtifactUrl: req.cloneArtifactUrl,
-        // The same no-silent-degrade flags the cohort path sets: they are
-        // what lets builders/merge.ts tell "upscale wasn't requested" apart
-        // from "upscale was requested and this frame's asset is missing".
-        upscaleFrames: plan.frameKinds.includes('dreamx-refine') || undefined,
+        // The same no-silent-degrade flag the cohort path sets, so "SFX
+        // wasn't requested" stays distinguishable from "SFX was requested
+        // and this frame's asset is missing".
         sfx: plan.frameKinds.includes('mmaudio') || undefined,
         textManifest: frame.textManifest,
       };

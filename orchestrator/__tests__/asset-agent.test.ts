@@ -1,5 +1,5 @@
 /**
- * Unit tests for assets/agent.ts — the loop all eight generator agents share.
+ * Unit tests for assets/agent.ts — the loop all the generator agents share.
  *
  * Same convention as generator.test.ts: the repo layer is mocked rather than
  * hit for real (the SQL itself is covered against a live Postgres in
@@ -12,6 +12,7 @@ import { RunpodClient } from '../src/runpod/client';
 import { runAssetAgentTick, applyAssetSuccess, assetWebhookToken, resolveHandoffs, type AssetAgentDeps } from '../src/assets/agent';
 import { webhookToken } from '../src/agents/generator';
 import { compilePlan } from '../src/assets/plan';
+import { executionName, type SfnImpl, type SfnExecution } from '../src/aws/sfn';
 import { ASSET_SPECS } from '../src/assets/kinds';
 import { RequestSchema } from '../src/agents/planner';
 import * as assetsRepo from '../src/db/repo/assets';
@@ -280,14 +281,15 @@ describe('completion', () => {
     expect(outcome).toBe('completed');
     const [, , , handoffs, gated] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
     expect(gated).toBe(false);
-    // tts feeds both wan2-i2v (real clip length) and merge (the narration).
-    expect(handoffs.map((h: { kind: string }) => h.kind).sort()).toEqual(['merge', 'wan2-i2v']);
+    // tts feeds wan2-i2v (real clip length); the narration itself is read by
+    // the tail from the manifest, so nothing else waits on it.
+    expect(handoffs.map((h: { kind: string }) => h.kind)).toEqual(['wan2-i2v']);
   });
 
   it('refuses a COMPLETED whose output carries a worker error string', async () => {
-    // postprod-lite reports its own failures inside a COMPLETED job
-    // (containers/media.md). Treating that as success is exactly how rows end
-    // up "complete" with no asset behind them.
+    // Workers report their own failures inside a COMPLETED job. Treating that
+    // as success is exactly how rows end up "complete" with no asset behind
+    // them.
     const outcome = await applyAssetSuccess(deps(jest.fn()), 101, 'qwen-image-gen', { error: 'ffmpeg exited 1' });
 
     expect(outcome).toBe('noop'); // retried
@@ -308,59 +310,202 @@ describe('completion', () => {
     expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
   });
 
-  it('dispatches the project-scoped tail as one manifest call, not a per-frame payload', async () => {
-    const tailRow = row({
-      id: 900,
-      kind: 'postprod-lite',
-      frameId: '*',
-      endpointId: ASSET_SPECS['postprod-lite'].endpointId,
-      input: { manifestUrl: 'https://cdn/manifests/proj_1.json' },
-    });
-    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([tailRow]);
-    const sent: Array<{ body: string }> = [];
-    const fetchImpl = jest.fn(async (_url: string, init: { body: string }) => {
-      sent.push(init);
-      return fakeRes(200, { id: 'rp-tail', status: 'IN_QUEUE' });
-    });
+});
 
-    const summary = await runAssetAgentTick(deps(fetchImpl as unknown as jest.Mock), 'postprod-lite');
+describe('the Step Functions-backed sfn-tail agent', () => {
+  const MANIFEST = 'https://cdn/pipeline-manifests/proj_1/m.json';
+  const ARN = 'arn:aws:states:us-east-1:123456789012:stateMachine:Tail';
+
+  function tailRow(over: Partial<AssetRow> = {}): AssetRow {
+    return row({
+      id: 900,
+      kind: 'sfn-tail',
+      frameId: '*',
+      provider: 'sfn',
+      endpointId: ASSET_SPECS['sfn-tail'].endpointId,
+      input: {
+        manifestUrl: MANIFEST,
+        aspectRatio: '9:16',
+        language: 'en',
+        options: { removeSilence: true, captions: true, bgm: true, bgmPrompt: 'soft piano', sfx: false },
+        totalDurationS: 9,
+      },
+      ...over,
+    });
+  }
+
+  function running(over: Partial<AssetRow> = {}): AssetRow {
+    return tailRow({ status: 'submitted', providerJobId: 'arn:exec:proj_1', submittedAt: new Date(Date.now() - 60_000), ...over });
+  }
+
+  function sfnDeps(impl: Partial<SfnImpl>, poolLike = fakePool()): AssetAgentDeps & { queries: Array<{ sql: string }> } {
+    const d = deps(jest.fn(), poolLike);
+    d.sfn = {
+      stateMachineArn: ARN,
+      region: 'us-east-1',
+      impl: {
+        start: jest.fn(async () => ({ executionArn: 'arn:exec:default' })),
+        describe: jest.fn(async () => ({ status: 'RUNNING' }) as SfnExecution),
+        stop: jest.fn(async () => undefined),
+        ...impl,
+      },
+    };
+    return d;
+  }
+
+  const tailPool = () =>
+    fakePool({ successRow: { asset_kind: 'sfn-tail', frame_id: '*', endpoint_id: ASSET_SPECS['sfn-tail'].endpointId } });
+
+  it('starts one execution with references only, and records its ARN as the provider job id', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([tailRow()]);
+    const start = jest.fn(async () => ({ executionArn: 'arn:exec:proj_1' }));
+
+    const summary = await runAssetAgentTick(sfnDeps({ start }), 'sfn-tail');
 
     expect(summary.submitted).toBe(1);
-    const body = JSON.parse(sent[0].body);
-    expect(body.input).toEqual({
-      mode: 'postprod',
-      manifest_url: 'https://cdn/manifests/proj_1.json',
-      project_id: 'proj_1',
+    const [arn, name, input] = start.mock.calls[0] as unknown as [string, string, Record<string, unknown>];
+    expect(arn).toBe(ARN);
+    // Deterministic: attempt number + a hash of THIS manifest, so a replayed
+    // start adopts the running execution and a recompile gets a fresh name.
+    expect(name).toBe(executionName('proj_1', 1, MANIFEST));
+    expect(input).toEqual({
+      projectId: 'proj_1',
+      manifestUrl: MANIFEST,
+      aspectRatio: '9:16',
+      language: 'en',
+      options: { removeSilence: true, captions: true, bgm: true, bgmPrompt: 'soft piano', sfx: false },
+      totalDurationS: 9,
+      outputPrefix: 'projects/proj_1/tail/',
     });
+    expect(assetsRepo.markSubmitted).toHaveBeenCalledWith(expect.anything(), 900, 'sfn-tail', 'arn:exec:proj_1');
   });
 
-  it('fails the tail row when it was released without a manifest', async () => {
-    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([
-      row({ id: 901, kind: 'postprod-lite', frameId: '*', endpointId: ASSET_SPECS['postprod-lite'].endpointId, input: {} }),
-    ]);
-    const fetchImpl = jest.fn();
+  it('never calls RunPod for the tail', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([tailRow()]);
+    const runpodFetch = jest.fn();
+    const d = sfnDeps({});
+    (d as { runpod: unknown }).runpod = new RunpodClient(RUNPOD_CFG, {
+      fetchImpl: runpodFetch as unknown as typeof fetch,
+      sleepImpl: async () => undefined,
+    });
+
+    await runAssetAgentTick(d, 'sfn-tail');
+
+    expect(runpodFetch).not.toHaveBeenCalled();
+  });
+
+  it('fails the row, without calling AWS, when it was armed without a manifest url', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([tailRow({ input: { aspectRatio: '9:16' } })]);
+    const start = jest.fn();
     const poolLike = fakePool();
 
-    const summary = await runAssetAgentTick(deps(fetchImpl, poolLike), 'postprod-lite');
+    const summary = await runAssetAgentTick(sfnDeps({ start }, poolLike), 'sfn-tail');
 
     expect(summary.submitted).toBe(0);
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
     expect(poolLike.queries.some((q) => q.sql.includes("status = 'failed'"))).toBe(true);
   });
 
-  it('records the tail\u2019s completion url, with nothing to hand off to', async () => {
-    const poolLike = fakePool({
-      successRow: { asset_kind: 'postprod-lite', frame_id: '*', endpoint_id: ASSET_SPECS['postprod-lite'].endpointId },
-    });
-    const outcome = await applyAssetSuccess(deps(jest.fn(), poolLike), 900, 'postprod-lite', {
-      video: 'https://cdn/final.mp4',
-      duration_s: 44.2,
-    });
+  it('does not submit when no sfn transport is configured', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([tailRow()]);
 
-    expect(outcome).toBe('completed');
+    const summary = await runAssetAgentTick(deps(jest.fn()), 'sfn-tail');
+
+    expect(summary.submitted).toBe(0);
+    expect(assetsRepo.markSubmitted).not.toHaveBeenCalled();
+  });
+
+  it('keeps polling while the execution is RUNNING, and touches the row', async () => {
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([running()]);
+    const describeFn = jest.fn(async () => ({ status: 'RUNNING' }) as SfnExecution);
+
+    await runAssetAgentTick(sfnDeps({ describe: describeFn }), 'sfn-tail');
+
+    expect(describeFn).toHaveBeenCalledWith('arn:exec:proj_1');
+    expect(assetsRepo.touchAsset).toHaveBeenCalledWith(expect.anything(), 900, 'sfn-tail');
+    expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
+  });
+
+  it('completes the row on SUCCEEDED, with the final url, its duration and the per-frame clips', async () => {
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([running()]);
+    const frames = [{ frameId: 'f1', url: 'https://cdn/f1-merged.mp4' }];
+    const d = sfnDeps(
+      {
+        describe: jest.fn(
+          async () => ({ status: 'SUCCEEDED', output: { videoUrl: 'https://cdn/final.mp4', durationSec: 44.2, frames } }) as SfnExecution,
+        ),
+      },
+      tailPool(),
+    );
+
+    const summary = await runAssetAgentTick(d, 'sfn-tail');
+
+    expect(summary.completed).toBe(1);
     const [, , result, handoffs] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
     expect(result).toMatchObject({ assetUrl: 'https://cdn/final.mp4', durationS: 44.2 });
+    expect(result.output.frames).toEqual(frames);
     expect(handoffs).toEqual([]);
+    // An execution has no worker-seconds rate: nothing is billed as GPU time.
+    expect(costsRepo.recordAssetCost).not.toHaveBeenCalled();
+  });
+
+  it('treats SUCCEEDED with no video url as a failure, never a complete row with nothing behind it', async () => {
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([running()]);
+    const d = sfnDeps({ describe: jest.fn(async () => ({ status: 'SUCCEEDED', output: {} }) as SfnExecution) }, tailPool());
+
+    await runAssetAgentTick(d, 'sfn-tail');
+
+    expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
+    expect(assetsRepo.failOrRetryAsset).toHaveBeenCalled();
+  });
+
+  it.each(['FAILED', 'TIMED_OUT', 'ABORTED'] as const)('routes a %s execution through the shared failure path', async (status) => {
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([running()]);
+    const d = sfnDeps({ describe: jest.fn(async () => ({ status, error: 'ECSTaskFailed', cause: 'ffmpeg exited 1' }) as SfnExecution) });
+
+    await runAssetAgentTick(d, 'sfn-tail');
+
+    const [, , , err] = (assetsRepo.failOrRetryAsset as jest.Mock).mock.calls[0];
+    expect(err).toMatchObject({ provider: 'sfn', status });
+    expect(err.error).toContain('ffmpeg exited 1');
+  });
+
+  it('stops an execution still RUNNING past the wall-clock budget, then requeues the row', async () => {
+    const spec = ASSET_SPECS['sfn-tail'];
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      running({ submittedAt: new Date(Date.now() - (spec.timeoutMs as number) - 1_000) }),
+    ]);
+    (assetsRepo.reworkAsset as jest.Mock).mockResolvedValue(true);
+    const stop = jest.fn(async () => undefined);
+
+    const summary = await runAssetAgentTick(sfnDeps({ stop }), 'sfn-tail');
+
+    expect(summary.timedOut).toBe(1);
+    expect(stop).toHaveBeenCalledWith('arn:exec:proj_1', expect.stringContaining('timeout'));
+    expect(assetsRepo.reworkAsset).toHaveBeenCalled();
+  });
+
+  it('retries the status check next tick when AWS errors, rather than failing the row', async () => {
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([running()]);
+    const d = sfnDeps({
+      describe: jest.fn(async () => {
+        throw new Error('ThrottlingException');
+      }),
+    });
+
+    await runAssetAgentTick(d, 'sfn-tail');
+
+    expect(assetsRepo.failOrRetryAsset).not.toHaveBeenCalled();
+    expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
+  });
+
+  it('is capped at its own concurrency ceiling, not a pod count', async () => {
+    (assetsRepo.countInFlightForEndpoint as jest.Mock).mockResolvedValue(ASSET_SPECS['sfn-tail'].maxInFlight);
+
+    const summary = await runAssetAgentTick(sfnDeps({}), 'sfn-tail');
+
+    expect(summary.skippedNoRoom).toBe(true);
+    expect(assetsRepo.claimPending).not.toHaveBeenCalled();
   });
 });
 
@@ -444,20 +589,16 @@ describe('request timeouts', () => {
     expect(ASSET_SPECS.remotion.cancelOnTimeout).toBe(false);
   });
 
-  it('times postprod-lite out at the pod\u2019s own limit, without cancelling', () => {
-    expect(ASSET_SPECS['postprod-lite'].timeoutMs).toBe(900_000);
-    expect(ASSET_SPECS['postprod-lite'].cancelOnTimeout).toBe(false);
-  });
-
-  it('gives bgm the same budget as mmaudio', () => {
-    expect(ASSET_SPECS.bgm.timeoutMs).toBe(ASSET_SPECS.mmaudio.timeoutMs);
+  it('stops an sfn-tail execution on timeout rather than letting it run on', () => {
+    expect(ASSET_SPECS['sfn-tail'].cancelOnTimeout).toBe(true);
+    // The state machine's own 90-minute timeout must fire before ours.
+    expect(ASSET_SPECS['sfn-tail'].timeoutMs).toBeGreaterThan(90 * 60_000);
   });
 
   it('carries the operator\u2019s timeout budgets', () => {
-    expect(ASSET_SPECS['qwen-image-gen'].timeoutMs).toBe(150_000);
-    expect(ASSET_SPECS['qwen-edit'].timeoutMs).toBe(150_000);
-    expect(ASSET_SPECS.tts.timeoutMs).toBe(150_000);
-    expect(ASSET_SPECS['dreamx-refine'].timeoutMs).toBe(150_000);
+    expect(ASSET_SPECS['qwen-image-gen'].timeoutMs).toBe(300_000);
+    expect(ASSET_SPECS['qwen-edit'].timeoutMs).toBe(300_000);
+    expect(ASSET_SPECS.tts.timeoutMs).toBe(300_000);
     expect(ASSET_SPECS.mmaudio.timeoutMs).toBe(150_000);
     expect(ASSET_SPECS['wan2-i2v'].timeoutMs).toBe(300_000);
   });
@@ -567,19 +708,19 @@ describe('handoff resolution', () => {
         aspectRatio: '9:16',
         resolution: '1080x1920',
         callbackUrl: 'https://convex.example/cb',
-        options: { upscale: true, upscaleEngine: 'dreamx' },
+        options: { sfx: true },
         frames: [{ frameId: 'f1', imagePrompt: 'p', narration: 'n', durationS: 5 }],
       }),
     );
     const handoffs = resolveHandoffs(plan, 'wan2-i2v', {});
     // Only the frame-scoped successor. The project-scoped tail is armed by
     // the compiler, never reached by a handoff.
-    expect(handoffs.map((h) => h.kind)).toEqual(['dreamx-refine']);
+    expect(handoffs.map((h) => h.kind)).toEqual(['mmaudio']);
 
-    const refine = handoffs[0];
-    expect(refine.endpointId).toBe(ASSET_SPECS['dreamx-refine'].endpointId);
-    expect(refine.requiredInputs).toEqual(['wan2-i2v']);
-    expect(refine.stage).toBeNull();
+    const sfx = handoffs[0];
+    expect(sfx.endpointId).toBe(ASSET_SPECS['mmaudio'].endpointId);
+    expect(sfx.requiredInputs).toEqual(['wan2-i2v']);
+    expect(sfx.stage).toBeNull();
   });
 });
 

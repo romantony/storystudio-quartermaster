@@ -25,23 +25,13 @@
  * RunPod dashboard.
  */
 import { FLEET } from '../fleet-registry';
-import {
-  POSTPROD_LITE_V2_ENDPOINT_ID,
-  POSTPROD_LITE_V2_PODS,
-  DREAMX_REFINER_ENDPOINT_ID,
-  AUDIO_POOL_ENDPOINT_ID,
-  AUDIO_POOL_PODS,
-} from '../steps/tail-endpoints';
 import { buildImageInput } from '../steps/builders/image';
 import { buildImageEditInput } from '../steps/builders/image-edit';
 import { buildTtsInput } from '../steps/builders/tts';
 import { buildI2vInput } from '../steps/builders/i2v';
-import { buildUpscaleFrameInput } from '../steps/builders/upscale-frame';
 import { buildSfxInput } from '../steps/builders/sfx';
-import { buildBgmInput } from '../steps/builders/bgm';
-import { buildMergeInput } from '../steps/builders/merge';
 import { buildRemotionOverlayInput } from '../steps/builders/remotion-overlay';
-import { buildPostprodInput } from '../steps/builders/postprod';
+import { buildSfnTailInput } from '../steps/builders/sfn-tail';
 import type { PayloadBuilder } from '../steps/builders/types';
 
 export const ASSET_KINDS = [
@@ -49,12 +39,9 @@ export const ASSET_KINDS = [
   'qwen-edit',
   'tts',
   'wan2-i2v',
-  'dreamx-refine',
   'mmaudio',
   'remotion',
-  'merge',
-  'bgm',
-  'postprod-lite',
+  'sfn-tail',
 ] as const;
 
 export type AssetKind = (typeof ASSET_KINDS)[number];
@@ -64,9 +51,7 @@ export function isAssetKind(v: string): v is AssetKind {
 }
 
 /** Reserved: a kind that needs more than one provider call walks these inside
- * one row. No kind uses it today — postprod-lite's merge/remove-silence/concat
- * chain became a single `postprod` call on the worker — but the Remotion
- * overlay is the obvious next user. */
+ * one row. No kind uses it today. */
 export type AssetStage = string;
 
 export interface AssetSpec {
@@ -76,17 +61,18 @@ export interface AssetSpec {
   endpointId: string;
   /** Frame-scoped kinds get one row per frame and are released by the
    * per-frame handoff. Project-scoped kinds ('*' as the frame id) get one row
-   * per project: `bgm`, which has no per-frame input at all, and
-   * `postprod-lite`, whose fan-in spans every frame and is therefore armed by
-   * the project compiler rather than by a handoff. */
+   * per project: `sfn-tail`, whose fan-in spans every frame and is therefore
+   * armed by the project compiler rather than by a handoff. */
   scope: 'frame' | 'project';
-  /** How this kind's work is dispatched. 'runpod' is everything except
-   * `remotion`, which is a direct, synchronous AWS Lambda invoke — the same
-   * deliberate exception steps/catalog.ts's seq 16 makes, for the same
-   * reason: that Lambda already exists and was live-tested rather than
-   * reimplemented on RunPod. `maxInFlight` then reads as a self-imposed
-   * concurrency limit, not a pod count. */
-  provider: 'runpod' | 'lambda';
+  /** How this kind's work is dispatched. 'runpod' is every asset the
+   * orchestrator generates on a GPU. `remotion` is a direct, synchronous AWS
+   * Lambda invoke — the same deliberate exception steps/catalog.ts's seq 16
+   * makes, for the same reason: that Lambda already exists and was
+   * live-tested rather than reimplemented on RunPod. `sfn-tail` starts an AWS
+   * Step Functions execution (the assembly tail: ECS merge/concat/silence,
+   * RunPod captions + BGM, ECS finalize) and polls it. For the last two,
+   * `maxInFlight` is a self-imposed concurrency limit, not a pod count. */
+  provider: 'runpod' | 'lambda' | 'sfn';
   /** Which QA rubric applies to this kind's output, or null for "nothing to
    * judge". Only the three generation kinds are gated — everything after them
    * is ffmpeg, which either works or errors. A gated kind's completion does
@@ -144,16 +130,15 @@ function podsFor(counterKey: string): number {
   return entry.workers;
 }
 
-/** Endpoints outside src/shared/fleet.ts (steps/tail-endpoints.ts) have no
- * generated pod count, so their real dashboard values are stated here —
- * re-synced 2026-09-20 (raised 2->4, operator's call, alongside the
- * audio-pool cutover: dreamx-refine went from opt-in to mandatory on every
- * wan2-i2v frame this same session — see plan.ts's `refine` comment — and
- * 2 pods was not going to keep up). mmaudio's and postprod-lite's own pod
- * counts moved to tail-endpoints.ts's AUDIO_POOL_PODS/POSTPROD_LITE_V2_PODS
- * (2026-09-20 pooling/merge-parallelization) — only dreamx-refine still has
- * its own siloed endpoint. */
-const DREAMX_PODS = 4;
+/** The assembly tail is an AWS Step Functions execution, not a RunPod
+ * endpoint: this sentinel is never sent anywhere, it only keys in-flight
+ * bookkeeping (`countInFlightForEndpoint`) the way `lambda:qm-remotion-overlay`
+ * does. */
+export const SFN_TAIL_ENDPOINT_ID = 'aws-sfn:tail';
+
+/** Concurrent tail executions across all projects — an operator-set limit on
+ * ECS task quota and cost, NOT a pod count (nothing in RunPod is held). */
+export const SFN_TAIL_MAX_EXECUTIONS = 3;
 
 export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
   'qwen-image-gen': {
@@ -164,7 +149,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_qwen_image_gen',
     endpointId: endpointFor('runpod:qwen-image-gen'),
     maxInFlight: podsFor('runpod:qwen-image-gen'),
-    timeoutMs: 150_000, // warm ~15s, cold pod ~120s
+    timeoutMs: 300_000, // warm ~15s; cold start measured 150-190s on 2026-09-30/10-01, raised from 150s
     cancelOnTimeout: true,
     legacySeq: 1,
     produces: 'image',
@@ -179,7 +164,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     table: 'asset_qwen_edit',
     endpointId: endpointFor('runpod:qwen-image-edit'),
     maxInFlight: podsFor('runpod:qwen-image-edit'),
-    timeoutMs: 150_000, // warm ~15s, cold pod ~120s
+    timeoutMs: 300_000, // warm ~15s; cold start measured 150-190s on 2026-09-30/10-01, raised from 150s
     cancelOnTimeout: true,
     legacySeq: 0,
     produces: 'image',
@@ -192,12 +177,11 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     gate: null,
     scope: 'frame',
     table: 'asset_tts',
-    // Same physical endpoint as ever (flux-tts-s2t, rnqxi6c0mlq517) — now
-    // pooled with mmaudio+bgm, repurposed in place (image swapped, workers
-    // raised 5->7, tail-endpoints.ts) rather than moved to a new endpoint.
-    endpointId: AUDIO_POOL_ENDPOINT_ID,
-    maxInFlight: AUDIO_POOL_PODS,
-    timeoutMs: 150_000, // operator-set
+    // TTS only: BGM and captions moved to BGM-S2T (called from the SFN tail)
+    // and SFX to its own MM-Audio endpoint, so this endpoint is no longer pooled.
+    endpointId: endpointFor('runpod:flux-tts-s2t'),
+    maxInFlight: podsFor('runpod:flux-tts-s2t'),
+    timeoutMs: 300_000, // cold start measured 150-190s on 2026-09-30/10-01, raised from 150s
     cancelOnTimeout: true,
     legacySeq: 2,
     produces: 'audio',
@@ -221,32 +205,16 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     stages: [],
     build: buildI2vInput,
   },
-  'dreamx-refine': {
-    kind: 'dreamx-refine',
-    provider: 'runpod',
-    gate: null,
-    scope: 'frame',
-    table: 'asset_dreamx_refine',
-    endpointId: DREAMX_REFINER_ENDPOINT_ID,
-    maxInFlight: DREAMX_PODS,
-    timeoutMs: 150_000, // operator-set
-    cancelOnTimeout: true,
-    legacySeq: 14,
-    produces: 'video',
-    stages: [],
-    build: buildUpscaleFrameInput,
-  },
   mmaudio: {
     kind: 'mmaudio',
     provider: 'runpod',
     gate: null,
     scope: 'frame',
     table: 'asset_mmaudio',
-    // Pooled onto the ex-TTS-only endpoint, now 7 pods shared with tts+bgm
-    // (tail-endpoints.ts) — was its own siloed 2-pod endpoint, MM-Audio-A40,
-    // decommissioned (scaled to 0) 2026-09-20.
-    endpointId: AUDIO_POOL_ENDPOINT_ID,
-    maxInFlight: AUDIO_POOL_PODS,
+    // MM-Audio-A40, its own endpoint again (5 pods, dashboard 2026-10-02) —
+    // it was pooled onto flux-tts-s2t from 2026-09-20.
+    endpointId: endpointFor('runpod:mm-audio'),
+    maxInFlight: podsFor('runpod:mm-audio'),
     timeoutMs: 150_000, // operator-set
     cancelOnTimeout: true,
     legacySeq: 15,
@@ -258,7 +226,7 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     // On-screen text for educational/explainer frames, rendered by the
     // existing AWS `QM-remotion-overlay` Lambda (src/lambda/client.ts) — the
     // one non-RunPod agent. It renders onto the frame's SILENT clip, before
-    // the postprod-lite one-shot merges narration into it; in the cohort
+    // the SFN tail's ECS merge mixes narration into it; in the cohort
     // model the equivalent step sits after merge instead, because there the
     // merge is its own call.
     //
@@ -290,99 +258,34 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     stages: [],
     build: buildRemotionOverlayInput,
   },
-  merge: {
-    // Frame + narration -> one clip, moved OUT of the postprod-lite one-shot
-    // tail and into its own parallel per-frame agent (2026-09-20 merge-
-    // parallelization — docs/qm-orchestrator-three-project-run-analysis-
-    // 2026-09-19.md's follow-up). Reuses steps/builders/merge.ts VERBATIM —
-    // it already reads exactly the same resolvedDeps seqs (2=tts, 3=wan2-i2v,
-    // 14=dreamx-refine, 15=mmaudio, 16=remotion) this kind's `requires` graph
-    // resolves (assets/plan.ts), because it is the SAME step the cohort
-    // model already calls "merge" at seq 6.
+  'sfn-tail': {
+    // The whole project's assembly tail as ONE Step Functions execution
+    // (docs/qm-sfn-ecs-tail-implementation-2026-10-02.md): ECS merges each
+    // frame's clip with its narration (+SFX), concatenates and removes
+    // silence; RunPod BGM-S2T then produces word-level captions and the BGM
+    // in parallel; ECS finalize upscales to 1080p, burns the captions and
+    // overlays the BGM. The orchestrator hands over asset REFERENCES only —
+    // a manifest file on R2 — and gets back one final url.
     //
-    // Only planned when the project has a motion model at all: an
-    // `motionEngine:'animate'` project has no per-frame clip to pre-merge —
-    // Ken Burns only happens inside the tail — so it keeps merging there,
-    // same as before this kind existed.
-    //
-    // Targets postprod-lite-v2's endpoint, not v1's: v1's `_prepare_frame`
-    // has no `preMerged` branch, so it would just re-merge a clip that
-    // already has narration in it — harmless but pointless. `postprod-lite`
-    // below points at the same v2 endpoint for the same reason; they move
-    // together.
-    kind: 'merge',
-    provider: 'runpod',
-    gate: null,
-    scope: 'frame',
-    table: 'asset_merge',
-    endpointId: POSTPROD_LITE_V2_ENDPOINT_ID,
-    maxInFlight: POSTPROD_LITE_V2_PODS,
-    timeoutMs: 150_000, // ffmpeg mux, `-c:v copy` — fast, same budget class as mmaudio/dreamx-refine
-    cancelOnTimeout: true,
-    legacySeq: 6, // the cohort model's own 'merge' step — see steps/catalog.ts seq 6
-    produces: 'video',
-    stages: [],
-    build: buildMergeInput,
-  },
-  bgm: {
-    // Project-scoped, and the only kind with no per-frame anything: one music
-    // bed for the whole video, generated in parallel with every frame's work
-    // and handed to the tail as `manifest.bgm.url`. It exists as an agent
-    // rather than as a call the compiler makes inline so the track is ready
-    // BEFORE assembly starts instead of adding a cold ACE-Step generation to
-    // the critical path — and so it retries, reworks and reports like any
-    // other asset.
-    kind: 'bgm',
-    provider: 'runpod',
+    // Project-scoped and armed by the compiler once every frame's assets
+    // exist, exactly as `postprod-lite` was. It replaces `postprod-lite`,
+    // `merge`, `bgm` and `dreamx-refine` (those endpoints are at 0 pods).
+    kind: 'sfn-tail',
+    provider: 'sfn',
     gate: null,
     scope: 'project',
-    table: 'asset_bgm',
-    // Pooled onto the ex-TTS-only endpoint, now 7 pods shared with tts+mmaudio
-    // (tail-endpoints.ts) — was its own siloed 2-pod endpoint, BGM-S2T,
-    // decommissioned (scaled to 0) 2026-09-20.
-    endpointId: AUDIO_POOL_ENDPOINT_ID,
-    maxInFlight: AUDIO_POOL_PODS,
-    // Same as MMAudio (operator, 2026-09-19).
-    timeoutMs: 150_000,
+    table: 'asset_sfn_tail',
+    endpointId: SFN_TAIL_ENDPOINT_ID,
+    maxInFlight: SFN_TAIL_MAX_EXECUTIONS,
+    // Wall-clock budget for one execution. The state machine's own timeout
+    // (90 min) fires first and is reported as TIMED_OUT; this only catches an
+    // execution that is stuck RUNNING past that, and stops it.
+    timeoutMs: 5_700_000,
     cancelOnTimeout: true,
-    legacySeq: 5,
-    produces: 'audio',
-    stages: [],
-    build: buildBgmInput,
-  },
-  'postprod-lite': {
-    // The whole project's tail in ONE call: animate stills (where there is no
-    // generated clip), merge each frame's narration and SFX, trim silences,
-    // concat, burn captions, mix the BGM — all on one pod, all on that pod's
-    // local disk, returning one final url. Nothing intermediate is ever
-    // uploaded, which is both why concurrent projects cannot mix assets and
-    // why this replaced a per-frame call chain that round-tripped every clip
-    // through R2 twice.
-    //
-    // Project-scoped, so `maxInFlight` reads as "how many projects assemble at
-    // once" — one per pod, exactly as intended.
-    kind: 'postprod-lite',
-    provider: 'runpod',
-    gate: null,
-    scope: 'project',
-    table: 'asset_postprod_lite',
-    // v2, not v1 (tail-endpoints.ts) — v1 is untouched and still live; v2 has
-    // the concat-normalize/bgm-loop/av-assert fixes and understands a
-    // `merge`-produced `preMerged` clip.
-    endpointId: POSTPROD_LITE_V2_ENDPOINT_ID,
-    maxInFlight: POSTPROD_LITE_V2_PODS,
-    // 900s, matching the pod's OWN execution limit (operator, 2026-09-19) —
-    // so this fires at the moment the worker has already given up, never
-    // before. Measured 2026-09-19 on a real 10-frame project: 33s.
-    //
-    // No cancel: the pod has already timed the request out by then, so the
-    // call could only fail. Resubmit straight away.
-    timeoutMs: 900_000,
-    cancelOnTimeout: false,
     legacySeq: 6,
     produces: 'video',
     stages: [],
-    build: buildPostprodInput,
+    build: buildSfnTailInput,
   },
 };
 

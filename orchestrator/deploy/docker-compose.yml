@@ -87,6 +87,12 @@ services:
       # agent); credentials come from AWS_* above.
       REMOTION_LAMBDA_FUNCTION_NAME: ${REMOTION_LAMBDA_FUNCTION_NAME:-QM-remotion-overlay}
       REMOTION_LAMBDA_REGION: ${REMOTION_LAMBDA_REGION:-us-east-1}
+      # The `sfn-tail` agent starts + polls this state machine (the assembly
+      # tail: ECS merge/concat/silence, RunPod captions + BGM, ECS finalize).
+      # Empty = no tail. Credentials come from AWS_* above and need
+      # states:StartExecution/DescribeExecution/StopExecution on this ARN only.
+      SFN_TAIL_STATE_MACHINE_ARN: ${SFN_TAIL_STATE_MACHINE_ARN:-}
+      SFN_TAIL_REGION: ${SFN_TAIL_REGION:-us-east-1}
     expose: ["8080"]
     ports: ["127.0.0.1:8080:8080"]
   watchdog:

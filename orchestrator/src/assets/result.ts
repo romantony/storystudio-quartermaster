@@ -46,15 +46,15 @@ function urlOf(rows: AssetRow[], kind: string, frameId: string): string | null {
 }
 
 /**
- * Per-frame merged clips, read back out of the one-shot tail's own response.
- * The worker hosts each finished clip (`frames[].url`) even though concat
+ * Per-frame merged clips, read back out of the SFN tail's own output. The
+ * tail's ECS task hosts each finished clip (`frames[].url`) even though concat
  * consumes the local file, so this contract field is populated exactly as the
  * cohort path populates it — there is just one row carrying all of them
  * instead of one row per frame.
  */
 function mergedClipUrls(rows: AssetRow[]): Map<string, string> {
   const out = new Map<string, string>();
-  const tail = rows.find((r) => r.kind === 'postprod-lite' && r.status === 'complete');
+  const tail = rows.find((r) => r.kind === 'sfn-tail' && r.status === 'complete');
   const frames = (tail?.output as { frames?: Array<{ frameId?: string; url?: string }> } | null)?.frames;
   for (const f of frames ?? []) {
     if (f.frameId && f.url) out.set(f.frameId, f.url);
@@ -92,9 +92,8 @@ export function buildAssetResult(facts: AssetResultFacts): QmResult {
       narrationAudioUrl: tts?.assetUrl ?? null,
       narrationDurationS: tts?.durationS ?? null,
       clipUrl:
-        urlOf(rows, 'merge', f.frameId) ??
+        urlOf(rows, 'remotion', f.frameId) ??
         urlOf(rows, 'mmaudio', f.frameId) ??
-        urlOf(rows, 'dreamx-refine', f.frameId) ??
         (plan.motionKind ? urlOf(rows, plan.motionKind, f.frameId) : null),
       // From the tail's own per-frame report. Null until the tail has run
       // (a project that failed before assembly), and null for a frame the
@@ -188,11 +187,9 @@ function legacySeqOf(kind: string): number {
     'qwen-image-gen': 1,
     tts: 2,
     'wan2-i2v': 3,
-    bgm: 5,
-    'postprod-lite': 6,
-    merge: 6,
-    'dreamx-refine': 14,
+    'sfn-tail': 6,
     mmaudio: 15,
+    remotion: 16,
   };
   return map[kind] ?? 99;
 }
@@ -258,7 +255,7 @@ export async function finalizeAssetProject(
     status: outcome.status,
     finalUrl: outcome.finalUrl,
     // The one-shot reports the finished video's real length on its own row.
-    finalDurationS: rows.find((r) => r.kind === 'postprod-lite' && r.status === 'complete')?.durationS ?? null,
+    finalDurationS: rows.find((r) => r.kind === 'sfn-tail' && r.status === 'complete')?.durationS ?? null,
     gpuCostUsd,
     startedAt: pp.startedAt,
   });

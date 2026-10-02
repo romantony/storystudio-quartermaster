@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1
 #
-# Orchestrator image. Self-contained within orchestrator/ — the committed
-# src/fleet-registry.ts is what the runtime uses, so no reach into ../src and
-# no `npm run gen:fleet` at build time (that script is a dev tool; its output is
-# guarded by fleet-registry.test.ts).
+# Orchestrator image. Self-contained within orchestrator/ — the committed,
+# hand-maintained src/fleet-registry.ts is what the runtime uses (the
+# orchestrator owns its fleet since 2026-10-02), so no reach into ../src.
 #
 #   build:   docker compose build orchestrator
 #   migrate: docker compose run --rm orchestrator node dist/db/migrate.js up

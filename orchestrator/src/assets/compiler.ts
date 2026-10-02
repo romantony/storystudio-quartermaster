@@ -9,22 +9,21 @@
  * if not, what is holding it up?* This agent answers it. Its remit, in the
  * operator's own terms:
  *
- *   1. compile every asset postprod-lite needs to run;
+ *   1. compile every asset the assembly tail needs;
  *   2. if something is missing, check its status — if it is stuck, cancel the
  *      job and resubmit it as rework;
- *   3. once all of a project's assets exist, write a JSON file and trigger
- *      the postprod-lite endpoint;
- *   4. one request completes all the tail work and returns the final url.
+ *   3. once all of a project's assets exist, write a JSON file and start the
+ *      assembly tail (a Step Functions execution) with a reference to it;
+ *   4. one execution completes all the tail work and returns the final url.
  *
- * On (3) and (4): the compiler does NOT call postprod-lite itself. It writes
- * the manifest and *arms* the project's own project-scoped `postprod-lite`
- * asset row, and the postprod-lite agent dispatches it like any other row.
- * That is what makes "one pod processes one project" an enforced property
- * rather than a hope: the number of projects assembling at once is that
- * endpoint's pod count, applied by the same in-flight ceiling every other
- * agent obeys. The worker then does the whole tail locally — animate, merge,
- * trim, concat, caption, mix — and returns one url (`postprod-lite/API.md`
- * §10). A later tick sees that row complete and finishes the project.
+ * On (3) and (4): the compiler does NOT start the execution itself. It writes
+ * the manifest and *arms* the project's own project-scoped `sfn-tail` asset
+ * row, and the sfn-tail agent starts and polls the execution like any other
+ * row — under the same in-flight ceiling every other agent obeys. The tail
+ * (ECS merge/concat/silence, RunPod captions + BGM, ECS upscale/burn/overlay)
+ * runs entirely in AWS and returns one url
+ * (docs/qm-sfn-ecs-tail-implementation-2026-10-02.md). A later tick sees that
+ * row complete and finishes the project.
  *
  * What this agent must never do: run generation work itself, or reach into
  * another project. Repair and rework happen by writing the SAME asset tables
@@ -40,6 +39,7 @@ import type { FrameJobInput } from '../steps/builders/types';
 import { assetSpec, type AssetKind } from './kinds';
 import { clipKind, inputsSatisfied, type AssetPlan } from './plan';
 import { buildManifest, manifestKey, type ManifestFrame, type TailManifest } from './manifest';
+import type { SfnTailRowInput } from '../steps/builders/sfn-tail';
 import { putJsonToR2, type R2Transport } from '../r2/client';
 import {
   armProjectAsset,
@@ -109,9 +109,8 @@ export interface ProjectAssetState {
  * from the tick so the decision — "whole", "stuck", "broken" — is unit
  * testable without a database, a clock or RunPod.
  *
- * Only FRAME-scoped kinds are judged here. `bgm` is handled separately (it is
- * optional to the tail, not to the frames), and `postprod-lite` is the thing
- * this state decides whether to arm.
+ * Only FRAME-scoped kinds are judged here; `sfn-tail` is the thing this state
+ * decides whether to arm.
  */
 export function classifyProjectAssets(
   plan: AssetPlan,
@@ -161,11 +160,6 @@ export function classifyProjectAssets(
 
   for (const kind of plan.frameKinds) {
     for (const frame of frames) classifyOne(byKey.get(`${kind}${KEY_SEP}${frame.frameId}`), kind, frame);
-  }
-  // The BGM track is project-scoped but IS a generation input to the tail, so
-  // assembly waits for it the same way it waits for a frame.
-  if (plan.kinds.includes('bgm')) {
-    classifyOne(byKey.get(`bgm${KEY_SEP}${PROJECT_SCOPE}`), 'bgm', { frameId: PROJECT_SCOPE, seq: -1 });
   }
 
   const readyFrames: ProjectAssetState['readyFrames'] = [];
@@ -245,24 +239,12 @@ export function manifestFrame(
 
   if (source) {
     entry.videoUrl = source;
-    // `mmaudio` was clipKind()'s top pick, and its output (SFX already muxed
-    // in) fed straight into the one-shot's own merge via sfx_from_video,
-    // before the `merge` kind existed (2026-09-20). Now `merge` is planned
-    // unconditionally whenever there's a motion model at all (plan.ts), so
-    // it always outranks `mmaudio` in clipKind()'s precedence — this branch
-    // is consequently unreachable today, but kept (rather than deleted) as
-    // the fallback for a project whose plan somehow lacks `merge` while
-    // still having `mmaudio`, which nothing currently constructs but nothing
-    // forbids either.
-    if (clip === 'mmaudio') entry.sfxFromVideo = true;
-    // `merge`'s own output already has narration (and sfx, if any) mixed in
-    // — buildMergeInput (steps/builders/merge.ts) passes the same
-    // sfx_from_video flag through to ITS merge call, so the work this branch
-    // used to hand off to the one-shot now happens inside `merge` instead.
-    // postprod-lite-v2's tail downloads the result and skips straight to
-    // concat. v1 has no preMerged branch and would just harmlessly re-merge,
-    // but `merge` only ever targets v2 (kinds.ts).
-    if (clip === 'merge') entry.preMerged = true;
+    // The clip is the most-processed per-frame output (remotion over mmaudio
+    // over wan2). With SFX planned, the mmaudio mp4 carries the SFX track —
+    // even when a remotion overlay was rendered on top of it — so the tail's
+    // merge mixes THAT audio under the narration instead of taking a separate
+    // SFX file (the `sfx_from_video` rule steps/builders/merge.ts applied).
+    if (plan.frameKinds.includes('mmaudio')) entry.sfxFromVideo = true;
   } else {
     const image = url(plan.imageKind);
     if (!image) throw new Error(`frame ${frame.frameId}: no still to animate`);
@@ -412,7 +394,7 @@ async function repair(deps: CompilerDeps, pp: PipelineProject, state: ProjectAss
  * One project's turn. Everything here is idempotent and restart-safe: arming
  * the tail is a conditional UPDATE (so two ticks cannot arm it twice), and a
  * process that dies between arming and completion leaves a `pending`
- * postprod-lite row the agent simply picks up.
+ * sfn-tail row the agent simply picks up.
  */
 export async function compileProject(deps: CompilerDeps, projectId: string): Promise<CompilerTickResult> {
   const pp = await getPipelineProject(deps.pool, projectId);
@@ -424,12 +406,12 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
   const frames = request.frames.map((f, i) => ({ frameId: f.frameId, seq: i }));
 
   const rows = await listProjectAssets(deps.pool, projectId);
-  const tailRow = rows.find((r) => r.kind === 'postprod-lite' && r.frameId === PROJECT_SCOPE);
+  const tailRow = rows.find((r) => r.kind === 'sfn-tail' && r.frameId === PROJECT_SCOPE);
 
   // ── already assembling: is the one-shot done? ──────────────────────────
   if (pp.status === 'assembling') {
     if (!tailRow) {
-      await returnToGenerating(deps.pool, projectId, { reason: 'assembling with no postprod-lite row' });
+      await returnToGenerating(deps.pool, projectId, { reason: 'assembling with no sfn-tail row' });
       return { projectId, action: 'waiting', detail: 'no tail row' };
     }
     if (tailRow.status === 'complete' && tailRow.assetUrl) {
@@ -456,8 +438,8 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
       log().warn({ projectId, reason, attempt: pp.attempts }, 'compiler: tail failed, will recompile and retry');
       return { projectId, action: 'failed', detail: reason };
     }
-    // pending / submitted — the postprod-lite agent owns it. Its own
-    // its own timeout brings it back here if the provider job wedges.
+    // pending / submitted — the sfn-tail agent owns it. Its own timeout
+    // (and the state machine's) brings it back here if the execution wedges.
     await touchPipelineProject(deps.pool, projectId);
     return { projectId, action: 'waiting', detail: `tail ${tailRow.status}` };
   }
@@ -497,7 +479,7 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
   if (pp.qaStatus !== 'passed' && pp.qaStatus !== 'bypassed') {
     // Generation is finished but verdicts are still outstanding. The QA agent
     // writes them within a tick or two; waiting here is the whole point of
-    // "only when the QA gate is clear can the compiler trigger postprod-lite".
+    // "only when the QA gate is clear can the compiler trigger the tail".
     await touchPipelineProject(deps.pool, projectId);
     return { projectId, action: 'waiting', detail: `qa ${pp.qaStatus}` };
   }
@@ -521,7 +503,7 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
   }
 
   if (!tailRow) {
-    await returnToGenerating(deps.pool, projectId, { reason: 'no postprod-lite row to arm' });
+    await returnToGenerating(deps.pool, projectId, { reason: 'no sfn-tail row to arm' });
     return { projectId, action: 'waiting', detail: 'no tail row' };
   }
 
@@ -542,7 +524,6 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
     return { projectId, action: 'failed', detail: 'manifest has fewer than two frames' };
   }
 
-  const bgmRow = rows.find((r) => r.kind === 'bgm' && r.status === 'complete');
   const manifest = buildManifest({
     projectId,
     requestId: project.requestId,
@@ -557,37 +538,54 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
     },
     frames: manifestFrames,
     droppedFrames: dropped,
-    bgmUrl: bgmRow?.assetUrl ?? undefined,
+    bgmPrompt: request.bgmPrompt,
   });
 
-  // The manifest travels as a FILE. Inline is the fallback when R2 isn't
-  // configured, and steps/builders/postprod.ts refuses an oversized one
-  // rather than sending it.
+  // The manifest travels as a FILE, never inline: Step Functions caps an
+  // execution's input at 256KB and builders/sfn-tail.ts refuses to send one
+  // without a manifestUrl. If R2 is unconfigured or the upload failed there is
+  // nothing to hand over, so wait and retry on the next tick instead of
+  // claiming assembly with nothing to assemble from.
   let manifestUrl: string | null = null;
   if (deps.r2?.accessKeyId && deps.r2?.secretAccessKey) {
     try {
       manifestUrl = await putJsonToR2(deps.r2, manifestKey(projectId), manifest);
     } catch (err) {
-      log().warn({ projectId, err }, 'compiler: manifest upload failed, falling back to an inline manifest');
+      log().warn({ projectId, err }, 'compiler: manifest upload failed, will retry next tick');
     }
+  }
+  if (!manifestUrl) {
+    log().error({ projectId }, 'compiler: no manifest url (R2 not configured or upload failed) — the SFN tail cannot start');
+    await touchPipelineProject(deps.pool, projectId);
+    return { projectId, action: 'waiting', detail: 'manifest upload failed' };
   }
 
   const claimed = await beginAssembly(deps.pool, projectId, manifest, manifestUrl);
   if (!claimed) return { projectId, action: 'waiting', detail: 'another tick claimed assembly' };
 
-  // Arm the project-scoped tail row. From here the postprod-lite agent owns
-  // it: it dispatches under that endpoint's pod limit — one project per pod —
-  // and the next compiler tick collects the result.
-  await armProjectAsset(deps.pool, projectId, 'postprod-lite', {
-    ...(manifestUrl ? { manifestUrl } : { manifest }),
-    frameId: PROJECT_SCOPE,
-  });
+  // Arm the project-scoped tail row. From here the sfn-tail agent owns it: it
+  // starts the execution under the kind's concurrency ceiling and the next
+  // compiler tick collects the result.
+  const rowInput: SfnTailRowInput = {
+    manifestUrl,
+    aspectRatio: request.aspectRatio,
+    language: request.language,
+    options: {
+      removeSilence: pp.plan.tail.removeSilence,
+      captions: pp.plan.tail.burnCaptions,
+      bgm: pp.plan.tail.bgm,
+      bgmPrompt: request.bgmPrompt,
+      sfx: pp.plan.frameKinds.includes('mmaudio'),
+    },
+    totalDurationS: request.frames.reduce((sum, f) => sum + f.durationS, 0),
+  };
+  await armProjectAsset(deps.pool, projectId, 'sfn-tail', { ...rowInput, frameId: PROJECT_SCOPE });
 
   log().info(
     { projectId, frames: manifestFrames.length, dropped: dropped.length, manifestUrl, steps: manifest.steps, bgm: !!manifest.bgm },
     'compiler: manifest compiled, tail armed',
   );
-  return { projectId, action: 'armed', detail: manifestUrl ?? 'inline manifest' };
+  return { projectId, action: 'armed', detail: manifestUrl };
 }
 
 /** One pass over every live project. */
