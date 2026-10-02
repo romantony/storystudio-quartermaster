@@ -43,15 +43,15 @@ interface Payload {
   trimSilence: boolean;
 }
 
-const BUCKET = process.env.OUTPUT_BUCKET!;
+export const BUCKET = process.env.OUTPUT_BUCKET!;
 const REGION = process.env.AWS_REGION ?? 'us-east-1';
-const s3 = new S3Client({ region: REGION });
+export const s3 = new S3Client({ region: REGION });
 
 // ── Dimension table — ported verbatim from storystudio-unified's
 // DimensionManager (infrastructure/lambda/layers/e2e-common/python/e2e/modules/dimensions.py).
 // Only 9:16/16:9 are ever sent by QM-New in practice; the full table is
 // kept for parity with the source it replaces.
-const ASPECT_RATIOS: Record<string, { width: number; height: number }> = {
+export const ASPECT_RATIOS: Record<string, { width: number; height: number }> = {
   '16:9': { width: 1920, height: 1088 },
   '9:16': { width: 1008, height: 1792 },
   '1:1': { width: 1088, height: 1088 },
@@ -64,7 +64,7 @@ const ASPECT_RATIOS: Record<string, { width: number; height: number }> = {
 const PARALLEL_THRESHOLD = 40;
 const BATCH_SIZE = 10;
 const MAX_BATCH_WORKERS = 2;
-const TARGET_FPS = 30;
+export const TARGET_FPS = 30;
 
 // ── Silence-trim tuning — ported verbatim from remove-silence.ts.
 const NOISE_DB = Number(process.env.SILENCE_NOISE_DB ?? -35);
@@ -72,19 +72,19 @@ const MIN_SILENCE_S = Number(process.env.SILENCE_MIN_DURATION_S ?? 0.4);
 const SILENCE_PAD_S = Number(process.env.SILENCE_PAD_S ?? 0.13);
 const MIN_KEEP_S = 0.3;
 
-function run(args: string[], timeoutMs?: number): { stdout: string; stderr: string; status: number } {
+export function run(args: string[], timeoutMs?: number): { stdout: string; stderr: string; status: number } {
   const r = spawnSync('ffmpeg', args, { maxBuffer: 1024 * 1024 * 256, timeout: timeoutMs });
   if (r.error) throw r.error;
   return { stdout: r.stdout?.toString() ?? '', stderr: r.stderr?.toString() ?? '', status: r.status ?? 1 };
 }
 
-function ffprobeJson(input: string): any {
+export function ffprobeJson(input: string): any {
   const r = spawnSync('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', input], { maxBuffer: 1024 * 1024 * 64 });
   if (r.status !== 0) throw new Error(`ffprobe failed: ${r.stderr?.toString()}`);
   return JSON.parse(r.stdout.toString());
 }
 
-function hasAudioStream(input: string): boolean {
+export function hasAudioStream(input: string): boolean {
   try {
     const data = ffprobeJson(input);
     return (data.streams || []).some((s: any) => s.codec_type === 'audio');
@@ -95,7 +95,7 @@ function hasAudioStream(input: string): boolean {
   }
 }
 
-function durationSeconds(input: string): number {
+export function durationSeconds(input: string): number {
   try {
     const data = ffprobeJson(input);
     return Math.max(0.01, Number(data.format?.duration || 0));
@@ -104,7 +104,7 @@ function durationSeconds(input: string): number {
   }
 }
 
-function download(url: string, dest: string): Promise<void> {
+export function download(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https:') ? https : http;
     const file = fs.createWriteStream(dest);
@@ -135,7 +135,7 @@ async function fetchPayload(): Promise<Payload> {
   return JSON.parse(body);
 }
 
-async function upload(localPath: string, key: string, contentType: string): Promise<void> {
+export async function upload(localPath: string, key: string, contentType: string): Promise<void> {
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
@@ -144,10 +144,16 @@ async function upload(localPath: string, key: string, contentType: string): Prom
   }));
 }
 
+// setsar=1 (2026-10-02): scale's rounding gives clips of DIFFERENT source sizes
+// slightly different sample aspect ratios (e.g. 3653:3654), and the concat
+// filter refuses to join them ("Input link parameters do not match"). The AWS
+// live path never hit it because its clips are all one size; the orchestrator
+// tail mixes Wan2 clips with Ken Burns stills. A no-op when SAR is already 1:1.
+//
 // ── Concat: per-clip normalize (scale+pad+fps+format, audio aformat or
 // synthesized silence) via one filter_complex, same as
 // concat_premium_audio_safe() in the Lambda this replaces.
-function concatNormalize(videoPaths: string[], outputPath: string, aspectRatio: string, preset: string): void {
+export function concatNormalize(videoPaths: string[], outputPath: string, aspectRatio: string, preset: string): void {
   const { width, height } = ASPECT_RATIOS[aspectRatio] ?? ASPECT_RATIOS['9:16'];
   const n = videoPaths.length;
   const audioPresent = videoPaths.map(hasAudioStream);
@@ -158,7 +164,7 @@ function concatNormalize(videoPaths: string[], outputPath: string, aspectRatio: 
   const filterParts: string[] = [];
   const concatInputs: string[] = [];
   for (let i = 0; i < n; i++) {
-    filterParts.push(`[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,fps=${TARGET_FPS},format=yuv420p[v${i}]`);
+    filterParts.push(`[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${TARGET_FPS},format=yuv420p[v${i}]`);
     concatInputs.push(`[v${i}]`);
     if (audioPresent[i]) {
       filterParts.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a${i}]`);
@@ -183,7 +189,7 @@ function concatNormalize(videoPaths: string[], outputPath: string, aspectRatio: 
   if (status !== 0) throw new Error(`concat filter_complex failed: ${stderr.slice(-1500)}`);
 }
 
-function streamCopyConcat(inputPaths: string[], outputPath: string): void {
+export function streamCopyConcat(inputPaths: string[], outputPath: string): void {
   const listPath = outputPath + '.list.txt';
   fs.writeFileSync(listPath, inputPaths.map(p => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'));
   try {
@@ -194,7 +200,7 @@ function streamCopyConcat(inputPaths: string[], outputPath: string): void {
   }
 }
 
-function extractAudioWav(input: string, outputPath: string): void {
+export function extractAudioWav(input: string, outputPath: string): void {
   const { status, stderr } = run(['-i', input, '-vn', '-ar', '48000', '-ac', '2', '-y', outputPath], 10 * 60_000);
   if (status !== 0) throw new Error(`audio extraction failed: ${stderr.slice(-1500)}`);
 }
@@ -217,11 +223,21 @@ async function concatAllFrames(videos: FrameVideo[], aspectRatio: string, workDi
     await download(v.videoUrl, dest);
     localPaths.push(dest);
   }
+  return concatLocalClips(localPaths, aspectRatio, workDir);
+}
+
+/** The concat itself, on clips already on local disk (in narrative order).
+ * Split out of concatAllFrames so the orchestrator tail (tail.ts) — which
+ * builds each frame's clip locally and has no URL to download — runs the exact
+ * same validated normalize/batch/stream-copy path. Deletes the inputs it has
+ * consumed, as the batched path always did. */
+export async function concatLocalClips(localPaths: string[], aspectRatio: string, workDir: string): Promise<{ videoPath: string; audioPath: string }> {
+  if (localPaths.length === 0) throw new Error('No clips provided for concatenation');
 
   const finalVideoPath = path.join(workDir, 'concatenated.mp4');
   const finalAudioPath = path.join(workDir, 'concatenated-audio.wav');
 
-  if (sorted.length <= PARALLEL_THRESHOLD) {
+  if (localPaths.length <= PARALLEL_THRESHOLD) {
     concatNormalize(localPaths, finalVideoPath, aspectRatio, 'fast');
   } else {
     const batchDir = path.join(workDir, 'batches');
@@ -300,7 +316,7 @@ function trimCutAndConcat(input: string, keep: [number, number][], workDir: stri
 
 /** Trims dead-air silence out of the concatenated video, returns the final
  * {videoPath, audioPath} — mutates nothing, produces new files in workDir. */
-function trimSilenceFromVideo(inputVideoPath: string, workDir: string): { videoPath: string; audioPath: string } {
+export function trimSilenceFromVideo(inputVideoPath: string, workDir: string): { videoPath: string; audioPath: string } {
   const outputPath = path.join(workDir, 'trimmed.mp4');
   const { duration, silences } = detectSilence(inputVideoPath);
   if (silences.length === 0 || duration === 0) {
@@ -337,7 +353,11 @@ async function main(): Promise<void> {
   }
 }
 
-main().then(
-  () => process.exit(0),
-  (err) => { console.error('[concat-and-trim] FAILED', err); process.exit(1); },
-);
+// Only when run as the task entrypoint (`node index.js`, the existing path).
+// tail.ts imports the helpers above and must NOT trigger this.
+if (require.main === module) {
+  main().then(
+    () => process.exit(0),
+    (err) => { console.error('[concat-and-trim] FAILED', err); process.exit(1); },
+  );
+}

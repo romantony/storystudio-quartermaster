@@ -1,0 +1,21 @@
+version: 0.2
+
+# The orchestrator assembly tail's image (QMOrchestratorTailStack's
+# qm-orchestrator-tail-build project). Same Dockerfile and repository as the
+# AWS live path's concat-and-trim image, but pushed ONLY under its own tag —
+# never :latest — so building the tail can never change the image the live-path
+# pipelines run (their task definition pins :latest).
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  build:
+    commands:
+      - echo Building $REPOSITORY_URI:$IMAGE_TAG ...
+      - docker build -t $REPOSITORY_URI:$IMAGE_TAG .
+  post_build:
+    commands:
+      - echo Pushing $REPOSITORY_URI:$IMAGE_TAG ...
+      - docker push $REPOSITORY_URI:$IMAGE_TAG

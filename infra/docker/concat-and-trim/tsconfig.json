@@ -8,5 +8,9 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["index.ts"]
+  "include": [
+    "index.ts",
+    "tail.ts",
+    "tail-core.ts"
+  ]
 }

@@ -7,6 +7,7 @@ import { WebhookStack } from '../lib/webhook-stack';
 import { SchedulerStack } from '../lib/scheduler-stack';
 import { DashboardStack } from '../lib/dashboard-stack';
 import { PipelineStack } from '../lib/pipeline-stack';
+import { OrchestratorTailStack } from '../lib/orchestrator-tail-stack';
 
 const app = new cdk.App();
 
@@ -93,5 +94,14 @@ const pipelineStack = new PipelineStack(app, 'QMPipelineStack', {
   r2SecretAccessKeySecretArn: ctx('R2_SECRET_ACCESS_KEY_SECRET_ARN'),
 });
 pipelineStack.addDependency(apiStack);
+
+// --- Orchestrator assembly tail ---
+// Its own stack, deliberately independent of QMPipelineStack (no cross-stack
+// references, no dependency): deploying it must never ship pending live-path
+// changes. See lib/orchestrator-tail-stack.ts.
+new OrchestratorTailStack(app, 'QMOrchestratorTailStack', {
+  env,
+  runpodKeySecretArn: ctx('RUNPOD_API_KEY_ARN'),
+});
 
 app.synth();
