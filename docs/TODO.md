@@ -2,7 +2,75 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
-## 2026-09-21 (NEXT SESSION) — finish the audio-pool cutover, then live-verify everything together
+## 2026-10-04 (NEXT SESSION) — harden the live SFN tail: big project, edge cases, cost
+
+**State going in:** the Step Functions assembly tail is LIVE in production since 2026-10-03. The VPS
+orchestrator (`b4e4f0f`) generates every asset on RunPod and hands each finished project to
+`E2E-VideoGenerationPipeline-Orchestrator` (stack `QMOrchestratorTailStack`) with asset references only.
+One project alone + three concurrent passed end to end (all first-attempt, callbacks delivered). Full
+record: `docs/qm-sfn-ecs-tail-implementation-2026-10-02.md` §8.1/§8.2.
+
+**Start here, in order:**
+
+- [ ] **Push `40ce613`** (docs record of the cutover; committed locally, not pushed) and this TODO update.
+- [ ] **Run a large project through the live path.** Only 3-frame (and one 18-frame manual SFN) runs so
+      far. Resubmit the 95-frame `js79cyk7dx664y1wvm19gr18fh8eqrgw__a1` or 111-frame
+      `js71jt6rf77hnf4ejty0xjfdgn8eqfv2__a1` 09-19 request with a fresh id (same method as the 10-03 runs:
+      copy `projects.request`, new projectId/requestId, POST `/v1/requests` on the VPS with the ingest token).
+      Watch: concat's >40-frame batched path, ECS 60-min task timeouts, finalize time at ~5 min of video,
+      the 15-min RunPod poll bound for a long transcribe, the SFN 256KB state (meta.json frames list).
+- [ ] **Simple-animation project (`options.motionEngine: 'animate'`) through the live path.** Never run
+      live on the SFN tail. The plan has NO motion asset (image + TTS only); the manifest carries
+      `imageUrl` + `animate:{effect, fps}` per frame and the tail's ECS `assemble` Ken Burns the still to
+      the narration's real length (`tail.ts prepareFrame`, ported from postprod-lite `_make_vf`). Only the
+      local real-ffmpeg e2e test covers it so far. Use a narration-basic request; set per-frame
+      `animateEffect` to a mix (zoom_in / zoom_out / pan_left / pan_right) to see every effect. Check:
+      motion is smooth, still is sized to the narration (no clipped voice-over), Ken Burns frames concat
+      cleanly with each other (the `setsar=1` path), captions + BGM land.
+- [ ] **Remotion text-overlay project (`options.textOverlay: true`) through the live path.** The
+      `remotion` agent (AWS Lambda `QM-remotion-overlay`) renders on-screen text onto each frame's clip
+      BEFORE the tail; frames need a per-frame `textManifest` (frames without one pass through
+      untouched). Never run together with the SFN tail, and **`remotion` + `mmaudio` together has never
+      run at all**: the overlay renders over the SFX-carrying clip and the tail then lifts that SFX track
+      back off it (`sfxFromVideo`) — if Remotion drops the audio, the frame fails loudly with "clip has no
+      audio track" (dropped, project `partial`). Run it with `sfx: true` deliberately to find out; if it
+      fails, either keep the audio in the Remotion render or route SFX separately. Use an
+      explainer/educational product (QA-exempt). Check: overlay text visible and on the right frames,
+      burned captions don't collide with the overlay text (both sit low in the frame), BGM/SFX intact.
+- [ ] **9:16 project with NATIVE Wan2 clips** (no DreamX any more). The manual 18-frame run used DreamX
+      1056×1856 clips, so letterboxing of raw Wan2 portrait output into the 1008×1792 concat canvas is
+      unchecked — grab a frame and look for bars.
+- [ ] **Hindi (or es/pt-BR) captions** — language is passed to Whisper; check the burned captions render
+      (Noto Sans Devanagari is in the image) and are in the right script.
+- [ ] **Per-execution cost.** Nothing records the tail's cost (Fargate seconds x 2 tasks + BGM-S2T RunPod
+      seconds). Measure from the 10-03 executions, compare with the 09-18 baseline ($0.045/frame all-in);
+      decide whether `asset_costs` should get an `sfn-tail` row. Note: the 3-frame 10-02 project reported
+      `gpuCostUsd 0.24` — cold starts dominate tiny projects, recheck on a big one.
+- [ ] **Decide the 8 undeployed live-path commits in `QMPipelineStack`** (since 2026-08-22: `75aae8a` fixed
+      pod pools, `d138d71` M0.5 lease, `a5a8b9d` ModelsLab decommission, `f429ba7` queue-index readers, ...).
+      `cdk diff QMPipelineStack` shows 29 changed resources. Separately, the live path's concat image
+      (`:latest`) has not been rebuilt: the next `qm-concat-and-trim-build` run ships the `setsar=1` fix and
+      the `index.ts` refactor to it — run one live-path pipeline after that rebuild.
+- [ ] **Delete `orchestrator/scripts/gen-fleet-registry.ts` + the `gen:fleet` script?** Obsolete since the
+      orchestrator owns its fleet; running it would overwrite `fleet-registry.ts`. Needs the operator's yes.
+- [ ] **Cohort mode cleanup** — VPS runs `ORCH_PIPELINE_MODE=assets`; the cohort model (`steps/catalog.ts`,
+      `agents/rework.ts`, old builders, `steps/tail-endpoints.ts` constants) points at 0-pod endpoints.
+      Confirm nothing uses cohort mode, then delete it.
+- [ ] **Small:** AWS SDK will need Node >= 22 for releases after Jan 2027 (orchestrator image is Node 20);
+      final videos are served from S3 `qm-remove-silence-output` — confirm StoryStudio is fine with S3 URLs
+      (vs R2).
+
+### Done 2026-10-02/03 (for the record)
+
+- [x] Fleet re-synced to the dashboard; `orchestrator/src/fleet-registry.ts` hand-maintained (6 endpoints / 29 pods).
+- [x] BGM-S2T smoke-tested live (transcribe word timestamps + bgm).
+- [x] Orchestrator: `sfn-tail` kind, retired dreamx-refine/merge/bgm/postprod-lite, migration 018, 300s timeouts.
+- [x] AWS: state machine + `QM-orchestrator-runpod` Lambda + `tail.js` in the concat-and-trim image (tag
+      `orchestrator-tail`), own stack; `e2e-finalize` NOT used (needs StoryStudio JWT).
+- [x] Deployed, policy attached to `qm-orchestrator-remotion-invoke`, VPS cut over, 1 + 3 concurrent projects passed.
+- [x] Committed `73c9710`, `546dd5e`, `b4e4f0f` (pushed) and `40ce613` (not pushed).
+
+## 2026-09-21 — SUPERSEDED 2026-10-02 (audio-pool tested; tail moved to Step Functions — see 2026-10-04 above)
 
 Yesterday (2026-09-20) fixed every P0/P1 item from the three-project run
 analysis (see the DONE section right below) and built two new things on top:
@@ -54,8 +122,8 @@ session ended mid-verification — **start here**:
       cohort mode still runs live traffic anywhere; if it's confirmed fully
       superseded by the asset pipeline, this whole class of staleness can be
       deleted instead of chased.
-- [ ] Minor: `docs/qm-orchestrator-three-project-run-analysis-2026-09-19.md`
-      is still untracked in git — commit it if it's meant to stay as a
+- [x] Minor (committed `b4e4f0f`): `docs/qm-orchestrator-three-project-run-analysis-2026-09-19.md`
+      was untracked in git — commit it if it's meant to stay as a
       permanent record (it's the source doc the whole 09-20 session's fixes
       trace back to).
 
