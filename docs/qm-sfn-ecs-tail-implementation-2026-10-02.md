@@ -1,7 +1,7 @@
 # Assembly tail on Step Functions + ECS — implementation plan
 
 **Date:** 2026-10-02
-**Status (2026-10-02 evening):** AWS side DEPLOYED as its own stack `QMOrchestratorTailStack` and verified with two real executions (§8.1). Orchestrator side built + tested, NOT deployed. Nothing committed.
+**Status (2026-10-03):** LIVE. AWS side deployed as `QMOrchestratorTailStack`; orchestrator `b4e4f0f` deployed to the VPS with migration 018; one project and then three concurrent projects ran end to end on production (§8.2). Committed `73c9710`, `546dd5e`, `b4e4f0f`.
 **Decision (operator, 2026-10-02):** asset and video generation stay on RunPod, driven by the
 orchestrator on the VPS. The *assembly tail* leaves RunPod `postprod-lite` and runs as an AWS Step
 Functions execution (`E2E-VideoGenerationPipeline-Orchestrator`) on the existing ECS task, calling RunPod only for the two things that need a GPU
@@ -387,6 +387,24 @@ e2e-finalize Dockerfile has the same apt line but ends the chain with `;`, which
 | `js79srd…__a1` from 09-19 (9:16, SFX) | 18 | SUCCEEDED | 6m52s (assemble 3m31s, layers ~30s warm, finalize 2m48s) | 1080×1920, 87.8s, A/V drift 0.18s, full-frame portrait (no bars — these clips were DreamX 1056×1856), captions + BGM to the last second |
 
 Outputs: `s3://qm-remove-silence-output/projects/manual-tail-test/…/tail/`.
+
+## 8.2 Orchestrator cutover + production runs — 2026-10-02/03
+
+Policy `qm-orchestrator-tail-control` attached to `qm-orchestrator-remotion-invoke`; `SFN_TAIL_STATE_MACHINE_ARN`/`SFN_TAIL_REGION`
+added to the VPS `.env` (backup `.env.bak-20261002`); compose synced (backup `docker-compose.yml.bak-20261002`); VPS drained (no live
+projects); `git pull` to `b4e4f0f`, images rebuilt, migration 018 applied, orchestrator + watchdog recreated. Health ok, 7 agents incl.
+`sfn-tail`, and the VPS credential verified against the state machine from inside the container.
+
+| Project | Frames | Run | Tail (SFN) | Result |
+|---|---|---|---|---|
+| `qm-e2e-sfntail-20261002-01` (alone) | 3 | 13.5 min | 3m55s | completed, 1920×1080, 10.7s, captions + BGM + SFX, callback delivered |
+| `qm-e2e-sfntail-20261003-02` (concurrent) | 3 | 12.3 min | 3m30s | completed, 10.6s, delivered |
+| `qm-e2e-sfntail-20261003-03` (concurrent) | 3 | 9.3 min | 2m25s | completed, 10.73s, delivered |
+| `qm-e2e-sfntail-20261003-04` (concurrent) | 3 | 10.8 min | 2m45s | completed, 10.63s, delivered |
+
+Every asset first-attempt, zero errors, every §9.6 result carries `mergedClipUrl`s. Generation is still the long pole (Wan2 at 6 pods);
+the tails overlap in AWS without contending for RunPod pods. Not yet run: a large project (the 111- and 95-frame 09-19 sets), a 9:16
+project with native (non-DreamX) Wan2 clips, Hindi captions. Per-execution cost still unrecorded.
 
 ## 8. Rollout and verification
 
