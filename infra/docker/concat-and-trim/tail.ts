@@ -284,7 +284,8 @@ export async function finalize(): Promise<void> {
       try {
         const srtPath = path.join(workDir, 'captions.srt');
         await download(p.srtUrl, srtPath);
-        const ass = createTiktokAss(fs.readFileSync(srtPath, 'utf8'), targetWidth, targetHeight);
+        const placement = manifest.chain?.overlay ? 'above-overlay' : 'bottom';
+        const ass = createTiktokAss(fs.readFileSync(srtPath, 'utf8'), targetWidth, targetHeight, placement);
         if (ass.includes('Dialogue:')) {
           captionsPath = path.join(workDir, 'captions.ass');
           fs.writeFileSync(captionsPath, ass, 'utf8');

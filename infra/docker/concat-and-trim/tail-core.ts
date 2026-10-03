@@ -42,6 +42,9 @@ export interface TailManifest {
   droppedFrames: Array<{ frameId: string; reason: string }>;
   steps: { removeSilence: boolean; burnCaptions: boolean };
   bgm?: { prompt: string; volume: number };
+  /** Which per-frame generators ran. `overlay` = Remotion on-screen text was
+   * rendered onto the clips; burned captions must keep clear of it. */
+  chain?: { overlay?: boolean };
 }
 
 export const SUPPORTED_MANIFEST_VERSION = 3;
@@ -233,6 +236,16 @@ const TIKTOK_REF_HEIGHT = 1920;
 const TIKTOK_BASE_FONT_SIZE = 92;
 const TIKTOK_BASE_STROKE_WIDTH = 8;
 const TIKTOK_MARGIN_V = 260;
+/**
+ * Bottom margin when the project carries a Remotion text overlay. The overlay
+ * owns three bands (StoryStudio `getAnchorBoxStyle`): top 8%..~18%, center
+ * ~40..60%, lower-third bottom 10%..~22%. The default 260 (13.5%) puts the
+ * captions inside the lower-third band and they collide (seen live
+ * 2026-10-03, qm-e2e-remotion-20261003-02). 500 (26%) ends them at 74% of the
+ * height, so even a two-line cue sits in the free band between center and
+ * lower-third.
+ */
+const TIKTOK_MARGIN_V_ABOVE_OVERLAY = 500;
 const TIKTOK_MARGIN_L = 96;
 const TIKTOK_MARGIN_R = 180;
 export const TIKTOK_MAX_WORDS_PER_CUE = 4;
@@ -299,8 +312,11 @@ function renderHighlightedText(words: string[], highlightIdx: number): string {
   return `${first}\\N${second}`;
 }
 
-/** One Dialogue line per word, each highlighted in turn across its cue. */
-export function createTiktokAss(srt: string, videoWidth: number, videoHeight: number): string {
+export type CaptionPlacement = 'bottom' | 'above-overlay';
+
+/** One Dialogue line per word, each highlighted in turn across its cue.
+ * `above-overlay` lifts the captions clear of a Remotion lower-third. */
+export function createTiktokAss(srt: string, videoWidth: number, videoHeight: number, placement: CaptionPlacement = 'bottom'): string {
   const entries = parseSrtEntries(srt);
   const primary = hexToAssColor(TIKTOK_PRIMARY_COLOR);
   const outline = hexToAssColor(TIKTOK_OUTLINE_COLOR);
@@ -308,7 +324,8 @@ export function createTiktokAss(srt: string, videoWidth: number, videoHeight: nu
   const yScale = Math.max(0.1, videoHeight / TIKTOK_REF_HEIGHT);
   const marginL = Math.max(0, Math.round(TIKTOK_MARGIN_L * xScale));
   const marginR = Math.max(0, Math.round(TIKTOK_MARGIN_R * xScale));
-  const marginV = Math.max(0, Math.round(TIKTOK_MARGIN_V * yScale));
+  const refMarginV = placement === 'above-overlay' ? TIKTOK_MARGIN_V_ABOVE_OVERLAY : TIKTOK_MARGIN_V;
+  const marginV = Math.max(0, Math.round(refMarginV * yScale));
   const stroke = Math.max(2, Math.round(TIKTOK_BASE_STROKE_WIDTH * (TIKTOK_FONT_SIZE / TIKTOK_BASE_FONT_SIZE)));
   const shadow = 1;
 

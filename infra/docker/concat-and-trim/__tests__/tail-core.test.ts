@@ -202,6 +202,12 @@ describe('captions', () => {
     expect(small).toContain(',48,90,130,1');
   });
 
+  it('lifts captions above a Remotion overlay\'s lower-third, scaled the same way', () => {
+    expect(createTiktokAss(srt, 1080, 1920, 'above-overlay')).toContain(',96,180,500,1');
+    expect(createTiktokAss(srt, 1920, 1080, 'above-overlay')).toContain(',171,320,281,1');
+    expect(createTiktokAss(srt, 1080, 1920, 'bottom')).toContain(',96,180,260,1');
+  });
+
   it('escapes ASS control characters in the text', () => {
     const ass = createTiktokAss('1\n00:00:00,000 --> 00:00:01,000\na{b}c\n', 1080, 1920);
     expect(ass).toContain('A\\{B\\}C');
