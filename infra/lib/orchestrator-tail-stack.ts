@@ -1,4 +1,4 @@
-import { Stack, StackProps, CfnOutput, Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { Stack, StackProps, CfnOutput, Duration, RemovalPolicy, Size } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -8,6 +8,7 @@ import * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import * as sfn from 'aws-cdk-lib/aws-stepfunctions';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as codebuild from 'aws-cdk-lib/aws-codebuild';
 import * as logs from 'aws-cdk-lib/aws-logs';
@@ -195,6 +196,34 @@ export class OrchestratorTailStack extends Stack {
       tags: [{ key: 'batchjob', value: 'true' }, { key: 'orchestrator', value: 'true' }],
     });
 
+    // ── QM-animate: per-frame Ken Burns for narration-basic (2026-10-03) ──
+    // The orchestrator invokes it once per frame, during generation, so the
+    // Remotion overlay has a real clip to draw on and every frame animates in
+    // parallel (see infra/docker/animate-lambda/handler.ts). CPU only: ffmpeg
+    // zoompan, ~7s per frame at 10 GB. Deploy with
+    // BUILDX_NO_DEFAULT_ATTESTATIONS=1 — Lambda rejects images that carry a
+    // buildx provenance attestation.
+    const animateFn = new lambda.DockerImageFunction(this, 'AnimateFunction', {
+      functionName: 'QM-animate',
+      description: 'Per-frame Ken Burns clip for the orchestrator (narration-basic motionEngine=animate)',
+      code: lambda.DockerImageCode.fromImageAsset(path.join(__dirname, '../docker'), {
+        file: 'animate-lambda/Dockerfile',
+        platform: Platform.LINUX_AMD64,
+        exclude: ['**/node_modules', '**/__tests__', '**/dist'],
+      }),
+      architecture: lambda.Architecture.X86_64,
+      memorySize: 10240,
+      timeout: Duration.seconds(300),
+      ephemeralStorageSize: Size.gibibytes(2),
+      environment: { OUTPUT_BUCKET: OUTPUT_BUCKET_NAME },
+      logGroup: new logs.LogGroup(this, 'AnimateLogs', {
+        logGroupName: '/aws/lambda/QM-animate',
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: RemovalPolicy.DESTROY,
+      }),
+    });
+    bucket.grantPut(animateFn, 'projects/*');
+
     // What the VPS orchestrator's IAM user needs, and nothing else. Attached BY
     // HAND to `qm-orchestrator-remotion-invoke` (not CDK-managed): a deploy
     // should not edit the credential a production box runs on.
@@ -207,6 +236,8 @@ export class OrchestratorTailStack extends Stack {
           actions: ['states:DescribeExecution', 'states:StopExecution'],
           resources: [`arn:aws:states:${this.region}:${this.account}:execution:${STATE_MACHINE_NAME}:*`],
         }),
+        // The `animate` asset agent (2026-10-03).
+        new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [animateFn.functionArn] }),
       ],
     });
 
@@ -219,5 +250,6 @@ export class OrchestratorTailStack extends Stack {
       description: 'Attach to the VPS IAM user qm-orchestrator-remotion-invoke.',
     });
     new CfnOutput(this, 'BuildProjectName', { value: buildProject.projectName });
+    new CfnOutput(this, 'AnimateFunctionName', { value: animateFn.functionName });
   }
 }

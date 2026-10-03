@@ -31,6 +31,7 @@ import { buildTtsInput } from '../steps/builders/tts';
 import { buildI2vInput } from '../steps/builders/i2v';
 import { buildSfxInput } from '../steps/builders/sfx';
 import { buildRemotionOverlayInput } from '../steps/builders/remotion-overlay';
+import { buildAnimateInput } from '../steps/builders/animate';
 import { buildSfnTailInput } from '../steps/builders/sfn-tail';
 import type { PayloadBuilder } from '../steps/builders/types';
 
@@ -40,6 +41,7 @@ export const ASSET_KINDS = [
   'tts',
   'wan2-i2v',
   'mmaudio',
+  'animate',
   'remotion',
   'sfn-tail',
 ] as const;
@@ -221,6 +223,26 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     produces: 'video',
     stages: [],
     build: buildSfxInput,
+  },
+  animate: {
+    // Narration-basic's motion (2026-10-03): the QM-animate Lambda renders a
+    // Ken Burns clip of the frame's still, sized to its real narration. It
+    // takes Wan2's place in the chain — same legacy seq, never both in one
+    // plan — so the Remotion overlay and the tail read it as THE clip.
+    kind: 'animate',
+    scope: 'frame',
+    provider: 'lambda',
+    gate: null, // ffmpeg on a still: it renders or it errors
+    table: 'asset_animate',
+    endpointId: 'lambda:qm-animate',
+    // Self-imposed: ~7s per frame at 10 GB; Lambda scales itself.
+    maxInFlight: 16,
+    timeoutMs: null, // synchronous invoke — see `remotion`
+    cancelOnTimeout: false,
+    legacySeq: 3,
+    produces: 'video',
+    stages: [],
+    build: buildAnimateInput,
   },
   remotion: {
     // On-screen text for educational/explainer frames, rendered by the

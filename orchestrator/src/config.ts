@@ -221,6 +221,9 @@ const ConfigSchema = z.object({
   // config — the VPS box needs `lambda:InvokeFunction` on this function.
   remotionLambdaFunctionName: z.string().default('QM-remotion-overlay'),
   remotionLambdaRegion: z.string().default('us-east-1'),
+  // QM-animate (QMOrchestratorTailStack): per-frame Ken Burns for narration-basic.
+  animateLambdaFunctionName: z.string().default('QM-animate'),
+  animateLambdaRegion: z.string().default('us-east-1'),
 
   // ── The assembly tail (assets/kinds.ts's `sfn-tail`, src/aws/sfn.ts) ─────
   // ARN of the Step Functions state machine the compiler hands a finished
@@ -239,6 +242,8 @@ const ConfigSchema = z.object({
   // perfectly linear in wall time) — right order of magnitude, correctable
   // later from real job_costs data.
   lambdaRenderRateUsdS: numeric(0.000127).pipe(z.number().positive()),
+  // QM-animate at 10 GB: $0.0000166667/GB-s x 10 (x86, us-east-1).
+  animateLambdaRateUsdS: numeric(0.000167).pipe(z.number().positive()),
 
   // ── R2 persistence for step 16's Lambda output (src/r2/client.ts) ──────
   // Remotion Lambda's own output lives on ITS S3 bucket, not QM's — same
@@ -370,9 +375,12 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   callbackTimeoutMs: 'ORCH_CALLBACK_TIMEOUT_MS',
   remotionLambdaFunctionName: 'REMOTION_LAMBDA_FUNCTION_NAME',
   remotionLambdaRegion: 'REMOTION_LAMBDA_REGION',
+  animateLambdaFunctionName: 'ANIMATE_LAMBDA_FUNCTION_NAME',
+  animateLambdaRegion: 'ANIMATE_LAMBDA_REGION',
   sfnTailStateMachineArn: 'SFN_TAIL_STATE_MACHINE_ARN',
   sfnTailRegion: 'SFN_TAIL_REGION',
   lambdaRenderRateUsdS: 'LAMBDA_RENDER_RATE_USD_S',
+  animateLambdaRateUsdS: 'ANIMATE_LAMBDA_RATE_USD_S',
   r2AccountId: 'R2_ACCOUNT_ID',
   r2Bucket: 'R2_BUCKET_NAME',
   r2PublicUrl: 'R2_PUBLIC_URL',

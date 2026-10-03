@@ -9,7 +9,7 @@
  * as stuck, what the worker is told to do, what the receiver sees) can be
  * pinned down without a Postgres or a RunPod.
  */
-import { compilePlan, handoffTargets, inputsSatisfied, toResolvedDeps, expectedAssetCount, clipKind } from '../src/assets/plan';
+import { compilePlan, handoffTargets, inputsSatisfied, toResolvedDeps, expectedAssetCount, clipKind, type AssetPlan } from '../src/assets/plan';
 import { buildAssetRows } from '../src/assets/submit';
 import { classifyProjectAssets, describeDrop, manifestFrame } from '../src/assets/compiler';
 import { buildManifest, MANIFEST_VERSION } from '../src/assets/manifest';
@@ -132,8 +132,8 @@ describe('the registry', () => {
   it('every kind has a positive timeout, or opts out explicitly', () => {
     for (const kind of ASSET_KINDS) {
       const t = ASSET_SPECS[kind].timeoutMs;
-      // null is the deliberate opt-out (remotion), never an oversight.
-      if (t === null) expect(kind).toBe('remotion');
+      // null is the deliberate opt-out for synchronous Lambda kinds, never an oversight.
+      if (t === null) expect(['remotion', 'animate']).toContain(kind);
       else expect(t).toBeGreaterThan(0);
     }
   });
@@ -170,11 +170,17 @@ describe('compilePlan', () => {
     }
   });
 
-  it('plans no motion asset at all for motionEngine=animate — the tail Ken Burns the still', () => {
+  it('plans the animate (Ken Burns Lambda) asset for motionEngine=animate, in Wan2\u2019s place (2026-10-03)', () => {
     const plan = compilePlan(withOptions({ motionEngine: 'animate' }));
-    expect(plan.motionKind).toBeNull();
-    expect(plan.frameKinds.sort()).toEqual(['qwen-image-gen', 'tts']);
-    expect(clipKind(plan)).toBeNull();
+    expect(plan.motionKind).toBe('animate');
+    expect(plan.frameKinds.sort()).toEqual(['animate', 'qwen-image-gen', 'tts']);
+    expect(plan.requires['animate']).toEqual(['qwen-image-gen', 'tts']);
+    expect(clipKind(plan)).toBe('animate');
+  });
+
+  it('never plans MMAudio over a Ken Burns clip, even when sfx is requested', () => {
+    const plan = compilePlan(withOptions({ motionEngine: 'animate', sfx: true }));
+    expect(plan.frameKinds).not.toContain('mmaudio');
   });
 
   it('routes options.referenceImage through qwen-edit instead of qwen-image-gen', () => {
@@ -214,12 +220,14 @@ describe('compilePlan', () => {
 });
 
 describe('the remotion agent', () => {
-  it('is planned only for a project with on-screen text AND a clip to render over', () => {
+  it('is planned for a project with on-screen text, over Wan2 or the Ken Burns clip', () => {
     expect(compilePlan(request()).frameKinds).not.toContain('remotion');
     expect(compilePlan(withOptions({ textOverlay: true })).frameKinds).toContain('remotion');
-    // No motion model means no clip yet — the still is animated inside the
-    // tail, well after this would have run.
-    expect(compilePlan(withOptions({ textOverlay: true, motionEngine: 'animate' })).frameKinds).not.toContain('remotion');
+    // Narration-basic explainers keep their text (2026-10-03): Remotion
+    // renders onto the animate Lambda's clip.
+    const basic = compilePlan(withOptions({ textOverlay: true, motionEngine: 'animate' }));
+    expect(basic.requires['remotion']).toEqual(['animate']);
+    expect(clipKind(basic)).toBe('remotion');
   });
 
   it('renders over the most-processed clip and becomes the frame\u2019s clip', () => {
@@ -236,8 +244,10 @@ describe('the remotion agent', () => {
     expect(ASSET_SPECS.remotion.provider).toBe('lambda');
     expect(ASSET_SPECS.remotion.endpointId).toBe('lambda:qm-remotion-overlay');
     expect(ASSET_SPECS.remotion.gate).toBeNull();
+    expect(ASSET_SPECS.animate.provider).toBe('lambda');
+    expect(ASSET_SPECS.animate.endpointId).toBe('lambda:qm-animate');
     // Every other kind stays on RunPod, except the SFN tail.
-    for (const k of ASSET_KINDS.filter((x) => x !== 'remotion' && x !== 'sfn-tail')) {
+    for (const k of ASSET_KINDS.filter((x) => x !== 'remotion' && x !== 'animate' && x !== 'sfn-tail')) {
       expect(ASSET_SPECS[k].provider).toBe('runpod');
     }
   });
@@ -512,8 +522,29 @@ describe('manifestFrame', () => {
     expect(entry.sfxFromVideo).toBe(true);
   });
 
-  it('sends the still plus a Ken Burns instruction when there is no motion model', () => {
+  it('sends the animate Lambda\u2019s clip as the frame video', () => {
     const plan = compilePlan(withOptions({ motionEngine: 'animate' }));
+    const entry = manifestFrame(
+      plan,
+      {
+        frameId: 'f1',
+        seq: 0,
+        rows: [
+          assetRow({ kind: 'qwen-image-gen', frameId: 'f1', assetUrl: 'https://cdn/f1.png' }),
+          assetRow({ kind: 'tts', frameId: 'f1', assetUrl: 'https://cdn/f1.mp3' }),
+          assetRow({ kind: 'animate', frameId: 'f1', assetUrl: 'https://cdn/f1-kb.mp4' }),
+        ],
+      },
+      request(),
+    );
+    expect(entry.videoUrl).toBe('https://cdn/f1-kb.mp4');
+    expect(entry.imageUrl).toBeUndefined();
+    expect(entry.animate).toBeUndefined();
+    expect(entry.sfxFromVideo).toBeUndefined();
+  });
+
+  it('a LEGACY plan (no motion kind, compiled before 2026-10-03) still sends the still plus a Ken Burns instruction', () => {
+    const plan = { ...compilePlan(withOptions({ motionEngine: 'animate' })), motionKind: null, frameKinds: ['qwen-image-gen', 'tts'] } as AssetPlan;
     const animReq = request({
       frames: [{ frameId: 'f1', imagePrompt: 'p', narration: 'one', durationS: 5, animateEffect: 'pan_left' }],
     });
@@ -759,6 +790,7 @@ describe('buildAssetResult', () => {
     const rows: AssetRow[] = [
       assetRow({ kind: 'qwen-image-gen', frameId: 'f1', assetUrl: 'https://cdn/f1.png' }),
       assetRow({ kind: 'tts', frameId: 'f1', assetUrl: 'https://cdn/f1.mp3' }),
+      assetRow({ kind: 'animate', frameId: 'f1', assetUrl: 'https://cdn/f1-kb.mp4' }),
     ];
     const result = buildAssetResult({
       project: { id: 'proj_1', requestId: 'req_1', createdAt: new Date(), request: req },
@@ -771,7 +803,7 @@ describe('buildAssetResult', () => {
       startedAt: new Date(),
     });
     expect(result.assets.frames[0].status).toBe('completed');
-    expect(result.assets.frames[0].clipUrl).toBeNull();
+    expect(result.assets.frames[0].clipUrl).toBe('https://cdn/f1-kb.mp4');
     expect(result.assets.frames[1].status).toBe('failed');
   });
 });

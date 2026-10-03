@@ -67,3 +67,27 @@ export async function invokeRemotionOverlay(deps: LambdaTransport, input: Remoti
   }
   return { overlayRenderedUrl: result.overlayRenderedUrl };
 }
+
+/** QM-animate (infra/docker/animate-lambda): one frame's Ken Burns clip. */
+export interface AnimateInput {
+  imageUrl: string;
+  durationS: number;
+  effect?: string;
+  fps?: number;
+  projectId: string;
+  frameId: string;
+}
+
+export interface AnimateResult {
+  videoUrl: string;
+  durationS: number;
+}
+
+export async function invokeAnimate(deps: LambdaTransport, input: AnimateInput): Promise<AnimateResult> {
+  const invoke = deps.invokeImpl ?? defaultInvoke;
+  const result = (await invoke(deps.functionName, deps.region, input)) as Partial<AnimateResult> | null;
+  if (!result?.videoUrl || !(typeof result.durationS === 'number' && result.durationS > 0)) {
+    throw new Error(`Lambda ${deps.functionName} returned no clip: ${JSON.stringify(result)}`);
+  }
+  return { videoUrl: result.videoUrl, durationS: result.durationS };
+}

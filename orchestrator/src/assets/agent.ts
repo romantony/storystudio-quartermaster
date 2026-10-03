@@ -52,7 +52,7 @@ import {
 } from '../db/repo/assets';
 import { recordAssetCost } from '../db/repo/asset-costs';
 import type { FrameJobInput } from '../steps/builders/types';
-import { invokeRemotionOverlay, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
+import { invokeAnimate, invokeRemotionOverlay, type AnimateInput, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
 import { persistToR2, type R2Transport } from '../r2/client';
 import {
   describeTailExecution,
@@ -73,6 +73,7 @@ export interface AssetAgentDeps {
     | 'assetReconcileAfterMs'
     | 'assetDispatchBatchSize'
     | 'lambdaRenderRateUsdS'
+    | 'animateLambdaRateUsdS'
   >;
   publicBaseUrl: string;
   webhookSecret: string;
@@ -80,6 +81,9 @@ export interface AssetAgentDeps {
   /** AWS Lambda transport for `provider: 'lambda'` kinds (`remotion`).
    * Without it such a row fails at submission with a clear error. */
   lambda?: LambdaTransport;
+  /** The `animate` kind's Lambda (QM-animate). Its clips land in QM's own S3
+   * bucket under projects/*, so unlike Remotion's they are not re-hosted. */
+  animateLambda?: LambdaTransport;
   /** Where a Lambda's output is re-hosted. Remotion Lambda writes to ITS OWN
    * S3 bucket, which QM does not control the retention of — the same class of
    * problem that cost 103/122 shots to expired replicate.delivery links on
@@ -383,6 +387,11 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
     return;
   }
 
+  if (kind === 'animate') {
+    await invokeAnimateRow(deps, kind, row, payload);
+    return;
+  }
+
   if (!deps.lambda) throw new Error(`${kind} is provider:'lambda' but no lambda transport is configured`);
   if (!deps.r2) throw new Error(`${kind} is provider:'lambda' but no r2 transport is configured`);
 
@@ -409,6 +418,37 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
     // `video`, not `overlayRenderedUrl`, so runpodOutUrl() resolves it
     // downstream exactly like every other video-producing kind's output.
     await applyAssetSuccess(deps, row.id, kind, { video: permanentUrl });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await applyAssetFailure(deps, row.id, kind, { provider: 'lambda', error: message.slice(0, 500) });
+  }
+}
+
+/** `animate`: one synchronous QM-animate invoke. Same failure contract as
+ * Remotion's — an invoke error fails the row through applyAssetFailure. */
+async function invokeAnimateRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
+  const spec = assetSpec(kind);
+  if (!deps.animateLambda) throw new Error(`${kind} is provider:'lambda' but no animate Lambda transport is configured`);
+  const jobId = `lambda:${row.id}:${row.attempts + 1}`;
+  await markSubmitted(deps.pool, row.id, kind, jobId);
+  const startedAt = Date.now();
+  try {
+    const result = await invokeAnimate(deps.animateLambda, payload as unknown as AnimateInput);
+    await recordAssetCost(deps.pool, {
+      assetId: row.id,
+      assetKind: kind,
+      projectId: row.projectId,
+      frameId: row.frameId,
+      endpointId: spec.endpointId,
+      providerJobId: jobId,
+      executionMs: Date.now() - startedAt,
+      delayMs: null,
+      workerRateUsdS: deps.cfg.animateLambdaRateUsdS,
+    });
+    // `video` + `duration_s`: runpodOutUrl()/outputDuration() resolve it like
+    // any other clip, and the Remotion builder reads the duration to size its
+    // render to the clip.
+    await applyAssetSuccess(deps, row.id, kind, { video: result.videoUrl, duration_s: result.durationS });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await applyAssetFailure(deps, row.id, kind, { provider: 'lambda', error: message.slice(0, 500) });

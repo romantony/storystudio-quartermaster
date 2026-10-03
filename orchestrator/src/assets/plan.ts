@@ -89,15 +89,19 @@ export interface TailSteps {
  * ORCH_PIPELINE_MODE is still 'cohort' is accepted and ignored, which is why
  * the schema keeps it optional with a 'wan2' default.
  *
- * `'animate'` plans NO motion asset: Ken Burns is something the SFN tail's ECS
- * task does to the still as part of assembly, not a separate generation.
- * For narration-basic that reduces the whole per-frame chain to image + TTS.
+ * `'animate'` plans the `animate` asset (2026-10-03): the QM-animate Lambda
+ * renders each frame's Ken Burns clip during generation, in Wan2's place. It
+ * used to be done inside the SFN tail, which left a Remotion overlay nothing
+ * to render onto — basic explainers lost their on-screen text. Plans compiled
+ * before then (motionKind null) still animate in the tail.
  */
 export function compilePlan(req: OrchestratorRequest): AssetPlan {
   const o = req.options;
   const imageKind: AssetKind = o.referenceImage ? 'qwen-edit' : 'qwen-image-gen';
-  const motionKind: AssetKind | null = o.motionEngine === 'animate' ? null : 'wan2-i2v';
-  const sfx = motionKind && o.sfx ? ('mmaudio' as const) : undefined;
+  const motionKind: AssetKind = o.motionEngine === 'animate' ? 'animate' : 'wan2-i2v';
+  // MMAudio listens to generated motion; a Ken Burns move over a still has
+  // nothing for it to hear, and narration-basic has no SFX.
+  const sfx = motionKind === 'wan2-i2v' && o.sfx ? ('mmaudio' as const) : undefined;
 
   const requires: Record<string, AssetKind[]> = {
     [imageKind]: [],
@@ -111,16 +115,15 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
     requires[motionKind] = [imageKind, 'tts'];
   }
   // MMAudio runs right after the motion clip, per frame (operator, 2026-10-02).
-  if (sfx) requires[sfx] = [motionKind as AssetKind];
+  if (sfx) requires[sfx] = [motionKind];
 
   // On-screen text (educational/explainer). It renders onto the frame's clip
   // BEFORE the tail, because the tail's merge/trim/concat all happen inside
   // the ECS task — there is no gap between merge and concat to slot it into,
-  // the way the cohort model has. With no motion model at all it has nothing
-  // to render over: the still is animated inside the tail, so there is no
-  // clip yet, and the overlay is skipped.
-  const overlay = o.textOverlay && motionKind ? ('remotion' as const) : undefined;
-  if (overlay) requires[overlay] = [sfx ?? (motionKind as AssetKind)];
+  // the way the cohort model has. Every plan now has a clip to render onto —
+  // Wan2's, or the `animate` Ken Burns clip (narration-basic explainers).
+  const overlay = o.textOverlay ? ('remotion' as const) : undefined;
+  if (overlay) requires[overlay] = [sfx ?? motionKind];
 
   const frameKinds = Object.keys(requires) as AssetKind[];
   const kinds: AssetKind[] = [...frameKinds, 'sfn-tail'];

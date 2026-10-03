@@ -30,6 +30,7 @@ import { compilePlan, expectedAssetCount, type AssetPlan } from './plan';
 import { estimateMinutes } from '../telemetry/ledger';
 import type { FrameJobInput } from '../steps/builders/types';
 import type { OrchestratorRequest } from '../agents/planner';
+import { defaultAnimateEffect } from '../steps/builders/animate';
 
 /** Every asset row a project needs, in one list. Pure — no DB, no clock —
  * so the fan-out is unit-testable the way the cohort planner's
@@ -78,7 +79,9 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         durationS: frame.durationS,
         motionPrompt: frame.motionPrompt,
         audioPrompt: frame.audioPrompt,
-        animateEffect: frame.animateEffect,
+        // A Ken Burns move per frame; cycled by narrative position when the
+        // request names none (only the `animate` builder reads it).
+        animateEffect: frame.animateEffect ?? defaultAnimateEffect(index),
         aspectRatio: req.aspectRatio,
         language: req.language,
         referenceImageUrl: frame.referenceImageUrl,

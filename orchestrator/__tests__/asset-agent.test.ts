@@ -39,6 +39,7 @@ const CFG: AssetAgentDeps['cfg'] = {
   assetReconcileAfterMs: 60_000,
   assetDispatchBatchSize: 10,
   lambdaRenderRateUsdS: 0.000127,
+  animateLambdaRateUsdS: 0.000167,
 };
 
 const PLAN = compilePlan(
@@ -601,6 +602,62 @@ describe('request timeouts', () => {
     expect(ASSET_SPECS.tts.timeoutMs).toBe(300_000);
     expect(ASSET_SPECS.mmaudio.timeoutMs).toBe(150_000);
     expect(ASSET_SPECS['wan2-i2v'].timeoutMs).toBe(300_000);
+  });
+});
+
+describe('the lambda-backed animate (Ken Burns) agent (2026-10-03)', () => {
+  function animateRow() {
+    return row({
+      id: 800,
+      kind: 'animate',
+      endpointId: ASSET_SPECS.animate.endpointId,
+      sources: {
+        'qwen-image-gen': { url: 'https://cdn/f1.png' },
+        tts: { url: 'https://cdn/f1.mp3', durationS: 3.47 },
+      },
+      input: { frameId: 'f1', imagePrompt: 'p', narration: 'n', durationS: 5, animateEffect: 'pan_left' },
+    });
+  }
+
+  it('invokes QM-animate sized to the REAL narration, completes on its S3 clip — no RunPod, no re-host', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([animateRow()]);
+    const runpodFetch = jest.fn();
+    const invoked: unknown[] = [];
+    const invokeImpl = jest.fn(async (_fn: string, _region: string, payload: unknown) => {
+      invoked.push(payload);
+      return { videoUrl: 'https://s3/projects/proj_1/animate/f1.mp4', durationS: 3.5625 };
+    });
+    const put = jest.fn(async () => undefined);
+    const d = deps(runpodFetch, fakePool({ successRow: { asset_kind: 'animate', endpoint_id: ASSET_SPECS.animate.endpointId } }));
+    d.animateLambda = { functionName: 'QM-animate', region: 'us-east-1', invokeImpl };
+    d.r2 = { accountId: 'a', bucket: 'b', publicUrl: 'https://cdn', accessKeyId: 'k', secretAccessKey: 's', putImpl: put };
+
+    const summary = await runAssetAgentTick(d, 'animate');
+
+    expect(summary.submitted).toBe(1);
+    expect(runpodFetch).not.toHaveBeenCalled();
+    expect(invokeImpl.mock.calls[0][0]).toBe('QM-animate');
+    expect(invoked[0]).toEqual({
+      imageUrl: 'https://cdn/f1.png',
+      durationS: 3.47, // TTS's real length, not the 5s estimate
+      effect: 'pan_left',
+      fps: 16,
+      projectId: 'proj_1',
+      frameId: 'f1',
+    });
+    expect(put).not.toHaveBeenCalled(); // already in QM's own bucket
+    const [, , result] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
+    expect(result.assetUrl).toBe('https://s3/projects/proj_1/animate/f1.mp4');
+    expect(result.durationS).toBe(3.5625);
+  });
+
+  it('fails the row (not the agent) when the Lambda errors', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([animateRow()]);
+    const d = deps(jest.fn(), fakePool({ successRow: { asset_kind: 'animate', endpoint_id: ASSET_SPECS.animate.endpointId } }));
+    d.animateLambda = { functionName: 'QM-animate', region: 'us-east-1', invokeImpl: async () => { throw new Error('ffmpeg Ken Burns failed'); } };
+
+    await expect(runAssetAgentTick(d, 'animate')).resolves.toBeDefined();
+    expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
   });
 });
 

@@ -11,6 +11,7 @@ import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
 import { buildRemoveSilenceInput } from '../src/steps/builders/remove-silence';
 import { buildRemotionOverlayInput, overlayDimensions } from '../src/steps/builders/remotion-overlay';
+import { buildAnimateInput, defaultAnimateEffect } from '../src/steps/builders/animate';
 import { buildUpscaleInput } from '../src/steps/builders/upscale';
 import { buildUpscaleFrameInput } from '../src/steps/builders/upscale-frame';
 import { buildSfxInput } from '../src/steps/builders/sfx';
@@ -713,5 +714,25 @@ describe('buildBgmOverlayInput (step 12, last in the tail — prefers caption, t
 
   it('throws when the bgm track is unresolved', () => {
     expect(() => buildBgmOverlayInput(projectCtx({ 8: ['https://pub.example/concat.mp4'] }))).toThrow(/no resolved bgm track URL/);
+  });
+});
+
+describe('buildAnimateInput (QM-animate Ken Burns, 2026-10-03)', () => {
+  it('cycles the default move by narrative position', () => {
+    expect([0, 1, 2, 3, 4].map(defaultAnimateEffect)).toEqual(['zoom_in', 'zoom_out', 'pan_left', 'pan_right', 'zoom_in']);
+  });
+
+  it('sizes the clip to the real TTS length and falls back to zoom_in for an unknown move', () => {
+    const out = buildAnimateInput(
+      ctx({
+        job: { ...baseJob, animateEffect: 'spin' },
+        resolvedDeps: { 1: { url: 'https://cdn/f.png' }, 2: { url: 'https://cdn/f.mp3', durationS: 3.06 } },
+      }),
+    );
+    expect(out).toEqual({ imageUrl: 'https://cdn/f.png', durationS: 3.06, effect: 'zoom_in', fps: 16, projectId: 'proj_8812', frameId: 'f_001' });
+  });
+
+  it('throws when there is no still to animate', () => {
+    expect(() => buildAnimateInput(ctx({ resolvedDeps: {} }))).toThrow(/no resolved image URL/);
   });
 });

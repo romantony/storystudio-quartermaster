@@ -73,6 +73,7 @@ async function main(): Promise<void> {
       webhookSecret: cfg.webhookSecret,
       // The `remotion` agent's transports — the one non-RunPod kind.
       lambda: { functionName: cfg.remotionLambdaFunctionName, region: cfg.remotionLambdaRegion },
+      animateLambda: { functionName: cfg.animateLambdaFunctionName, region: cfg.animateLambdaRegion },
       r2,
       // The `sfn-tail` agent's transport: starts + polls the assembly tail.
       sfn: cfg.sfnTailStateMachineArn

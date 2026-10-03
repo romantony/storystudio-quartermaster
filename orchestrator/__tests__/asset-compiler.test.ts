@@ -10,7 +10,7 @@
  */
 import { RunpodClient } from '../src/runpod/client';
 import { compileProject, type CompilerDeps } from '../src/assets/compiler';
-import { compilePlan } from '../src/assets/plan';
+import { compilePlan, type AssetPlan } from '../src/assets/plan';
 import { ASSET_SPECS } from '../src/assets/kinds';
 import { PROJECT_SCOPE, type AssetRow } from '../src/db/repo/assets';
 import { RequestSchema, type OrchestratorRequest } from '../src/agents/planner';
@@ -431,12 +431,30 @@ describe('arming the tail', () => {
     expect(m.captions).toBeDefined();
   });
 
-  it('sends stills with a Ken Burns instruction when there is no motion model', async () => {
+  it('sends each frame\u2019s animate (Ken Burns Lambda) clip, not the still (2026-10-03)', async () => {
     const req = request({ motionEngine: 'animate' });
     const plan = compilePlan(req);
     (projectsRepo.getProject as jest.Mock).mockResolvedValue({ id: 'proj_1', requestId: 'req_1', request: req, callbackUrl: null });
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
     (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(req, { motionEngine: 'animate' }));
+
+    await compileProject(deps(), 'proj_1');
+
+    const m = armedManifest()!;
+    expect(m.chain.motion).toBe('animate');
+    expect(m.frames[0].videoUrl).toBe('https://cdn/animate-f1.mp4');
+    expect(m.frames[0].imageUrl).toBeUndefined();
+    expect(m.frames[0].animate).toBeUndefined();
+  });
+
+  it('a LEGACY plan (no motion kind) still sends stills with a Ken Burns instruction', async () => {
+    const req = request({ motionEngine: 'animate' });
+    const plan = { ...compilePlan(req), motionKind: null, frameKinds: ['qwen-image-gen', 'tts'] } as AssetPlan;
+    (projectsRepo.getProject as jest.Mock).mockResolvedValue({ id: 'proj_1', requestId: 'req_1', request: req, callbackUrl: null });
+    (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(pipelineRow(plan));
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(
+      generatedProject(req, { motionEngine: 'animate' }).filter((r) => r.kind !== 'animate'),
+    );
 
     await compileProject(deps(), 'proj_1');
 
