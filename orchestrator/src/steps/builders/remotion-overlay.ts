@@ -46,6 +46,30 @@ import type { BuildContext, PayloadBuilder } from './types';
  */
 const CLIP_SOURCE_SEQS = [7, 6, 15, 14, 3];
 
+/**
+ * Explicit render dimensions from an "W:H" aspect ratio, on the same
+ * 1920-long-edge rule as StoryStudio's `resolveManifestDimensions`.
+ *
+ * The deployed `FrameOverlay` composition is supposed to derive these from
+ * `aspectRatio` itself, but live it does not: a 9:16 manifest with only
+ * `aspectRatio` renders 1920x1080 (reproduced directly against
+ * QM-remotion-overlay 2026-10-03), and the tail then letterboxes that
+ * landscape render back into the portrait canvas. Explicit width/height —
+ * the resolver's first branch — renders 1080x1920 correctly, so set them.
+ */
+export function overlayDimensions(aspectRatio: string | undefined): { width: number; height: number } | undefined {
+  const match = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec((aspectRatio ?? '').trim());
+  if (!match) return undefined;
+  const ratioW = parseFloat(match[1]);
+  const ratioH = parseFloat(match[2]);
+  if (!ratioW || !ratioH) return undefined;
+  const longEdge = 1920;
+  const even = (n: number) => Math.round(n / 2) * 2;
+  return ratioH > ratioW
+    ? { width: even((longEdge * ratioW) / ratioH), height: longEdge }
+    : { width: longEdge, height: even((longEdge * ratioH) / ratioW) };
+}
+
 export const buildRemotionOverlayInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
   const dep = CLIP_SOURCE_SEQS.map((seq) => ctx.resolvedDeps[seq]).find((d) => d?.url);
   const clipUrl = dep?.url;
@@ -56,7 +80,11 @@ export const buildRemotionOverlayInput: PayloadBuilder = (ctx: BuildContext): Re
     return { __passthrough: true, clipUrl };
   }
 
-  const manifest = { ...ctx.job.textManifest, background: { type: 'video', src: clipUrl } };
+  const manifest: Record<string, unknown> = { ...ctx.job.textManifest, background: { type: 'video', src: clipUrl } };
+  if (!manifest.width || !manifest.height) {
+    const dims = overlayDimensions((manifest.aspectRatio as string | undefined) ?? ctx.job.aspectRatio);
+    if (dims) Object.assign(manifest, dims);
+  }
 
   const payload: Record<string, unknown> = {
     clipUrl,

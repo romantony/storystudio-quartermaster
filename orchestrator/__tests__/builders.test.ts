@@ -10,7 +10,7 @@ import { buildI2vInput } from '../src/steps/builders/i2v';
 import { buildMergeInput } from '../src/steps/builders/merge';
 import { buildConcatInput } from '../src/steps/builders/concat';
 import { buildRemoveSilenceInput } from '../src/steps/builders/remove-silence';
-import { buildRemotionOverlayInput } from '../src/steps/builders/remotion-overlay';
+import { buildRemotionOverlayInput, overlayDimensions } from '../src/steps/builders/remotion-overlay';
 import { buildUpscaleInput } from '../src/steps/builders/upscale';
 import { buildUpscaleFrameInput } from '../src/steps/builders/upscale-frame';
 import { buildSfxInput } from '../src/steps/builders/sfx';
@@ -460,7 +460,33 @@ describe('buildRemotionOverlayInput (step 16, source: lambda — sits between re
     expect(out.clipUrl).toBe('https://pub.example/f_001_trimmed.mp4');
     expect(out.frameId).toBe('f_001');
     expect(out.duration).toBe(4.6);
-    expect(JSON.parse(out.textManifest as string)).toEqual({ ...textManifest, background: { type: 'video', src: 'https://pub.example/f_001_trimmed.mp4' } });
+    // baseJob is 9:16 and the manifest carries no dimensions: explicit portrait ones are added.
+    expect(JSON.parse(out.textManifest as string)).toEqual({
+      ...textManifest,
+      background: { type: 'video', src: 'https://pub.example/f_001_trimmed.mp4' },
+      width: 1080,
+      height: 1920,
+    });
+  });
+
+  it('sizes the render from the manifest aspectRatio first, and never overrides explicit dimensions', () => {
+    const deps = { 7: { url: 'https://pub.example/f_001_trimmed.mp4', durationS: 4.6 } };
+    const landscape = buildRemotionOverlayInput(ctx({ job: { ...baseJob, textManifest: { ...textManifest, aspectRatio: '16:9' } }, resolvedDeps: deps }));
+    expect(JSON.parse(landscape.textManifest as string)).toMatchObject({ width: 1920, height: 1080 });
+
+    const explicit = buildRemotionOverlayInput(ctx({ job: { ...baseJob, textManifest: { ...textManifest, width: 720, height: 1280 } }, resolvedDeps: deps }));
+    expect(JSON.parse(explicit.textManifest as string)).toMatchObject({ width: 720, height: 1280 });
+
+    const unknown = buildRemotionOverlayInput(ctx({ job: { ...baseJob, aspectRatio: undefined, textManifest }, resolvedDeps: deps }));
+    expect(JSON.parse(unknown.textManifest as string)).not.toHaveProperty('width');
+  });
+
+  it('overlayDimensions follows the composition\'s 1920-long-edge rule', () => {
+    expect(overlayDimensions('9:16')).toEqual({ width: 1080, height: 1920 });
+    expect(overlayDimensions('16:9')).toEqual({ width: 1920, height: 1080 });
+    expect(overlayDimensions('1:1')).toEqual({ width: 1920, height: 1920 });
+    expect(overlayDimensions('portrait')).toBeUndefined();
+    expect(overlayDimensions(undefined)).toBeUndefined();
   });
 
   it('falls back to step 6 (merge) when remove-silence did not run', () => {
