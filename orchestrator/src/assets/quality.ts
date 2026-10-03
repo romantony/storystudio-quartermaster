@@ -359,8 +359,13 @@ export async function gateOneAsset(
  *   bypassed  nothing to judge: gating off, no gated kinds in the plan, or a
  *             product Remotion renders deterministically
  *   pending   verdicts still outstanding
- *   failed    a gated asset exhausted its rework budget and is still bad
+ *   flagged   every gated asset judged, some accepted flagged after
+ *             exhausting their rework budget — the compiler still assembles
+ *             and the project finishes `partial` (migration 019)
  *   passed    every gated asset judged and acceptable
+ *
+ * (`failed` is no longer produced: one flagged asset used to stop the whole
+ * project before assembly — a 42-frame StoryStudio project, 2026-10-03.)
  */
 export async function refreshProjectQa(
   deps: AssetQualityDeps,
@@ -388,12 +393,12 @@ export async function refreshProjectQa(
     return 'pending';
   }
   if (st.exhausted > 0) {
-    await setProjectQa(deps.pool, projectId, 'failed', {
-      reason: 'assets exhausted their rework budget and still fail the gate',
+    await setProjectQa(deps.pool, projectId, 'flagged', {
+      reason: 'assets exhausted their rework budget and were accepted flagged',
       exhausted: st.exhausted,
       total: st.total,
     });
-    return 'failed';
+    return 'flagged';
   }
   await setProjectQa(deps.pool, projectId, 'passed', { judged: st.judged, total: st.total, ...(opts.sampledOut ? { note: 'some assets not VLM-sampled' } : {}) });
   return 'passed';

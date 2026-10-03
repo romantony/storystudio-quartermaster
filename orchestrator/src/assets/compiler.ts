@@ -417,7 +417,10 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
     if (tailRow.status === 'complete' && tailRow.assetUrl) {
       const manifest = pp.manifest as TailManifest | null;
       const anyDropped = (manifest?.droppedFrames.length ?? 0) > 0 || rows.some((r) => r.status === 'failed');
-      const status = anyDropped ? 'partial' : 'completed';
+      // An asset the QA agent accepted flagged is in the video but may need
+      // review — the receiver shows `partial` as exactly that.
+      const anyFlagged = rows.some((r) => r.qualityStatus === 'exhausted');
+      const status = anyDropped || anyFlagged ? 'partial' : 'completed';
       await finishPipelineProject(deps.pool, projectId, { status, finalUrl: tailRow.assetUrl });
       await finalizeAssetProject(deps, projectId, { status, finalUrl: tailRow.assetUrl });
       log().info({ projectId, status, finalUrl: tailRow.assetUrl }, 'compiler: project finished');
@@ -427,7 +430,7 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
       const reason = extractErrorText(tailRow.error)?.slice(0, 300) ?? 'tail failed';
       if (pp.attempts >= PIPELINE_ATTEMPTS_HARD_CAP) {
         await finishPipelineProject(deps.pool, projectId, { status: 'failed', error: { tail: reason } });
-        await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null });
+        await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null, reason: `assembly tail failed: ${reason}` });
         log().error({ projectId, reason }, 'compiler: tail failed and attempts are exhausted');
         return { projectId, action: 'failed', detail: reason };
       }
@@ -466,17 +469,19 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
   }
 
   // The project-level QA verdict decides whether assembly may start at all
-  // (migration 016). The compiler triggers on `passed` or `bypassed` only.
+  // (migrations 016/019). The compiler triggers on `passed`, `bypassed` or
+  // `flagged` (assets accepted flagged — assembled, finished `partial`).
+  // `failed` is only on rows written before 019.
   if (pp.qaStatus === 'failed') {
     await finishPipelineProject(deps.pool, projectId, {
       status: 'failed',
       error: { reason: 'quality gate failed for this project', qa: pp.qaDetail },
     });
-    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null });
+    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null, reason: 'quality gate failed for this project' });
     log().error({ projectId, qa: pp.qaDetail }, 'compiler: project failed its quality gate, not assembling');
     return { projectId, action: 'failed', detail: 'quality gate failed' };
   }
-  if (pp.qaStatus !== 'passed' && pp.qaStatus !== 'bypassed') {
+  if (pp.qaStatus !== 'passed' && pp.qaStatus !== 'bypassed' && pp.qaStatus !== 'flagged') {
     // Generation is finished but verdicts are still outstanding. The QA agent
     // writes them within a tick or two; waiting here is the whole point of
     // "only when the QA gate is clear can the compiler trigger the tail".
@@ -491,14 +496,18 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
       status: 'failed',
       error: { reason: 'too few frames to assemble', ready: state.readyFrames.length, dropped: state.droppedFrames },
     });
-    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null });
+    await finalizeAssetProject(deps, projectId, {
+      status: 'failed',
+      finalUrl: null,
+      reason: `too few frames to assemble (${state.readyFrames.length} usable, need 2)`,
+    });
     log().error({ projectId, ready: state.readyFrames.length }, 'compiler: project failed — fewer than two usable frames');
     return { projectId, action: 'failed', detail: 'fewer than two usable frames' };
   }
 
   if (pp.attempts >= PIPELINE_ATTEMPTS_HARD_CAP) {
     await finishPipelineProject(deps.pool, projectId, { status: 'failed', error: { reason: 'assembly attempts exhausted' } });
-    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null });
+    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null, reason: 'assembly attempts exhausted' });
     return { projectId, action: 'failed', detail: 'assembly attempts exhausted' };
   }
 
@@ -520,7 +529,7 @@ export async function compileProject(deps: CompilerDeps, projectId: string): Pro
   }
   if (manifestFrames.length < 2) {
     await finishPipelineProject(deps.pool, projectId, { status: 'failed', error: { reason: 'manifest has fewer than two frames', dropped } });
-    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null });
+    await finalizeAssetProject(deps, projectId, { status: 'failed', finalUrl: null, reason: 'manifest has fewer than two frames' });
     return { projectId, action: 'failed', detail: 'manifest has fewer than two frames' };
   }
 

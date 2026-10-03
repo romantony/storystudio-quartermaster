@@ -296,6 +296,22 @@ describe('the project quality gate', () => {
     expect(res.action).toBe('armed');
   });
 
+  it('assembles on a flagged verdict — an asset accepted flagged no longer stops the project (2026-10-03)', async () => {
+    const plan = compilePlan(request());
+    let manifest: unknown = null;
+    (assetsRepo.armProjectAsset as jest.Mock).mockResolvedValue(true);
+    (pipelineRepo.beginAssembly as jest.Mock).mockImplementation(async (_c: unknown, _p: string, m: unknown) => { manifest = m; return true; });
+    (pipelineRepo.getPipelineProject as jest.Mock).mockImplementation(async () =>
+      manifest
+        ? pipelineRow(plan, { status: 'assembling', manifest, qaStatus: 'flagged', attempts: 1 })
+        : pipelineRow(plan, { qaStatus: 'flagged' }));
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(generatedProject(request()));
+
+    const res = await compileProject(deps(), 'proj_1');
+    expect(res.action).toBe('armed');
+    expect(pipelineRepo.finishPipelineProject).not.toHaveBeenCalled();
+  });
+
   it('finishes the project rather than hanging when the gate failed', async () => {
     const plan = compilePlan(request());
     (pipelineRepo.getPipelineProject as jest.Mock).mockResolvedValue(
@@ -312,7 +328,11 @@ describe('the project quality gate', () => {
     expect(pipelineRepo.finishPipelineProject).toHaveBeenCalledWith(
       expect.anything(), 'proj_1', expect.objectContaining({ status: 'failed' }),
     );
-    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(expect.anything(), 'proj_1', { status: 'failed', finalUrl: null });
+    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(expect.anything(), 'proj_1', {
+      status: 'failed',
+      finalUrl: null,
+      reason: 'quality gate failed for this project',
+    });
   });
 });
 
@@ -469,7 +489,12 @@ describe('arming the tail', () => {
     expect(res.action).toBe('failed');
     expect(res.detail).toBe('fewer than two usable frames');
     expect(assetsRepo.armProjectAsset).not.toHaveBeenCalled();
-    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(expect.anything(), 'proj_1', { status: 'failed', finalUrl: null });
+    // The reason reaches the receiver's `errors` (it used to stay in the orchestrator).
+    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(expect.anything(), 'proj_1', {
+      status: 'failed',
+      finalUrl: null,
+      reason: expect.stringContaining('too few frames to assemble'),
+    });
   });
 
   it('does not arm twice when another tick already claimed assembly', async () => {
@@ -528,6 +553,21 @@ describe('collecting the tail', () => {
     );
   });
 
+  it('reports partial when an asset was accepted flagged by QA', async () => {
+    assembling({ qaStatus: 'flagged' }, { status: 'complete', assetUrl: 'https://cdn/final.mp4' });
+    const rows = (await (assetsRepo.listProjectAssets as jest.Mock)()) as AssetRow[];
+    const clip = rows.find((r) => r.kind === 'wan2-i2v');
+    if (clip) clip.qualityStatus = 'exhausted';
+    (assetsRepo.listProjectAssets as jest.Mock).mockResolvedValue(rows);
+
+    const res = await compileProject(deps(), 'proj_1');
+
+    expect(res.action).toBe('assembled');
+    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(
+      expect.anything(), 'proj_1', { status: 'partial', finalUrl: 'https://cdn/final.mp4' },
+    );
+  });
+
   it('recompiles and retries when the tail failed and attempts remain', async () => {
     assembling({ attempts: 1 }, { status: 'failed', assetUrl: null, error: { error: 'ffmpeg exited 1' } });
     const res = await compileProject(deps(), 'proj_1');
@@ -546,6 +586,10 @@ describe('collecting the tail', () => {
     expect(pipelineRepo.finishPipelineProject).toHaveBeenCalledWith(
       expect.anything(), 'proj_1', expect.objectContaining({ status: 'failed' }),
     );
-    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(expect.anything(), 'proj_1', { status: 'failed', finalUrl: null });
+    expect(resultMod.finalizeAssetProject).toHaveBeenCalledWith(expect.anything(), 'proj_1', {
+      status: 'failed',
+      finalUrl: null,
+      reason: expect.stringMatching(/^assembly tail failed: .*ffmpeg exited 1/),
+    });
   });
 });

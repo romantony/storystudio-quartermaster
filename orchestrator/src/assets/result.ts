@@ -38,6 +38,11 @@ export interface AssetResultFacts {
   gpuCostUsd: number | null;
   startedAt: Date;
   finishedAt?: Date;
+  /** Why the PROJECT failed, when it failed for a project-level reason (QA
+   * gate, too few frames, tail exhausted) rather than per-asset failures.
+   * Reported as the first `errors` entry: before 2026-10-03 it never left
+   * the orchestrator, and StoryStudio received `failed` with no reason. */
+  projectReason?: string;
 }
 
 function urlOf(rows: AssetRow[], kind: string, frameId: string): string | null {
@@ -83,11 +88,9 @@ export function buildAssetResult(facts: AssetResultFacts): QmResult {
       index,
       frameId: f.frameId,
       status: complete ? 'completed' : 'failed',
-      // The asset pipeline has no quality gate of its own yet — the prompt
-      // harness is the intended replacement (feedback-prompt-harness-over-
-      // llm-rework), and nothing here ever accepts a marginal asset, so this
-      // is structurally false rather than unknown.
-      qualityFlagged: false,
+      // An asset the QA agent accepted flagged after exhausting its rework
+      // budget: it is in the video, but may need review.
+      qualityFlagged: mine.some((r) => r.qualityStatus === 'exhausted'),
       imageUrl: urlOf(rows, plan.imageKind, f.frameId),
       narrationAudioUrl: tts?.assetUrl ?? null,
       narrationDurationS: tts?.durationS ?? null,
@@ -114,6 +117,21 @@ export function buildAssetResult(facts: AssetResultFacts): QmResult {
       reason: `${r.kind}: ${extractErrorText(r.error)?.slice(0, 300) ?? 'failed'}`,
       triedRungs: [],
     }));
+  for (const r of rows.filter((x) => x.qualityStatus === 'exhausted')) {
+    const issues = Array.isArray(r.qualityIssues) ? (r.qualityIssues as unknown[]).map(describeIssue).join('; ') : '';
+    allErrors.push({
+      frameId: r.frameId === '*' ? null : r.frameId,
+      step: legacySeqOf(r.kind),
+      agent: 'quality',
+      reason:
+        `${r.kind}: failed quality checks after ${r.qualityAttempts} attempt(s), accepted flagged` +
+        (issues ? ` (${issues.slice(0, 200)})` : ''),
+      triedRungs: [],
+    });
+  }
+  if (facts.projectReason) {
+    allErrors.unshift({ frameId: null, step: 0, agent: 'orchestrator', reason: facts.projectReason.slice(0, 300), triedRungs: [] });
+  }
   const errors = allErrors.slice(0, MAX_ERRORS);
 
   const kindCounts = new Map<string, { total: number; completed: number; failed: number }>();
@@ -181,6 +199,15 @@ export function buildAssetResult(facts: AssetResultFacts): QmResult {
 }
 
 /** Kept local so assets/kinds.ts stays free of result-shape concerns. */
+/** `{priority:'P0', category:'FROZEN', description:'nothing moves…'}` ->
+ * "P0 FROZEN: nothing moves…"; a bare string passes through. */
+function describeIssue(issue: unknown): string {
+  if (typeof issue === 'string') return issue;
+  const i = (issue ?? {}) as { priority?: string; category?: string; description?: string };
+  const head = [i.priority, i.category].filter(Boolean).join(' ');
+  return i.description ? (head ? `${head}: ${i.description}` : i.description) : head || 'issue';
+}
+
 function legacySeqOf(kind: string): number {
   const map: Record<string, number> = {
     'qwen-edit': 0,
@@ -221,7 +248,7 @@ async function headBytes(fetchImpl: typeof fetch, url: string): Promise<number |
 export async function finalizeAssetProject(
   deps: FinalizeDeps,
   projectId: string,
-  outcome: { status: ResultStatus; finalUrl: string | null },
+  outcome: { status: ResultStatus; finalUrl: string | null; reason?: string },
 ): Promise<void> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const project = await getProject(deps.pool, projectId);
@@ -258,6 +285,7 @@ export async function finalizeAssetProject(
     finalDurationS: rows.find((r) => r.kind === 'sfn-tail' && r.status === 'complete')?.durationS ?? null,
     gpuCostUsd,
     startedAt: pp.startedAt,
+    projectReason: outcome.reason,
   });
   if (result.assets.final) result.assets.final.bytes = await headBytes(fetchImpl, result.assets.final.url);
 

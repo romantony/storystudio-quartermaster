@@ -15,7 +15,7 @@ export type PipelineStatus = 'generating' | 'assembling' | 'completed' | 'partia
 
 /** The project-level QA verdict (migration 016). The compiler assembles on
  * `passed` or `bypassed` only; `failed` is terminal. */
-export type ProjectQaStatus = 'pending' | 'passed' | 'bypassed' | 'failed';
+export type ProjectQaStatus = 'pending' | 'passed' | 'bypassed' | 'flagged' | 'failed';
 
 export interface PipelineProject {
   projectId: string;

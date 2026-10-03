@@ -610,9 +610,9 @@ describe('refreshProjectQa', () => {
     expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('passed');
   });
 
-  it('fails the project when an asset exhausted its rework budget and still fails', async () => {
+  it('flags (not fails) the project when an asset exhausted its rework budget — it still assembles, finished partial (2026-10-03)', async () => {
     (assetsRepo.projectGateState as jest.Mock).mockResolvedValue({ total: 4, judged: 4, exhausted: 1, pendingKinds: [] });
-    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('failed');
+    expect(await refreshProjectQa(d(), 'proj_1', PLAN)).toBe('flagged');
     const [, , , detail] = (pipelineRepo.setProjectQa as jest.Mock).mock.calls[0];
     expect(detail.exhausted).toBe(1);
   });

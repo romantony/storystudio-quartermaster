@@ -680,6 +680,39 @@ describe('buildAssetResult', () => {
     expect(result.metrics.gpuCostUsd).toBe(0.09);
   });
 
+  it('marks a QA-flagged frame and explains it in errors; a project-level reason comes first (2026-10-03)', () => {
+    const rows: AssetRow[] = [
+      assetRow({ kind: 'qwen-image-gen', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.png' }),
+      assetRow({ kind: 'tts', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.mp3' }),
+      assetRow({
+        kind: 'wan2-i2v',
+        frameId: 'f1',
+        seq: 0,
+        assetUrl: 'https://cdn/f1.mp4',
+        qualityStatus: 'exhausted',
+        qualityAttempts: 4,
+        qualityIssues: [{ priority: 'P0', category: 'FROZEN', description: 'nothing moves in the clip' }],
+      }),
+    ];
+    const result = buildAssetResult({
+      project: { id: 'proj_1', requestId: 'req_1', createdAt: new Date(), request: req },
+      plan,
+      rows,
+      status: 'failed',
+      finalUrl: null,
+      finalDurationS: null,
+      gpuCostUsd: null,
+      startedAt: new Date(),
+      projectReason: 'assembly tail failed: ffmpeg exited 1',
+    });
+    expect(result.assets.frames[0].qualityFlagged).toBe(true);
+    expect(result.errors[0]).toMatchObject({ frameId: null, agent: 'orchestrator', reason: 'assembly tail failed: ffmpeg exited 1' });
+    expect(result.errors[1]).toMatchObject({ frameId: 'f1', agent: 'quality', step: 3 });
+    expect(result.errors[1].reason).toBe(
+      'wan2-i2v: failed quality checks after 4 attempt(s), accepted flagged (P0 FROZEN: nothing moves in the clip)',
+    );
+  });
+
   it('leaves mergedClipUrl null when the tail reported no per-frame clips', () => {
     const rows: AssetRow[] = [
       assetRow({ kind: 'qwen-image-gen', frameId: 'f1', seq: 0, assetUrl: 'https://cdn/f1.png' }),
