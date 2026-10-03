@@ -2,7 +2,58 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
-## 2026-10-04 (NEXT SESSION) — harden the live SFN tail: big project, edge cases, cost
+## 2026-10-04 (NEXT SESSION) — create projects with video generated through the ComfyUI API
+
+**Why:** the 2026-10-03 provider bake-off (same harbour still + prompt, ~5s at 720p) —
+
+| provider | time / clip | notes |
+|---|---|---|
+| **Comfy Cloud — LTX-2.3 workflow** (`cloud.comfy.org`) | **44s** (10s clip: 51s) | joint audio: spoke the prompted line word-for-word (Whisper-verified), ambience, push-in, background motion, identity stable over 10s |
+| ours — Wan2.2 Lightning 4-step 720p (RTX PRO 6000 endpoint `ny5hatr6l2xu0z`) | 92s warm (+~6 min cold) | no audio; ignores camera direction |
+| comfy.org API — Wan 3.0 (`api.comfy.org/v2/models/wan/wan3.0-video`) | 132s | strong camera direction, 30 fps, audio; result URL expires in 24h |
+| RunComfy — Wan2.2 base 20-step (A100 PCIe) | ~53 min | cancelled — not viable as configured |
+
+Clips: `s3://qm-remove-silence-output/projects/manual-provider-tests-20261003/`. Memory:
+`qm-i2v-provider-bakeoff-20261003`.
+
+**Goal:** a project whose per-frame video (motion + dialogue/ambience audio) comes from the ComfyUI API —
+first Comfy Cloud running the LTX-2.3 i2v workflow (`~/Downloads/image-to-video-api.json`).
+
+- [ ] **Cost first.** Read the per-clip cost of the 10-03 runs from the Comfy Cloud / comfy.org dashboards
+      (5s and 10s LTX-2.3, 5s Wan 3.0) and compare with our RunPod $/clip — decides whether this is worth wiring.
+- [ ] **New asset kind** (e.g. `comfy-i2v`, provider `comfy`) in the orchestrator, in Wan2's place in the
+      per-frame chain (same pattern as `animate`/`remotion`: kinds.ts spec, payload builder, agent branch,
+      migration for the partition). Flow, all verified 10-03:
+      `POST /api/upload/image` (multipart `image`, `type=input`) → patch the workflow (node `269` image,
+      `320:312`/`320:299` width/height, `320:319` prompt, `320:300` fps, `320:301` duration, seeds
+      `320:276`/`320:277`) → `POST /api/prompt` `{prompt, extra_data:{api_key_comfy_org}}` → poll
+      **`GET /api/job/{id}/status`** (NOT `/api/history` — never updates there) → `GET /api/jobs/{id}` for
+      outputs → `GET /api/view?filename=&subfolder=video&type=output` (302 → signed GCS) → **re-host to
+      our own storage** before completing the row (signed links expire — the 2026-08-17 Replicate lesson).
+- [ ] **Audio:** the clip carries dialogue + ambience. Decide per product how the tail uses it — for a
+      dialogue frame it REPLACES TTS (+MMAudio); for narration frames keep TTS and either mute the clip or
+      mix its ambience under the narration (the existing `sfxFromVideo` path).
+- [ ] **Duration/frames:** request duration from the real narration length (as `animate`/i2v do);
+      frames = duration × fps + 1. Raise the workflow's output bitrate (it encodes at ~1.7–1.8 Mbit/s).
+- [ ] **Prompts:** LTX follows rich prompts (walk/stop/turn, quoted dialogue, background motion, ONE
+      camera move, sound cues) — the terse StoryStudio motion prompt gave a near-static clip. Add a
+      prompt builder for this kind (ties into the direction/lock-clause gap in
+      `qm-wan2-720p-a100-ltx-evaluation-20261003`).
+- [ ] **API key** as a VPS secret (`.env` + compose forwarding — `qm-vps-config-must-be-forwarded`),
+      never in the repo. Concurrency: comfy.org reported `x-concurrency-limit: 5`.
+- [ ] **Live test:** one StoryStudio-shaped project (premium, a few frames incl. one dialogue frame)
+      end to end through the SFN tail; check A/V sync, captions vs spoken dialogue, BGM mix.
+
+**Also tomorrow:**
+- [ ] **LTX-2.5 worker** (`~/ltx25-worker`, memory `qm-ltx25-worker-20261003`): GitHub repo + Actions
+      build (never locally — a local build filled the disk on 10-03), HF token (gated), volume ≥100 GB,
+      RTX 6000 Ada endpoint, compare with Comfy Cloud LTX-2.3.
+- [ ] **Commit the StoryStudio change** (narration-basic `motionEngine:'animate'`, deployed to Convex prod
+      10-03, uncommitted — shares files with older uncommitted shot-contract work) and run one real
+      narration-basic project end to end.
+- [ ] Wan2 720p on the RTX PRO 6000: 5-frame QA comparison + shift 5 vs 7 (branch `wan2-720p`, `5e8870e`).
+
+## 2026-10-04 (deferred from 10-03) — harden the live SFN tail: big project, edge cases, cost
 
 **State going in:** the Step Functions assembly tail is LIVE in production since 2026-10-03. The VPS
 orchestrator (`b4e4f0f`) generates every asset on RunPod and hands each finished project to
