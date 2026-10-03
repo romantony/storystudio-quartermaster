@@ -8,7 +8,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { RunpodClient } from '../src/runpod/client';
-import { checkOnce, watchedEndpoints } from '../src/watchdog';
+import { checkOnce, DIAGNOSIS_COOLDOWN_MS, watchedEndpoints } from '../src/watchdog';
 import type { FleetEndpoint } from '../src/fleet-registry';
 import { STEP_CATALOG } from '../src/steps/catalog';
 
@@ -168,7 +168,55 @@ describe('watchdog checkOnce', () => {
   });
 });
 
+describe('watchdog diagnostics spend guards (2026-10-03: 7,811 Sonnet calls drained the Replicate credit)', () => {
+  const healthy = () => {
+    const fetchImpl = jest.fn(async () => fakeRes(200, fixture('health.json')));
+    return { fetchImpl, runpod: new RunpodClient(CFG, { fetchImpl, sleepImpl: jest.fn(async () => {}) }) };
+  };
+
+  it('does nothing at all in assets mode — no health call, no DB read, no alert', async () => {
+    const { fetchImpl, runpod } = healthy();
+    const pool = fakePool(undefined);
+    const diagnosed = new Map<string, number>();
+
+    await checkOnce(runpod, pool, { ...WATCHDOG_CFG, pipelineMode: 'assets' }, [ENDPOINT], diagnosed);
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect((pool.query as jest.Mock).mock.calls.length).toBe(0);
+    expect(diagnosed.size).toBe(0);
+  });
+
+  it('diagnoses a standing orphan once per cooldown, while still logging it every tick', async () => {
+    const { runpod } = healthy();
+    const pool = fakePool(undefined);
+    const diagnosed = new Map<string, number>();
+    const logger = require('../src/telemetry/log').log();
+    const errorSpy = jest.spyOn(logger, 'error');
+    let t = 1_000_000;
+    const now = () => t;
+
+    await checkOnce(runpod, pool, WATCHDOG_CFG, [ENDPOINT], diagnosed, now);
+    const first = diagnosed.get(ENDPOINT.endpointId);
+    expect(first).toBe(t);
+
+    t += 60_000; // next tick
+    await checkOnce(runpod, pool, WATCHDOG_CFG, [ENDPOINT], diagnosed, now);
+    expect(diagnosed.get(ENDPOINT.endpointId)).toBe(first); // no new diagnosis
+
+    t = first! + DIAGNOSIS_COOLDOWN_MS; // cooldown elapsed
+    await checkOnce(runpod, pool, WATCHDOG_CFG, [ENDPOINT], diagnosed, now);
+    expect(diagnosed.get(ENDPOINT.endpointId)).toBe(t);
+
+    expect(errorSpy.mock.calls.filter(([, msg]) => String(msg).includes('ORPHANED'))).toHaveLength(3);
+    errorSpy.mockRestore();
+  });
+});
+
 describe('watchedEndpoints', () => {
+  it('never watches non-RunPod (lambda:) step endpoints — their /health 404s every tick', () => {
+    expect(watchedEndpoints([]).some((e) => e.endpointId.startsWith('lambda:'))).toBe(false);
+  });
+
   const MULTITALK: FleetEndpoint = { counterKey: 'runpod:multitalk', endpointId: 'mt6vmstwzw0evp', workers: 2 };
   // A FLEET entry no catalogued step targets — bgm-s2t (formerly this
   // example) got a real catalogued step (5, 2026-09-12) and had to be
@@ -183,7 +231,7 @@ describe('watchedEndpoints', () => {
   });
 
   it('includes every FLEET endpoint a catalogued step references', () => {
-    const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId));
+    const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId).filter((id) => !id.startsWith('lambda:')));
     const fleet = [ENDPOINT, MULTITALK, UNUSED, ...[...cataloguedIds].map((id) => ({ counterKey: id, endpointId: id, workers: 1 }))];
     const watched = watchedEndpoints(fleet);
     for (const id of cataloguedIds) {
@@ -192,7 +240,7 @@ describe('watchedEndpoints', () => {
   });
 
   it('watches a catalogued endpoint even when FLEET has no entry for it at all (2026-09-11: postprod-lite, orchestrator-only, never shared with the AWS live path)', () => {
-    const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId));
+    const cataloguedIds = new Set(STEP_CATALOG.map((s) => s.endpointId).filter((id) => !id.startsWith('lambda:')));
     // Deliberately empty/unrelated FLEET — the old fleet.filter(...) implementation
     // would have watched nothing at all in this case, silently.
     const watched = watchedEndpoints([MULTITALK, UNUSED]);

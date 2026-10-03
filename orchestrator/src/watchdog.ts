@@ -58,7 +58,9 @@ import type { Config } from './config';
  * header comment for why that distinction matters). */
 export function watchedEndpoints(fleet: readonly FleetEndpoint[] = FLEET): FleetEndpoint[] {
   const fleetById = new Map(fleet.map((e) => [e.endpointId, e] as const));
-  const uniqueIds = [...new Set(STEP_CATALOG.map((s) => s.endpointId))];
+  // `lambda:...` steps (Remotion) are not RunPod endpoints: their /health is a
+  // 404 on every tick, and there are no workers to orphan.
+  const uniqueIds = [...new Set(STEP_CATALOG.map((s) => s.endpointId))].filter((id) => !id.startsWith('lambda:'));
   return uniqueIds.map(
     (endpointId) => fleetById.get(endpointId) ?? { endpointId, counterKey: `orchestrator-only:${endpointId}`, workers: 0 },
   );
@@ -85,10 +87,26 @@ async function alert(
   }
 }
 
+/**
+ * Minimum gap between two Sonnet diagnoses of the same endpoint's orphan
+ * signal, whatever the first one's outcome. Before this, every tick of a
+ * standing orphan signal called Sonnet again: 7,811 diagnoses 2026-09-17..
+ * 10-02, all "bookkeeping drift", which drained the Replicate credit (every
+ * call since 10-02 07:05 UTC is a 429). The log line + webhook alert still
+ * fire every tick; only the paid model call is rate-limited.
+ */
+export const DIAGNOSIS_COOLDOWN_MS = 6 * 60 * 60_000;
+const lastDiagnosedAt = new Map<string, number>();
+
 export async function checkOnce(
   runpod: RunpodClient,
   pool: ReturnType<typeof getPool>,
   cfg: {
+    /** 'assets' = no orphan check at all: the per-asset agents never claim
+     * or release endpoints (endpoint_state is cohort-mode bookkeeping), and
+     * the fleet is fixed pods that always report ready workers — so every
+     * endpoint reads as "orphaned" on every tick. Absent = 'cohort'. */
+    pipelineMode?: Config['pipelineMode'];
     orphanGraceMs: number;
     watchdogAutodrain: boolean;
     watchdogAlertWebhookUrl?: string;
@@ -104,7 +122,10 @@ export async function checkOnce(
     diagnosticsEffort?: Config['diagnosticsEffort'];
   },
   endpoints: readonly FleetEndpoint[] = watchedEndpoints(),
+  diagnosedAt: Map<string, number> = lastDiagnosedAt,
+  now: () => number = Date.now,
 ): Promise<void> {
+  if (cfg.pipelineMode === 'assets') return;
   for (const endpoint of endpoints) {
     let realWorkers = 0;
     try {
@@ -130,6 +151,10 @@ export async function checkOnce(
       orphanForMs: Number.isFinite(staleMs) ? staleMs : -1,
     };
     await alert(cfg.watchdogAlertWebhookUrl, orphanFacts);
+
+    const last = diagnosedAt.get(endpoint.endpointId);
+    if (last !== undefined && now() - last < DIAGNOSIS_COOLDOWN_MS) continue;
+    diagnosedAt.set(endpoint.endpointId, now());
     void runDiagnostic(
       {
         pool,
@@ -172,9 +197,12 @@ async function main(): Promise<void> {
       intervalMs: cfg.watchdogIntervalMs,
       autodrain: cfg.watchdogAutodrain,
       orphanGraceMs: cfg.orphanGraceMs,
-      watching: watched.map((e) => e.endpointId),
+      pipelineMode: cfg.pipelineMode,
+      watching: cfg.pipelineMode === 'assets' ? [] : watched.map((e) => e.endpointId),
     },
-    'watchdog starting',
+    cfg.pipelineMode === 'assets'
+      ? 'watchdog starting — orphan check OFF (assets mode never claims endpoints)'
+      : 'watchdog starting',
   );
 
   initPool(cfg);

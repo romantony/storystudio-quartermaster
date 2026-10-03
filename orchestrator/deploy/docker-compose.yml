@@ -110,6 +110,9 @@ services:
       ORCH_PUBLIC_BASE_URL: ${ORCH_PUBLIC_BASE_URL}
       RUNPOD_API_KEY: ${RUNPOD_API_KEY}
       WATCHDOG_AUTODRAIN: ${WATCHDOG_AUTODRAIN}
+      # Same value as the orchestrator's: in 'assets' mode the orphan check
+      # is off (nothing claims endpoints, so it false-positives every tick).
+      ORCH_PIPELINE_MODE: ${ORCH_PIPELINE_MODE:-cohort}
       # The read-only diagnostic assistant reaches Sonnet 5 through Replicate
       # (2026-09-19). Unset REPLICATE_API_TOKEN = the feature is off.
       REPLICATE_API_TOKEN: ${REPLICATE_API_TOKEN}
