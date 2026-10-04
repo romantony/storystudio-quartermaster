@@ -2,7 +2,51 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
-## 2026-10-04 (NEXT SESSION) — create projects with video generated through the ComfyUI API
+## 2026-10-05 (NEXT SESSION) — verify and harden LTX-2.3 on Comfy
+
+**State going in:** LTX-2.3 per-frame video via Comfy Cloud is built, deployed and live-tested (commits `e78afd3` .. `e4aa030`,
+migrations 021–023, tail image rebuilt). Narration Premium + Dialogue Basic (narration, `ia2v`, `flf_ia2v`, `sfx-only` action frames) all
+passed end to end on the VPS (`qm-ltx-dlg-live-20261004-04`: 24.9 s, 1080p, first attempt). No MMAudio for LTX (operator).
+`flf_ia2v` is one-character only. Details: memory `qm-ltx-comfy-build-20261004`.
+
+**Verify first — nothing was listened to yesterday:**
+- [ ] **Play `-04`'s final video** (`s3://qm-remove-silence-output/projects/qm-ltx-dlg-live-20261004-04/tail/final.mp4`): lip-sync on
+      f2/f3 (padded line vs mouth), loudness balance of the clip's own audio under the line, the f4 action frame's audio level, caption
+      timing ("THEN," showed up on Mara's frame just before Tobin's line).
+- [ ] **Does an `ia2v` clip carry ambience besides our line?** The handoff said no (StoryStudio) and the operator said LTX generates it
+      from the prompt. Check the clip's audio on f2/f3 (`comfy-video/<project>/f2.mp4`). If it is speech only, decide how dialogue frames
+      get ambience without MMAudio (richer prompt / BGM only / accept).
+- [ ] **Real StoryStudio-built requests:** with `QM_LTX_MODE=on`, run one real Narration Premium and one real Dialogue Basic project from
+      StoryStudio (not hand-built JSON). Check the payload StoryStudio actually sends (speaker `cloneArtifactUrl`s, one character on
+      `flf_ia2v`, `lastFramePrompt`/`shotType`/`actionS`).
+- [ ] **Cost:** read the Comfy Cloud credits for the four live projects and set `COMFY_RATE_USD_S` from real data (it is a placeholder).
+
+**Known gaps (not built):**
+- [ ] **BGM ducking** under action-frame audio / narration + clip SFX (tail mixes BGM flat at 0.15; clip SFX under narration is flat 0.22).
+- [ ] **QA for `comfy-video`** (ungated today): a frozen-camera / identity check, like `wan2-i2v`'s motion gate.
+- [ ] **Output is 1280×704** (the workflow rounds 720 up/down to a multiple of 32). Decide: leave, or set an exact 720 / crop.
+- [ ] **Two-character first frames:** the composite edit lost identity details (Tobin's sweater went navy). Better edit prompt, or only
+      one character per ia2v/flf_ia2v shot (StoryStudio's job); wide establishing frames from a reference come out as tight portraits.
+- [ ] **Orphan recovery vs long Comfy jobs:** `LAMBDA_ORPHAN_RECOVERY_MS` is 600 s but `runGraph` waits up to 15 min — a slow Comfy
+      job could be requeued and duplicated while still running. Align them (or cancel the Comfy job on requeue).
+- [ ] **Concurrency:** Comfy reported a limit of 5 and `comfy-video.maxInFlight` is 4. Run 2–3 projects at once and watch for 429s.
+- [ ] **Open questions in the handoff doc:** (1) upscale for LTX (tail already scales 720p→1080p; today StoryStudio sends
+      `upscale:true, dreamx`), (3) check the still against the motion prompt after the image step, (4) port `lintLtxWireFrame` into QM.
+- [ ] **Voices:** a real child voice via `voice.instruct` + `voice.speaker` (design mode, shipped `e4aa030`) — not live-tested.
+
+**Housekeeping:**
+- [ ] VPS dumps from 10-04 (`backup-2026-10-04.dump`, `-pre-022.dump`) — nightly backup to object storage is still not wired.
+- [ ] Test artifacts: R2 `comfy-video/`, `dialogue-audio/`, `char-ref/` for `qm-ltx-*` projects; tail output under `s3://qm-remove-silence-output/projects/qm-ltx-*`.
+
+**Carried over from the 10-04 plan (still open):**
+- [ ] **LTX-2.5 worker** (`~/ltx25-worker`, memory `qm-ltx25-worker-20261003`): GitHub repo + Actions build (never locally), HF token (gated),
+      volume ≥100 GB, RTX 6000 Ada endpoint, compare with Comfy Cloud LTX-2.3.
+- [ ] **Commit the StoryStudio narration-basic change** (`motionEngine:'animate'`, deployed to Convex prod 10-03, uncommitted) and run one
+      real narration-basic project end to end.
+- [ ] Wan2 720p on the RTX PRO 6000: 5-frame QA comparison + shift 5 vs 7 (branch `wan2-720p`, `5e8870e`).
+- [ ] **Harden the live SFN tail** (section below, deferred twice): a 95/111-frame project, ECS timeouts, the 256KB state.
+
+## 2026-10-04 — create projects with video generated through the ComfyUI API (DONE 10-04 — see 10-05 section above)
 
 **Why:** the 2026-10-03 provider bake-off (same harbour still + prompt, ~5s at 720p) —
 
