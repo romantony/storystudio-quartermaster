@@ -103,7 +103,7 @@ describe('ltx builders', () => {
     expect(buildComfyVideoInput(ctx(job, { 1: { url: 'http://i' }, 2: { url: 'http://a', durationS: 3 }, 17: { url: 'http://l' } }))).toMatchObject({ workflow: 'ltx23_flf2v', lastImageUrl: 'http://l' });
   });
   it('comfy-last: edit for flf, passthrough otherwise', () => {
-    expect(buildComfyLastInput(ctx({ shotKind: 'flf', lastFrameEdit: 'lit' }, { 1: { url: 'http://i' } }))).toMatchObject({ image_url: 'http://i', prompt: 'lit' });
+    expect(buildComfyLastInput(ctx({ shotKind: 'flf', lastFrameEdit: 'lit' }, { 1: { url: 'http://i' } }))).toMatchObject({ image_url: 'http://i', prompt: 'lit', frame_id: 'f1_last' }); // never the first-frame edit's frame_id (same output filename)
     expect(buildComfyLastInput(ctx({ shotKind: 'i2v' }, { 1: { url: 'http://i' } }))).toEqual({ __passthroughUrl: 'http://i' });
   });
 });

@@ -20,6 +20,9 @@ export const buildComfyLastInput: PayloadBuilder = (ctx: BuildContext): Record<s
     image_url: imageUrl,
     prompt: ctx.job.lastFrameEdit,
     project_id: ctx.projectId,
-    ...(ctx.frameId ? { frame_id: ctx.frameId } : {}),
+    // The endpoint names its output <project_id>_<frame_id>_image_edit.png. The
+    // first-frame edit (qwen-edit) already owns <frame_id>; sharing it made the
+    // last frame OVERWRITE the first (live run 2026-10-04: identical urls).
+    ...(ctx.frameId ? { frame_id: `${ctx.frameId}_last` } : {}),
   };
 };
