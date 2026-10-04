@@ -305,6 +305,18 @@ describe('completion', () => {
     expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
   });
 
+  it('completes a skip: passthrough (not an http url) and leaves it ungated — live bug 2026-10-04', async () => {
+    const poolLike = fakePool({ successRow: { asset_kind: 'qwen-image-gen', endpoint_id: ASSET_SPECS['qwen-image-gen'].endpointId } });
+    const outcome = await applyAssetSuccess(deps(jest.fn(), poolLike), 101, 'qwen-image-gen', {
+      image: 'skip:char', __passthrough: true, __passthroughUrl: 'skip:char',
+    });
+    expect(outcome).toBe('completed');
+    expect(assetsRepo.failOrRetryAsset).not.toHaveBeenCalled();
+    const [, , result, , gated] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
+    expect(result.assetUrl).toBe('skip:char');
+    expect(gated).toBe(false); // a gated kind's skip row must not enter QA
+  });
+
   it('does nothing when the row is no longer submitted (webhook racing reconcile)', async () => {
     const poolLike = fakePool({ successRow: { status: 'complete' } });
     const outcome = await applyAssetSuccess(deps(jest.fn(), poolLike), 101, 'qwen-image-gen', { image: 'https://cdn/x.png' });

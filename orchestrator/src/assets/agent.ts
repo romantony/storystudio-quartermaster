@@ -267,7 +267,11 @@ export async function applyAssetSuccess(
     }
 
     const workerError = outputError(output);
-    const url = workerError ? undefined : runpodOutUrl(output);
+    // A passthrough/skip row (builder said "nothing to do, reuse this url") names
+    // its url directly — a `skip:` marker is not http, so runpodOutUrl would
+    // reject it as "no asset URL" (found in the 2026-10-04 live dialogue run).
+    const passthroughUrl = (output as { __passthroughUrl?: unknown } | null)?.__passthroughUrl;
+    const url = workerError ? undefined : typeof passthroughUrl === 'string' ? passthroughUrl : runpodOutUrl(output);
     if (workerError || !url) {
       const reason = workerError ?? 'provider reported COMPLETED with no asset URL in its output';
       const retried = await failOrRetryAsset(client, assetId, kind, { stage: row.stage, error: reason.slice(0, 500) }, assetRetryCeiling(reason, deps.cfg));
@@ -592,7 +596,7 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
     if (passthroughUrl) {
       await markSubmitted(client, row.id, kind, `passthrough:${row.id}`);
       await client.query('COMMIT');
-      await applyAssetSuccess(deps, row.id, kind, { [spec.produces]: passthroughUrl, __passthrough: true });
+      await applyAssetSuccess(deps, row.id, kind, { [spec.produces]: passthroughUrl, __passthrough: true, __passthroughUrl: passthroughUrl });
       return true;
     }
 
