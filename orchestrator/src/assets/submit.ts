@@ -148,9 +148,13 @@ function speakerVoice(req: OrchestratorRequest, frame: OrchestratorRequest['fram
   if (v.voiceId) out.voiceId = v.voiceId;
   if (v.cloneArtifactUrl) out.cloneArtifactUrl = v.cloneArtifactUrl;
   if (v.language) out.voiceLanguage = v.language;
-  // A character's own design replaces the narrator's: clear the narrator's
-  // clone so a qwen design instruct is not shadowed by it.
-  if (v.instruct && !v.cloneArtifactUrl) out.cloneArtifactUrl = undefined;
+  // TTS priority (builders/tts.ts): clone artifact > voice design. A clone wins
+  // when the character has one. Without one, a character with a design
+  // (`instruct`, and `speaker` to carry it) is spoken in design mode, so the
+  // narrator's request-level clone must not shadow it.
+  if (!v.cloneArtifactUrl && (v.instruct || v.speaker)) out.cloneArtifactUrl = undefined;
+  if (v.speaker) out.voiceSpeaker = v.speaker;
+  // `delivery` steers a design instruct only; a clone ignores the instruct.
   const instruct = [v.instruct ?? req.voiceInstruct, frame.dialogue.delivery].filter(Boolean).join('. ');
   if (instruct) out.voiceInstruct = instruct;
   return out;

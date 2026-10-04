@@ -142,6 +142,9 @@ const CharacterSchema = z
     voice: z
       .object({
         instruct: z.string().min(1).optional(),
+        // A Qwen3-TTS preset speaker (gender-matched by StoryStudio). With
+        // `instruct` and no clone, the line is spoken in voice-design mode.
+        speaker: z.string().min(1).optional(),
         gender: z.string().optional(),
         language: z.string().optional(),
         voiceId: z.string().min(1).optional(),

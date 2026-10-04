@@ -7,6 +7,7 @@ import { buildComfyLastInput } from '../src/steps/builders/comfy-last';
 import { ASSET_SPECS } from '../src/assets/kinds';
 import { assertOpenWeightGraph, buildGraph, runGraph, type ComfyGraph } from '../src/comfy/client';
 import { buildDialogueAudioInput, dialogueClipS } from '../src/steps/builders/dialogue-audio';
+import { buildTtsInput } from '../src/steps/builders/tts';
 import { buildCharRefInput } from '../src/steps/builders/char-ref';
 import { buildImageInput } from '../src/steps/builders/image';
 import { buildImageEditInput } from '../src/steps/builders/image-edit';
@@ -366,5 +367,43 @@ describe('action frames (sfx-only) + dialogue-basic tier', () => {
   it('carries lastFramePrompt / shotType / actionS onto the rows', () => {
     const rows = buildAssetRows(r, compilePlan(r));
     expect(rows.find((x) => x.kind === 'comfy-video' && x.frameId === 'f2')!.input).toMatchObject({ lastFramePrompt: 'full last frame', shotType: 'primary', actionS: 7 });
+  });
+});
+
+describe('speaker voices: clone > design (handoff "Voices")', () => {
+  const narratorClone = 'https://r2.example/narrator.pt';
+  const build = (voice: Record<string, unknown>) => {
+    const r = RequestSchema.parse({
+      ...req([dframe('f1')], { characters: [{ id: 'keeper', description: 'd', referenceImageUrl: REF, voice }], cloneArtifactUrl: narratorClone, voiceInstruct: 'narrator', voiceSpeaker: 'Aiden' }, { voiceEngine: 'qwen' }),
+      tier: 'dialogue-basic',
+    });
+    const row = buildAssetRows(r, compilePlan(r)).find((x) => x.kind === 'tts')!;
+    return buildTtsInput(ctx(row.input as Record<string, unknown>, {}));
+  };
+  it('a speaker clone wins over design', () => {
+    expect(build({ cloneArtifactUrl: 'https://r2.example/boy.pt', instruct: 'a boy', speaker: 'Ryan' })).toMatchObject({ clone_artifact_url: 'https://r2.example/boy.pt' });
+  });
+  it('instruct + speaker with no clone is voice design, not the narrator clone', () => {
+    const p = buildTtsInput(ctx(buildAssetRowsTts({ instruct: 'a ten-year-old boy, bright', speaker: 'Dylan' }), {}));
+    expect(p).toMatchObject({ engine: 'qwen', speaker: 'Dylan', instruct: 'a ten-year-old boy, bright. gravelly, calm' });
+    expect(p.clone_artifact_url).toBeUndefined();
+  });
+  function buildAssetRowsTts(voice: Record<string, unknown>) {
+    const r = RequestSchema.parse({
+      ...req([dframe('f1')], { characters: [{ id: 'keeper', description: 'd', referenceImageUrl: REF, voice }], cloneArtifactUrl: narratorClone, voiceInstruct: 'narrator', voiceSpeaker: 'Aiden' }, { voiceEngine: 'qwen' }),
+      tier: 'dialogue-basic',
+    });
+    return buildAssetRows(r, compilePlan(r)).find((x) => x.kind === 'tts')!.input as Record<string, unknown>;
+  }
+  it('a catalog clone from StoryStudio is used as sent', () => {
+    expect(buildTtsInput(ctx(buildAssetRowsTts({ voiceId: 'en-us-doc-m', cloneArtifactUrl: 'https://r2.example/doc-m.pt' }), {}))).toMatchObject({ clone_artifact_url: 'https://r2.example/doc-m.pt' });
+  });
+  it('narration frames keep the narrator voice', () => {
+    const r = RequestSchema.parse({ ...req([frame('f1')], { characters: chars, cloneArtifactUrl: narratorClone }, { voiceEngine: 'qwen' }), tier: 'dialogue-basic' });
+    const row = buildAssetRows(r, compilePlan(r)).find((x) => x.kind === 'tts')!;
+    expect(buildTtsInput(ctx(row.input as Record<string, unknown>, {}))).toMatchObject({ clone_artifact_url: narratorClone });
+  });
+  it('rejects an unknown voice key', () => {
+    expect(RequestSchema.safeParse(req([frame('f1')], { characters: [{ id: 'k', description: 'd', referenceImageUrl: REF, voice: { bogus: 1 } }] })).success).toBe(false);
   });
 });
