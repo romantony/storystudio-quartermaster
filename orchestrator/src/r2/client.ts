@@ -74,3 +74,11 @@ export async function putJsonToR2(deps: R2Transport, key: string, value: unknown
   await put(deps, key, body, 'application/json');
   return `${deps.publicUrl.replace(/\/$/, '')}/${key}`;
 }
+
+/** Uploads bytes this process fetched itself (a Comfy Cloud clip behind an
+ * API-key-gated, signed link) and returns the permanent public URL. */
+export async function putBytesToR2(deps: R2Transport, key: string, body: Buffer, contentType: string): Promise<string> {
+  const put = deps.putImpl ?? defaultPut;
+  await put(deps, key, body, contentType);
+  return `${deps.publicUrl.replace(/\/$/, '')}/${key}`;
+}

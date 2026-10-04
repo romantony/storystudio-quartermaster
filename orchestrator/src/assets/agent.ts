@@ -53,7 +53,8 @@ import {
 import { recordAssetCost } from '../db/repo/asset-costs';
 import type { FrameJobInput } from '../steps/builders/types';
 import { invokeAnimate, invokeRemotionOverlay, type AnimateInput, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
-import { persistToR2, type R2Transport } from '../r2/client';
+import { persistToR2, putBytesToR2, type R2Transport } from '../r2/client';
+import { COMFY_FPS, COMFY_SIZE, buildGraph, runGraph, uploadImage, type ComfyTransport, type ComfyWorkflow } from '../comfy/client';
 import {
   describeTailExecution,
   executionName,
@@ -74,6 +75,7 @@ export interface AssetAgentDeps {
     | 'assetDispatchBatchSize'
     | 'lambdaRenderRateUsdS'
     | 'animateLambdaRateUsdS'
+    | 'comfyRateUsdS'
   >;
   publicBaseUrl: string;
   webhookSecret: string;
@@ -84,6 +86,9 @@ export interface AssetAgentDeps {
   /** The `animate` kind's Lambda (QM-animate). Its clips land in QM's own S3
    * bucket under projects/*, so unlike Remotion's they are not re-hosted. */
   animateLambda?: LambdaTransport;
+  /** Comfy Cloud, for the `comfy-video` kind. Without it such a row fails with
+   * a clear error rather than hanging. */
+  comfy?: ComfyTransport;
   /** Where a Lambda's output is re-hosted. Remotion Lambda writes to ITS OWN
    * S3 bucket, which QM does not control the retention of — the same class of
    * problem that cost 103/122 shots to expired replicate.delivery links on
@@ -391,6 +396,10 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
     await invokeAnimateRow(deps, kind, row, payload);
     return;
   }
+  if (kind === 'comfy-video') {
+    await invokeComfyRow(deps, kind, row, payload);
+    return;
+  }
 
   if (!deps.lambda) throw new Error(`${kind} is provider:'lambda' but no lambda transport is configured`);
   if (!deps.r2) throw new Error(`${kind} is provider:'lambda' but no r2 transport is configured`);
@@ -421,6 +430,49 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await applyAssetFailure(deps, row.id, kind, { provider: 'lambda', error: message.slice(0, 500) });
+  }
+}
+
+/** `comfy-video`: upload the still(s), run the LTX-2.3 graph on Comfy Cloud,
+ * and re-host the clip in R2 before completing — the signed output link
+ * expires, so completing with it would be the 2026-08-17 incident again. */
+async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
+  const spec = assetSpec(kind);
+  if (!deps.comfy) throw new Error(`${kind}: no Comfy Cloud transport configured (COMFY_API_KEY)`);
+  if (!deps.r2) throw new Error(`${kind}: no r2 transport is configured`);
+  const p = payload as {
+    workflow: ComfyWorkflow; firstImageUrl: string; lastImageUrl?: string; prompt: string; negativePrompt?: string;
+    durationS: number; portrait: boolean; seed?: number; frameId: string;
+  };
+  const jobId = `comfy:${row.id}:${row.attempts + 1}`;
+  await markSubmitted(deps.pool, row.id, kind, jobId);
+  const startedAt = Date.now();
+  try {
+    const tag = `${row.projectId}-${p.frameId}-${row.attempts + 1}`.replace(/[^A-Za-z0-9_-]/g, '_');
+    const firstImage = await uploadImage(deps.comfy, p.firstImageUrl, `${tag}-first.png`);
+    const lastImage = p.lastImageUrl ? await uploadImage(deps.comfy, p.lastImageUrl, `${tag}-last.png`) : undefined;
+    const [width, height] = p.portrait ? COMFY_SIZE.portrait : COMFY_SIZE.landscape;
+    const graph = buildGraph({
+      workflow: p.workflow, firstImage, lastImage, prompt: p.prompt, negativePrompt: p.negativePrompt,
+      width, height, fps: COMFY_FPS, durationS: p.durationS,
+      seed: p.seed ?? Math.floor(Math.random() * 2 ** 31),
+    });
+    const result = await runGraph(deps.comfy, graph, async (promptId) => {
+      // Record the provider job id for the operator; attempts was already counted.
+      await deps.pool.query(`UPDATE assets SET provider_job_id = $3, updated_at = now() WHERE asset_kind = $2 AND id = $1`, [
+        row.id, kind, `comfy:${promptId}`,
+      ]);
+    });
+    const url = await putBytesToR2(deps.r2, `comfy-video/${row.projectId}/${p.frameId}.mp4`, result.bytes, 'video/mp4');
+    await recordAssetCost(deps.pool, {
+      assetId: row.id, assetKind: kind, projectId: row.projectId, frameId: row.frameId,
+      endpointId: spec.endpointId, providerJobId: `comfy:${result.promptId}`,
+      executionMs: Date.now() - startedAt, delayMs: null, workerRateUsdS: deps.cfg.comfyRateUsdS,
+    });
+    await applyAssetSuccess(deps, row.id, kind, { video: url, duration_s: p.durationS });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await applyAssetFailure(deps, row.id, kind, { provider: 'comfy', error: message.slice(0, 500) });
   }
 }
 
@@ -489,6 +541,16 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
       await client.query('COMMIT');
       log().warn({ assetId: row.id, kind, error: message }, 'asset-agent: payload build failed, row failed');
       return false;
+    }
+
+    // A builder may answer "nothing to do for this frame, reuse this URL"
+    // (comfy-last on a non-flf shot). Generic across providers.
+    const passthroughUrl = (payload as { __passthroughUrl?: string }).__passthroughUrl;
+    if (passthroughUrl) {
+      await markSubmitted(client, row.id, kind, `passthrough:${row.id}`);
+      await client.query('COMMIT');
+      await applyAssetSuccess(deps, row.id, kind, { image: passthroughUrl });
+      return true;
     }
 
     if (spec.provider === 'lambda') {

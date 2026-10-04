@@ -39,6 +39,7 @@ const CFG: AssetAgentDeps['cfg'] = {
   assetReconcileAfterMs: 60_000,
   assetDispatchBatchSize: 10,
   lambdaRenderRateUsdS: 0.000127,
+  comfyRateUsdS: 0.0005,
   animateLambdaRateUsdS: 0.000167,
 };
 

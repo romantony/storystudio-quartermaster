@@ -74,6 +74,7 @@ async function main(): Promise<void> {
       // The `remotion` agent's transports — the one non-RunPod kind.
       lambda: { functionName: cfg.remotionLambdaFunctionName, region: cfg.remotionLambdaRegion },
       animateLambda: { functionName: cfg.animateLambdaFunctionName, region: cfg.animateLambdaRegion },
+      comfy: cfg.comfyApiKey ? { apiKey: cfg.comfyApiKey } : undefined,
       r2,
       // The `sfn-tail` agent's transport: starts + polls the assembly tail.
       sfn: cfg.sfnTailStateMachineArn

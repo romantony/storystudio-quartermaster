@@ -245,6 +245,8 @@ export function manifestFrame(
     // merge mixes THAT audio under the narration instead of taking a separate
     // SFX file (the `sfx_from_video` rule steps/builders/merge.ts applied).
     if (plan.frameKinds.includes('mmaudio')) entry.sfxFromVideo = true;
+    // LTX-2.3 generates its own SFX with the clip ('sfx-under-narration').
+    if (plan.motionKind === 'comfy-video') entry.sfxFromVideo = true;
   } else {
     const image = url(plan.imageKind);
     if (!image) throw new Error(`frame ${frame.frameId}: no still to animate`);

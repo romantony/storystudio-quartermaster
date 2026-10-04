@@ -95,6 +95,14 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         // and this frame's asset is missing".
         sfx: plan.frameKinds.includes('mmaudio') || undefined,
         textManifest: frame.textManifest,
+        shotKind: frame.shotKind,
+        characters: frame.characters,
+        lastFrameEdit: frame.lastFrameEdit,
+        stateLocks: frame.stateLocks,
+        negativePrompt: frame.negativePrompt,
+        soundCues: frame.soundCues,
+        cameraMove: frame.cameraMove,
+        audioMode: frame.audioMode,
       };
       rows.push({
         kind,

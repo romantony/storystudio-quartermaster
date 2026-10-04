@@ -31,6 +31,8 @@ import { buildTtsInput } from '../steps/builders/tts';
 import { buildI2vInput } from '../steps/builders/i2v';
 import { buildSfxInput } from '../steps/builders/sfx';
 import { buildRemotionOverlayInput } from '../steps/builders/remotion-overlay';
+import { buildComfyVideoInput } from '../steps/builders/comfy-video';
+import { buildComfyLastInput } from '../steps/builders/comfy-last';
 import { buildAnimateInput } from '../steps/builders/animate';
 import { buildSfnTailInput } from '../steps/builders/sfn-tail';
 import type { PayloadBuilder } from '../steps/builders/types';
@@ -42,6 +44,8 @@ export const ASSET_KINDS = [
   'wan2-i2v',
   'mmaudio',
   'animate',
+  'comfy-last',
+  'comfy-video',
   'remotion',
   'sfn-tail',
 ] as const;
@@ -243,6 +247,43 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     produces: 'video',
     stages: [],
     build: buildAnimateInput,
+  },
+  'comfy-last': {
+    // The last frame of an LTX `flf` shot: an edit of the first frame on the
+    // qwen-image-edit endpoint. Non-flf frames pass the still through.
+    kind: 'comfy-last',
+    scope: 'frame',
+    provider: 'runpod',
+    gate: null,
+    table: 'asset_comfy_last',
+    endpointId: endpointFor('runpod:qwen-image-edit'),
+    maxInFlight: podsFor('runpod:qwen-image-edit'),
+    timeoutMs: 300_000,
+    cancelOnTimeout: true,
+    legacySeq: 17,
+    produces: 'image',
+    stages: [],
+    build: buildComfyLastInput,
+  },
+  'comfy-video': {
+    // LTX-2.3 on Comfy Cloud (options.motionEngine 'ltx'), in Wan2's place.
+    // Dispatched like `animate`/`remotion`: one in-process call that blocks
+    // for the render (~45-90 s), then the clip is re-hosted into R2. There is
+    // no row-lock-held network call and no webhook. Not QA-gated (yet).
+    kind: 'comfy-video',
+    scope: 'frame',
+    provider: 'lambda',
+    gate: null,
+    table: 'asset_comfy_video',
+    endpointId: 'lambda:comfy-ltx23',
+    // comfy.org reported x-concurrency-limit: 5.
+    maxInFlight: 4,
+    timeoutMs: null,
+    cancelOnTimeout: false,
+    legacySeq: 3,
+    produces: 'video',
+    stages: [],
+    build: buildComfyVideoInput,
   },
   remotion: {
     // On-screen text for educational/explainer frames, rendered by the

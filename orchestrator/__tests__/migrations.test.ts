@@ -8,7 +8,7 @@ import { loadMigrations } from '../src/db/migrate';
 const migrations = loadMigrations();
 
 describe('migrations', () => {
-  it('are the expected ordered set 001..020', () => {
+  it('are the expected ordered set 001..021', () => {
     expect(migrations.map((m) => m.version)).toEqual([
       '001_init',
       '002_measurement',
@@ -30,6 +30,7 @@ describe('migrations', () => {
       '018_asset_sfn_tail',
       '019_project_qa_flagged',
       '020_asset_animate',
+      '021_asset_comfy',
     ]);
   });
 

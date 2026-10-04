@@ -98,21 +98,27 @@ export interface TailSteps {
 export function compilePlan(req: OrchestratorRequest): AssetPlan {
   const o = req.options;
   const imageKind: AssetKind = o.referenceImage ? 'qwen-edit' : 'qwen-image-gen';
-  const motionKind: AssetKind = o.motionEngine === 'animate' ? 'animate' : 'wan2-i2v';
+  const motionKind: AssetKind =
+    o.motionEngine === 'animate' ? 'animate' : o.motionEngine === 'ltx' ? 'comfy-video' : 'wan2-i2v';
   // MMAudio listens to generated motion; a Ken Burns move over a still has
-  // nothing for it to hear, and narration-basic has no SFX.
+  // nothing for it to hear, and narration-basic has no SFX. LTX clips carry
+  // their own SFX, so MMAudio never runs for them either.
   const sfx = motionKind === 'wan2-i2v' && o.sfx ? ('mmaudio' as const) : undefined;
 
   const requires: Record<string, AssetKind[]> = {
     [imageKind]: [],
     tts: [],
   };
+  // LTX `flf` shots need a last frame; the kind exists only when one does, and
+  // is a passthrough for the frames that are plain `i2v`.
+  const needsLast = motionKind === 'comfy-video' && req.frames.some((f) => f.shotKind === 'flf');
+  if (needsLast) requires['comfy-last'] = [imageKind];
   if (motionKind) {
     // Motion needs the still AND the narration — not for the audio, but for
     // its real generated length. builders/i2v.ts sizes the clip to it; the
     // caller's estimate and the real narration routinely diverge and the
     // tail's `-shortest` mux silently clips the difference.
-    requires[motionKind] = [imageKind, 'tts'];
+    requires[motionKind] = [imageKind, 'tts', ...(needsLast ? (['comfy-last'] as const) : [])];
   }
   // MMAudio runs right after the motion clip, per frame (operator, 2026-10-02).
   if (sfx) requires[sfx] = [motionKind];

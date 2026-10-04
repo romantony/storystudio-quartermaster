@@ -133,7 +133,7 @@ describe('the registry', () => {
     for (const kind of ASSET_KINDS) {
       const t = ASSET_SPECS[kind].timeoutMs;
       // null is the deliberate opt-out for synchronous Lambda kinds, never an oversight.
-      if (t === null) expect(['remotion', 'animate']).toContain(kind);
+      if (t === null) expect(['remotion', 'animate', 'comfy-video']).toContain(kind);
       else expect(t).toBeGreaterThan(0);
     }
   });
@@ -247,7 +247,7 @@ describe('the remotion agent', () => {
     expect(ASSET_SPECS.animate.provider).toBe('lambda');
     expect(ASSET_SPECS.animate.endpointId).toBe('lambda:qm-animate');
     // Every other kind stays on RunPod, except the SFN tail.
-    for (const k of ASSET_KINDS.filter((x) => x !== 'remotion' && x !== 'animate' && x !== 'sfn-tail')) {
+    for (const k of ASSET_KINDS.filter((x) => x !== 'remotion' && x !== 'animate' && x !== 'comfy-video' && x !== 'sfn-tail')) {
       expect(ASSET_SPECS[k].provider).toBe('runpod');
     }
   });

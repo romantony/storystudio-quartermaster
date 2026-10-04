@@ -78,6 +78,37 @@ const FrameSchema = z
     // of the harness's internal schema; harness/prepare.ts re-validates it
     // and falls back to extraction on a bad shape.
     shot: z.unknown().optional(),
+
+    // ── LTX-2.3 (Comfy) contract, options.motionEngine === 'ltx' ─────────
+    // docs: storystudio-unified/docs/quartermaster/storystudio-ltx23-qm-handoff.md.
+    // Accepted on any request but only read by the `comfy-video` plan;
+    // validateRequest enforces the cross-field rules when motionEngine is 'ltx'.
+    // `i2v`/`flf` are narration shots; `ia2v`/`flf_ia2v` are Dialogue Basic's
+    // (a later phase) and are rejected until that lands.
+    shotKind: z.enum(['i2v', 'flf', 'ia2v', 'flf_ia2v']).optional(),
+    // Character ids in this frame (<= 2), keys of the request's `characters`.
+    characters: z.array(z.string().min(1)).max(2).optional(),
+    // An edit applied to the FIRST frame to produce the last (flf shots).
+    lastFrameEdit: z.string().min(1).optional(),
+    // "lighthouse:dark" (lock) or "lighthouse:dark→lit" (change in-shot).
+    stateLocks: z.array(z.string().min(1)).optional(),
+    // Kept out of motionPrompt; wired to the flf workflow's negative node.
+    negativePrompt: z.string().min(1).optional(),
+    // Already inside motionPrompt's "Sound:" sentence; carried for the
+    // dialogue ambience pass.
+    soundCues: z.array(z.string().min(1)).max(8).optional(),
+    cameraMove: z.string().min(1).optional(),
+    // 'sfx-under-narration': the clip's own SFX is mixed under the narration.
+    audioMode: z.enum(['sfx-under-narration', 'clip']).optional(),
+  })
+  .strict();
+
+const CharacterSchema = z
+  .object({
+    id: z.string().min(1),
+    sheetPrompt: z.string().min(1),
+    description: z.string().min(1),
+    referenceImageUrl: z.string().url().optional(),
   })
   .strict();
 
@@ -96,7 +127,8 @@ const OptionsSchema = z
     // by the asset pipeline (assets/plan.ts); the cohort step graph always
     // plans seq 3, so a request that sets this while ORCH_PIPELINE_MODE is
     // 'cohort' is accepted and ignored.
-    motionEngine: z.enum(['wan2', 'animate']).default('wan2'),
+    // 'ltx' = LTX-2.3 on Comfy Cloud (`comfy-video`, assets/kinds.ts).
+    motionEngine: z.enum(['wan2', 'animate', 'ltx']).default('wan2'),
     // Per-frame MMAudio SFX (step 15), mixed under the narration at merge.
     // Off by default — MMAudio's weights are non-commercial (CC-BY-NC-4.0).
     sfx: z.boolean().default(false),
@@ -144,6 +176,8 @@ export const RequestSchema = z
     callbackUrl: z.string().url(),
     options: OptionsSchema,
     frames: z.array(FrameSchema).min(1),
+    // LTX mode: character sheets the frames' `characters` ids refer to.
+    characters: z.array(CharacterSchema).optional(),
     // Qwen3-TTS voice-design fields (options.voiceEngine === 'qwen'),
     // request-level like the real AWS contract's §9.1 shape — mirrors
     // voiceSpeaker/voiceInstruct/voiceLanguage in
@@ -372,6 +406,31 @@ function buildStepsAndJobs(
   return { steps, jobs };
 }
 
+/** LTX-2.3 cross-field rules (handoff doc, "What StoryStudio sends"). Fails the
+ * request loudly at POST time: a frame with no valid contract must not reach
+ * the Comfy credits. Dialogue shot kinds are the next phase and are refused. */
+export function validateLtxRequest(req: OrchestratorRequest): void {
+  const issues: z.ZodIssue[] = [];
+  const bad = (path: (string | number)[], message: string): void => {
+    issues.push({ code: z.ZodIssueCode.custom, path, message });
+  };
+  const known = new Set((req.characters ?? []).map((c) => c.id));
+  req.frames.forEach((f, i) => {
+    const at = ['frames', i];
+    if (!f.shotKind) return bad([...at, 'shotKind'], `frame ${f.frameId}: shotKind is required when motionEngine is 'ltx'`);
+    if (f.shotKind === 'ia2v' || f.shotKind === 'flf_ia2v') {
+      return bad([...at, 'shotKind'], `frame ${f.frameId}: shotKind '${f.shotKind}' (dialogue) is not supported yet`);
+    }
+    if (!f.motionPrompt) bad([...at, 'motionPrompt'], `frame ${f.frameId}: motionPrompt is required for LTX`);
+    if (f.shotKind === 'flf' && !f.lastFrameEdit) bad([...at, 'lastFrameEdit'], `frame ${f.frameId}: shotKind 'flf' needs lastFrameEdit`);
+    if (f.shotKind === 'i2v' && f.lastFrameEdit) bad([...at, 'lastFrameEdit'], `frame ${f.frameId}: lastFrameEdit is only valid for 'flf'`);
+    for (const id of f.characters ?? []) {
+      if (!known.has(id)) bad([...at, 'characters'], `frame ${f.frameId}: unknown character '${id}' (not in request.characters)`);
+    }
+  });
+  if (issues.length > 0) throw new PlanValidationError(issues);
+}
+
 /**
  * Every check that can run WITHOUT touching the DB — zod shape plus the two
  * business rules (referenceImage needs referenceImageUrl per frame, bgm
@@ -411,6 +470,8 @@ export function validateRequest(rawRequest: unknown): { req: OrchestratorRequest
       { code: z.ZodIssueCode.custom, path: ['bgmPrompt'], message: 'options.bgm is true but bgmPrompt is missing' },
     ]);
   }
+
+  if (req.options.motionEngine === 'ltx') validateLtxRequest(req);
 
   const resolvedSeqs = resolveStepSet(req);
   const uncatalogued = resolvedSeqs.filter((s) => !catalogEntry(s));

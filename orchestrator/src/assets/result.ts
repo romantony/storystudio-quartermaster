@@ -214,6 +214,8 @@ function legacySeqOf(kind: string): number {
     'qwen-image-gen': 1,
     tts: 2,
     'wan2-i2v': 3,
+    'comfy-video': 3,
+    'comfy-last': 17,
     'sfn-tail': 6,
     mmaudio: 15,
     remotion: 16,

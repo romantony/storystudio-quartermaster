@@ -245,6 +245,16 @@ const ConfigSchema = z.object({
   // QM-animate at 10 GB: $0.0000166667/GB-s x 10 (x86, us-east-1).
   animateLambdaRateUsdS: numeric(0.000167).pipe(z.number().positive()),
 
+  // ── Comfy Cloud (assets/kinds.ts's `comfy-video`, src/comfy/client.ts) ──
+  // LTX-2.3 per-frame video for options.motionEngine 'ltx'. A subscription
+  // key: empty = no transport, a comfy-video row then fails with a clear error.
+  // Like every key here it does NOTHING until deploy/docker-compose.yml
+  // forwards it. Never commit the value.
+  comfyApiKey: z.string().default(''),
+  // Subscription credits, not per-second billing: this rate is a clearly-labeled
+  // placeholder so job_costs rows exist (~91 credits per 80 s story, 10-04).
+  comfyRateUsdS: numeric(0.0005).pipe(z.number().nonnegative()),
+
   // ── R2 persistence for step 16's Lambda output (src/r2/client.ts) ──────
   // Remotion Lambda's own output lives on ITS S3 bucket, not QM's — same
   // "external providers return ephemeral delivery URLs" risk the top-level
@@ -381,6 +391,8 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   sfnTailRegion: 'SFN_TAIL_REGION',
   lambdaRenderRateUsdS: 'LAMBDA_RENDER_RATE_USD_S',
   animateLambdaRateUsdS: 'ANIMATE_LAMBDA_RATE_USD_S',
+  comfyApiKey: 'COMFY_API_KEY',
+  comfyRateUsdS: 'COMFY_RATE_USD_S',
   r2AccountId: 'R2_ACCOUNT_ID',
   r2Bucket: 'R2_BUCKET_NAME',
   r2PublicUrl: 'R2_PUBLIC_URL',

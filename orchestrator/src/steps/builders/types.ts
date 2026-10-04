@@ -128,6 +128,16 @@ export interface FrameJobInput {
    * before the orchestrator generates it); the builder overwrites it with
    * the resolved step 6/7 output. */
   textManifest?: Record<string, unknown>;
+
+  // ── LTX-2.3 (options.motionEngine === 'ltx'), see agents/planner.ts ──
+  shotKind?: 'i2v' | 'flf' | 'ia2v' | 'flf_ia2v';
+  characters?: string[];
+  lastFrameEdit?: string;
+  stateLocks?: string[];
+  negativePrompt?: string;
+  soundCues?: string[];
+  cameraMove?: string;
+  audioMode?: 'sfx-under-narration' | 'clip';
 }
 
 export type FallbackRung = 'flux-4b' | 'replicate-wan22-fast';
