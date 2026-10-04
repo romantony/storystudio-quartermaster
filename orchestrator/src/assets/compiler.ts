@@ -212,29 +212,38 @@ export function describeDrop(frameRows: AssetRow[]): string {
 export function manifestFrame(
   plan: AssetPlan,
   frame: { frameId: string; seq: number; rows: AssetRow[] },
-  request: { frames: Array<{ frameId: string; narration: string; durationS: number; animateEffect?: string }> },
+  request: { frames: Array<{ frameId: string; narration?: string; dialogue?: { line: string }; audioMode?: string; durationS: number; animateEffect?: string }> },
 ): ManifestFrame {
   const url = (kind: AssetKind): string | undefined =>
     frame.rows.find((r) => r.kind === kind && r.status === 'complete')?.assetUrl ?? undefined;
 
+  const requested = request.frames.find((f) => f.frameId === frame.frameId);
+  const clipAudioOnly = requested?.audioMode === 'sfx-only';
   const tts = frame.rows.find((r) => r.kind === 'tts');
-  const audioUrl = tts?.assetUrl;
-  if (!audioUrl) throw new Error(`frame ${frame.frameId}: no narration audio`);
+  // A project with dialogue frames pads each line with its lead silence
+  // (`dialogue-audio`); that padded track is what the clip was lip-synced to,
+  // so it — not the raw TTS — is what the tail must lay over the clip. The
+  // kind passes the TTS straight through for narration frames.
+  const audioRow = plan.frameKinds.includes('dialogue-audio')
+    ? frame.rows.find((r) => r.kind === 'dialogue-audio' && r.status === 'complete')
+    : tts;
+  const audioUrl = clipAudioOnly ? undefined : audioRow?.assetUrl;
+  if (!clipAudioOnly && !audioUrl) throw new Error(`frame ${frame.frameId}: no narration audio`);
+  if (clipAudioOnly && !plan.motionKind) throw new Error(`frame ${frame.frameId}: sfx-only needs a generated clip`);
 
   const clip = clipKind(plan);
   const source = clip ? url(clip) : undefined;
-  const requested = request.frames.find((f) => f.frameId === frame.frameId);
 
   if (clip && !source) throw new Error(`frame ${frame.frameId}: no clip from ${clip}`);
 
   const entry: ManifestFrame = {
     frameId: frame.frameId,
     seq: frame.seq,
-    audioUrl,
+    ...(audioUrl ? { audioUrl } : { clipAudioOnly: true }),
     // TTS's own reported length — the worker re-probes it anyway, this is for
     // the reader of the manifest.
-    durationS: tts?.durationS ?? requested?.durationS ?? null,
-    narration: requested?.narration ?? (tts?.input as FrameJobInput | undefined)?.narration ?? '',
+    durationS: clipAudioOnly ? (requested?.durationS ?? null) : (audioRow?.durationS ?? tts?.durationS ?? requested?.durationS ?? null),
+    narration: requested?.narration ?? requested?.dialogue?.line ?? (tts?.input as FrameJobInput | undefined)?.narration ?? '',
   };
 
   if (source) {

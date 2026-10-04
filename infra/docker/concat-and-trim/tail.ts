@@ -50,6 +50,7 @@ import {
   evenDims,
   kenBurnsArgs,
   mergeArgs,
+  clipAudioArgs,
   parseLoudness,
   parseResolution,
   s3Url,
@@ -147,9 +148,12 @@ function payloadFromEnv<T>(): T {
 async function prepareFrame(frame: ManifestFrame, defaultFps: number, workDir: string): Promise<{ clipPath: string; durationS: number }> {
   const id = frame.frameId;
   const audPath = path.join(workDir, `${id}.aud`);
-  await download(frame.audioUrl, audPath);
-  const audioS = formatDuration(audPath);
-  if (audioS <= 0) throw new Error(`frame ${id}: narration audio is empty or unreadable`);
+  let audioS = 0;
+  if (frame.audioUrl) {
+    await download(frame.audioUrl, audPath);
+    audioS = formatDuration(audPath);
+    if (audioS <= 0) throw new Error(`frame ${id}: narration audio is empty or unreadable`);
+  }
 
   let vidPath: string;
   if (frame.videoUrl) {
@@ -170,7 +174,11 @@ async function prepareFrame(frame: ManifestFrame, defaultFps: number, workDir: s
   }
 
   const merged = path.join(workDir, `${id}.merged.mp4`);
-  if (frame.sfxFromVideo) {
+  if (frame.clipAudioOnly) {
+    // Action frame: nobody speaks, the clip's own LTX sound is the audio.
+    if (!hasAudioStream(vidPath)) throw new Error(`frame ${id}: sfx-only but the clip has no audio track`);
+    ff(clipAudioArgs(vidPath, merged), `frame ${id} clip audio`);
+  } else if (frame.sfxFromVideo) {
     // The clip's own audio track IS the SFX layer (MMAudio returns the clip with
     // SFX muxed in): lift it off, level it against the narration, mix under it.
     if (!hasAudioStream(vidPath)) throw new Error(`frame ${id}: sfx was planned but the clip has no audio track`);

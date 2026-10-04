@@ -32,6 +32,8 @@ import { buildI2vInput } from '../steps/builders/i2v';
 import { buildSfxInput } from '../steps/builders/sfx';
 import { buildRemotionOverlayInput } from '../steps/builders/remotion-overlay';
 import { buildComfyVideoInput } from '../steps/builders/comfy-video';
+import { buildCharRefInput } from '../steps/builders/char-ref';
+import { buildDialogueAudioInput } from '../steps/builders/dialogue-audio';
 import { buildComfyLastInput } from '../steps/builders/comfy-last';
 import { buildAnimateInput } from '../steps/builders/animate';
 import { buildSfnTailInput } from '../steps/builders/sfn-tail';
@@ -44,7 +46,9 @@ export const ASSET_KINDS = [
   'wan2-i2v',
   'mmaudio',
   'animate',
+  'char-ref',
   'comfy-last',
+  'dialogue-audio',
   'comfy-video',
   'remotion',
   'sfn-tail',
@@ -264,6 +268,40 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     produces: 'image',
     stages: [],
     build: buildComfyLastInput,
+  },
+  'char-ref': {
+    // The frame's character reference(s) as ONE edit source: none = skipped,
+    // one = that reference, two = a side-by-side composite (ffmpeg, in process).
+    kind: 'char-ref',
+    scope: 'frame',
+    provider: 'lambda',
+    gate: null,
+    table: 'asset_char_ref',
+    endpointId: 'lambda:char-ref',
+    maxInFlight: 8,
+    timeoutMs: null,
+    cancelOnTimeout: false,
+    legacySeq: 19,
+    produces: 'image',
+    stages: [],
+    build: buildCharRefInput,
+  },
+  'dialogue-audio': {
+    // A dialogue line padded to the clip length for lip-sync (ffmpeg, in
+    // process, no GPU). Passthrough for narration frames. See the builder.
+    kind: 'dialogue-audio',
+    scope: 'frame',
+    provider: 'lambda',
+    gate: null,
+    table: 'asset_dialogue_audio',
+    endpointId: 'lambda:dialogue-audio',
+    maxInFlight: 8,
+    timeoutMs: null,
+    cancelOnTimeout: false,
+    legacySeq: 18,
+    produces: 'audio',
+    stages: [],
+    build: buildDialogueAudioInput,
   },
   'comfy-video': {
     // LTX-2.3 on Comfy Cloud (options.motionEngine 'ltx'), in Wan2's place.

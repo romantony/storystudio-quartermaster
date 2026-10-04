@@ -54,6 +54,8 @@ import { recordAssetCost } from '../db/repo/asset-costs';
 import type { FrameJobInput } from '../steps/builders/types';
 import { invokeAnimate, invokeRemotionOverlay, type AnimateInput, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
 import { persistToR2, putBytesToR2, type R2Transport } from '../r2/client';
+import { padDialogueAudio } from './dialogue-audio-pad';
+import { compositeCharacterRefs } from './char-ref-composite';
 import { COMFY_FPS, COMFY_SIZE, buildGraph, runGraph, uploadImage, type ComfyTransport, type ComfyWorkflow } from '../comfy/client';
 import {
   describeTailExecution,
@@ -321,7 +323,8 @@ export async function applyAssetSuccess(
       // A QA-exempt product (explainer/educational, plan.qaExempt) skips the
       // queue entirely: its frames are a deterministic Remotion composition,
       // so there is nothing to judge and nothing worth delaying assembly for.
-      spec.gate !== null && !(plan?.qaExempt ?? false),
+      // A passthrough/skip row has nothing of its own to judge.
+      spec.gate !== null && !(plan?.qaExempt ?? false) && !(output as { __passthrough?: boolean } | null)?.__passthrough,
     );
     await client.query('COMMIT');
     log().info(
@@ -396,6 +399,14 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
     await invokeAnimateRow(deps, kind, row, payload);
     return;
   }
+  if (kind === 'char-ref') {
+    await invokeCharRefRow(deps, kind, row, payload);
+    return;
+  }
+  if (kind === 'dialogue-audio') {
+    await invokeDialogueAudioRow(deps, kind, row, payload);
+    return;
+  }
   if (kind === 'comfy-video') {
     await invokeComfyRow(deps, kind, row, payload);
     return;
@@ -433,6 +444,37 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
   }
 }
 
+/** `char-ref` with two characters: one side-by-side composite as the edit source. */
+async function invokeCharRefRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
+  if (!deps.r2) throw new Error(`${kind}: no r2 transport is configured`);
+  const p = payload as { refs: string[]; frameId: string };
+  await markSubmitted(deps.pool, row.id, kind, `local:${row.id}:${row.attempts + 1}`);
+  try {
+    const bytes = await compositeCharacterRefs(p.refs);
+    const url = await putBytesToR2(deps.r2, `char-ref/${row.projectId}/${p.frameId}.png`, bytes, 'image/png');
+    await applyAssetSuccess(deps, row.id, kind, { image: url });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await applyAssetFailure(deps, row.id, kind, { provider: 'local', error: message.slice(0, 500) });
+  }
+}
+
+/** `dialogue-audio`: pad the TTS line with its lead silence, to exactly the
+ * clip length, as 48 kHz stereo (what the ia2v workflows take), and host it. */
+async function invokeDialogueAudioRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
+  if (!deps.r2) throw new Error(`${kind}: no r2 transport is configured`);
+  const p = payload as { ttsUrl: string; leadS: number; durationS: number; frameId: string };
+  await markSubmitted(deps.pool, row.id, kind, `local:${row.id}:${row.attempts + 1}`);
+  try {
+    const bytes = await padDialogueAudio(p.ttsUrl, p.leadS, p.durationS);
+    const url = await putBytesToR2(deps.r2, `dialogue-audio/${row.projectId}/${p.frameId}.wav`, bytes, 'audio/wav');
+    await applyAssetSuccess(deps, row.id, kind, { audio: url, duration_s: p.durationS });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await applyAssetFailure(deps, row.id, kind, { provider: 'local', error: message.slice(0, 500) });
+  }
+}
+
 /** `comfy-video`: upload the still(s), run the LTX-2.3 graph on Comfy Cloud,
  * and re-host the clip in R2 before completing — the signed output link
  * expires, so completing with it would be the 2026-08-17 incident again. */
@@ -441,7 +483,7 @@ async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetR
   if (!deps.comfy) throw new Error(`${kind}: no Comfy Cloud transport configured (COMFY_API_KEY)`);
   if (!deps.r2) throw new Error(`${kind}: no r2 transport is configured`);
   const p = payload as {
-    workflow: ComfyWorkflow; firstImageUrl: string; lastImageUrl?: string; prompt: string; negativePrompt?: string;
+    workflow: ComfyWorkflow; firstImageUrl: string; lastImageUrl?: string; audioUrl?: string; prompt: string; negativePrompt?: string;
     durationS: number; portrait: boolean; seed?: number; frameId: string;
   };
   const jobId = `comfy:${row.id}:${row.attempts + 1}`;
@@ -451,9 +493,10 @@ async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetR
     const tag = `${row.projectId}-${p.frameId}-${row.attempts + 1}`.replace(/[^A-Za-z0-9_-]/g, '_');
     const firstImage = await uploadImage(deps.comfy, p.firstImageUrl, `${tag}-first.png`);
     const lastImage = p.lastImageUrl ? await uploadImage(deps.comfy, p.lastImageUrl, `${tag}-last.png`) : undefined;
+    const audio = p.audioUrl ? await uploadImage(deps.comfy, p.audioUrl, `${tag}-line.wav`) : undefined;
     const [width, height] = p.portrait ? COMFY_SIZE.portrait : COMFY_SIZE.landscape;
     const graph = buildGraph({
-      workflow: p.workflow, firstImage, lastImage, prompt: p.prompt, negativePrompt: p.negativePrompt,
+      workflow: p.workflow, firstImage, lastImage, audio, prompt: p.prompt, negativePrompt: p.negativePrompt,
       width, height, fps: COMFY_FPS, durationS: p.durationS,
       seed: p.seed ?? Math.floor(Math.random() * 2 ** 31),
     });
@@ -549,7 +592,7 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
     if (passthroughUrl) {
       await markSubmitted(client, row.id, kind, `passthrough:${row.id}`);
       await client.query('COMMIT');
-      await applyAssetSuccess(deps, row.id, kind, { image: passthroughUrl });
+      await applyAssetSuccess(deps, row.id, kind, { [spec.produces]: passthroughUrl, __passthrough: true });
       return true;
     }
 

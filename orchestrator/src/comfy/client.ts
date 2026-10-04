@@ -14,6 +14,8 @@
  */
 import i2vWorkflow from './workflows/ltx23_i2v.json';
 import flf2vWorkflow from './workflows/ltx23_flf2v.json';
+import ia2vWorkflow from './workflows/ltx23_ia2v.json';
+import flfIa2vWorkflow from './workflows/ltx23_flf_ia2v.json';
 
 export const COMFY_BASE = 'https://cloud.comfy.org';
 export const COMFY_FPS = 25;
@@ -25,10 +27,10 @@ export const ALLOWED_NODE_TYPES: ReadonlySet<string> = new Set([
   'CFGGuider', 'CLIPTextEncode', 'CheckpointLoaderSimple', 'ComfyMathExpression', 'ComfySwitchNode', 'CreateVideo',
   'EmptyLTXVLatentVideo', 'GetImageSize', 'KSamplerSelect', 'LTXAVTextEncoderLoader', 'LTXVAddGuide', 'LTXVAudioVAEDecode',
   'LTXVAudioVAELoader', 'LTXVConcatAVLatent', 'LTXVConditioning', 'LTXVCropGuides', 'LTXVEmptyLatentAudio',
-  'LTXVImgToVideoInplace', 'LTXVLatentUpsampler', 'LTXVPreprocess', 'LTXVSeparateAVLatent', 'LatentUpscaleModelLoader',
-  'LoadImage', 'LoraLoader', 'LoraLoaderModelOnly', 'ManualSigmas', 'PreviewAny', 'PrimitiveBoolean', 'PrimitiveFloat',
+  'LTXVAudioVAEEncode', 'LTXVImgToVideoInplace', 'LTXVLatentUpsampler', 'LTXVPreprocess', 'LTXVSeparateAVLatent', 'LatentUpscaleModelLoader',
+  'LoadAudio', 'LoadImage', 'LoraLoader', 'LoraLoaderModelOnly', 'ManualSigmas', 'PreviewAny', 'PrimitiveBoolean', 'PrimitiveFloat',
   'PrimitiveInt', 'PrimitiveStringMultiline', 'RandomNoise', 'ResizeImageMaskNode', 'SamplerCustomAdvanced',
-  'SamplerEulerAncestral', 'SaveVideo', 'TextGenerateLTX2Prompt', 'VAEDecodeTiled',
+  'SamplerEulerAncestral', 'SaveVideo', 'SetLatentNoiseMask', 'SolidMask', 'TrimAudioDuration', 'TextGenerateLTX2Prompt', 'VAEDecodeTiled',
 ]);
 
 export type ComfyGraph = Record<string, { class_type: string; inputs: Record<string, unknown> }>;
@@ -40,13 +42,15 @@ export function assertOpenWeightGraph(graph: ComfyGraph): void {
   if (bad.length > 0) throw new Error(`comfy graph has non-allow-listed nodes (partner/API nodes are refused): ${bad.join(', ')}`);
 }
 
-export type ComfyWorkflow = 'ltx23_i2v' | 'ltx23_flf2v';
+export type ComfyWorkflow = 'ltx23_i2v' | 'ltx23_flf2v' | 'ltx23_ia2v' | 'ltx23_flf_ia2v';
 
 export interface ComfyJobSpec {
   workflow: ComfyWorkflow;
   /** Uploaded input names (from `uploadImage`). `lastImage` only for flf2v. */
   firstImage: string;
   lastImage?: string;
+  /** Uploaded input name of the padded dialogue audio (ia2v workflows). */
+  audio?: string;
   prompt: string;
   negativePrompt?: string;
   width: number;
@@ -62,8 +66,13 @@ export const NEG_DEFAULT = 'pc game, console game, video game, cartoon, childish
 
 /** Patch the node map found in the 10-03/10-04 tests (comfy-story-test/run.py). */
 export function buildGraph(spec: ComfyJobSpec): ComfyGraph {
-  const g = structuredClone(spec.workflow === 'ltx23_i2v' ? i2vWorkflow : flf2vWorkflow) as unknown as ComfyGraph;
+  const src = { ltx23_i2v: i2vWorkflow, ltx23_flf2v: flf2vWorkflow, ltx23_ia2v: ia2vWorkflow, ltx23_flf_ia2v: flfIa2vWorkflow }[spec.workflow];
+  const g = structuredClone(src) as unknown as ComfyGraph;
   const neg = [spec.negativePrompt, NEG_DEFAULT].filter(Boolean).join(', ');
+  const needAudio = spec.workflow === 'ltx23_ia2v' || spec.workflow === 'ltx23_flf_ia2v';
+  const needLast = spec.workflow === 'ltx23_flf2v' || spec.workflow === 'ltx23_flf_ia2v';
+  if (needAudio && !spec.audio) throw new Error(`${spec.workflow} needs audio`);
+  if (needLast && !spec.lastImage) throw new Error(`${spec.workflow} needs lastImage`);
   if (spec.workflow === 'ltx23_i2v') {
     g['269'].inputs.image = spec.firstImage;
     g['320:319'].inputs.value = spec.prompt;
@@ -73,8 +82,18 @@ export function buildGraph(spec: ComfyJobSpec): ComfyGraph {
     g['320:301'].inputs.value = spec.durationS;
     g['320:276'].inputs.noise_seed = spec.seed;
     g['320:313'].inputs.text = `${g['320:313'].inputs.text as string}, ${neg}`;
+  } else if (spec.workflow === 'ltx23_ia2v') {
+    // Audio-driven: the clip length is the audio's (340:331, float seconds).
+    g['269'].inputs.image = spec.firstImage;
+    g['276'].inputs.audio = spec.audio;
+    g['340:319'].inputs.value = spec.prompt;
+    g['340:330'].inputs.value = spec.width;
+    g['340:324'].inputs.value = spec.height;
+    g['340:331'].inputs.value = Number(spec.durationS);
+    g['340:285'].inputs.noise_seed = spec.seed;
+    g['340:314'].inputs.text = `${g['340:314'].inputs.text as string}, ${neg}`;
   } else {
-    if (!spec.lastImage) throw new Error('ltx23_flf2v needs lastImage');
+    // flf2v and flf_ia2v share the 129:* subgraph; the latter adds the audio.
     g['31'].inputs.image = spec.firstImage;
     g['39'].inputs.image = spec.lastImage;
     g['129:128'].inputs.text = spec.prompt;
@@ -84,6 +103,10 @@ export function buildGraph(spec: ComfyJobSpec): ComfyGraph {
     g['129:114'].inputs.value = spec.fps;
     g['129:102'].inputs.value = spec.durationS;
     g['129:100'].inputs.noise_seed = spec.seed;
+    if (spec.workflow === 'ltx23_flf_ia2v') {
+      g['276'].inputs.audio = spec.audio;
+      g['129:200'].inputs.value = Number(spec.durationS);
+    }
   }
   assertOpenWeightGraph(g);
   return g;
@@ -104,7 +127,8 @@ const f = (t: ComfyTransport): typeof fetch => t.fetchImpl ?? fetch;
 const base = (t: ComfyTransport): string => t.baseUrl ?? COMFY_BASE;
 const headers = (t: ComfyTransport): Record<string, string> => ({ 'X-API-Key': t.apiKey });
 
-/** Download `url` and upload it as a Comfy input image; returns the input name. */
+/** Download `url` and upload it as a Comfy input (image or audio — same
+ * endpoint); returns the input name. */
 export async function uploadImage(t: ComfyTransport, url: string, name: string): Promise<string> {
   const src = await f(t)(url);
   if (!src.ok) throw new Error(`comfy upload: GET ${url} -> HTTP ${src.status}`);

@@ -33,9 +33,12 @@ export interface ManifestFrame {
   /** A still for the tail to Ken Burns, when the project has no motion
    * model (`options.motionEngine: 'animate'`). */
   imageUrl?: string;
-  /** Narration. Always required — the tail sizes the clip to its REAL
-   * probed length, not to `durationS`. */
-  audioUrl: string;
+  /** Narration. Required unless `clipAudioOnly` — the tail sizes the clip to
+   * its REAL probed length, not to `durationS`. */
+  audioUrl?: string;
+  /** An LTX action frame (`audioMode: 'sfx-only'`): nobody speaks, so there is
+   * no narration; the clip's own audio is the frame's audio at full level. */
+  clipAudioOnly?: boolean;
   durationS: number | null;
   narration: string;
   /** True when `videoUrl` carries MMAudio's SFX track (the mp4 MMAudio

@@ -12,9 +12,25 @@
  */
 import type { BuildContext, PayloadBuilder } from './types';
 
+const IMAGE_STEP_SEQ = 1;
+const CHAR_REF_SEQ = 19;
+
 export const buildImageEditInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
   const attribution: Record<string, unknown> = { project_id: ctx.projectId };
   if (ctx.frameId) attribution.frame_id = ctx.frameId;
+  // LTX project with characters: edit the frame's character reference
+  // (builders/char-ref.ts) into the scene; a frame with no characters already
+  // has its still from the t2i kind, which this row passes through.
+  if (ctx.job.characterRefs) {
+    const ref = ctx.resolvedDeps[CHAR_REF_SEQ]?.url;
+    if (ctx.job.characterRefs.length === 0) {
+      const still = ctx.resolvedDeps[IMAGE_STEP_SEQ]?.url;
+      if (!still) throw new Error(`image-edit builder: no t2i still for frame ${ctx.frameId ?? '(none)'}`);
+      return { __passthroughUrl: still };
+    }
+    if (!ref) throw new Error(`image-edit builder: no character reference for frame ${ctx.frameId ?? '(none)'}`);
+    return { image_url: ref, prompt: ctx.job.imagePrompt, ...attribution };
+  }
   if (!ctx.job.referenceImageUrl) {
     throw new Error(`image-edit builder: no referenceImageUrl for frame ${ctx.frameId ?? '(none)'}`);
   }

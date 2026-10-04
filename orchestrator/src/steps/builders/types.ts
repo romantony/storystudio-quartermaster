@@ -132,13 +132,27 @@ export interface FrameJobInput {
   // ── LTX-2.3 (options.motionEngine === 'ltx'), see agents/planner.ts ──
   shotKind?: 'i2v' | 'flf' | 'ia2v' | 'flf_ia2v';
   characters?: string[];
+  /** Reference image urls of `characters`, in order. Present (possibly empty)
+   * only on LTX projects that have characters — it switches the image chain
+   * to edit-the-reference (builders/char-ref.ts, image.ts, image-edit.ts). */
+  characterRefs?: string[];
   lastFrameEdit?: string;
   stateLocks?: string[];
   negativePrompt?: string;
   soundCues?: string[];
   cameraMove?: string;
-  audioMode?: 'sfx-under-narration' | 'clip';
+  audioMode?: 'sfx-under-narration' | 'clip' | 'sfx-only';
+  actionS?: number;
+  lastFramePrompt?: string;
+  shotType?: string;
+  /** Dialogue frames: `narration` carries the spoken line; this adds the lead. */
+  dialogue?: { speaker: string; line: string; delivery?: string; leadS?: number };
 }
+
+/** Completed-but-not-applicable marker: a row whose kind does not apply to this
+ * frame completes with a `skip:` url so the chain can advance; `toResolvedDeps`
+ * hides it from builders. */
+export const SKIP_URL_PREFIX = 'skip:';
 
 export type FallbackRung = 'flux-4b' | 'replicate-wan22-fast';
 

@@ -8,6 +8,7 @@ import {
   assertManifest,
   buildFinalizeArgs,
   buildFinalizeFilter,
+  clipAudioArgs,
   createTiktokAss,
   escapeFfmpegFilterPath,
   evenDims,
@@ -279,5 +280,22 @@ describe('buildFinalizeArgs', () => {
 describe('s3Url', () => {
   it('builds the virtual-hosted URL the rest of the pipeline already uses', () => {
     expect(s3Url('qm-bucket', 'projects/p/tail/video.mp4')).toBe('https://qm-bucket.s3.us-east-1.amazonaws.com/projects/p/tail/video.mp4');
+  });
+});
+
+describe('action frames (clipAudioOnly)', () => {
+  const base = { version: 3, projectId: 'p', fps: 25, project: { aspectRatio: '16:9', language: 'en', frameCount: 1 }, droppedFrames: [], steps: { removeSilence: false, burnCaptions: false } };
+  it('accepts a clip with no narration audio when clipAudioOnly', () => {
+    const f = { frameId: 'a', seq: 0, videoUrl: 'https://cdn/a.mp4', clipAudioOnly: true, durationS: 6, narration: '' };
+    expect(() => assertManifest({ ...base, frames: [f] })).not.toThrow();
+  });
+  it('still requires audioUrl otherwise, and a clip for clipAudioOnly', () => {
+    expect(() => assertManifest({ ...base, frames: [{ frameId: 'a', seq: 0, videoUrl: 'v', durationS: 1, narration: '' }] })).toThrow(/audioUrl is required/);
+    expect(() => assertManifest({ ...base, frames: [{ frameId: 'a', seq: 0, imageUrl: 'i', clipAudioOnly: true, durationS: 1, narration: '' }] })).toThrow(/needs a videoUrl/);
+  });
+  it('keeps the clip audio (no narration input) and stream-copies the video', () => {
+    const a = clipAudioArgs('in.mp4', 'out.mp4');
+    expect(a.filter((x) => x === '-i')).toHaveLength(1);
+    expect(a.join(' ')).toContain('-map 0:v:0 -map 0:a:0 -c:v copy -c:a aac');
   });
 });

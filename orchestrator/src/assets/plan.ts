@@ -33,6 +33,7 @@
  * change cannot re-route a project that is already half generated.
  */
 import type { OrchestratorRequest } from '../agents/planner';
+import { SKIP_URL_PREFIX } from '../steps/builders/types';
 import { ASSET_SPECS, assetSpec, type AssetKind, type AssetStage } from './kinds';
 
 export interface AssetPlan {
@@ -97,13 +98,22 @@ export interface TailSteps {
  */
 export function compilePlan(req: OrchestratorRequest): AssetPlan {
   const o = req.options;
-  const imageKind: AssetKind = o.referenceImage ? 'qwen-edit' : 'qwen-image-gen';
+  const imageKind: AssetKind =
+    o.referenceImage || (o.motionEngine === 'ltx' && req.frames.some((f) => (f.characters ?? []).length > 0)) ? 'qwen-edit' : 'qwen-image-gen';
   const motionKind: AssetKind =
     o.motionEngine === 'animate' ? 'animate' : o.motionEngine === 'ltx' ? 'comfy-video' : 'wan2-i2v';
   // MMAudio listens to generated motion; a Ken Burns move over a still has
   // nothing for it to hear, and narration-basic has no SFX. LTX clips carry
   // their own SFX, so MMAudio never runs for them either.
   const sfx = motionKind === 'wan2-i2v' && o.sfx ? ('mmaudio' as const) : undefined;
+  // Dialogue frames pad their TTS line for lip-sync (LTX generates the ambience
+  // itself from the prompt — no MMAudio, operator 2026-10-04).
+  const hasDialogue = motionKind === 'comfy-video' && req.frames.some((f) => f.dialogue);
+  // StoryStudio sends each character's reference image. A frame with characters
+  // is an EDIT of that reference (two: a side-by-side composite); a frame with
+  // none is plain text-to-image. Both image kinds are planned, chained so the
+  // final one (`qwen-edit`) always holds the frame's still.
+  const charFrames = motionKind === 'comfy-video' && req.frames.some((f) => (f.characters ?? []).length > 0);
 
   const requires: Record<string, AssetKind[]> = {
     [imageKind]: [],
@@ -111,14 +121,25 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
   };
   // LTX `flf` shots need a last frame; the kind exists only when one does, and
   // is a passthrough for the frames that are plain `i2v`.
-  const needsLast = motionKind === 'comfy-video' && req.frames.some((f) => f.shotKind === 'flf');
+  const needsLast = motionKind === 'comfy-video' && req.frames.some((f) => f.shotKind === 'flf' || f.shotKind === 'flf_ia2v');
+  if (charFrames) {
+    requires['char-ref'] = [];
+    requires['qwen-image-gen'] = ['char-ref'];
+    requires['qwen-edit'] = ['qwen-image-gen', 'char-ref'];
+  }
   if (needsLast) requires['comfy-last'] = [imageKind];
+  if (hasDialogue) requires['dialogue-audio'] = ['tts'];
   if (motionKind) {
     // Motion needs the still AND the narration — not for the audio, but for
     // its real generated length. builders/i2v.ts sizes the clip to it; the
     // caller's estimate and the real narration routinely diverge and the
     // tail's `-shortest` mux silently clips the difference.
-    requires[motionKind] = [imageKind, 'tts', ...(needsLast ? (['comfy-last'] as const) : [])];
+    requires[motionKind] = [
+      imageKind,
+      'tts',
+      ...(needsLast ? (['comfy-last'] as const) : []),
+      ...(hasDialogue ? (['dialogue-audio'] as const) : []),
+    ];
   }
   // MMAudio runs right after the motion clip, per frame (operator, 2026-10-02).
   if (sfx) requires[sfx] = [motionKind];
@@ -217,6 +238,9 @@ export function toResolvedDeps(
   for (const [kind, value] of Object.entries(sources)) {
     const spec = ASSET_SPECS[kind as AssetKind];
     if (!spec || !value) continue;
+    // A frame this kind does not apply to completes with a `skip:` url so the
+    // chain can advance; builders must see it as absent.
+    if (typeof value.url === 'string' && value.url.startsWith(SKIP_URL_PREFIX)) continue;
     out[spec.legacySeq] = { url: value.url, durationS: value.durationS };
   }
   return out;

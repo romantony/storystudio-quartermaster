@@ -16,7 +16,7 @@
  * request shape) — falls through to speaker/instruct design mode when
  * cloneArtifactUrl is absent, same as before.
  */
-import type { BuildContext, PayloadBuilder } from './types';
+import { SKIP_URL_PREFIX, type BuildContext, type PayloadBuilder } from './types';
 
 const KOKORO_LANG_CODE: Record<string, string> = {
   english: 'a',
@@ -26,6 +26,8 @@ const KOKORO_LANG_CODE: Record<string, string> = {
 };
 
 export const buildTtsInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
+  // An action frame (audioMode 'sfx-only') has nothing to say: no TTS, no captions.
+  if (ctx.job.audioMode === 'sfx-only') return { __passthroughUrl: `${SKIP_URL_PREFIX}none` };
   const attribution: Record<string, unknown> = { project_id: ctx.projectId };
   if (ctx.frameId) attribution.frame_id = ctx.frameId;
 

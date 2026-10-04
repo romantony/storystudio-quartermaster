@@ -33,7 +33,9 @@ const FrameSchema = z
   .object({
     frameId: z.string().min(1),
     imagePrompt: z.string().min(1),
-    narration: z.string().min(1),
+    // Optional only for dialogue frames (the spoken line is `dialogue.line`);
+    // validateRequest enforces exactly one of the two.
+    narration: z.string().min(1).optional(),
     durationS: z.number().positive(),
     motionPrompt: z.string().optional(),
     // Sound description for step 15 (MMAudio): SFX, ambience, environmental
@@ -99,16 +101,54 @@ const FrameSchema = z
     soundCues: z.array(z.string().min(1)).max(8).optional(),
     cameraMove: z.string().min(1).optional(),
     // 'sfx-under-narration': the clip's own SFX is mixed under the narration.
-    audioMode: z.enum(['sfx-under-narration', 'clip']).optional(),
+    // 'sfx-under-narration' (narration frame), 'clip' (dialogue frame: the clip's
+    // audio is our line), 'sfx-only' (action frame: no narration/dialogue/TTS —
+    // the clip's own LTX sound IS the audio, at full level).
+    audioMode: z.enum(['sfx-under-narration', 'clip', 'sfx-only']).optional(),
+    // This shot's own action time (2-10 s; the whole shot for an action frame).
+    // clip length = min(10, max(5, leadS + ttsSeconds + actionS)).
+    actionS: z.number().min(1).max(10).optional(),
+    // The LAST frame written out in full (action frames); `lastFrameEdit` is
+    // what QM runs. Carried for QA / a direct-generation route.
+    lastFramePrompt: z.string().min(1).optional(),
+    // Dialogue Basic shot type (backend/convex/lib/shotTypes.ts catalogue);
+    // not enumerated here — StoryStudio owns the catalogue.
+    shotType: z.string().min(1).optional(),
+    // Dialogue Basic: one character speaks the line, lip-synced (ia2v/flf_ia2v).
+    // The line is OUR TTS in that character's voice, padded with `leadS` of
+    // silence before the lips move (default 0.4 s).
+    dialogue: z
+      .object({
+        speaker: z.string().min(1),
+        line: z.string().min(1),
+        delivery: z.string().optional(),
+        leadS: z.number().min(0).max(2).optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
 const CharacterSchema = z
   .object({
     id: z.string().min(1),
-    sheetPrompt: z.string().min(1),
     description: z.string().min(1),
-    referenceImageUrl: z.string().url().optional(),
+    // The CDN url of the image StoryStudio generated for this character (its
+    // existing flow). Always present; QM never generates a character.
+    referenceImageUrl: z.string().url(),
+    // Speakers only: ONE voice per character. `instruct` is a Qwen3-TTS voice
+    // design, `cloneArtifactUrl`/`voiceId` the catalog fallbacks. Overrides the
+    // request-level narrator voice for that speaker's lines.
+    voice: z
+      .object({
+        instruct: z.string().min(1).optional(),
+        gender: z.string().optional(),
+        language: z.string().optional(),
+        voiceId: z.string().min(1).optional(),
+        cloneArtifactUrl: z.string().url().optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -271,7 +311,10 @@ const STEP_TOPOLOGY: ReadonlyArray<{ seq: number; dialogueOnly?: boolean; gatedB
 ];
 
 function resolveStepSet(req: OrchestratorRequest): number[] {
-  const isDialogue = req.tier.toLowerCase().includes('dialogue');
+  // Dialogue-only steps are InfiniteTalk/PiP; an LTX dialogue project has
+  // neither (its lip-sync is the ia2v workflow), so the tier name alone must
+  // not switch them on.
+  const isDialogue = req.tier.toLowerCase().includes('dialogue') && req.options.motionEngine !== 'ltx';
   return STEP_TOPOLOGY.filter((s) => {
     if (s.dialogueOnly && !isDialogue) return false;
     if (s.gatedBy && !s.gatedBy(req.options)) return false;
@@ -365,7 +408,7 @@ function buildStepsAndJobs(
         input: {
           bgmPrompt: req.bgmPrompt,
           totalDurationS: req.frames.reduce((sum, f) => sum + f.durationS, 0),
-          narrations: req.frames.map((f) => ({ frameId: f.frameId, narration: f.narration })),
+          narrations: req.frames.map((f) => ({ frameId: f.frameId, narration: f.narration ?? f.dialogue?.line ?? '' })),
         },
       });
       continue;
@@ -375,7 +418,7 @@ function buildStepsAndJobs(
       const input: FrameJobInput = {
         frameId: frame.frameId,
         imagePrompt: frame.imagePrompt,
-        narration: frame.narration,
+        narration: frame.narration ?? frame.dialogue?.line ?? '',
         durationS: frame.durationS,
         motionPrompt: frame.motionPrompt,
         audioPrompt: frame.audioPrompt,
@@ -414,20 +457,51 @@ export function validateLtxRequest(req: OrchestratorRequest): void {
   const bad = (path: (string | number)[], message: string): void => {
     issues.push({ code: z.ZodIssueCode.custom, path, message });
   };
-  const known = new Set((req.characters ?? []).map((c) => c.id));
+  const chars = new Map((req.characters ?? []).map((c) => [c.id, c]));
+  const speakers = new Set<string>();
   req.frames.forEach((f, i) => {
     const at = ['frames', i];
     if (!f.shotKind) return bad([...at, 'shotKind'], `frame ${f.frameId}: shotKind is required when motionEngine is 'ltx'`);
-    if (f.shotKind === 'ia2v' || f.shotKind === 'flf_ia2v') {
-      return bad([...at, 'shotKind'], `frame ${f.frameId}: shotKind '${f.shotKind}' (dialogue) is not supported yet`);
+    const dialogueShot = f.shotKind === 'ia2v' || f.shotKind === 'flf_ia2v';
+    const lastFrameShot = f.shotKind === 'flf' || f.shotKind === 'flf_ia2v';
+    const actionShot = f.audioMode === 'sfx-only';
+    if (actionShot) {
+      // Character animation, nobody speaks: no TTS, no captions.
+      if (f.shotKind !== 'flf') bad([...at, 'shotKind'], `frame ${f.frameId}: an sfx-only action frame is always shotKind 'flf'`);
+      if (f.narration) bad([...at, 'narration'], `frame ${f.frameId}: an sfx-only action frame has no narration`);
+      if (f.dialogue) bad([...at, 'dialogue'], `frame ${f.frameId}: an sfx-only action frame has no dialogue`);
+      if (!f.actionS) bad([...at, 'actionS'], `frame ${f.frameId}: an sfx-only action frame needs actionS (the whole shot, 5-10 s)`);
+    } else if (dialogueShot) {
+      if (!f.dialogue) bad([...at, 'dialogue'], `frame ${f.frameId}: shotKind '${f.shotKind}' needs dialogue`);
+      else {
+        speakers.add(f.dialogue.speaker);
+        if (!chars.has(f.dialogue.speaker)) bad([...at, 'dialogue', 'speaker'], `frame ${f.frameId}: unknown speaker '${f.dialogue.speaker}' (not in request.characters)`);
+        if (!(f.characters ?? []).includes(f.dialogue.speaker)) {
+          bad([...at, 'characters'], `frame ${f.frameId}: speaker '${f.dialogue.speaker}' is not among the frame's characters`);
+        }
+      }
+      if (f.narration) bad([...at, 'narration'], `frame ${f.frameId}: a dialogue frame has no narration`);
+    } else {
+      if (f.dialogue) bad([...at, 'dialogue'], `frame ${f.frameId}: dialogue is only valid for ia2v/flf_ia2v`);
+      if (!f.narration) bad([...at, 'narration'], `frame ${f.frameId}: narration is required for '${f.shotKind}'`);
     }
     if (!f.motionPrompt) bad([...at, 'motionPrompt'], `frame ${f.frameId}: motionPrompt is required for LTX`);
-    if (f.shotKind === 'flf' && !f.lastFrameEdit) bad([...at, 'lastFrameEdit'], `frame ${f.frameId}: shotKind 'flf' needs lastFrameEdit`);
-    if (f.shotKind === 'i2v' && f.lastFrameEdit) bad([...at, 'lastFrameEdit'], `frame ${f.frameId}: lastFrameEdit is only valid for 'flf'`);
+    if (lastFrameShot && !f.lastFrameEdit) bad([...at, 'lastFrameEdit'], `frame ${f.frameId}: shotKind '${f.shotKind}' needs lastFrameEdit`);
+    if (!lastFrameShot && f.lastFrameEdit) bad([...at, 'lastFrameEdit'], `frame ${f.frameId}: lastFrameEdit is only valid for 'flf'/'flf_ia2v'`);
     for (const id of f.characters ?? []) {
-      if (!known.has(id)) bad([...at, 'characters'], `frame ${f.frameId}: unknown character '${id}' (not in request.characters)`);
+      if (!chars.has(id)) bad([...at, 'characters'], `frame ${f.frameId}: unknown character '${id}' (not in request.characters)`);
     }
   });
+  // One voice per character: two speakers sharing the request-level voice
+  // would be indistinguishable, so refuse rather than degrade silently.
+  if (speakers.size > 1) {
+    for (const id of speakers) {
+      const v = chars.get(id)?.voice;
+      if (chars.has(id) && !v?.instruct && !v?.voiceId && !v?.cloneArtifactUrl) {
+        bad(['characters'], `speaker '${id}' has no voice (voice.instruct/voiceId/cloneArtifactUrl) but ${speakers.size} characters speak`);
+      }
+    }
+  }
   if (issues.length > 0) throw new PlanValidationError(issues);
 }
 

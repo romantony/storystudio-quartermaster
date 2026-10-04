@@ -75,7 +75,8 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
       const input: FrameJobInput = {
         frameId: frame.frameId,
         imagePrompt: frame.imagePrompt,
-        narration: frame.narration,
+        // A dialogue frame's spoken line goes through TTS as its narration.
+        narration: frame.narration ?? frame.dialogue?.line ?? '',
         durationS: frame.durationS,
         motionPrompt: frame.motionPrompt,
         audioPrompt: frame.audioPrompt,
@@ -90,6 +91,7 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         voiceInstruct: req.voiceInstruct,
         voiceLanguage: req.voiceLanguage,
         cloneArtifactUrl: req.cloneArtifactUrl,
+        ...speakerVoice(req, frame),
         // The same no-silent-degrade flag the cohort path sets, so "SFX
         // wasn't requested" stays distinguishable from "SFX was requested
         // and this frame's asset is missing".
@@ -97,12 +99,17 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         textManifest: frame.textManifest,
         shotKind: frame.shotKind,
         characters: frame.characters,
+        characterRefs: characterRefs(req, frame),
         lastFrameEdit: frame.lastFrameEdit,
         stateLocks: frame.stateLocks,
         negativePrompt: frame.negativePrompt,
         soundCues: frame.soundCues,
         cameraMove: frame.cameraMove,
         audioMode: frame.audioMode,
+        dialogue: frame.dialogue,
+        actionS: frame.actionS,
+        lastFramePrompt: frame.lastFramePrompt,
+        shotType: frame.shotType,
       };
       rows.push({
         kind,
@@ -118,6 +125,35 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
     });
   }
   return rows;
+}
+
+/** LTX projects with characters: the frame's reference images (possibly none —
+ * the key's presence is what switches the image chain). undefined otherwise. */
+function characterRefs(req: OrchestratorRequest, frame: OrchestratorRequest['frames'][number]): string[] | undefined {
+  if (req.options.motionEngine !== 'ltx' || !req.frames.some((f) => (f.characters ?? []).length > 0)) return undefined;
+  const byId = new Map((req.characters ?? []).map((c) => [c.id, c.referenceImageUrl] as const));
+  return (frame.characters ?? []).map((id) => byId.get(id)).filter((u): u is string => !!u);
+}
+
+/** A dialogue frame is spoken in its character's own voice: that character's
+ * voice fields replace the request-level ones, and the delivery direction is
+ * appended to a qwen design instruct. Empty for narration frames. */
+function speakerVoice(req: OrchestratorRequest, frame: OrchestratorRequest['frames'][number]): Partial<FrameJobInput> {
+  if (!frame.dialogue) return {};
+  const c = (req.characters ?? []).find((x) => x.id === frame.dialogue!.speaker);
+  if (!c) return {};
+  const out: Partial<FrameJobInput> = {};
+  const v = c.voice;
+  if (!v) return out;
+  if (v.voiceId) out.voiceId = v.voiceId;
+  if (v.cloneArtifactUrl) out.cloneArtifactUrl = v.cloneArtifactUrl;
+  if (v.language) out.voiceLanguage = v.language;
+  // A character's own design replaces the narrator's: clear the narrator's
+  // clone so a qwen design instruct is not shadowed by it.
+  if (v.instruct && !v.cloneArtifactUrl) out.cloneArtifactUrl = undefined;
+  const instruct = [v.instruct ?? req.voiceInstruct, frame.dialogue.delivery].filter(Boolean).join('. ');
+  if (instruct) out.voiceInstruct = instruct;
+  return out;
 }
 
 /**

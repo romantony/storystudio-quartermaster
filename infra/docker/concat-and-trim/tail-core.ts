@@ -26,7 +26,11 @@ export interface ManifestFrame {
   seq: number;
   videoUrl?: string;
   imageUrl?: string;
-  audioUrl: string;
+  /** Required unless `clipAudioOnly`. */
+  audioUrl?: string;
+  /** LTX action frame (audioMode 'sfx-only'): nobody speaks; the clip's own
+   * audio is the frame's audio, at full level (no narration mux). */
+  clipAudioOnly?: boolean;
   durationS: number | null;
   narration: string;
   sfxFromVideo?: boolean;
@@ -57,7 +61,8 @@ export function assertManifest(m: unknown): asserts m is TailManifest {
   }
   if (!Array.isArray(x.frames) || x.frames.length < 1) throw new Error('manifest has no frames');
   for (const f of x.frames) {
-    if (!f.audioUrl) throw new Error(`frame ${f.frameId}: audioUrl is required`);
+    if (!f.audioUrl && !f.clipAudioOnly) throw new Error(`frame ${f.frameId}: audioUrl is required`);
+    if (f.clipAudioOnly && !f.videoUrl) throw new Error(`frame ${f.frameId}: clipAudioOnly needs a videoUrl`);
     if (!f.videoUrl && !f.imageUrl) throw new Error(`frame ${f.frameId}: needs a videoUrl (generated clip) or an imageUrl (to animate)`);
   }
 }
@@ -124,6 +129,17 @@ export function mergeArgs(
     '-map', '0:v:0', '-map', '[a]',
     '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
     '-shortest', '-movflags', '+faststart', out,
+  ];
+}
+
+/** An action frame: the clip's own audio, re-encoded to the same AAC the other
+ * frames use so the concat is uniform, video stream-copied. */
+export function clipAudioArgs(vid: string, out: string): string[] {
+  return [
+    '-y', '-i', vid,
+    '-map', '0:v:0', '-map', '0:a:0',
+    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
+    '-movflags', '+faststart', out,
   ];
 }
 
