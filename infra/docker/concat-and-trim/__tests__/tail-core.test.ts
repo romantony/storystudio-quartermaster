@@ -10,6 +10,8 @@ import {
   buildFinalizeFilter,
   clipAudioArgs,
   createTiktokAss,
+  groupWordCues,
+  dedupeOverlappingCues,
   escapeFfmpegFilterPath,
   evenDims,
   formatAssTime,
@@ -297,5 +299,59 @@ describe('action frames (clipAudioOnly)', () => {
     const a = clipAudioArgs('in.mp4', 'out.mp4');
     expect(a.filter((x) => x === '-i')).toHaveLength(1);
     expect(a.join(' ')).toContain('-map 0:v:0 -map 0:a:0 -c:v copy -c:a aac');
+  });
+});
+
+describe('captions from per-word cues', () => {
+  const cue = (i: number, a: number, b: number, w: string) => `${i}\n${t(a)} --> ${t(b)}\n${w}\n\n`;
+  const t = (x: number) => `00:00:${String(Math.floor(x)).padStart(2, '0')},${String(Math.round((x % 1) * 1000)).padStart(3, '0')}`;
+  // Real Whisper timings from qm-ltx-dlg-live-20261004-04: Mara's line ends at
+  // 10.62 s, Tobin's "Then" is spoken at 12.78 s.
+  const srt =
+    cue(1, 8.74, 9.06, 'keep') + cue(2, 9.06, 10.02, "someone's") + cue(3, 10.02, 10.62, 'promise.') +
+    cue(4, 12.78, 13.14, 'Then') + cue(5, 13.14, 13.88, 'can') + cue(6, 13.88, 14.0, 'you');
+
+  it('never groups words across a silence or a sentence end', () => {
+    const groups = groupWordCues(parseSrtEntries(srt)).map((g) => g.map((w) => w.text));
+    expect(groups).toEqual([['keep', "someone's", 'promise.'], ['Then', 'can', 'you']]);
+  });
+
+  it('shows the next speaker\'s first word no earlier than it is spoken', () => {
+    const lines = createTiktokAss(srt, 1920, 1080).split('\n').filter((l) => l.startsWith('Dialogue:'));
+    const first = lines.find((l) => l.includes('THEN'))!;
+    expect(first).toMatch(/Dialogue: 0,0:00:12.7[78],/); // not 8.74 as in the evenly-split 4-word cue
+    expect(lines.filter((l) => l.includes('THEN') && l.includes('PROMISE'))).toHaveLength(0);
+  });
+
+  it('highlights each word over its own spoken interval', () => {
+    const lines = createTiktokAss(srt, 1920, 1080).split('\n').filter((l) => l.startsWith('Dialogue:'));
+    const promise = lines.find((l) => l.includes('{\\c&H0000D4FF}PROMISE.'))!;
+    expect(promise).toMatch(/Dialogue: 0,0:00:10.0[12],0:00:10.6[12],/);
+  });
+
+  it('breaks a group at the word limit', () => {
+    const many = ['a', 'b', 'c', 'd', 'e'].map((w, i) => cue(i + 1, i * 0.3, i * 0.3 + 0.3, w)).join('');
+    expect(groupWordCues(parseSrtEntries(many)).map((g) => g.length)).toEqual([4, 1]);
+  });
+
+  it('shows each word once when the transcriber returns an overlapped window twice', () => {
+    // Live shape from js7d0d5p…: the first pass ends at 24.7 s, the second restarts at 20.0 s.
+    const dup =
+      cue(1, 19.26, 19.38, 'The') + cue(2, 19.38, 19.7, 'water') + cue(3, 19.7, 20.08, 'vapor') + cue(4, 20.08, 20.56, 'cools') +
+      cue(5, 20.56, 21.18, 'instantly') + cue(6, 21.18, 21.58, 'and') +
+      cue(7, 20.0, 20.46, 'cools') + cue(8, 20.46, 21.14, 'instantly') + cue(9, 21.14, 21.6, 'and') +
+      cue(10, 21.6, 22.2, 'condenses');
+    const words = dedupeOverlappingCues(parseSrtEntries(dup)).map((e) => e.text);
+    expect(words).toEqual(['The', 'water', 'vapor', 'cools', 'instantly', 'and', 'condenses']);
+    const lines = createTiktokAss(dup, 1920, 1080).split('\n').filter((l) => l.startsWith('Dialogue:'));
+    expect(lines).toHaveLength(7);
+  });
+
+  it('drops a run of zero-length cues from a decoding loop', () => {
+    const loop =
+      cue(1, 28.96, 29.84, 'Together,') + cue(2, 29.98, 29.98, 'millions') + cue(3, 29.98, 29.98, 'of') + cue(4, 29.98, 29.98, 'people') +
+      cue(5, 29.6, 30.06, 'millions') + cue(6, 30.06, 30.32, 'of') + cue(7, 30.32, 30.68, 'crystals');
+    // The restart at 29.6 supersedes "Together," (28.96 -> kept) only from 29.6 on; the loop never shows.
+    expect(dedupeOverlappingCues(parseSrtEntries(loop)).map((e) => e.text)).toEqual(['Together,', 'millions', 'of', 'crystals']);
   });
 });

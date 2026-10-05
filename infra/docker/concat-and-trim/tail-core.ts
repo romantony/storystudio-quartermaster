@@ -328,6 +328,50 @@ function renderHighlightedText(words: string[], highlightIdx: number): string {
   return `${first}\\N${second}`;
 }
 
+/** A silence longer than this between two words starts a new caption group, so a
+ * line never sits on screen through a pause (or a hand-off between speakers)
+ * waiting for words that have not been spoken yet. */
+export const CAPTION_GROUP_GAP_S = 0.6;
+
+/** Cleans a per-word transcript before it is shown. Two defects were seen live
+ * (js7d0d5p…, 243 cues for ~170 spoken words, two caption lines on screen):
+ *  - the transcriber stitches overlapping audio windows and returns the overlap
+ *    twice. When the file steps back in time, the later window supersedes the
+ *    earlier one's tail: cues from the restart point on are dropped, then the new
+ *    window's cues follow.
+ *  - a decoding loop emits runs of zero-length cues ("millions of people and ..."
+ *    all at one timestamp). A spoken word is never that short, so they are dropped. */
+export function dedupeOverlappingCues(entries: SrtEntry[]): SrtEntry[] {
+  const kept: SrtEntry[] = [];
+  let lastStart = -Infinity;
+  for (const e of entries) {
+    if (e.end - e.start < 0.02) continue;
+    if (e.start < lastStart - 0.02) {
+      while (kept.length > 0 && kept[kept.length - 1].start >= e.start - 0.02) kept.pop();
+    }
+    kept.push(e);
+    lastStart = e.start;
+  }
+  return kept;
+}
+
+/** Groups per-word cues into caption lines of at most TIKTOK_MAX_WORDS_PER_CUE
+ * words, breaking at a long gap or after sentence-final punctuation. */
+export function groupWordCues(entries: SrtEntry[]): SrtEntry[][] {
+  const groups: SrtEntry[][] = [];
+  let cur: SrtEntry[] = [];
+  for (const e of entries) {
+    const prev = cur[cur.length - 1];
+    if (prev && (e.start - prev.end > CAPTION_GROUP_GAP_S || /[.?!]["')\]]?$/.test(prev.text.trim()) || cur.length >= TIKTOK_MAX_WORDS_PER_CUE)) {
+      groups.push(cur);
+      cur = [];
+    }
+    cur.push(e);
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+
 export type CaptionPlacement = 'bottom' | 'above-overlay';
 
 /** One Dialogue line per word, each highlighted in turn across its cue.
@@ -360,6 +404,22 @@ Style: Default,Montserrat,${TIKTOK_FONT_SIZE},${primary},${primary},${outline},&
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
+
+  // Per-word cues (the transcriber ran with words_per_group 1) carry real word
+  // timings: group them here, breaking at silences and sentence ends, and
+  // highlight each word over its own interval. A multi-word cue only knows its
+  // outer bounds, so it falls back to splitting that interval evenly.
+  if (entries.length > 0 && entries.every((e) => e.text.trim().split(/\s+/).length === 1)) {
+    for (const group of groupWordCues(dedupeOverlappingCues(entries))) {
+      const words = group.map((g) => g.text.trim());
+      group.forEach((w, idx) => {
+        const next = group[idx + 1];
+        const we = next ? Math.max(next.start, w.end) : w.end;
+        ass += `Dialogue: 0,${formatAssTime(w.start)},${formatAssTime(Math.max(we, w.start + 0.05))},Default,,0,0,0,,${renderHighlightedText(words, idx)}\n`;
+      });
+    }
+    return ass;
+  }
 
   for (const entry of entries) {
     const words = entry.text.trim().split(/\s+/).filter(Boolean);

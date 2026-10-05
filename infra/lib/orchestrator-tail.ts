@@ -251,7 +251,9 @@ export function buildOrchestratorTailDefinition(cfg: OrchestratorTailConfig): De
       // Without it Whisper guesses, and transcribes e.g. Hindi as English phonetics.
       'language.$': '$.language',
       return_timestamps: 'word',
-      words_per_group: 4,
+      // One cue per word: finalize groups them itself, so each highlight lands
+      // on the real word timing (a 4-word cue only has its outer bounds).
+      words_per_group: 1,
     },
     resultField: 'srtUrl',
     outputField: 'srtUrl',

@@ -390,7 +390,7 @@ describe('the happy path', () => {
     expect(submit).toEqual({
       action: 'submit',
       endpointId: '6apg6j7suzuezw',
-      input: { mode: 'transcribe', audio_url: META.audioUrl, task: 'transcribe', language: 'hi', return_timestamps: 'word', words_per_group: 4 },
+      input: { mode: 'transcribe', audio_url: META.audioUrl, task: 'transcribe', language: 'hi', return_timestamps: 'word', words_per_group: 1 },
     });
   });
 
