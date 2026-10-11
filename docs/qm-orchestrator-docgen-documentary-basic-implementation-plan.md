@@ -1,7 +1,7 @@
 # Documentary Basic on doc-gen: implementation plan
 
 **Date:** 2026-10-11
-**Status:** plan only, nothing built.
+**Status (updated 2026-10-11, end of day):** phases 0 to 3 are built. The orchestrator side (phases 1 and 2) is deployed and was verified with two real back-to-back jobs. The StoryStudio side (phase 3) is deployed to Convex production with `QM_DOCGEN_MODE=live`, but **no real MCP project has gone through it yet**; that check and phase 4 are next (`docs/TODO.md`, 2026-10-12). Sections 1 to 7 are the original plan with decisions, steps and phases marked up with what happened; section 8 lists every place the build differs from it.
 **Sources:** `~/local-gen-documentary/docs/ORCHESTRATOR_INTEGRATION.md` (the doc-gen contract, called "the contract" below) and `DOCKER_SERVICE_DESIGN.md`; `orchestrator/` in this repository; `storystudio-unified/backend/convex/orchestrator/`.
 
 ## 1. What is being built
@@ -28,20 +28,21 @@ This is a separate path from the per-frame asset pipeline. A documentary has no 
 
 ## 2. Decisions needed before coding
 
-| # | Decision | Recommendation |
-|---|---|---|
-| D1 | `review_mode` for StoryStudio requests | `auto`. These are background requests with no reviewer waiting. With `checkpoints` the instance stays up and billing at each pause, and `max_runtime_minutes` keeps counting. Build the checkpoint routes in phase 4 for operator-submitted jobs. |
-| D2 | AWS credential for start and stop | Create an access key for the existing `docgen-orchestrator` IAM user and pass it under separate variable names. The existing credential keeps its Lambda and Step Functions scope. |
-| D3 | Which StoryStudio projects route here | MCP-created `documentary-basic`, English only, behind a new `QM_DOCGEN_MODE` switch (off, live). Projects made in the UI keep the current Step Functions path, because that flow has a script and storyboard editing step that doc-gen replaces. |
-| D4 | Duration mismatch | StoryStudio accepts 5 to 15 minutes; doc-gen builds 4 to 12 (`long.target_seconds` 240 to 720). Clamp to 720 and add a line to the result `warnings`, or lower StoryStudio's limit to 12. Recommend lowering the limit for routed projects. |
-| D5 | Automatic retry of a failed job | One retry at most, only when `error.retryable` is true and the code is `internal` or `llm_error`. A retry starts from nothing and pays for generation again, so `timeout` and `generation_failed` go to an operator. |
-| D6 | Paid-generation defaults | Use the doc-gen defaults (3 talking clips, 10 animated stills, 3 Shorts) unless StoryStudio's request says otherwise. Costs per episode are not measured yet. |
+| # | Decision | Recommendation | Outcome |
+|---|---|---|---|
+| D1 | `review_mode` for StoryStudio requests | `auto`. These are background requests with no reviewer waiting. With `checkpoints` the instance stays up and billing at each pause, and `max_runtime_minutes` keeps counting. Build the checkpoint routes in phase 4 for operator-submitted jobs. | **As recommended.** `DOCGEN_REVIEW_MODE` defaults to `auto`. The checkpoint routes are not built (phase 4). |
+| D2 | AWS credential for start and stop | Create an access key for the existing `docgen-orchestrator` IAM user and pass it under separate variable names. The existing credential keeps its Lambda and Step Functions scope. | **Changed by the user.** No new key: inline policy `QMOrchestratorDocgenInstanceControl` (start/stop on the one instance, plus describe) on the existing user `qm-orchestrator-remotion-invoke`, whose key is already on the VPS. The default AWS credential chain is used; there are no `DOCGEN_AWS_*` variables. The `docgen-orchestrator` user is unused. |
+| D3 | Which StoryStudio projects route here | MCP-created `documentary-basic`, English only, behind a new `QM_DOCGEN_MODE` switch (off, live). Projects made in the UI keep the current Step Functions path, because that flow has a script and storyboard editing step that doc-gen replaces. | **As recommended.** Set to `live` in production on 2026-10-11. |
+| D4 | Duration mismatch | StoryStudio accepts 5 to 15 minutes; doc-gen builds 4 to 12 (`long.target_seconds` 240 to 720). Clamp to 720 and add a line to the result `warnings`, or lower StoryStudio's limit to 12. Recommend lowering the limit for routed projects. | **As recommended.** A routed `create_project` must ask for 5 to 12 minutes (400 otherwise). |
+| D5 | Automatic retry of a failed job | One retry at most, only when `error.retryable` is true and the code is `internal` or `llm_error`. A retry starts from nothing and pays for generation again, so `timeout` and `generation_failed` go to an operator. | **Extended.** Also `instance_unreachable` and `job_lost`, the two codes the orchestrator itself raises when the instance disappears (same kind of loss as `internal`). A retry is re-queued under `<id>-r2`. |
+| D6 | Paid-generation defaults | Use the doc-gen defaults (3 talking clips, 10 animated stills, 3 Shorts) unless StoryStudio's request says otherwise. Costs per episode are not measured yet. | **Confirmed by the user.** Nothing is sent unless the MCP request carries it in `documentaryMetadata.shorts` / `.visuals` / `.series` (strict: an unknown or out-of-range field is a 400). `0` and `false` are preserved. Cost per default episode is still not measured. |
+| D7 | Synopsis (not in the original plan) | The plan said to write one with "the existing script model" when the project has none. | **Decided by the user:** Claude writes it (`MODELS.anthropic.primary`) unless the request carries a real one (at least 40 characters and not the topic echoed back, because the synchronous create path defaults `synopsis` to the topic). Falls back to the requester's notes, then to "A documentary about <topic>." The model call itself has not been run against the live API. |
 
 ## 3. Prerequisites (before any orchestrator code is deployed)
 
-1. Create the access key for `docgen-orchestrator` (contract section 2). Add to `/opt/qm-orchestrator/.env`.
-2. Copy `/docgen/DOCGEN_API_TOKEN` and `/docgen/DOCGEN_CALLBACK_SECRET` from Parameter Store into the VPS `.env`.
-3. From the VPS, run the manual sequence in contract section 10 with a small `auto` request (240 seconds, no Shorts, no talking clips, no animated stills). This is the first real job on the instance and the first call through the public URL after a stop and start; both are listed as untested in contract section 12. It needs a temporary receiver for the webhooks, or accept failed deliveries and poll.
+1. ~~Create the access key for `docgen-orchestrator`.~~ **Not done, by decision D2.** The inline EC2 policy went on the existing orchestrator IAM user instead.
+2. Copy `/docgen/DOCGEN_API_TOKEN` and `/docgen/DOCGEN_CALLBACK_SECRET` from Parameter Store into the VPS `.env`. **Done** (backup `.env.bak-pre-docgen`).
+3. From the VPS, run the manual sequence in contract section 10 with a small `auto` request (240 seconds, no Shorts, no talking clips, no animated stills). **Done 2026-10-11:** job `dg_4b8e2518b5bc` succeeded in 38 minutes (a 212-second video; thumbnail, metadata and credits uploaded, all CDN URLs public). The public URL works from the VPS after a stop and start (four 504s while booting, then 200), and health reported `ready: true` with Storyblocks still connected. Webhook delivery was not exercised (a placeholder callback URL was used and the job was polled).
 
 Step 3 can fail for reasons that have nothing to do with the orchestrator. Finding that out before writing the integration is the point.
 
@@ -181,35 +182,61 @@ One panel on the existing admin dashboard: instance state, the current job with 
 | File | Change |
 |---|---|
 | `lib/orchestratorRouting.ts` | `docgenRoute()`: `QM_DOCGEN_MODE` live, `projectType` is `documentary-basic`, created through MCP, English. Otherwise the current path. |
-| `orchestrator/buildDocgenRequest.ts` (new) | Builds the 4.4 body from `documentaryMetadata`: `topic`, `synopsis`, `targetDurationMin` times 60, voice, Shorts settings. When the project has no synopsis, write a two to three sentence one with the existing script model before submitting; doc-gen requires it. |
+| `lib/docgen.ts` and `orchestrator/docgen.ts` (new; planned as `buildDocgenRequest.ts`) | Builds the 4.4 body from `documentaryMetadata`: `topic`, `synopsis`, `targetDurationMin` times 60, voice, Shorts settings. When the project has no synopsis, write a two to three sentence one with the existing script model before submitting; doc-gen requires it. |
 | `schema.ts` | `orchestratorRequests.kind` (`frames` or `documentary`), optional so old rows stay valid. |
 | `orchestrator/submit.ts` | The outbox drain posts `documentary` rows to `/v1/documentaries`. These rows do not count toward `QM_ORCH_MAX_IN_FLIGHT`, because the orchestrator queues them itself and always answers 202. |
 | `orchestrator/ingest.ts` | No change expected; it already keys on `requestId` and reads `status`. |
-| `orchestrator/postProcessDocumentary.ts` (new) | For `kind: "documentary"`: store the final video URL, the Shorts, the thumbnail and the credits; fetch the metadata file and store title, description and tags; skip StoryStudio's own YouTube-metadata and thumbnail generation, since doc-gen supplies both; put `warnings` on the project; send the completion or failure email. |
-| `orchestrator/watchdog.ts` | An overdue threshold for documentaries: no result 4 hours after acceptance. |
+| `orchestrator/postProcessDocgen.ts` (new; planned as `postProcessDocumentary.ts`) | For `kind: "documentary"`: store the final video URL, the Shorts, the thumbnail and the credits; fetch the metadata file and store title, description and tags; skip StoryStudio's own YouTube-metadata and thumbnail generation, since doc-gen supplies both; put `warnings` on the project; send the completion or failure email. |
+| `orchestrator/watchdog.ts` | An overdue threshold for documentaries: no result 4 hours after acceptance. **Not changed:** the existing rule (6 hours after `estimatedResultAt`) already covers documentary rows, so it was left alone; tightening it is a phase 4 item. |
 | `http.ts` (agent API) | For routed projects, skip the `E2E_STEP_FUNCTION_DOCUMENTARY_BASIC_ARN` requirement and apply the D4 duration limit. |
 
-To confirm while building: whether `documentaryMetadata.voiceName` already holds Gemini voice names (doc-gen expects one, default `Charon`), and where the project stores Shorts so the doc-gen ones appear in the UI.
+Both questions below were answered while building. `voiceName` can hold another provider's voice, so it is forwarded only when it is a Gemini TTS voice (otherwise doc-gen's `Charon` applies). Shorts are stored as rows in the `shorts` table (`language "en"`, `partNumber` 1 to 3, titles taken from doc-gen's ids such as `a_spark`).
 
 ## 6. Phases and how each is verified
 
-| Phase | Work | Done when |
-|---|---|---|
-| 0 | Section 3 prerequisites and the manual job from the VPS | A real job succeeds on the instance and its CDN URLs open |
-| 1 | Migration, repo, client, EC2 wrapper, request mapping, webhook receiver, unit tests | Tests pass; signed sample webhooks from the doc-gen mock runner are applied in `seq` order on the VPS |
-| 2 | Dispatcher, intake and status routes, result callback, config and compose, deploy | A request posted to `/v1/documentaries` with curl starts the instance, runs, delivers a signed result to a test receiver, and the instance stops. Then two requests back to back: the second runs without a stop in between. |
-| 3 | StoryStudio routing, request builder, drain, post-processing | One MCP `documentary-basic` project goes end to end on the Convex dev deployment, then one on production with `QM_DOCGEN_MODE=live` |
-| 4 | Failure handling and operations: silence detection, instance-stopped recovery, the D5 retry, missing-URL re-host, dashboard panel, cancel, checkpoint routes | Each is exercised on purpose: stop the instance mid-job, block the webhook route, cancel a running job |
-| 5 | Update `storystudio-orchestrator-integration.md` with the documentary contract; record measured cost and duration per episode | |
+| Phase | Work | Done when | Status |
+|---|---|---|---|
+| 0 | Section 3 prerequisites and the manual job from the VPS | A real job succeeds on the instance and its CDN URLs open | **Done.** A real 38-minute job succeeded; URLs open. |
+| 1 | Migration, repo, client, EC2 wrapper, request mapping, webhook receiver, unit tests | Tests pass; signed sample webhooks from the doc-gen mock runner are applied in `seq` order on the VPS | **Done and deployed** (`eb3befc`). Signed events sent through the public URL: 401s, a gap, a late and a duplicate event, a heartbeat, a final event with outputs, and no resurrection after the end. |
+| 2 | Dispatcher, intake and status routes, result callback, config and compose, deploy | A request posted to `/v1/documentaries` with curl starts the instance, runs, delivers a signed result to a test receiver, and the instance stops. Then two requests back to back: the second runs without a stop in between. | **Done and deployed** (`8aa6bc5`). Two real jobs (14 and 21 minutes): the instance stayed up between them and stopped after the second; both callbacks were answered 200 by StoryStudio production (the receiver was `accomplished-firefly-291.convex.site`, which answers `unknown_request` for an unknown id and stores nothing). No alerts. |
+| 3 | StoryStudio routing, request builder, drain, post-processing | One MCP `documentary-basic` project goes end to end on the Convex dev deployment, then one on production with `QM_DOCGEN_MODE=live` | **Built, committed and deployed to production** (`2f63107`, `cdb9fad`; `QM_DOCGEN_MODE=live`). **The end-to-end check with a real MCP project is still pending.** |
+| 4 | Failure handling and operations: silence detection, instance-stopped recovery, the D5 retry, missing-URL re-host, dashboard panel, cancel, checkpoint routes | Each is exercised on purpose: stop the instance mid-job, block the webhook route, cancel a running job | **Partly built.** Silence detection, instance-stopped recovery and the D5 retry are in the dispatcher, with 31 scenarios tested against a real Postgres, but have not run live. Cancel, checkpoint and files routes, the missing-URL re-host and the dashboard panel are not built. |
+| 5 | Update `storystudio-orchestrator-integration.md` with the documentary contract; record measured cost and duration per episode | | Not started. |
 
 Phases 1 and 2 are about two days of work, phase 3 about one, phase 4 about one. Phase 0 depends on how the first real doc-gen run behaves.
 
 ## 7. Risks
 
-- **The production path of doc-gen has never run.** Everything on the instance was tested with a mock runner. Phase 0 exists to find this out early.
+- ~~The production path of doc-gen has never run.~~ **Resolved:** three real jobs ran on 2026-10-11. What none of them used: stock footage (see section 8) and talking clips or animated stills (all three runs turned them off).
 - **Storyblocks sign-in lifetime is unknown.** When it expires, every stock job is refused until a person signs in on the instance desktop. The dispatcher holds the queue and alerts; it cannot fix it.
 - **No one hears the audio.** doc-gen reports "No audio has been listened to" as a warning on every job. With `auto` the video reaches the user unreviewed, so StoryStudio should show the warnings.
 - **Output URLs are public as soon as they are reported**, including for jobs that later fail or are cancelled.
 - **One job at a time.** At 1 to 1.5 hours each, ten queued requests take most of a day. `estimatedResultAt` in the acknowledgement should reflect queue position.
 - **Allowed caller address.** doc-gen admits only `129.121.78.38`. If the VPS address changes, every call returns 403 until the CloudFront function is edited.
 - **An instance left running** costs about 127 USD a month. Covered three ways: the dispatcher's explicit stop, the instance's idle stop, and the CloudWatch uptime alarm named in the design document (confirm that alarm exists).
+
+## 8. What was built, and where it differs from the plan
+
+Built 2026-10-11. Orchestrator: `eb3befc` (phase 1), `8aa6bc5` (phase 2). StoryStudio (`storystudio-unified`, `master`): `2f63107`, `cdb9fad`.
+
+**Orchestrator, against sections 4.1 to 4.9**
+- **Files.** The webhook receiver is its own plugin, `src/http/routes/docgen-webhook.ts`, so its raw-body JSON parser stays scoped to that route; intake, status and the admin view are in `src/http/routes/docgen.ts`. Extra modules: `src/docgen/types.ts`, `events.ts` (applies one event; shared by the webhook and by catch-up polling), `signature.ts` and `setup.ts` (builds the client and EC2 transport, or null when the feature is off). Tests: `docgen-request`, `docgen-client`, `docgen-webhook`, `docgen-result`, `docgen-routes`, and two against real Postgres (`docgen-repo.integration`, `docgen-dispatcher.integration`).
+- **Routes.** Built: `POST /v1/documentaries`, `GET /v1/documentaries/:requestId`, `POST /v1/webhooks/docgen`, `GET /v1/admin/docgen`. Not built: the admin cancel, respond and files routes.
+- **Intake.** `tier` must be the literal `documentary-basic`. `requestId` is at most 61 characters so a `-rN` retry suffix still fits doc-gen's 64.
+- **Config.** `DOCGEN_AWS_ACCESS_KEY_ID` and `DOCGEN_AWS_SECRET_ACCESS_KEY` do not exist (D2). The feature is on only when `DOCGEN_BASE_URL`, `DOCGEN_API_TOKEN` and `DOCGEN_CALLBACK_SECRET` are all set. The dispatcher's timings (5-minute boot timeout, 5-minute silence, 10-minute unreachable, and the retry back-offs) are constants in `dispatcher.ts` rather than environment variables.
+- **Dispatcher.** A start the instance refuses (no capacity, still stopping, busy with an unknown job, not ready, bad credentials, a CloudFront 403) goes back to the queue with a back-off and consumes no attempt; a 400 fails the request for good. Only an accepted job counts as an attempt. An output with no URL leaves the instance up (it stops itself after 20 idle minutes) and logs an alert; the automatic re-host is phase 4. Operator alerts are error-level log lines with `alert: true`, not rows in `diagnostic_alerts` (that table is for Sonnet diagnoses).
+- **Estimate.** `estimatedResultAt` is a flat 75 minutes per job ahead, and the response says `estimateBasis: "default"`. The three measured runs took 14, 21 and 38 minutes at the smallest settings.
+
+**StoryStudio, against section 5**
+- **Routing hook.** The single hook is `agentApi.runInlineScriptAndGenerate`, because both ways a project starts (the MCP queue and `POST /projects`) end there.
+- **Bug caught after the first push.** Neither create path stores `documentaryMetadata` on the project; it only travels in that action's `settings`. The first version read it from the project, so it would have used the placeholder title (`Agent Project 3`) as the topic. Fixed in `cdb9fad`: the metadata is passed explicitly, and an admin resubmit reuses the previous documentary request's payload. A pure function, `buildIntakeFromMetadata`, now holds that logic and is unit-tested with the model call injected.
+- **Generated types.** `_generated/api.d.ts` was edited by hand: `convex codegen` pushes to the live dev deployment.
+- **Result handling.** Title, description and tags come from doc-gen's `youtube_metadata.md` (parsed; tested against two real files, saved as fixtures); the thumbnail is doc-gen's own and is saved before the shared terminal effects, so they skip StoryStudio's thumbnail generator. The result's `warnings` are stored only in the `orchestratorRequests` row; the user sees "N notes to review" (showing them is a TODO).
+
+**Measured on the instance**
+- Phase 0: 212-second video in 38 minutes. Phase 2: 215 seconds in 14 minutes and 183 seconds in 21 minutes. All three came out short of the 240-second target.
+- The instance reported image `docgen:e42ee20`, not the overlay build `b08c855`; overlays still rendered. Not explained.
+- doc-gen's `stage` and `message` lag the real work by minutes (it showed "Generating narration" while fetching images), so the dispatcher treats `updated_at` and the heartbeat, not the stage, as the sign of life.
+- Warnings on every job: "No audio has been listened to", plus weak-image notes (a modern photo for a period scene, small line drawings). Wikimedia Commons searches were rate-limited.
+- **Stock footage was never used.** doc-gen reported "stock skipped because the builder takes only images" on both phase 2 jobs. Whether Storyblocks video is used at all is open (it lives in `~/local-gen-documentary`).
+- Cost per default episode (3 talking clips, 10 animated stills, 3 Shorts) has not been measured; none of the three runs used them.
