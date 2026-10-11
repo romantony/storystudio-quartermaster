@@ -2,6 +2,61 @@
 
 Running list of planned/queued work not yet in progress. Add a target date range where known; move to a dated doc under `docs/` once actually started.
 
+## 2026-10-12 (NEXT SESSION) — doc-gen documentaries: live end-to-end check, then phase 4
+
+**State going in:** documentary-basic on the doc-gen EC2 generator is built and deployed on both sides (memory `qm-docgen-documentary-basic`,
+plan `docs/qm-orchestrator-docgen-documentary-basic-implementation-plan.md`). Orchestrator: phase 1 `eb3befc`, phase 2 `8aa6bc5` (live, two real
+back-to-back jobs passed). StoryStudio: `2f63107` + `cdb9fad`, deployed to Convex prod 10-11 with **`QM_DOCGEN_MODE=live`** — any real MCP
+`documentary-basic` request now routes to doc-gen. **No real MCP project has gone through it yet.** The instance is stopped.
+
+**Verify first — one real MCP `create_project`** (I have no StoryStudio API key; the operator sends it). Cheap request, no paid clips, no synopsis
+(so the Claude synopsis is exercised), no `hostPersona` (so the relaxed validation is exercised):
+`{"projectType":"documentary-basic","title":"doc-gen live check","documentaryMetadata":{"topic":"The Rosetta Stone","targetDurationMin":5,"shorts":{"count":0},"visuals":{"talkingClips":0,"animatedStills":0}}}`
+- [ ] **Accepted, not a 400** — if it is a 400 about the host persona or duration, that is a bug in the `http.ts` change.
+- [ ] **Synopsis is Claude-written**, not "A documentary about …": read the queued `orchestratorRequests.payload` (Convex) or `docgen_jobs.request` (VPS).
+      If it fell back, the orchestrator-side Convex log says `synopsis topic|notes` — then check `ANTHROPIC_API_KEY` and the model name
+      (`MODELS.anthropic.primary`). This is the one call never run against the real API.
+- [ ] **Payload carries the zeros** (`shorts.count 0`, `visuals.talkingClips 0 / animatedStills 0`) and the instance starts (202, `jobsAhead`).
+- [ ] **Project gets filled:** `videoTitle`, `videoDescription` (+ image-credits link), `videoTags`, `thumbnailUrl`, `finalVideoUrl`, and
+      `videoExportMessage` says how many notes to review.
+- [ ] **Completion email** arrives — it will probably say 0 scenes / 0 duration (frames are empty for a documentary); fix the template if ugly.
+- [ ] **Nothing else changed:** a narration-basic project still routes as before; a documentary-basic made in the UI still uses the Step Function.
+- [ ] **Instance stopped afterwards** (`aws ec2 describe-instances …`), no row stuck in `docgen_jobs`, no `alert:true` lines in `docker compose logs orchestrator`.
+- [ ] **Listen to the video** — "No audio has been listened to" is on every doc-gen job and nobody has yet.
+
+**Then, a default-settings run** (only after the first passes — it spends on 3 talking clips ≈ $0.75 and 10 animated stills, plus 3 Shorts):
+- [ ] Topic-only request. Check the 3 Shorts land as `shorts` rows (`language "en"`, `partNumber` 1–3, titles Spark/Myth/Matters-style) and read the
+      real `costs` from the result to learn what a default documentary costs. Then one request with `series` filled in.
+- [ ] **Stock footage was never actually used** in the two phase-2 runs: doc-gen warned "stock skipped because the builder takes only images".
+      Find out (in `~/local-gen-documentary`) whether Storyblocks video is used at all, and test once with `visuals.stock:true` on a topic that wants it.
+
+**Phase 4 — orchestrator hardening** (nothing here has run live; the retry / lost-job / missing-upload paths are integration-tested only):
+- [ ] **Cancel**: `POST /v1/admin/docgen/:requestId/cancel` (remove a `queued` row, or call doc-gen `cancel` on a running one). Checkpoint `respond`
+      + `files` proxy routes for operator-submitted `review_mode: checkpoints` jobs.
+- [ ] **Re-host an output with no url**: fetch it through the instance `files` endpoint, upload to R2, then stop. Today the instance is left up
+      (self-stops after 20 idle min) and an alert is logged.
+- [ ] **Dashboard panel**: instance state, current job stage/progress, time since last heartbeat, queue, last five jobs with their warnings.
+- [ ] **Fault injection, live**: stop the instance mid-job (expect `job_lost`/`instance_unreachable` then one retry as `<id>-r2`), block
+      `/v1/webhooks/docgen` for a while (expect polling to carry it), cancel a running job.
+- [ ] **Alerts go nowhere**: `alert:true` is only an error log line. Decide delivery (email/Slack/dashboard) — same gap as the StoryStudio watchdog TODO.
+- [ ] **Overdue watchdog** (StoryStudio): it alerts 6 h after `estimatedResultAt`, and the estimate is a flat 75 min/job — tighten once real durations are known.
+
+**StoryStudio follow-ups:**
+- [ ] Document `documentaryMetadata.shorts / .visuals / .series` in the MCP guide (offered, not written) — clients cannot discover them otherwise.
+- [ ] Show the result's `warnings` to the user: today they live only in `orchestratorRequests.result` (the user sees just "N notes to review").
+- [ ] Add the documentary contract to `docs/storystudio-orchestrator-integration.md` (phase 5 of the plan) and record measured cost/duration per episode.
+
+**Watch / open questions:**
+- doc-gen videos run short (215 s and 183 s vs 240 s) with weak-image warnings (modern photo for a period scene, small line drawings); Commons searches
+  get rate-limited. That is the instance's producer prompt, in `~/local-gen-documentary` — not this repo.
+- The instance runs image `docgen:e42ee20`, not the overlay build `b08c855` the design doc cites — overlays still rendered; find out why.
+- Storyblocks sign-in lifetime is still unknown; a stock job on an expired sign-in is held (`not_ready`) and needs a person on the instance desktop.
+
+**Housekeeping:**
+- [ ] Prod test rows `dgcheck_p2_a` / `dgcheck_p2_b` in `docgen_jobs` and CDN files `docgen/dgcheck_p2_*`, `docgen/qm-phase0-001` — delete when no longer wanted
+      (the phase-2 callbacks went to StoryStudio prod and were answered `unknown_request`).
+- [ ] VPS: `backup-2026-10-11-pre-docgen.dump` and `.env.bak-pre-docgen` in `/opt/qm-orchestrator/`; nightly backup to object storage is still not wired.
+
 ## 2026-10-05 (NEXT SESSION) — verify and harden LTX-2.3 on Comfy
 
 **State going in:** LTX-2.3 per-frame video via Comfy Cloud is built, deployed and live-tested (commits `e78afd3` .. `e4aa030`,
