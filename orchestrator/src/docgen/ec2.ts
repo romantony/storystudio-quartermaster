@@ -32,6 +32,16 @@ export function isCapacityError(err: unknown): boolean {
   return CAPACITY_ERRORS.has(e?.name ?? '') || CAPACITY_ERRORS.has(e?.Code ?? '');
 }
 
+/**
+ * StartInstances on an instance that is still `stopping` (a request arriving
+ * right after the previous job's stop) fails with this. Transient: the stop
+ * finishes in under a minute, so retry shortly instead of alerting.
+ */
+export function isIncorrectStateError(err: unknown): boolean {
+  const e = err as { name?: string; Code?: string };
+  return e?.name === 'IncorrectInstanceState' || e?.Code === 'IncorrectInstanceState';
+}
+
 function defaultImpl(region: string): Ec2Impl {
   const client = new EC2Client({ region });
   return {

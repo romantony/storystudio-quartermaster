@@ -22,6 +22,8 @@ import { ASSET_KINDS } from './assets/kinds';
 import { startAssetAgents } from './assets/agent';
 import { startCompiler } from './assets/compiler';
 import { startAssetQa } from './assets/quality';
+import { createDocgenRuntime } from './docgen/setup';
+import { createDocgenDispatcher } from './docgen/dispatcher';
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -32,7 +34,11 @@ async function main(): Promise<void> {
   initPool(cfg);
   const runpod = new RunpodClient(cfg);
 
-  const app = await buildServer(cfg, logger, { pool: getPool(), runpod });
+  // doc-gen (documentary-basic on a start/stop EC2 instance). Null when the
+  // feature is off — no dispatcher, and the routes answer 503.
+  const docgen = createDocgenRuntime(cfg);
+
+  const app = await buildServer(cfg, logger, { pool: getPool(), runpod, docgenEc2: docgen?.ec2 });
   await app.listen({ host: '0.0.0.0', port: cfg.port });
   logger.info(`listening on :${cfg.port}`);
 
@@ -119,6 +125,28 @@ async function main(): Promise<void> {
     logger.info({ kinds: ASSET_KINDS.length, qa: cfg.assetQa }, 'asset pipeline active');
   }
 
+  // The doc-gen dispatcher: one documentary at a time, driven entirely by
+  // Postgres state, so a restart resumes mid-job (src/docgen/dispatcher.ts).
+  let docgenDispatcher: { stop(): void } | undefined;
+  if (docgen) {
+    const d = createDocgenDispatcher({
+      pool: getPool(),
+      client: docgen.client,
+      ec2: docgen.ec2,
+      maxAttempts: cfg.docgenMaxAttempts,
+      callback: {
+        secret: cfg.callbackSecret,
+        maxAttempts: cfg.callbackMaxAttempts,
+        baseDelayMs: cfg.callbackBaseDelayMs,
+        maxDelayMs: cfg.callbackMaxDelayMs,
+        timeoutMs: cfg.callbackTimeoutMs,
+      },
+    });
+    d.start(cfg.docgenTickMs);
+    docgenDispatcher = d;
+    logger.info({ instance: docgen.ec2.instanceId, tickMs: cfg.docgenTickMs }, 'docgen dispatcher active');
+  }
+
   // ORCH_SCHEDULING_MODE=batch's window-close trigger. Fires at every
   // windowCron boundary regardless of mode — runBatchWindow()'s own first
   // line is the real gate, so this stays a harmless no-op while the mode is
@@ -136,6 +164,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'shutting down');
     try {
       batchWindowTask.stop();
+      docgenDispatcher?.stop();
       assetAgents?.stop();
       assetQa?.stop();
       compiler?.stop();

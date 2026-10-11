@@ -27,7 +27,8 @@ export const DocgenIntakeSchema = z
     requestId: requestIdSchema,
     projectId: z.string().min(1),
     source: z.literal('mcp'),
-    tier: z.string().min(1),
+    // Only documentary-basic runs on doc-gen; anything else is a routing mistake upstream, not a label to echo.
+    tier: z.literal('documentary-basic'),
     callbackUrl: z.string().url().startsWith('https://', 'callbackUrl must be https'),
     topic: z.string().min(1).max(200),
     synopsis: z.string().min(1).max(1000),
