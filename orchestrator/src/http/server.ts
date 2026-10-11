@@ -16,6 +16,7 @@ import { webhookRoutes } from './routes/webhooks';
 import { assetWebhookRoutes } from './routes/asset-webhooks';
 import { adminRoutes } from './routes/admin';
 import { harnessRoutes } from './routes/harness';
+import { docgenWebhookRoutes } from './routes/docgen-webhook';
 
 /** Return type is inferred so the pino logger's type provider is preserved. */
 export async function buildServer(cfg: Config, logger: Logger, deps: { pool: Pool; runpod: RunpodClient }) {
@@ -34,6 +35,8 @@ export async function buildServer(cfg: Config, logger: Logger, deps: { pool: Poo
   await app.register(assetWebhookRoutes, { pool: deps.pool, cfg, runpod: deps.runpod, publicBaseUrl: cfg.publicBaseUrl });
   await app.register(adminRoutes, { pool: deps.pool, runpod: deps.runpod, cfg, publicBaseUrl: cfg.publicBaseUrl });
   await app.register(harnessRoutes, { pool: deps.pool, cfg });
+  // doc-gen's signed status events. Own plugin so its raw-body JSON parser stays scoped to it.
+  await app.register(docgenWebhookRoutes, { pool: deps.pool, cfg });
 
   return app;
 }

@@ -18,6 +18,7 @@
     "migrate:status": "ts-node src/db/migrate.ts status"
   },
   "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1133.0",
     "@aws-sdk/client-lambda": "^3.1133.0",
     "@aws-sdk/client-s3": "^3.1133.0",
     "@aws-sdk/client-sfn": "^3.1133.0",

@@ -234,6 +234,26 @@ const ConfigSchema = z.object({
   // deploy/docker-compose.yml forwards it.
   sfnTailStateMachineArn: z.string().default(''),
   sfnTailRegion: z.string().default('us-east-1'),
+
+  // ── doc-gen: documentary-basic on a start/stop EC2 instance (src/docgen/) ─
+  // Empty base URL = the feature is off: routes answer 503 and the dispatcher
+  // never starts. The EC2 start/stop calls use the default AWS credential
+  // chain (the VPS's existing IAM user carries an inline policy scoped to this
+  // one instance) — there are deliberately no DOCGEN_AWS_* keys. Like every key
+  // here these do NOTHING until deploy/docker-compose.yml forwards them.
+  docgenBaseUrl: z.string().default(''),
+  docgenApiToken: z.string().optional(),
+  // Verifies X-Docgen-Signature on webhooks — its own secret, like callbackSecret.
+  docgenCallbackSecret: z.string().optional(),
+  docgenInstanceId: z.string().default('i-0a6c5182dd9377129'),
+  docgenRegion: z.string().default('us-east-1'),
+  // 'auto' = no checkpoints. StoryStudio requests have no reviewer waiting, and
+  // a paused job keeps the instance up and billing.
+  docgenReviewMode: z.enum(['auto', 'checkpoints']).default('auto'),
+  docgenModel: z.string().default('claude-sonnet-5-5'),
+  // One automatic retry at most — a retry restarts from nothing and pays again.
+  docgenMaxAttempts: numeric(2).pipe(z.number().int().min(1).max(5)),
+  docgenTickMs: numeric(10_000).pipe(z.number().int().positive()),
   // Same "clearly-labeled estimate, not a measurement" precedent as
   // qualityVlmCostUsd above: Lambda's job_costs row is computed the same
   // way as RunPod's (execution_ms * rate), but this rate is derived from
@@ -389,6 +409,15 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   animateLambdaRegion: 'ANIMATE_LAMBDA_REGION',
   sfnTailStateMachineArn: 'SFN_TAIL_STATE_MACHINE_ARN',
   sfnTailRegion: 'SFN_TAIL_REGION',
+  docgenBaseUrl: 'DOCGEN_BASE_URL',
+  docgenApiToken: 'DOCGEN_API_TOKEN',
+  docgenCallbackSecret: 'DOCGEN_CALLBACK_SECRET',
+  docgenInstanceId: 'DOCGEN_INSTANCE_ID',
+  docgenRegion: 'DOCGEN_REGION',
+  docgenReviewMode: 'DOCGEN_REVIEW_MODE',
+  docgenModel: 'DOCGEN_MODEL',
+  docgenMaxAttempts: 'DOCGEN_MAX_ATTEMPTS',
+  docgenTickMs: 'DOCGEN_TICK_MS',
   lambdaRenderRateUsdS: 'LAMBDA_RENDER_RATE_USD_S',
   animateLambdaRateUsdS: 'ANIMATE_LAMBDA_RATE_USD_S',
   comfyApiKey: 'COMFY_API_KEY',

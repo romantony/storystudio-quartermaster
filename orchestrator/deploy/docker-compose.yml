@@ -96,6 +96,19 @@ services:
       # states:StartExecution/DescribeExecution/StopExecution on this ARN only.
       SFN_TAIL_STATE_MACHINE_ARN: ${SFN_TAIL_STATE_MACHINE_ARN:-}
       SFN_TAIL_REGION: ${SFN_TAIL_REGION:-us-east-1}
+      # doc-gen (src/docgen/): documentary-basic on a start/stop EC2 instance.
+      # Empty DOCGEN_BASE_URL = off. EC2 start/stop uses the AWS_* credential
+      # above (inline policy QMOrchestratorDocgenInstanceControl, scoped to
+      # the one instance) — no separate key.
+      DOCGEN_BASE_URL: ${DOCGEN_BASE_URL:-}
+      DOCGEN_API_TOKEN: ${DOCGEN_API_TOKEN:-}
+      DOCGEN_CALLBACK_SECRET: ${DOCGEN_CALLBACK_SECRET:-}
+      DOCGEN_INSTANCE_ID: ${DOCGEN_INSTANCE_ID:-i-0a6c5182dd9377129}
+      DOCGEN_REGION: ${DOCGEN_REGION:-us-east-1}
+      DOCGEN_REVIEW_MODE: ${DOCGEN_REVIEW_MODE:-auto}
+      DOCGEN_MODEL: ${DOCGEN_MODEL:-claude-sonnet-5-5}
+      DOCGEN_MAX_ATTEMPTS: ${DOCGEN_MAX_ATTEMPTS:-2}
+      DOCGEN_TICK_MS: ${DOCGEN_TICK_MS:-10000}
     expose: ["8080"]
     ports: ["127.0.0.1:8080:8080"]
   watchdog:
