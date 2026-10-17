@@ -305,10 +305,12 @@ describe('character references', () => {
     expect(refs('f2')).toEqual([REF]);
     expect(refs('f3')).toEqual([]);
   });
-  it('char-ref: skip / passthrough / composite', () => {
-    const c = (characterRefs: string[]) => buildCharRefInput(ctx({ characterRefs }, {}));
+  it('char-ref: skip / pad to the frame aspect / composite', () => {
+    const c = (characterRefs: string[], aspectRatio = '9:16') => buildCharRefInput(ctx({ characterRefs, aspectRatio }, {}));
     expect(c([])).toEqual({ __passthroughUrl: 'skip:none' });
-    expect(c(['http://a'])).toEqual({ __passthroughUrl: 'http://a' });
+    // one sheet is never passed through square: qwen edit keeps its source's aspect
+    expect(c(['http://a'], '16:9')).toMatchObject({ refs: ['http://a'], canvas: [1280, 720] });
+    expect(c(['http://a'])).toMatchObject({ refs: ['http://a'], canvas: [720, 1280] });
     expect(c(['http://a', 'http://b'])).toMatchObject({ refs: ['http://a', 'http://b'] });
   });
   it('t2i skips frames that have characters; edit edits the reference or passes the t2i still', () => {
