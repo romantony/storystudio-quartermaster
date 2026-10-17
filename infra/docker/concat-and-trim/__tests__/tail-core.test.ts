@@ -9,6 +9,7 @@ import {
   buildFinalizeArgs,
   buildFinalizeFilter,
   clipAudioArgs,
+  clipAudioGainDb,
   createTiktokAss,
   groupWordCues,
   dedupeOverlappingCues,
@@ -299,6 +300,24 @@ describe('action frames (clipAudioOnly)', () => {
     const a = clipAudioArgs('in.mp4', 'out.mp4');
     expect(a.filter((x) => x === '-i')).toHaveLength(1);
     expect(a.join(' ')).toContain('-map 0:v:0 -map 0:a:0 -c:v copy -c:a aac');
+  });
+  it('levels the clip audio when given a gain', () => {
+    expect(clipAudioArgs('in.mp4', 'out.mp4', 9.5).join(' ')).toContain('-map 0:a:0 -af volume=9.50dB -c:v copy');
+  });
+  it('a spoken line is lifted to the narration; ambience sits 6 dB under it', () => {
+    const narr = { i: -18, peak: -3 };
+    expect(clipAudioGainDb({ i: -30, peak: -20 }, narr, true)).toBe(12);
+    expect(clipAudioGainDb({ i: -30, peak: -20 }, narr, false)).toBe(6);
+  });
+  it('never pushes the clip past the peak ceiling or the max-gain cap', () => {
+    // the 2026-10-17 spoken test: peaks at -14.5 dB
+    expect(clipAudioGainDb({ i: -33.5, peak: -14.5 }, { i: -16, peak: -1 }, true)).toBe(13.5);
+    expect(clipAudioGainDb({ i: -60, peak: -60 }, { i: -16, peak: -1 }, true)).toBe(30);
+  });
+  it('turns a loud clip down; unmeasurable clip -> 0; no narration -> fixed target', () => {
+    expect(clipAudioGainDb({ i: -10, peak: -1 }, { i: -18, peak: -3 }, true)).toBe(-8);
+    expect(clipAudioGainDb(null, { i: -18, peak: -3 }, true)).toBe(0);
+    expect(clipAudioGainDb({ i: -26, peak: -12 }, null, true)).toBe(10);
   });
 });
 

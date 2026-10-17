@@ -60,12 +60,17 @@ export const buildComfyVideoInput: PayloadBuilder = (ctx: BuildContext): Record<
     audioUrl = a.url;
     durationS = a.durationS;
   } else {
-    // An action frame (sfx-only) has no speech: actionS is the whole shot.
+    // An sfx-only frame (a silent action, or a line LTX speaks itself on i2v)
+    // has no TTS: actionS is the whole shot.
     durationS = ctx.job.audioMode === 'sfx-only'
       ? Math.min(LTX_MAX_S, Math.max(LTX_MIN_S, Math.ceil(ctx.job.actionS ?? ctx.job.durationS)))
       : ltxDurationS(ctx.resolvedDeps[TTS_STEP_SEQ]?.durationS, ctx.job.durationS, ctx.job.actionS);
   }
-  const workflow = { i2v: 'ltx23_i2v', flf: 'ltx23_flf2v', ia2v: 'ltx23_ia2v', flf_ia2v: 'ltx23_flf_ia2v' }[kind];
+  // The caller's workflow id names the model; shotKind (validated to agree)
+  // is the fallback for requests that predate it.
+  const workflow = ctx.job.workflow
+    ? { 'i2v-ltx2.3': 'ltx23_i2v', 'flf-ltx2.3': 'ltx23_flf2v' }[ctx.job.workflow]
+    : { i2v: 'ltx23_i2v', flf: 'ltx23_flf2v', ia2v: 'ltx23_ia2v', flf_ia2v: 'ltx23_flf_ia2v' }[kind];
   return {
     workflow,
     firstImageUrl,

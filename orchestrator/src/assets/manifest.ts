@@ -39,6 +39,10 @@ export interface ManifestFrame {
   /** An LTX action frame (`audioMode: 'sfx-only'`): nobody speaks, so there is
    * no narration; the clip's own audio is the frame's audio at full level. */
   clipAudioOnly?: boolean;
+  /** A `clipAudioOnly` frame whose clip audio is a character speaking (an
+   * sfx-only i2v frame): the tail levels it to narration loudness instead of
+   * the lower ambience level of a silent action. */
+  clipAudioSpoken?: boolean;
   durationS: number | null;
   narration: string;
   /** True when `videoUrl` carries MMAudio's SFX track (the mp4 MMAudio

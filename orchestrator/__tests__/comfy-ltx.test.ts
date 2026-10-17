@@ -344,7 +344,7 @@ describe('action frames (sfx-only) + dialogue-basic tier', () => {
   it.each([
     ['narration on an action frame', aframe('f1', { narration: 'x' }), /no narration/],
     ['dialogue on an action frame', aframe('f1', { dialogue: { speaker: 'keeper', line: 'x' } }), /no dialogue/],
-    ['non-flf action frame', aframe('f1', { shotKind: 'i2v', lastFrameEdit: undefined }), /always shotKind 'flf'/],
+    ['an ia2v sfx-only frame', aframe('f1', { shotKind: 'ia2v', lastFrameEdit: undefined }), /shotKind 'i2v' or 'flf'/],
     ['no actionS', aframe('f1', { actionS: undefined }), /needs actionS/],
     ['no lastFrameEdit', aframe('f1', { lastFrameEdit: undefined }), /needs lastFrameEdit/],
   ])('rejects %s', (_n, f, msg) => {
@@ -367,6 +367,56 @@ describe('action frames (sfx-only) + dialogue-basic tier', () => {
   it('carries lastFramePrompt / shotType / actionS onto the rows', () => {
     const rows = buildAssetRows(r, compilePlan(r));
     expect(rows.find((x) => x.kind === 'comfy-video' && x.frameId === 'f2')!.input).toMatchObject({ lastFramePrompt: 'full last frame', shotType: 'primary', actionS: 7 });
+  });
+});
+
+describe('spoken i2v lines (sfx-only i2v) + per-frame workflow id', () => {
+  // LTX speaks the quoted line itself; no TTS, no dialogue, no last frame.
+  const sframe = (id: string, over: Record<string, unknown> = {}) => ({
+    ...frame(id, { narration: undefined }),
+    workflow: 'i2v-ltx2.3', audioMode: 'sfx-only', actionS: 5, durationS: 5, characters: ['keeper'],
+    motionPrompt: 'The keeper says quietly: "The light is out." Sound: waves. No music.', ...over,
+  });
+  const r = RequestSchema.parse({ ...req([frame('f1', { workflow: 'i2v-ltx2.3' }), sframe('f2')], { characters: chars }), tier: 'dialogue-basic', product: 'dialogue' });
+  it('accepts an sfx-only i2v frame with no narration and no dialogue', () => {
+    expect(() => validateRequest(r)).not.toThrow();
+  });
+  it('accepts a frame without workflow (requests that predate it)', () => {
+    expect(() => validateRequest(req([sframe('f1', { workflow: undefined })], { characters: chars }))).not.toThrow();
+  });
+  it.each([
+    ['narration', sframe('f1', { narration: 'x' }), /no narration/],
+    ['dialogue', sframe('f1', { dialogue: { speaker: 'keeper', line: 'x' } }), /no dialogue/],
+    ['lastFrameEdit', sframe('f1', { lastFrameEdit: 'e' }), /only valid for 'flf'/],
+    ['i2v-ltx2.3 on flf', sframe('f1', { shotKind: 'flf', lastFrameEdit: 'e' }), /workflow 'i2v-ltx2.3' needs shotKind 'i2v'/],
+    ['flf-ltx2.3 on i2v', sframe('f1', { workflow: 'flf-ltx2.3' }), /workflow 'flf-ltx2.3' needs shotKind 'flf'/],
+    ['an unknown workflow id', sframe('f1', { workflow: 'i2v-ltx9' }), /workflow/],
+  ])('rejects a spoken frame with %s', (_n, f, msg) => {
+    expect(() => validateRequest(req([f], { characters: chars }))).toThrow(msg);
+  });
+  it('comfy-video: ltx23_i2v, sized from actionS, no TTS', () => {
+    const j = { audioMode: 'sfx-only', actionS: 6, shotKind: 'i2v', workflow: 'i2v-ltx2.3', motionPrompt: 'm' };
+    expect(buildTtsInput(ctx(j, {}))).toEqual({ __passthroughUrl: 'skip:none' });
+    const out = buildComfyVideoInput(ctx(j, { 1: { url: 'http://i' } }));
+    expect(out).toMatchObject({ workflow: 'ltx23_i2v', durationS: 6 });
+    expect(out).not.toHaveProperty('lastImageUrl');
+    expect(out).not.toHaveProperty('audioUrl');
+  });
+  it('comfy-video picks the Comfy workflow from the workflow id', () => {
+    const j = { shotKind: 'flf', workflow: 'flf-ltx2.3', motionPrompt: 'm', lastFrameEdit: 'e' };
+    expect(buildComfyVideoInput(ctx(j, { 1: { url: 'http://i' }, 2: { url: 'http://a', durationS: 3 }, 17: { url: 'http://l' } }))).toMatchObject({ workflow: 'ltx23_flf2v' });
+  });
+  it('carries workflow onto the rows', () => {
+    const rows = buildAssetRows(r, compilePlan(r));
+    expect(rows.find((x) => x.kind === 'comfy-video' && x.frameId === 'f2')!.input).toMatchObject({ workflow: 'i2v-ltx2.3', shotKind: 'i2v', audioMode: 'sfx-only' });
+  });
+  it('manifest: a spoken line is clipAudioOnly + clipAudioSpoken; a silent action is not spoken', () => {
+    const plan = compilePlan(r);
+    const row = (kind: string, url: string) => ({ id: 1, projectId: 'p1', seq: 1, frameId: 'f2', kind, status: 'complete', assetUrl: url, durationS: null, input: {} }) as unknown as AssetRow;
+    const rows = [row('tts', 'skip:none'), row('comfy-video', 'http://clip.mp4')];
+    expect(manifestFrame(plan, { frameId: 'f2', seq: 1, rows }, r)).toMatchObject({ clipAudioOnly: true, clipAudioSpoken: true });
+    const silent = { frames: [{ ...r.frames[1], shotKind: 'flf' as const }] };
+    expect(manifestFrame(plan, { frameId: 'f2', seq: 1, rows }, silent)).not.toHaveProperty('clipAudioSpoken');
   });
 });
 

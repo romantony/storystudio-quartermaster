@@ -88,6 +88,10 @@ const FrameSchema = z
     // `i2v`/`flf` are narration shots; `ia2v`/`flf_ia2v` are Dialogue Basic's
     // (a later phase) and are rejected until that lands.
     shotKind: z.enum(['i2v', 'flf', 'ia2v', 'flf_ia2v']).optional(),
+    // The model-specific workflow StoryStudio chose for this frame; must agree
+    // with shotKind (i2v-ltx2.3 <-> i2v, flf-ltx2.3 <-> flf). A later model is a
+    // new id, never a new meaning for shotKind.
+    workflow: z.enum(['i2v-ltx2.3', 'flf-ltx2.3']).optional(),
     // Character ids in this frame (<= 2), keys of the request's `characters`.
     characters: z.array(z.string().min(1)).max(2).optional(),
     // An edit applied to the FIRST frame to produce the last (flf shots).
@@ -452,6 +456,9 @@ function buildStepsAndJobs(
   return { steps, jobs };
 }
 
+/** The shotKind each per-frame `workflow` id is. */
+export const LTX_WORKFLOW_SHOT_KIND = { 'i2v-ltx2.3': 'i2v', 'flf-ltx2.3': 'flf' } as const;
+
 /** LTX-2.3 cross-field rules (handoff doc, "What StoryStudio sends"). Fails the
  * request loudly at POST time: a frame with no valid contract must not reach
  * the Comfy credits. Dialogue shot kinds are the next phase and are refused. */
@@ -468,9 +475,13 @@ export function validateLtxRequest(req: OrchestratorRequest): void {
     const dialogueShot = f.shotKind === 'ia2v' || f.shotKind === 'flf_ia2v';
     const lastFrameShot = f.shotKind === 'flf' || f.shotKind === 'flf_ia2v';
     const actionShot = f.audioMode === 'sfx-only';
+    if (f.workflow && LTX_WORKFLOW_SHOT_KIND[f.workflow] !== f.shotKind) {
+      bad([...at, 'workflow'], `frame ${f.frameId}: workflow '${f.workflow}' needs shotKind '${LTX_WORKFLOW_SHOT_KIND[f.workflow]}', not '${f.shotKind}'`);
+    }
     if (actionShot) {
-      // Character animation, nobody speaks: no TTS, no captions.
-      if (f.shotKind !== 'flf') bad([...at, 'shotKind'], `frame ${f.frameId}: an sfx-only action frame is always shotKind 'flf'`);
+      // Clip audio only, no TTS, no captions: a silent action (flf) or a line
+      // LTX speaks itself from the quoted text in motionPrompt (i2v).
+      if (f.shotKind !== 'flf' && f.shotKind !== 'i2v') bad([...at, 'shotKind'], `frame ${f.frameId}: an sfx-only frame is shotKind 'i2v' or 'flf'`);
       if (f.narration) bad([...at, 'narration'], `frame ${f.frameId}: an sfx-only action frame has no narration`);
       if (f.dialogue) bad([...at, 'dialogue'], `frame ${f.frameId}: an sfx-only action frame has no dialogue`);
       if (!f.actionS) bad([...at, 'actionS'], `frame ${f.frameId}: an sfx-only action frame needs actionS (the whole shot, 5-10 s)`);

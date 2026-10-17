@@ -31,6 +31,9 @@ export interface ManifestFrame {
   /** LTX action frame (audioMode 'sfx-only'): nobody speaks; the clip's own
    * audio is the frame's audio, at full level (no narration mux). */
   clipAudioOnly?: boolean;
+  /** A `clipAudioOnly` frame where a character speaks (sfx-only i2v): levelled
+   * to the narration rather than to the quieter action-ambience target. */
+  clipAudioSpoken?: boolean;
   durationS: number | null;
   narration: string;
   sfxFromVideo?: boolean;
@@ -132,12 +135,32 @@ export function mergeArgs(
   ];
 }
 
-/** An action frame: the clip's own audio, re-encoded to the same AAC the other
- * frames use so the concat is uniform, video stream-copied. */
-export function clipAudioArgs(vid: string, out: string): string[] {
+/** LTX clip audio is quiet (a spoken line measured mean -33.5 dB, peak
+ * -14.5 dB, 2026-10-17), so a clipAudioOnly frame is levelled: a spoken line to
+ * the narration's loudness, a silent action's ambience this far below it. */
+export const CLIP_AMBIENCE_UNDER_NARRATION_DB = 6.0;
+/** The narration target when the project has no narration frame to measure. */
+export const CLIP_FALLBACK_NARRATION_LUFS = -16.0;
+
+/** How many dB to move a clipAudioOnly frame's own audio. The narration
+ * reaches the mix at its native level (mergeArgs' volume=2.0 undoes amix's
+ * halving), so its measured loudness is the target. Same peak ceiling and
+ * max-gain cap as the SFX normalisation. */
+export function clipAudioGainDb(clip: Loudness | null, narr: Loudness | null, spoken: boolean): number {
+  if (!clip) return 0.0;
+  const target = (narr?.i ?? CLIP_FALLBACK_NARRATION_LUFS) - (spoken ? 0 : CLIP_AMBIENCE_UNDER_NARRATION_DB);
+  const peakRoom = SFX_PEAK_CEILING_DBFS - clip.peak;
+  return Math.round(Math.min(target - clip.i, SFX_MAX_GAIN_DB, peakRoom) * 100) / 100;
+}
+
+/** A clipAudioOnly frame: the clip's own audio, levelled by `gainDb` and
+ * re-encoded to the same AAC the other frames use so the concat is uniform,
+ * video stream-copied. */
+export function clipAudioArgs(vid: string, out: string, gainDb = 0): string[] {
   return [
     '-y', '-i', vid,
     '-map', '0:v:0', '-map', '0:a:0',
+    ...(gainDb !== 0 ? ['-af', `volume=${gainDb.toFixed(2)}dB`] : []),
     '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ar', '44100',
     '-movflags', '+faststart', out,
   ];

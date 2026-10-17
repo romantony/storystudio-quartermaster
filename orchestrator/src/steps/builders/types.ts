@@ -131,6 +131,8 @@ export interface FrameJobInput {
 
   // ── LTX-2.3 (options.motionEngine === 'ltx'), see agents/planner.ts ──
   shotKind?: 'i2v' | 'flf' | 'ia2v' | 'flf_ia2v';
+  /** StoryStudio's model-specific workflow id; validated against shotKind. */
+  workflow?: 'i2v-ltx2.3' | 'flf-ltx2.3';
   characters?: string[];
   /** Reference image urls of `characters`, in order. Present (possibly empty)
    * only on LTX projects that have characters — it switches the image chain

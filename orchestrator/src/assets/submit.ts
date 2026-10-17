@@ -98,6 +98,7 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         sfx: plan.frameKinds.includes('mmaudio') || undefined,
         textManifest: frame.textManifest,
         shotKind: frame.shotKind,
+        workflow: frame.workflow,
         characters: frame.characters,
         characterRefs: characterRefs(req, frame),
         lastFrameEdit: frame.lastFrameEdit,

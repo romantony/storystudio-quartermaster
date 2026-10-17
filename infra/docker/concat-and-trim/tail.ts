@@ -51,6 +51,8 @@ import {
   kenBurnsArgs,
   mergeArgs,
   clipAudioArgs,
+  clipAudioGainDb,
+  type Loudness,
   parseLoudness,
   parseResolution,
   s3Url,
@@ -145,7 +147,7 @@ function payloadFromEnv<T>(): T {
 
 /** One frame, start to finish, on local disk. Throws on anything that would
  * silently drop or corrupt the frame; the caller decides what to do. */
-async function prepareFrame(frame: ManifestFrame, defaultFps: number, workDir: string): Promise<{ clipPath: string; durationS: number }> {
+async function prepareFrame(frame: ManifestFrame, defaultFps: number, workDir: string, narrRef: Loudness | null): Promise<{ clipPath: string; durationS: number }> {
   const id = frame.frameId;
   const audPath = path.join(workDir, `${id}.aud`);
   let audioS = 0;
@@ -175,9 +177,12 @@ async function prepareFrame(frame: ManifestFrame, defaultFps: number, workDir: s
 
   const merged = path.join(workDir, `${id}.merged.mp4`);
   if (frame.clipAudioOnly) {
-    // Action frame: nobody speaks, the clip's own LTX sound is the audio.
+    // No TTS: the clip's own LTX sound is the audio — a line the character
+    // speaks (levelled to the narration) or a silent action's ambience (lower).
     if (!hasAudioStream(vidPath)) throw new Error(`frame ${id}: sfx-only but the clip has no audio track`);
-    ff(clipAudioArgs(vidPath, merged), `frame ${id} clip audio`);
+    const gainDb = clipAudioGainDb(loudness(vidPath), narrRef, frame.clipAudioSpoken === true);
+    console.log(`${TAG} frame ${id} clip audio ${frame.clipAudioSpoken ? 'spoken' : 'ambience'} gain ${gainDb} dB`);
+    ff(clipAudioArgs(vidPath, merged, gainDb), `frame ${id} clip audio`);
   } else if (frame.sfxFromVideo) {
     // The clip's own audio track IS the SFX layer (MMAudio returns the clip with
     // SFX muxed in): lift it off, level it against the narration, mix under it.
@@ -198,6 +203,27 @@ async function prepareFrame(frame: ManifestFrame, defaultFps: number, workDir: s
   return { clipPath: merged, durationS };
 }
 
+/** The narration loudness clipAudioOnly frames are levelled against: the
+ * first narration track, measured once. null when nothing needs it or nothing
+ * is measurable (clipAudioGainDb then falls back to a fixed target). */
+async function narrationReference(frames: ManifestFrame[], workDir: string): Promise<Loudness | null> {
+  if (!frames.some((f) => f.clipAudioOnly)) return null;
+  const first = frames.find((f) => f.audioUrl);
+  if (!first?.audioUrl) return null;
+  const refPath = path.join(workDir, 'narration-ref.aud');
+  try {
+    await download(first.audioUrl, refPath);
+    const ref = loudness(refPath);
+    console.log(`${TAG} narration reference (${first.frameId}): ${ref ? `${ref.i} LUFS` : 'unmeasurable'}`);
+    return ref;
+  } catch (err) {
+    console.warn(`${TAG} narration reference failed, using the fixed target: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  } finally {
+    fs.rmSync(refPath, { force: true });
+  }
+}
+
 export async function assemble(): Promise<void> {
   const p = payloadFromEnv<AssemblePayload>();
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tail-assemble-'));
@@ -207,12 +233,13 @@ export async function assemble(): Promise<void> {
     const frames = [...manifest.frames].sort((a, b) => a.seq - b.seq);
     console.log(`${TAG} assemble ${manifest.projectId}: ${frames.length} frames (${manifest.droppedFrames.length} dropped upstream), aspect=${p.aspectRatio}, removeSilence=${p.removeSilence}`);
 
+    const narrRef = await narrationReference(frames, workDir);
     const clips: string[] = [];
     const hosted: AssembleMeta['frames'] = [];
     const dropped = [...manifest.droppedFrames];
     for (const frame of frames) {
       try {
-        const { clipPath, durationS } = await prepareFrame(frame, manifest.fps, workDir);
+        const { clipPath, durationS } = await prepareFrame(frame, manifest.fps, workDir, narrRef);
         // Each frame's finished clip is the project's durable per-frame
         // artifact: a rework of one frame starts from it, and it is what the
         // §9.6 result calls mergedClipUrl. Uploaded BEFORE concat, which

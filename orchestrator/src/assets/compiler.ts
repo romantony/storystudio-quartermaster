@@ -212,7 +212,7 @@ export function describeDrop(frameRows: AssetRow[]): string {
 export function manifestFrame(
   plan: AssetPlan,
   frame: { frameId: string; seq: number; rows: AssetRow[] },
-  request: { frames: Array<{ frameId: string; narration?: string; dialogue?: { line: string }; audioMode?: string; durationS: number; animateEffect?: string }> },
+  request: { frames: Array<{ frameId: string; narration?: string; dialogue?: { line: string }; audioMode?: string; shotKind?: string; durationS: number; animateEffect?: string }> },
 ): ManifestFrame {
   const url = (kind: AssetKind): string | undefined =>
     frame.rows.find((r) => r.kind === kind && r.status === 'complete')?.assetUrl ?? undefined;
@@ -240,6 +240,9 @@ export function manifestFrame(
     frameId: frame.frameId,
     seq: frame.seq,
     ...(audioUrl ? { audioUrl } : { clipAudioOnly: true }),
+    // An sfx-only i2v frame is a line LTX speaks itself: the tail levels it to
+    // the narration, where a silent action's ambience sits lower.
+    ...(clipAudioOnly && requested?.shotKind === 'i2v' ? { clipAudioSpoken: true } : {}),
     // TTS's own reported length — the worker re-probes it anyway, this is for
     // the reader of the manifest.
     durationS: clipAudioOnly ? (requested?.durationS ?? null) : (audioRow?.durationS ?? tts?.durationS ?? requested?.durationS ?? null),
