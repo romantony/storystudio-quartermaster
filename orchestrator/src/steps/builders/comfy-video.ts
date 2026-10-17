@@ -4,12 +4,15 @@
  * Takes Wan2's place in the per-frame chain for `options.motionEngine: 'ltx'`.
  * Narration shots only (`i2v`, `flf`): every spoken line is our TTS and the
  * clip carries its own SFX, which the tail mixes under the narration.
+ * `refs2` (2026-10-17) runs MiniMax H3 fast from two references on the same
+ * transport; it is sized exactly like an `i2v`/`flf` shot.
  *
  * QM, not StoryStudio, owns the workflow choice and the duration: the clip is
  * sized from the REAL TTS length (+ a 1 s tail), clamped to 5-10 s, never the
  * caller's estimate (same rule as builders/i2v.ts — the tail's `-shortest` mux
  * would clip the narration otherwise).
  */
+import { REF2_EDIT_SEQ } from './ref2';
 import type { BuildContext, PayloadBuilder } from './types';
 
 const IMAGE_EDIT_STEP_SEQ = 0;
@@ -39,7 +42,7 @@ export const buildComfyVideoInput: PayloadBuilder = (ctx: BuildContext): Record<
   const firstImageUrl = ctx.resolvedDeps[IMAGE_EDIT_STEP_SEQ]?.url ?? ctx.resolvedDeps[IMAGE_STEP_SEQ]?.url;
   if (!firstImageUrl) throw new Error(`comfy-video builder: no resolved image URL for frame ${frame}`);
   const kind = ctx.job.shotKind;
-  if (kind !== 'i2v' && kind !== 'flf' && kind !== 'ia2v' && kind !== 'flf_ia2v') {
+  if (kind !== 'i2v' && kind !== 'flf' && kind !== 'ia2v' && kind !== 'flf_ia2v' && kind !== 'refs2') {
     throw new Error(`comfy-video builder: unsupported shotKind '${kind}' for frame ${frame}`);
   }
   if (!ctx.job.motionPrompt) throw new Error(`comfy-video builder: no motionPrompt for frame ${frame}`);
@@ -48,6 +51,9 @@ export const buildComfyVideoInput: PayloadBuilder = (ctx: BuildContext): Record<
   if (withLast && (!lastImageUrl || lastImageUrl === firstImageUrl)) {
     throw new Error(`comfy-video builder: ${kind} frame ${frame} has no distinct last frame`);
   }
+  // refs2: reference 1 is the still above, reference 2 the second character.
+  const secondImageUrl = kind === 'refs2' ? ctx.resolvedDeps[REF2_EDIT_SEQ]?.url : undefined;
+  if (kind === 'refs2' && !secondImageUrl) throw new Error(`comfy-video builder: refs2 frame ${frame} has no second reference`);
   const dialogueShot = kind === 'ia2v' || kind === 'flf_ia2v';
   let durationS: number;
   let audioUrl: string | undefined;
@@ -69,11 +75,12 @@ export const buildComfyVideoInput: PayloadBuilder = (ctx: BuildContext): Record<
   // The caller's workflow id names the model; shotKind (validated to agree)
   // is the fallback for requests that predate it.
   const workflow = ctx.job.workflow
-    ? { 'i2v-ltx2.3': 'ltx23_i2v', 'flf-ltx2.3': 'ltx23_flf2v' }[ctx.job.workflow]
-    : { i2v: 'ltx23_i2v', flf: 'ltx23_flf2v', ia2v: 'ltx23_ia2v', flf_ia2v: 'ltx23_flf_ia2v' }[kind];
+    ? { 'i2v-ltx2.3': 'ltx23_i2v', 'flf-ltx2.3': 'ltx23_flf2v', 'refs2-minimax-h3-fast': 'minimax_h3_ref2v_fast' }[ctx.job.workflow]
+    : { i2v: 'ltx23_i2v', flf: 'ltx23_flf2v', ia2v: 'ltx23_ia2v', flf_ia2v: 'ltx23_flf_ia2v', refs2: 'minimax_h3_ref2v_fast' }[kind];
   return {
     workflow,
     firstImageUrl,
+    ...(secondImageUrl ? { secondImageUrl } : {}),
     ...(lastImageUrl ? { lastImageUrl } : {}),
     ...(audioUrl ? { audioUrl } : {}),
     prompt: ctx.job.motionPrompt,

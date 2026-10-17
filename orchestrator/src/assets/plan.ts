@@ -128,6 +128,13 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
     requires['qwen-edit'] = ['qwen-image-gen', 'char-ref'];
   }
   if (needsLast) requires['comfy-last'] = [imageKind];
+  // MiniMax H3 two-character shots need a second reference: the second
+  // character's padded sheet, edited with `secondReferencePrompt`.
+  const needsRef2 = motionKind === 'comfy-video' && req.frames.some((f) => f.shotKind === 'refs2');
+  if (needsRef2) {
+    requires['ref2-sheet'] = [];
+    requires['ref2-edit'] = ['ref2-sheet'];
+  }
   if (hasDialogue) requires['dialogue-audio'] = ['tts'];
   if (motionKind) {
     // Motion needs the still AND the narration — not for the audio, but for
@@ -138,6 +145,7 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
       imageKind,
       'tts',
       ...(needsLast ? (['comfy-last'] as const) : []),
+      ...(needsRef2 ? (['ref2-edit'] as const) : []),
       ...(hasDialogue ? (['dialogue-audio'] as const) : []),
     ];
   }

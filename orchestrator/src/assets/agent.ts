@@ -55,8 +55,8 @@ import type { FrameJobInput } from '../steps/builders/types';
 import { invokeAnimate, invokeRemotionOverlay, type AnimateInput, type LambdaTransport, type RemotionOverlayInput } from '../lambda/client';
 import { persistToR2, putBytesToR2, type R2Transport } from '../r2/client';
 import { padDialogueAudio } from './dialogue-audio-pad';
-import { compositeCharacterRefs } from './char-ref-composite';
-import { COMFY_FPS, COMFY_SIZE, buildGraph, runGraph, uploadImage, type ComfyTransport, type ComfyWorkflow } from '../comfy/client';
+import { compositeCharacterRefs, padCharacterRef } from './char-ref-composite';
+import { H3_FPS, allowedNodeTypes, buildGraph, comfyFormat, h3Frames, runGraph, uploadImage, type ComfyTransport, type ComfyWorkflow } from '../comfy/client';
 import {
   describeTailExecution,
   executionName,
@@ -403,7 +403,7 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
     await invokeAnimateRow(deps, kind, row, payload);
     return;
   }
-  if (kind === 'char-ref') {
+  if (kind === 'char-ref' || kind === 'ref2-sheet') {
     await invokeCharRefRow(deps, kind, row, payload);
     return;
   }
@@ -448,14 +448,16 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
   }
 }
 
-/** `char-ref` with two characters: one side-by-side composite as the edit source. */
+/** `char-ref` with two characters: one side-by-side composite as the edit
+ * source. With a `canvas` (refs2 frames, and `ref2-sheet`): one reference
+ * padded onto a canvas of the frame's aspect. */
 async function invokeCharRefRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
   if (!deps.r2) throw new Error(`${kind}: no r2 transport is configured`);
-  const p = payload as { refs: string[]; frameId: string };
+  const p = payload as { refs: string[]; canvas?: [number, number]; frameId: string };
   await markSubmitted(deps.pool, row.id, kind, `local:${row.id}:${row.attempts + 1}`);
   try {
-    const bytes = await compositeCharacterRefs(p.refs);
-    const url = await putBytesToR2(deps.r2, `char-ref/${row.projectId}/${p.frameId}.png`, bytes, 'image/png');
+    const bytes = p.canvas ? await padCharacterRef(p.refs[0], p.canvas) : await compositeCharacterRefs(p.refs);
+    const url = await putBytesToR2(deps.r2, `${kind}/${row.projectId}/${p.frameId}.png`, bytes, 'image/png');
     await applyAssetSuccess(deps, row.id, kind, { image: url });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -487,7 +489,7 @@ async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetR
   if (!deps.comfy) throw new Error(`${kind}: no Comfy Cloud transport configured (COMFY_API_KEY)`);
   if (!deps.r2) throw new Error(`${kind}: no r2 transport is configured`);
   const p = payload as {
-    workflow: ComfyWorkflow; firstImageUrl: string; lastImageUrl?: string; audioUrl?: string; prompt: string; negativePrompt?: string;
+    workflow: ComfyWorkflow; firstImageUrl: string; secondImageUrl?: string; lastImageUrl?: string; audioUrl?: string; prompt: string; negativePrompt?: string;
     durationS: number; portrait: boolean; seed?: number; frameId: string;
   };
   const jobId = `comfy:${row.id}:${row.attempts + 1}`;
@@ -496,12 +498,13 @@ async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetR
   try {
     const tag = `${row.projectId}-${p.frameId}-${row.attempts + 1}`.replace(/[^A-Za-z0-9_-]/g, '_');
     const firstImage = await uploadImage(deps.comfy, p.firstImageUrl, `${tag}-first.png`);
+    const secondImage = p.secondImageUrl ? await uploadImage(deps.comfy, p.secondImageUrl, `${tag}-ref2.png`) : undefined;
     const lastImage = p.lastImageUrl ? await uploadImage(deps.comfy, p.lastImageUrl, `${tag}-last.png`) : undefined;
     const audio = p.audioUrl ? await uploadImage(deps.comfy, p.audioUrl, `${tag}-line.wav`) : undefined;
-    const [width, height] = p.portrait ? COMFY_SIZE.portrait : COMFY_SIZE.landscape;
+    const { width, height, fps } = comfyFormat(p.workflow, p.portrait);
     const graph = buildGraph({
-      workflow: p.workflow, firstImage, lastImage, audio, prompt: p.prompt, negativePrompt: p.negativePrompt,
-      width, height, fps: COMFY_FPS, durationS: p.durationS,
+      workflow: p.workflow, firstImage, secondImage, lastImage, audio, prompt: p.prompt, negativePrompt: p.negativePrompt,
+      width, height, fps, durationS: p.durationS,
       seed: p.seed ?? Math.floor(Math.random() * 2 ** 31),
     });
     const result = await runGraph(deps.comfy, graph, async (promptId) => {
@@ -509,14 +512,16 @@ async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetR
       await deps.pool.query(`UPDATE assets SET provider_job_id = $3, updated_at = now() WHERE asset_kind = $2 AND id = $1`, [
         row.id, kind, `comfy:${promptId}`,
       ]);
-    });
+    }, allowedNodeTypes(p.workflow));
     const url = await putBytesToR2(deps.r2, `comfy-video/${row.projectId}/${p.frameId}.mp4`, result.bytes, 'video/mp4');
     await recordAssetCost(deps.pool, {
       assetId: row.id, assetKind: kind, projectId: row.projectId, frameId: row.frameId,
       endpointId: spec.endpointId, providerJobId: `comfy:${result.promptId}`,
       executionMs: Date.now() - startedAt, delayMs: null, workerRateUsdS: deps.cfg.comfyRateUsdS,
     });
-    await applyAssetSuccess(deps, row.id, kind, { video: url, duration_s: p.durationS });
+    // H3 rounds its length up to 17k + 5 frames; report the clip it made.
+    const durationS = p.workflow === 'minimax_h3_ref2v_fast' ? Math.round((h3Frames(p.durationS) / H3_FPS) * 100) / 100 : p.durationS;
+    await applyAssetSuccess(deps, row.id, kind, { video: url, duration_s: durationS });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await applyAssetFailure(deps, row.id, kind, { provider: 'comfy', error: message.slice(0, 500) });

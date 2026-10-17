@@ -99,6 +99,7 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         textManifest: frame.textManifest,
         shotKind: frame.shotKind,
         workflow: frame.workflow,
+        secondReferencePrompt: frame.secondReferencePrompt,
         characters: frame.characters,
         characterRefs: characterRefs(req, frame),
         lastFrameEdit: frame.lastFrameEdit,
@@ -112,6 +113,9 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         lastFramePrompt: frame.lastFramePrompt,
         shotType: frame.shotType,
       };
+      // Reference 2 of a refs2 frame is its own still: the row's imagePrompt is
+      // that still's prompt, so QA judges and rewrites what was generated.
+      if (kind === 'ref2-edit' && frame.secondReferencePrompt) input.imagePrompt = frame.secondReferencePrompt;
       rows.push({
         kind,
         projectId: req.projectId,

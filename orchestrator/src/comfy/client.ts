@@ -11,11 +11,17 @@
  * Operator decision 2026-10-04: open-weight LTX-2.3 ONLY. `assertOpenWeightGraph`
  * refuses a graph with any node outside the allow-list, so a partner/API node
  * (billed per call) can never be submitted by a future workflow edit.
+ *
+ * Product owner, 2026-10-17: two-character shots run MiniMax H3 (fast) — Comfy
+ * Hub's "Create a video from references". It is open-weight too (local UNET /
+ * CLIP / VAE + a 4-step turbo LoRA, not a partner node), but its node types
+ * are allowed ONLY in its own graph (`allowedNodeTypes`), never in an LTX one.
  */
 import i2vWorkflow from './workflows/ltx23_i2v.json';
 import flf2vWorkflow from './workflows/ltx23_flf2v.json';
 import ia2vWorkflow from './workflows/ltx23_ia2v.json';
 import flfIa2vWorkflow from './workflows/ltx23_flf_ia2v.json';
+import h3FastWorkflow from './workflows/minimax_h3_ref2v_fast.json';
 
 export const COMFY_BASE = 'https://cloud.comfy.org';
 export const COMFY_FPS = 25;
@@ -33,21 +39,53 @@ export const ALLOWED_NODE_TYPES: ReadonlySet<string> = new Set([
   'SamplerEulerAncestral', 'SaveVideo', 'SetLatentNoiseMask', 'SolidMask', 'TrimAudioDuration', 'TextGenerateLTX2Prompt', 'VAEDecodeTiled',
 ]);
 
+/** MiniMax H3 reference-to-video's own node types, on top of the shared ones —
+ * accepted only for `minimax_h3_ref2v_fast`. */
+export const H3_NODE_TYPES: ReadonlySet<string> = new Set([
+  'BasicGuider', 'BasicScheduler', 'CLIPLoader', 'MiniMaxH3ReferenceToVideo', 'UNETLoader', 'VAEDecode', 'VAEDecodeAudio', 'VAELoader',
+]);
+
 export type ComfyGraph = Record<string, { class_type: string; inputs: Record<string, unknown> }>;
 
-export function assertOpenWeightGraph(graph: ComfyGraph): void {
+export function assertOpenWeightGraph(graph: ComfyGraph, allowed: ReadonlySet<string> = ALLOWED_NODE_TYPES): void {
   const bad = Object.entries(graph)
-    .filter(([, n]) => !ALLOWED_NODE_TYPES.has(n.class_type))
+    .filter(([, n]) => !allowed.has(n.class_type))
     .map(([id, n]) => `${id}:${n.class_type}`);
   if (bad.length > 0) throw new Error(`comfy graph has non-allow-listed nodes (partner/API nodes are refused): ${bad.join(', ')}`);
 }
 
-export type ComfyWorkflow = 'ltx23_i2v' | 'ltx23_flf2v' | 'ltx23_ia2v' | 'ltx23_flf_ia2v';
+export type ComfyWorkflow = 'ltx23_i2v' | 'ltx23_flf2v' | 'ltx23_ia2v' | 'ltx23_flf_ia2v' | 'minimax_h3_ref2v_fast';
+
+/** The node types `workflow`'s graph may contain. */
+export function allowedNodeTypes(workflow: ComfyWorkflow): ReadonlySet<string> {
+  return workflow === 'minimax_h3_ref2v_fast' ? new Set([...ALLOWED_NODE_TYPES, ...H3_NODE_TYPES]) : ALLOWED_NODE_TYPES;
+}
+
+/** H3 fast renders 480p at 24 fps (the template's 0.4 MP, as tested
+ * 2026-10-17: 9 credits a 5 s clip); the tail upscales it like LTX's 720p. */
+export const H3_SIZE = { landscape: [864, 480], portrait: [480, 864] } as const;
+export const H3_FPS = 24;
+
+export function comfyFormat(workflow: ComfyWorkflow, portrait: boolean): { width: number; height: number; fps: number } {
+  const h3 = workflow === 'minimax_h3_ref2v_fast';
+  const [width, height] = (h3 ? H3_SIZE : COMFY_SIZE)[portrait ? 'portrait' : 'landscape'];
+  return { width, height, fps: h3 ? H3_FPS : COMFY_FPS };
+}
+
+/** H3's clip length in frames for `durationS`: the template's own expression
+ * (node 131) — at least durationS x 24, rounded UP to 17k + 5, so the clip is
+ * never shorter than asked (5 s -> 124 frames = 5.17 s). */
+export function h3Frames(durationS: number): number {
+  const n = Math.max(5, Math.round(durationS * H3_FPS));
+  return n + ((5 - (n % 17)) % 17 + 17) % 17;
+}
 
 export interface ComfyJobSpec {
   workflow: ComfyWorkflow;
-  /** Uploaded input names (from `uploadImage`). `lastImage` only for flf2v. */
+  /** Uploaded input names (from `uploadImage`). `lastImage` only for flf2v;
+   * `secondImage` (reference 2) only for H3. */
   firstImage: string;
+  secondImage?: string;
   lastImage?: string;
   /** Uploaded input name of the padded dialogue audio (ia2v workflows). */
   audio?: string;
@@ -66,8 +104,25 @@ export const NEG_DEFAULT = 'pc game, console game, video game, cartoon, childish
 
 /** Patch the node map found in the 10-03/10-04 tests (comfy-story-test/run.py). */
 export function buildGraph(spec: ComfyJobSpec): ComfyGraph {
-  const src = { ltx23_i2v: i2vWorkflow, ltx23_flf2v: flf2vWorkflow, ltx23_ia2v: ia2vWorkflow, ltx23_flf_ia2v: flfIa2vWorkflow }[spec.workflow];
+  const src = {
+    ltx23_i2v: i2vWorkflow, ltx23_flf2v: flf2vWorkflow, ltx23_ia2v: ia2vWorkflow, ltx23_flf_ia2v: flfIa2vWorkflow,
+    minimax_h3_ref2v_fast: h3FastWorkflow,
+  }[spec.workflow];
   const g = structuredClone(src) as unknown as ComfyGraph;
+  if (spec.workflow === 'minimax_h3_ref2v_fast') {
+    // Reference 1 = the first character in the setting, 2 = the second alone.
+    // No negative prompt node; fps is fixed at 24 in CreateVideo.
+    if (!spec.secondImage) throw new Error(`${spec.workflow} needs secondImage`);
+    g['137'].inputs.image = spec.firstImage;
+    g['139'].inputs.image = spec.secondImage;
+    g['138'].inputs.value = spec.prompt;
+    g['136'].inputs.width = spec.width;
+    g['136'].inputs.height = spec.height;
+    g['132'].inputs.value = Number(spec.durationS);
+    g['129'].inputs.noise_seed = spec.seed;
+    assertOpenWeightGraph(g, allowedNodeTypes(spec.workflow));
+    return g;
+  }
   const neg = [spec.negativePrompt, NEG_DEFAULT].filter(Boolean).join(', ');
   const needAudio = spec.workflow === 'ltx23_ia2v' || spec.workflow === 'ltx23_flf_ia2v';
   const needLast = spec.workflow === 'ltx23_flf2v' || spec.workflow === 'ltx23_flf_ia2v';
@@ -158,8 +213,13 @@ function findVideo(x: unknown): OutputFile | undefined {
 export interface ComfyResult { promptId: string; wallS: number; file: OutputFile; bytes: Buffer }
 
 /** Submit, poll to completion, and fetch the clip's bytes. Throws on any failure. */
-export async function runGraph(t: ComfyTransport, graph: ComfyGraph, onSubmitted?: (promptId: string) => Promise<void>): Promise<ComfyResult> {
-  assertOpenWeightGraph(graph);
+export async function runGraph(
+  t: ComfyTransport,
+  graph: ComfyGraph,
+  onSubmitted?: (promptId: string) => Promise<void>,
+  allowed: ReadonlySet<string> = ALLOWED_NODE_TYPES,
+): Promise<ComfyResult> {
+  assertOpenWeightGraph(graph, allowed);
   const sleep = t.sleepImpl ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const sub = await f(t)(`${base(t)}/api/prompt`, {
     method: 'POST',

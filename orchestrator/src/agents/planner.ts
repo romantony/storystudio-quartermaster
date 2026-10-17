@@ -87,11 +87,16 @@ const FrameSchema = z
     // validateRequest enforces the cross-field rules when motionEngine is 'ltx'.
     // `i2v`/`flf` are narration shots; `ia2v`/`flf_ia2v` are Dialogue Basic's
     // (a later phase) and are rejected until that lands.
-    shotKind: z.enum(['i2v', 'flf', 'ia2v', 'flf_ia2v']).optional(),
+    // `refs2`: two characters in one shot, MiniMax H3 (fast) from two
+    // reference images (storystudio-refs2-minimax-h3-qm-request.md).
+    shotKind: z.enum(['i2v', 'flf', 'ia2v', 'flf_ia2v', 'refs2']).optional(),
     // The model-specific workflow StoryStudio chose for this frame; must agree
-    // with shotKind (i2v-ltx2.3 <-> i2v, flf-ltx2.3 <-> flf). A later model is a
-    // new id, never a new meaning for shotKind.
-    workflow: z.enum(['i2v-ltx2.3', 'flf-ltx2.3']).optional(),
+    // with shotKind (LTX_WORKFLOW_SHOT_KIND). A later model is a new id, never
+    // a new meaning for shotKind.
+    workflow: z.enum(['i2v-ltx2.3', 'flf-ltx2.3', 'refs2-minimax-h3-fast']).optional(),
+    // refs2 only: reference 2, the second character alone (edited from
+    // characters[1]'s sheet; `imagePrompt` makes reference 1 from characters[0]).
+    secondReferencePrompt: z.string().min(1).optional(),
     // Character ids in this frame (<= 2), keys of the request's `characters`.
     characters: z.array(z.string().min(1)).max(2).optional(),
     // An edit applied to the FIRST frame to produce the last (flf shots).
@@ -457,7 +462,7 @@ function buildStepsAndJobs(
 }
 
 /** The shotKind each per-frame `workflow` id is. */
-export const LTX_WORKFLOW_SHOT_KIND = { 'i2v-ltx2.3': 'i2v', 'flf-ltx2.3': 'flf' } as const;
+export const LTX_WORKFLOW_SHOT_KIND = { 'i2v-ltx2.3': 'i2v', 'flf-ltx2.3': 'flf', 'refs2-minimax-h3-fast': 'refs2' } as const;
 
 /** LTX-2.3 cross-field rules (handoff doc, "What StoryStudio sends"). Fails the
  * request loudly at POST time: a frame with no valid contract must not reach
@@ -478,10 +483,23 @@ export function validateLtxRequest(req: OrchestratorRequest): void {
     if (f.workflow && LTX_WORKFLOW_SHOT_KIND[f.workflow] !== f.shotKind) {
       bad([...at, 'workflow'], `frame ${f.frameId}: workflow '${f.workflow}' needs shotKind '${LTX_WORKFLOW_SHOT_KIND[f.workflow]}', not '${f.shotKind}'`);
     }
+    if (f.shotKind === 'refs2') {
+      // Two characters, each from its own reference; nobody speaks on screen.
+      if (f.workflow !== 'refs2-minimax-h3-fast') bad([...at, 'workflow'], `frame ${f.frameId}: a refs2 frame needs workflow 'refs2-minimax-h3-fast'`);
+      if ((f.characters ?? []).length !== 2) bad([...at, 'characters'], `frame ${f.frameId}: a refs2 frame has exactly 2 characters`);
+      if (!f.secondReferencePrompt) bad([...at, 'secondReferencePrompt'], `frame ${f.frameId}: a refs2 frame needs secondReferencePrompt`);
+      if (f.lastFramePrompt) bad([...at, 'lastFramePrompt'], `frame ${f.frameId}: a refs2 frame has no lastFramePrompt`);
+      if (f.audioMode === 'clip') bad([...at, 'audioMode'], `frame ${f.frameId}: a refs2 frame is 'sfx-under-narration' or 'sfx-only'`);
+      if (f.motionPrompt && /["\u201C\u201D]/.test(f.motionPrompt)) bad([...at, 'motionPrompt'], `frame ${f.frameId}: a refs2 frame never carries a quoted line`);
+    } else if (f.secondReferencePrompt) {
+      bad([...at, 'secondReferencePrompt'], `frame ${f.frameId}: secondReferencePrompt is only valid for 'refs2'`);
+    }
     if (actionShot) {
-      // Clip audio only, no TTS, no captions: a silent action (flf) or a line
-      // LTX speaks itself from the quoted text in motionPrompt (i2v).
-      if (f.shotKind !== 'flf' && f.shotKind !== 'i2v') bad([...at, 'shotKind'], `frame ${f.frameId}: an sfx-only frame is shotKind 'i2v' or 'flf'`);
+      // Clip audio only, no TTS, no captions: a silent action (flf, refs2) or a
+      // line LTX speaks itself from the quoted text in motionPrompt (i2v).
+      if (f.shotKind !== 'flf' && f.shotKind !== 'i2v' && f.shotKind !== 'refs2') {
+        bad([...at, 'shotKind'], `frame ${f.frameId}: an sfx-only frame is shotKind 'i2v', 'flf' or 'refs2'`);
+      }
       if (f.narration) bad([...at, 'narration'], `frame ${f.frameId}: an sfx-only action frame has no narration`);
       if (f.dialogue) bad([...at, 'dialogue'], `frame ${f.frameId}: an sfx-only action frame has no dialogue`);
       if (!f.actionS) bad([...at, 'actionS'], `frame ${f.frameId}: an sfx-only action frame needs actionS (the whole shot, 5-10 s)`);

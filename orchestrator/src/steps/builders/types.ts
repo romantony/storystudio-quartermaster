@@ -130,9 +130,12 @@ export interface FrameJobInput {
   textManifest?: Record<string, unknown>;
 
   // ── LTX-2.3 (options.motionEngine === 'ltx'), see agents/planner.ts ──
-  shotKind?: 'i2v' | 'flf' | 'ia2v' | 'flf_ia2v';
+  shotKind?: 'i2v' | 'flf' | 'ia2v' | 'flf_ia2v' | 'refs2';
   /** StoryStudio's model-specific workflow id; validated against shotKind. */
-  workflow?: 'i2v-ltx2.3' | 'flf-ltx2.3';
+  workflow?: 'i2v-ltx2.3' | 'flf-ltx2.3' | 'refs2-minimax-h3-fast';
+  /** refs2: reference 2's prompt. The `ref2-edit` row carries it as its own
+   * `imagePrompt` too, so the image gate and its rewrite act on the right text. */
+  secondReferencePrompt?: string;
   characters?: string[];
   /** Reference image urls of `characters`, in order. Present (possibly empty)
    * only on LTX projects that have characters — it switches the image chain

@@ -5,14 +5,15 @@ import { buildAssetRows } from '../src/assets/submit';
 import { buildComfyVideoInput, ltxDurationS } from '../src/steps/builders/comfy-video';
 import { buildComfyLastInput } from '../src/steps/builders/comfy-last';
 import { ASSET_SPECS } from '../src/assets/kinds';
-import { assertOpenWeightGraph, buildGraph, runGraph, type ComfyGraph } from '../src/comfy/client';
+import { allowedNodeTypes, assertOpenWeightGraph, buildGraph, comfyFormat, h3Frames, runGraph, type ComfyGraph } from '../src/comfy/client';
+import { buildRef2EditInput, buildRef2SheetInput } from '../src/steps/builders/ref2';
 import { buildDialogueAudioInput, dialogueClipS } from '../src/steps/builders/dialogue-audio';
 import { buildTtsInput } from '../src/steps/builders/tts';
 import { buildCharRefInput } from '../src/steps/builders/char-ref';
 import { buildImageInput } from '../src/steps/builders/image';
 import { buildImageEditInput } from '../src/steps/builders/image-edit';
 import { toResolvedDeps } from '../src/assets/plan';
-import { compositeCharacterRefs } from '../src/assets/char-ref-composite';
+import { compositeCharacterRefs, padCharacterRef } from '../src/assets/char-ref-composite';
 import { padDialogueAudio } from '../src/assets/dialogue-audio-pad';
 import { manifestFrame } from '../src/assets/compiler';
 import type { AssetRow } from '../src/db/repo/assets';
@@ -344,7 +345,7 @@ describe('action frames (sfx-only) + dialogue-basic tier', () => {
   it.each([
     ['narration on an action frame', aframe('f1', { narration: 'x' }), /no narration/],
     ['dialogue on an action frame', aframe('f1', { dialogue: { speaker: 'keeper', line: 'x' } }), /no dialogue/],
-    ['an ia2v sfx-only frame', aframe('f1', { shotKind: 'ia2v', lastFrameEdit: undefined }), /shotKind 'i2v' or 'flf'/],
+    ['an ia2v sfx-only frame', aframe('f1', { shotKind: 'ia2v', lastFrameEdit: undefined }), /shotKind 'i2v', 'flf' or 'refs2'/],
     ['no actionS', aframe('f1', { actionS: undefined }), /needs actionS/],
     ['no lastFrameEdit', aframe('f1', { lastFrameEdit: undefined }), /needs lastFrameEdit/],
   ])('rejects %s', (_n, f, msg) => {
@@ -455,5 +456,120 @@ describe('speaker voices: clone > design (handoff "Voices")', () => {
   });
   it('rejects an unknown voice key', () => {
     expect(RequestSchema.safeParse(req([frame('f1')], { characters: [{ id: 'k', description: 'd', referenceImageUrl: REF, voice: { bogus: 1 } }] })).success).toBe(false);
+  });
+});
+
+describe('refs2: two characters from two references (MiniMax H3 fast)', () => {
+  const GIRL = 'https://r2.example/girl.png';
+  const rframe = (id: string, over: Record<string, unknown> = {}) => ({
+    ...frame(id, { narration: undefined }),
+    shotKind: 'refs2', workflow: 'refs2-minimax-h3-fast', audioMode: 'sfx-only', actionS: 5, durationS: 5, characters: ['keeper', 'girl'],
+    secondReferencePrompt: 'Full-body reference of the girl, three-quarter view, plain grey background.',
+    motionPrompt: 'Use the first reference for the keeper and the setting, the second for the girl. The keeper slips and falls; the girl runs to him. No speech, no music.',
+    ...over,
+  });
+  const r = RequestSchema.parse({ ...req([frame('f1', { characters: ['keeper'] }), rframe('f2')], { characters: voices }), tier: 'dialogue-basic', product: 'dialogue' });
+  it('accepts a refs2 sfx-only frame, and a narrated one', () => {
+    expect(() => validateRequest(r)).not.toThrow();
+    expect(() => validateRequest(req([rframe('f1', { audioMode: 'sfx-under-narration', narration: 'They fell.' })], { characters: voices }))).not.toThrow();
+  });
+  it.each([
+    ['1 character', rframe('f1', { characters: ['keeper'] }), /exactly 2 characters/],
+    ['3 characters', rframe('f1', { characters: ['keeper', 'girl', 'keeper'] }), /characters/],
+    ['no secondReferencePrompt', rframe('f1', { secondReferencePrompt: undefined }), /needs secondReferencePrompt/],
+    ['lastFrameEdit', rframe('f1', { lastFrameEdit: 'e' }), /only valid for 'flf'/],
+    ['lastFramePrompt', rframe('f1', { lastFramePrompt: 'p' }), /no lastFramePrompt/],
+    ['dialogue', rframe('f1', { dialogue: { speaker: 'keeper', line: 'x' } }), /no dialogue/],
+    ['a quoted line', rframe('f1', { motionPrompt: 'The girl says "Hold on!" No music.' }), /quoted line/],
+    ['no workflow', rframe('f1', { workflow: undefined }), /needs workflow 'refs2-minimax-h3-fast'/],
+    ['the i2v workflow', rframe('f1', { workflow: 'i2v-ltx2.3' }), /needs shotKind 'i2v'/],
+    ['an unknown character', rframe('f1', { characters: ['keeper', 'ghost'] }), /unknown character 'ghost'/],
+  ])('rejects a refs2 frame with %s', (_n, f, msg) => {
+    expect(() => validateRequest(req([f], { characters: voices }))).toThrow(msg);
+  });
+  it('rejects the H3 workflow on an i2v frame, and secondReferencePrompt off refs2', () => {
+    expect(() => validateRequest(req([frame('f1', { workflow: 'refs2-minimax-h3-fast' })]))).toThrow(/needs shotKind 'refs2'/);
+    expect(() => validateRequest(req([frame('f1', { secondReferencePrompt: 'x' })]))).toThrow(/only valid for 'refs2'/);
+  });
+  it('plans ref2-sheet -> ref2-edit -> comfy-video; not planned without a refs2 frame', () => {
+    const p = compilePlan(r);
+    expect(p.requires['ref2-sheet']).toEqual([]);
+    expect(p.requires['ref2-edit']).toEqual(['ref2-sheet']);
+    expect(p.requires['comfy-video']).toEqual(expect.arrayContaining(['qwen-edit', 'ref2-edit']));
+    expect(compilePlan(RequestSchema.parse(req([frame('f1')]))).frameKinds).not.toContain('ref2-edit');
+  });
+  it('reference 1 from characters[0], reference 2 from characters[1], both on a 1280x720 canvas', () => {
+    const rows = buildAssetRows(r, compilePlan(r));
+    const job = (kind: string) => rows.find((x) => x.kind === kind && x.frameId === 'f2')!.input as Record<string, unknown>;
+    const c = (kind: string) => ctx(job(kind), {});
+    expect(buildCharRefInput(c('char-ref'))).toMatchObject({ refs: [REF], canvas: [1280, 720] });
+    expect(buildRef2SheetInput(c('ref2-sheet'))).toMatchObject({ refs: [GIRL], canvas: [1280, 720] });
+    // ctx() defaults aspectRatio to 9:16; the rows above carry the request's 16:9.
+    expect(buildRef2SheetInput(ctx({ ...job('ref2-sheet'), aspectRatio: '9:16' }, {}))).toMatchObject({ canvas: [720, 1280] });
+    // the edit row's own imagePrompt IS the second reference prompt (QA + rewrite act on it)
+    expect(job('ref2-edit').imagePrompt).toMatch(/^Full-body reference of the girl/);
+    expect(job('qwen-edit').imagePrompt).toBe('a lighthouse');
+    expect(buildRef2EditInput(ctx(job('ref2-edit'), { 20: { url: 'http://sheet2' } }))).toEqual({
+      image_url: 'http://sheet2', prompt: job('ref2-edit').imagePrompt, project_id: 'p1', frame_id: 'f1_ref2',
+    });
+  });
+  it('ref2 kinds skip every non-refs2 frame', () => {
+    expect(buildRef2SheetInput(ctx({ shotKind: 'i2v', characterRefs: [REF, GIRL] }, {}))).toEqual({ __passthroughUrl: 'skip:none' });
+    expect(buildRef2EditInput(ctx({ shotKind: 'flf' }, {}))).toEqual({ __passthroughUrl: 'skip:none' });
+  });
+  it('padCharacterRef pads the whole sheet onto a grey canvas (never crops, never black)', async () => {
+    let args: string[] = [];
+    const f = (async () => ({ ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(2) })) as unknown as typeof fetch;
+    await expect(padCharacterRef('http://a', [1280, 720], f, async (a) => { args = a; })).rejects.toThrow();
+    expect(args.join(' ')).toContain('scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=0xC8C8C8');
+  });
+  it('comfy-video: H3 gets both references and the prompt, sized from actionS', () => {
+    const j = { shotKind: 'refs2', workflow: 'refs2-minimax-h3-fast', audioMode: 'sfx-only', actionS: 7, motionPrompt: 'm', aspectRatio: '16:9' };
+    expect(buildComfyVideoInput(ctx(j, { 0: { url: 'http://ref1' }, 21: { url: 'http://ref2' } }))).toMatchObject({
+      workflow: 'minimax_h3_ref2v_fast', firstImageUrl: 'http://ref1', secondImageUrl: 'http://ref2', prompt: 'm', durationS: 7, portrait: false,
+    });
+    expect(() => buildComfyVideoInput(ctx(j, { 0: { url: 'http://ref1' } }))).toThrow(/no second reference/);
+    // narrated: sized from the real TTS like any LTX shot
+    const n = { ...j, audioMode: 'sfx-under-narration', actionS: undefined };
+    expect(buildComfyVideoInput(ctx(n, { 0: { url: 'http://ref1' }, 2: { url: 'http://tts', durationS: 6.2 }, 21: { url: 'http://ref2' } }))).toMatchObject({ durationS: 9 });
+  });
+  it('H3 graph: refs, prompt, size, length, seed, fast switch on', () => {
+    const { width, height, fps } = comfyFormat('minimax_h3_ref2v_fast', false);
+    expect([width, height, fps]).toEqual([864, 480, 24]);
+    expect(comfyFormat('minimax_h3_ref2v_fast', true)).toMatchObject({ width: 480, height: 864 });
+    expect(comfyFormat('ltx23_i2v', false)).toEqual({ width: 1280, height: 720, fps: 25 });
+    const g = buildGraph({ workflow: 'minimax_h3_ref2v_fast', firstImage: 'r1.png', secondImage: 'r2.png', prompt: 'P', width, height, fps, durationS: 5, seed: 9 });
+    expect(g['137'].inputs.image).toBe('r1.png');
+    expect(g['139'].inputs.image).toBe('r2.png');
+    expect(g['138'].inputs.value).toBe('P');
+    expect([g['136'].inputs.width, g['136'].inputs.height]).toEqual([864, 480]);
+    expect(g['132'].inputs.value).toBe(5);
+    expect(g['129'].inputs.noise_seed).toBe(9);
+    expect(g['146'].inputs.value).toBe(true); // fast = the 4-step turbo LoRA
+    expect(() => buildGraph({ workflow: 'minimax_h3_ref2v_fast', firstImage: 'r1.png', prompt: 'P', width, height, fps, durationS: 5, seed: 9 })).toThrow(/secondImage/);
+  });
+  it('H3 length rounds UP to 17k+5 frames at 24 fps (never shorter than asked)', () => {
+    expect(h3Frames(5)).toBe(124); // 5.17 s, the 2026-10-17 test clip
+    for (const d of [5, 6, 7.5, 8, 10]) {
+      const n = h3Frames(d);
+      expect(n % 17).toBe(5);
+      expect(n / 24).toBeGreaterThanOrEqual(d);
+      expect(n / 24 - d).toBeLessThan(17 / 24);
+    }
+  });
+  it('allow-lists: H3 nodes only in the H3 graph; any other partner node still refused', () => {
+    const h3 = buildGraph({ workflow: 'minimax_h3_ref2v_fast', firstImage: 'a', secondImage: 'b', prompt: 'P', width: 864, height: 480, fps: 24, durationS: 5, seed: 1 });
+    expect(() => assertOpenWeightGraph(h3)).toThrow(/MiniMaxH3ReferenceToVideo/);
+    expect(() => assertOpenWeightGraph(h3, allowedNodeTypes('minimax_h3_ref2v_fast'))).not.toThrow();
+    const partner: ComfyGraph = { ...h3, '999': { class_type: 'MinimaxHailuoVideoNode', inputs: {} } };
+    expect(() => assertOpenWeightGraph(partner, allowedNodeTypes('minimax_h3_ref2v_fast'))).toThrow(/999:MinimaxHailuoVideoNode/);
+    expect(() => assertOpenWeightGraph(partner, allowedNodeTypes('ltx23_i2v'))).toThrow(/non-allow-listed/);
+  });
+  it('manifest: a refs2 clip is the LTX clip path (SFX from video; sfx-only not "spoken")', () => {
+    const plan = compilePlan(r);
+    const row = (kind: string, url: string) => ({ id: 1, projectId: 'p1', seq: 1, frameId: 'f2', kind, status: 'complete', assetUrl: url, durationS: null, input: {} }) as unknown as AssetRow;
+    const m = manifestFrame(plan, { frameId: 'f2', seq: 1, rows: [row('tts', 'skip:none'), row('comfy-video', 'http://h3.mp4')] }, r);
+    expect(m).toMatchObject({ clipAudioOnly: true, videoUrl: 'http://h3.mp4', sfxFromVideo: true });
+    expect(m).not.toHaveProperty('clipAudioSpoken');
   });
 });

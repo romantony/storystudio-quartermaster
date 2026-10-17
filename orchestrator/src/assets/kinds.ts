@@ -33,6 +33,7 @@ import { buildSfxInput } from '../steps/builders/sfx';
 import { buildRemotionOverlayInput } from '../steps/builders/remotion-overlay';
 import { buildComfyVideoInput } from '../steps/builders/comfy-video';
 import { buildCharRefInput } from '../steps/builders/char-ref';
+import { buildRef2EditInput, buildRef2SheetInput, REF2_EDIT_SEQ, REF2_SHEET_SEQ } from '../steps/builders/ref2';
 import { buildDialogueAudioInput } from '../steps/builders/dialogue-audio';
 import { buildComfyLastInput } from '../steps/builders/comfy-last';
 import { buildAnimateInput } from '../steps/builders/animate';
@@ -47,6 +48,8 @@ export const ASSET_KINDS = [
   'mmaudio',
   'animate',
   'char-ref',
+  'ref2-sheet',
+  'ref2-edit',
   'comfy-last',
   'dialogue-audio',
   'comfy-video',
@@ -285,6 +288,42 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     produces: 'image',
     stages: [],
     build: buildCharRefInput,
+  },
+  'ref2-sheet': {
+    // refs2 frames (MiniMax H3, 2026-10-17): the SECOND character's reference,
+    // padded onto a 16:9 canvas in process, as `char-ref` does for the first.
+    // Skipped for every other frame.
+    kind: 'ref2-sheet',
+    scope: 'frame',
+    provider: 'lambda',
+    gate: null,
+    table: 'asset_ref2_sheet',
+    endpointId: 'lambda:char-ref',
+    maxInFlight: 8,
+    timeoutMs: null,
+    cancelOnTimeout: false,
+    legacySeq: REF2_SHEET_SEQ,
+    produces: 'image',
+    stages: [],
+    build: buildRef2SheetInput,
+  },
+  'ref2-edit': {
+    // Reference 2 of a refs2 frame: a qwen-image-edit of the padded sheet with
+    // `secondReferencePrompt`. Image-gated like the first-frame still (aspect,
+    // character present). Skipped for every other frame.
+    kind: 'ref2-edit',
+    scope: 'frame',
+    provider: 'runpod',
+    gate: 'image',
+    table: 'asset_ref2_edit',
+    endpointId: endpointFor('runpod:qwen-image-edit'),
+    maxInFlight: podsFor('runpod:qwen-image-edit'),
+    timeoutMs: 300_000,
+    cancelOnTimeout: true,
+    legacySeq: REF2_EDIT_SEQ,
+    produces: 'image',
+    stages: [],
+    build: buildRef2EditInput,
   },
   'dialogue-audio': {
     // A dialogue line padded to the clip length for lip-sync (ffmpeg, in

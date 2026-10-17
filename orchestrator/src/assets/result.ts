@@ -218,6 +218,8 @@ function legacySeqOf(kind: string): number {
     'comfy-last': 17,
     'dialogue-audio': 18,
     'char-ref': 19,
+    'ref2-sheet': 20,
+    'ref2-edit': 21,
     'sfn-tail': 6,
     mmaudio: 15,
     remotion: 16,
