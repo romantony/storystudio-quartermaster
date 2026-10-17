@@ -9,7 +9,7 @@
  * bad row can take anything else down with it.
  */
 import { RunpodClient } from '../src/runpod/client';
-import { runAssetAgentTick, applyAssetSuccess, assetWebhookToken, resolveHandoffs, type AssetAgentDeps } from '../src/assets/agent';
+import { runAssetAgentTick, applyAssetSuccess, completeRunpodAsset, assetWebhookToken, resolveHandoffs, type AssetAgentDeps } from '../src/assets/agent';
 import { webhookToken } from '../src/agents/generator';
 import { compilePlan } from '../src/assets/plan';
 import { executionName, type SfnImpl, type SfnExecution } from '../src/aws/sfn';
@@ -19,6 +19,8 @@ import * as assetsRepo from '../src/db/repo/assets';
 import * as costsRepo from '../src/db/repo/asset-costs';
 import * as pipelineRepo from '../src/db/repo/pipeline';
 import type { AssetRow } from '../src/db/repo/assets';
+import * as conform from '../src/assets/conform-media';
+import * as r2Client from '../src/r2/client';
 
 jest.mock('../src/db/repo/assets');
 jest.mock('../src/db/repo/asset-costs');
@@ -324,6 +326,51 @@ describe('completion', () => {
     expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
   });
 
+});
+
+describe('completion conforms stills to the project size (2026-10-17)', () => {
+  const row = (aspectRatio?: string) => ({ id: 101, projectId: 'proj_1', frameId: 'f1', input: { aspectRatio } as AssetRow['input'] });
+  const R2 = { accountId: 'a', bucket: 'b', publicUrl: 'https://r2.example', accessKeyId: 'k', secretAccessKey: 's' };
+  afterEach(() => jest.restoreAllMocks());
+
+  it('re-hosts a wrong-size still and completes with the conformed url', async () => {
+    jest.spyOn(conform, 'conformStill').mockResolvedValue(Buffer.from('png'));
+    const put = jest.spyOn(r2Client, 'putBytesToR2').mockResolvedValue('https://r2.example/stills/proj_1/f1-qwen-image-gen.png');
+    const outcome = await completeRunpodAsset({ ...deps(jest.fn()), r2: R2 }, row('16:9'), 'qwen-image-gen', { image_url: 'https://worker/x.png' });
+    expect(outcome).toBe('completed');
+    expect(conform.conformStill).toHaveBeenCalledWith('https://worker/x.png', [1280, 720]);
+    expect(put.mock.calls[0][1]).toBe('stills/proj_1/f1-qwen-image-gen.png');
+    expect((assetsRepo.completeAsset as jest.Mock).mock.calls[0][2].assetUrl).toBe('https://r2.example/stills/proj_1/f1-qwen-image-gen.png');
+  });
+  it('keeps the worker url when the still is already the size', async () => {
+    jest.spyOn(conform, 'conformStill').mockResolvedValue(null);
+    await completeRunpodAsset({ ...deps(jest.fn()), r2: R2 }, row('9:16'), 'qwen-image-gen', { image: 'https://worker/x.png' });
+    expect((assetsRepo.completeAsset as jest.Mock).mock.calls[0][2].assetUrl).toBe('https://worker/x.png');
+  });
+  it('conforms a generated Wan2 clip and completes with the re-hosted url', async () => {
+    jest.spyOn(conform, 'conformClipUrl').mockResolvedValue(Buffer.from('mp4'));
+    const put = jest.spyOn(r2Client, 'putBytesToR2').mockResolvedValue('https://r2.example/clips/proj_1/f1-wan2-i2v.mp4');
+    const poolLike = fakePool({ successRow: { asset_kind: 'wan2-i2v', endpoint_id: ASSET_SPECS['wan2-i2v'].endpointId } });
+    await completeRunpodAsset({ ...deps(jest.fn(), poolLike), r2: R2 }, row('16:9'), 'wan2-i2v', { video: 'https://worker/c.mp4' });
+    expect(conform.conformClipUrl).toHaveBeenCalledWith('https://worker/c.mp4', [1280, 720]);
+    expect(put.mock.calls[0][3]).toBe('video/mp4');
+    expect((assetsRepo.completeAsset as jest.Mock).mock.calls[0][2].assetUrl).toBe('https://r2.example/clips/proj_1/f1-wan2-i2v.mp4');
+  });
+  it('leaves non-image kinds, other aspects and worker errors alone', async () => {
+    const spy = jest.spyOn(conform, 'conformStill');
+    const poolLike = fakePool({ successRow: { asset_kind: 'tts', endpoint_id: ASSET_SPECS.tts.endpointId } });
+    await completeRunpodAsset({ ...deps(jest.fn(), poolLike), r2: R2 }, row('16:9'), 'tts', { audio: 'https://cdn/a.mp3' });
+    await completeRunpodAsset({ ...deps(jest.fn()), r2: R2 }, row('1:1'), 'qwen-image-gen', { image: 'https://worker/x.png' });
+    await completeRunpodAsset({ ...deps(jest.fn()), r2: R2 }, row('16:9'), 'qwen-image-gen', { error: 'oom' });
+    expect(spy).not.toHaveBeenCalled();
+  });
+  it('fails the attempt (never completes at the wrong size) when conforming fails', async () => {
+    jest.spyOn(conform, 'conformStill').mockRejectedValue(new Error('ffmpeg: boom'));
+    const outcome = await completeRunpodAsset({ ...deps(jest.fn()), r2: R2 }, row('16:9'), 'qwen-edit', { image: 'https://worker/x.png' });
+    expect(outcome).toBe('noop'); // retried
+    expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
+    expect(assetsRepo.failOrRetryAsset).toHaveBeenCalled();
+  });
 });
 
 describe('the Step Functions-backed sfn-tail agent', () => {

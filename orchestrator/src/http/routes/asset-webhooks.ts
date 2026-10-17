@@ -25,7 +25,7 @@ import type { Config } from '../../config';
 import type { RunpodClient } from '../../runpod/client';
 import { log } from '../../telemetry/log';
 import { getAssetByProviderJobId } from '../../db/repo/assets';
-import { applyAssetSuccess, applyAssetFailure, assetWebhookToken, type AssetAgentDeps } from '../../assets/agent';
+import { completeRunpodAsset, applyAssetFailure, assetWebhookToken, type AssetAgentDeps } from '../../assets/agent';
 import { isTerminal, extractErrorText } from '../../runpod/types';
 
 function safeEqual(a: string, b: string): boolean {
@@ -45,6 +45,14 @@ export async function assetWebhookRoutes(
     cfg: opts.cfg,
     publicBaseUrl: opts.publicBaseUrl,
     webhookSecret: opts.cfg.webhookSecret,
+    // Image completions are conformed to the project size and re-hosted here.
+    r2: {
+      accountId: opts.cfg.r2AccountId,
+      bucket: opts.cfg.r2Bucket,
+      publicUrl: opts.cfg.r2PublicUrl,
+      accessKeyId: opts.cfg.r2AccessKeyId ?? '',
+      secretAccessKey: opts.cfg.r2SecretAccessKey ?? '',
+    },
   };
 
   app.post<{
@@ -84,7 +92,7 @@ export async function assetWebhookRoutes(
       }
 
       if (body.status === 'COMPLETED') {
-        await applyAssetSuccess(deps, row.id, row.kind, body.output, {
+        await completeRunpodAsset(deps, row, row.kind, body.output, {
           executionMs: body.executionTime ?? null,
           delayMs: body.delayTime ?? null,
         });

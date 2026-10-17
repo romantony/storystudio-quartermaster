@@ -56,6 +56,7 @@ import { invokeAnimate, invokeRemotionOverlay, type AnimateInput, type LambdaTra
 import { persistToR2, putBytesToR2, type R2Transport } from '../r2/client';
 import { padDialogueAudio } from './dialogue-audio-pad';
 import { compositeCharacterRefs, padCharacterRef } from './char-ref-composite';
+import { conformClip, conformClipUrl, conformStill, stillSize } from './conform-media';
 import { H3_FPS, allowedNodeTypes, buildGraph, comfyFormat, h3Frames, runGraph, uploadImage, type ComfyTransport, type ComfyWorkflow } from '../comfy/client';
 import {
   describeTailExecution,
@@ -236,6 +237,59 @@ function outputDuration(output: unknown): number | undefined {
     if (typeof d === 'number' && Number.isFinite(d)) return d;
   }
   return undefined;
+}
+
+/**
+ * A RunPod completion, from any of its three paths (inline /run result,
+ * reconcile poll, webhook): a generated still or clip is first conformed to the
+ * project's exact frame size (assets/conform-media.ts), OUTSIDE the row lock
+ * applyAssetSuccess takes, then applied. One that cannot be conformed fails
+ * the attempt rather than completing at the wrong size.
+ */
+export async function completeRunpodAsset(
+  deps: AssetAgentDeps,
+  row: Pick<AssetRow, 'id' | 'projectId' | 'frameId' | 'input'>,
+  kind: AssetKind,
+  output: unknown,
+  billing?: { executionMs: number | null; delayMs: number | null },
+): Promise<'completed' | 'advanced' | 'failed' | 'noop'> {
+  let conformed: unknown;
+  try {
+    conformed = await conformMediaOutput(deps, row, kind, output);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log().warn({ assetId: row.id, kind, err: message }, 'asset-agent: still could not be conformed to the project size');
+    const outcome = await applyAssetFailure(deps, row.id, kind, { provider: 'conform', error: message.slice(0, 500) });
+    return outcome === 'failed' ? 'failed' : 'noop';
+  }
+  return applyAssetSuccess(deps, row.id, kind, conformed, billing);
+}
+
+/** RunPod kinds that GENERATE a clip. MMAudio and the overlay re-render an
+ * already-conformed clip, so they are not re-checked. */
+const GENERATED_CLIP_KINDS: ReadonlySet<AssetKind> = new Set(['wan2-i2v']);
+
+async function conformMediaOutput(
+  deps: AssetAgentDeps,
+  row: Pick<AssetRow, 'id' | 'projectId' | 'frameId' | 'input'>,
+  kind: AssetKind,
+  output: unknown,
+): Promise<unknown> {
+  const spec = assetSpec(kind);
+  const still = spec.produces === 'image';
+  if ((!still && !GENERATED_CLIP_KINDS.has(kind)) || outputError(output)) return output;
+  if ((output as { __passthroughUrl?: unknown } | null)?.__passthroughUrl !== undefined) return output;
+  const url = runpodOutUrl(output);
+  const size = stillSize((row.input as FrameJobInput | null)?.aspectRatio);
+  if (!url || !size) return output;
+  if (!deps.r2) throw new Error(`${kind}: no r2 transport to host the conformed ${still ? 'still' : 'clip'}`);
+  const bytes = still ? await conformStill(url, size) : await conformClipUrl(url, size);
+  if (!bytes) return output;
+  const conformedUrl = still
+    ? await putBytesToR2(deps.r2, `stills/${row.projectId}/${row.frameId}-${kind}.png`, bytes, 'image/png')
+    : await putBytesToR2(deps.r2, `clips/${row.projectId}/${row.frameId}-${kind}.mp4`, bytes, 'video/mp4');
+  // `image`/`video` lead runpodOutUrl()'s key order; the worker's own url is kept for the record.
+  return { ...(output as Record<string, unknown>), [still ? 'image' : 'video']: conformedUrl, worker_url: url };
 }
 
 /**
@@ -513,7 +567,10 @@ async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetR
         row.id, kind, `comfy:${promptId}`,
       ]);
     }, allowedNodeTypes(p.workflow));
-    const url = await putBytesToR2(deps.r2, `comfy-video/${row.projectId}/${p.frameId}.mp4`, result.bytes, 'video/mp4');
+    // LTX renders 1280x704, H3 864x480: conform to the project's exact frame size.
+    const size = stillSize((row.input as FrameJobInput | null)?.aspectRatio);
+    const bytes = (size ? await conformClip(result.bytes, size) : null) ?? result.bytes;
+    const url = await putBytesToR2(deps.r2, `comfy-video/${row.projectId}/${p.frameId}.mp4`, bytes, 'video/mp4');
     await recordAssetCost(deps.pool, {
       assetId: row.id, assetKind: kind, projectId: row.projectId, frameId: row.frameId,
       endpointId: spec.endpointId, providerJobId: `comfy:${result.promptId}`,
@@ -645,7 +702,7 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
     // outside this transaction, through the same path a webhook would use,
     // so there is exactly one completion code path.
     if (res.status === 'COMPLETED') {
-      await applyAssetSuccess(deps, row.id, kind, res.output, {
+      await completeRunpodAsset(deps, row, kind, res.output, {
         executionMs: res.executionTime ?? null,
         delayMs: res.delayTime ?? null,
       });
@@ -855,7 +912,7 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
       }
 
       if (res.status === 'COMPLETED') {
-        const outcome = await applyAssetSuccess(deps, row.id, kind, res.output, {
+        const outcome = await completeRunpodAsset(deps, row, kind, res.output, {
           executionMs: res.executionTime ?? null,
           delayMs: res.delayTime ?? null,
         });
