@@ -29,7 +29,8 @@ export interface DocgenResult {
   assets: {
     final: { url: string; bytes: number | null; durationS: null; resolution: null } | null;
     frames: [];
-    shorts: Array<{ id: string; url: string; bytes: number | null }>;
+    /** `thumbnail`: the Short's own 9:16 thumbnail (output kind short_thumbnail at shorts/<id>/thumb/), when doc-gen made one. */
+    shorts: Array<{ id: string; url: string; bytes: number | null; thumbnail: { url: string } | null }>;
     thumbnail: { url: string } | null;
     metadata: { url: string } | null;
     shortsMetadata: { url: string } | null;
@@ -54,7 +55,11 @@ export function buildDocgenResult(row: DocgenJobRow, now: Date = new Date()): Do
     return o?.url ? { url: o.url } : null;
   };
   const long = one('long_video');
-  const shorts = outputs.filter((o) => o.kind === 'short' && o.url).map((o) => ({ id: shortId(o.path), url: o.url as string, bytes: o.bytes ?? null }));
+  const shortThumbs = new Map(outputs.filter((o) => o.kind === 'short_thumbnail' && o.url).map((o) => [shortId(o.path), o.url as string]));
+  const shorts = outputs.filter((o) => o.kind === 'short' && o.url).map((o) => {
+    const id = shortId(o.path); const thumb = shortThumbs.get(id);
+    return { id, url: o.url as string, bytes: o.bytes ?? null, thumbnail: thumb ? { url: thumb } : null };
+  });
 
   // Every output the instance reported must have a url to count as complete;
   // an entry without one means its upload failed (the instance says which in `warnings`).

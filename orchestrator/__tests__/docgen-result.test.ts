@@ -10,6 +10,7 @@ const FULL = [
   out('long_video', 'out/a.mp4', undefined, 9),
   out('short', 'shorts/a_spark/out/a_spark.mp4'),
   out('short', 'shorts/b_myth/out/b_myth.mp4'),
+  out('short_thumbnail', 'shorts/a_spark/thumb/thumbnail.jpg'),
   out('thumbnail', 'thumb/thumbnail.jpg'),
   out('metadata', 'out/youtube_metadata.md'),
   out('shorts_metadata', 'out/shorts_metadata.md'),
@@ -33,6 +34,8 @@ describe('buildDocgenResult', () => {
     expect(r.assets.final).toEqual({ url: `${CDN}/out/a.mp4`, bytes: 184220331, durationS: null, resolution: null });
     expect(r.assets.frames).toEqual([]);
     expect(r.assets.shorts.map((s) => s.id)).toEqual(['a_spark', 'b_myth']);
+    // each Short carries its own thumbnail when doc-gen made one
+    expect(r.assets.shorts.map((s) => s.thumbnail)).toEqual([{ url: `${CDN}/shorts/a_spark/thumb/thumbnail.jpg` }, null]);
     expect(r.assets.thumbnail).toEqual({ url: `${CDN}/thumb/thumbnail.jpg` });
     expect(r.assets.metadata?.url).toMatch(/youtube_metadata\.md$/);
     expect(r.assets.shortsMetadata?.url).toMatch(/shorts_metadata\.md$/);
