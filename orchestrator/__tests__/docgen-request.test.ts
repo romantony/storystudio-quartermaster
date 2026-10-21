@@ -33,8 +33,8 @@ describe('validateIntake', () => {
 
   it('enforces doc-gen limits, with the offending path in the issue', () => {
     const cases: Array<[Record<string, unknown>, string]> = [
-      [{ targetSeconds: 239 }, 'targetSeconds'],
-      [{ targetSeconds: 721 }, 'targetSeconds'],
+      [{ targetSeconds: 59 }, 'targetSeconds'],
+      [{ targetSeconds: 1801 }, 'targetSeconds'],
       [{ topic: 'x'.repeat(201) }, 'topic'],
       [{ synopsis: 'x'.repeat(1001) }, 'synopsis'],
       [{ shorts: { count: 4 } }, 'shorts'],

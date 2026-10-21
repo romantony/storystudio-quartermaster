@@ -32,7 +32,7 @@ export const DocgenIntakeSchema = z
     callbackUrl: z.string().url().startsWith('https://', 'callbackUrl must be https'),
     topic: z.string().min(1).max(200),
     synopsis: z.string().min(1).max(1000),
-    targetSeconds: z.number().int().min(240).max(720).optional(),
+    targetSeconds: z.number().int().min(60).max(1800).optional(),
     narratorVoice: z.string().min(1).optional(),
     series: z
       .object({
