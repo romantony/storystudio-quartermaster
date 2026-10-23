@@ -274,6 +274,11 @@ const ConfigSchema = z.object({
   // Subscription credits, not per-second billing: this rate is a clearly-labeled
   // placeholder so job_costs rows exist (~91 credits per 80 s story, 10-04).
   comfyRateUsdS: numeric(0.0005).pipe(z.number().nonnegative()),
+  // Seedance 2 Mini on KIE (the `seedance-video` kind, options.motionEngine 'seedance'). Empty key =
+  // no transport; such a row fails with a clear error. Never commit the value.
+  kieApiKey: z.string().default(''),
+  // KIE bills per clip-second; a placeholder rate so job_costs rows exist.
+  kieSeedanceRateUsdS: numeric(0.04).pipe(z.number().nonnegative()),
 
   // ── R2 persistence for step 16's Lambda output (src/r2/client.ts) ──────
   // Remotion Lambda's own output lives on ITS S3 bucket, not QM's — same
@@ -422,6 +427,8 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   animateLambdaRateUsdS: 'ANIMATE_LAMBDA_RATE_USD_S',
   comfyApiKey: 'COMFY_API_KEY',
   comfyRateUsdS: 'COMFY_RATE_USD_S',
+  kieApiKey: 'KIE_API_KEY',
+  kieSeedanceRateUsdS: 'KIE_SEEDANCE_RATE_USD_S',
   r2AccountId: 'R2_ACCOUNT_ID',
   r2Bucket: 'R2_BUCKET_NAME',
   r2PublicUrl: 'R2_PUBLIC_URL',

@@ -20,7 +20,7 @@ import { listProjectAssets, type AssetRow } from '../db/repo/assets';
 import { projectAssetCost } from '../db/repo/asset-costs';
 import { getPipelineProject } from '../db/repo/pipeline';
 import { getProject } from '../db/repo/projects';
-import type { AssetPlan } from './plan';
+import { motionKindsOf, type AssetPlan } from './plan';
 import type { OrchestratorRequest } from '../agents/planner';
 import { extractErrorText } from '../runpod/types';
 
@@ -43,6 +43,16 @@ export interface AssetResultFacts {
    * Reported as the first `errors` entry: before 2026-10-03 it never left
    * the orchestrator, and StoryStudio received `failed` with no reason. */
   projectReason?: string;
+}
+
+/** The first of `kinds` that produced a real url for the frame: a mixed plan has a row per motion
+ * kind on every frame, and the ones that do not apply hold a `skip:` marker. */
+function realUrlOf(rows: AssetRow[], kinds: readonly string[], frameId: string): string | null {
+  for (const k of kinds) {
+    const u = urlOf(rows, k, frameId);
+    if (u && !u.startsWith('skip:')) return u;
+  }
+  return null;
 }
 
 function urlOf(rows: AssetRow[], kind: string, frameId: string): string | null {
@@ -97,7 +107,7 @@ export function buildAssetResult(facts: AssetResultFacts): QmResult {
       clipUrl:
         urlOf(rows, 'remotion', f.frameId) ??
         urlOf(rows, 'mmaudio', f.frameId) ??
-        (plan.motionKind ? urlOf(rows, plan.motionKind, f.frameId) : null),
+        realUrlOf(rows, motionKindsOf(plan), f.frameId),
       // From the tail's own per-frame report. Null until the tail has run
       // (a project that failed before assembly), and null for a frame the
       // tail dropped.
@@ -215,6 +225,7 @@ function legacySeqOf(kind: string): number {
     tts: 2,
     'wan2-i2v': 3,
     'comfy-video': 3,
+    'seedance-video': 3,
     'comfy-last': 17,
     'dialogue-audio': 18,
     'char-ref': 19,

@@ -90,6 +90,14 @@ const FrameSchema = z
     // `refs2`: two characters in one shot, MiniMax H3 (fast) from two
     // reference images (storystudio-refs2-minimax-h3-qm-request.md).
     shotKind: z.enum(['i2v', 'flf', 'ia2v', 'flf_ia2v', 'refs2']).optional(),
+    // Dialogue Premium (options.motionEngine === 'seedance'): the clip's own audio is a character
+    // speaking (Seedance voices the quoted lines in `motionPrompt`), so the tail levels it to
+    // narration loudness instead of the quieter ambience of a silent shot.
+    spoken: z.boolean().optional(),
+    // Dialogue Premium mixes engines in ONE request (motionEngine 'seedance'): a narration frame is
+    // 'ltx' (Qwen voice-clone TTS + an LTX-2.3 clip, 720p, its own ambience/SFX), everything else
+    // 'seedance' (the clip speaks for itself). Absent = the request's engine.
+    engine: z.enum(['ltx', 'seedance']).optional(),
     // The model-specific workflow StoryStudio chose for this frame; must agree
     // with shotKind (LTX_WORKFLOW_SHOT_KIND). A later model is a new id, never
     // a new meaning for shotKind.
@@ -180,7 +188,9 @@ const OptionsSchema = z
     // plans seq 3, so a request that sets this while ORCH_PIPELINE_MODE is
     // 'cohort' is accepted and ignored.
     // 'ltx' = LTX-2.3 on Comfy Cloud (`comfy-video`, assets/kinds.ts).
-    motionEngine: z.enum(['wan2', 'animate', 'ltx']).default('wan2'),
+    // 'seedance' = Seedance 2 Mini through KIE (`seedance-video`): Dialogue Premium, the clip
+    // carries its own speech, two characters may talk in one frame.
+    motionEngine: z.enum(['wan2', 'animate', 'ltx', 'seedance']).default('wan2'),
     // Per-frame MMAudio SFX (step 15), mixed under the narration at merge.
     // Off by default — MMAudio's weights are non-commercial (CC-BY-NC-4.0).
     sfx: z.boolean().default(false),
@@ -326,7 +336,7 @@ function resolveStepSet(req: OrchestratorRequest): number[] {
   // Dialogue-only steps are InfiniteTalk/PiP; an LTX dialogue project has
   // neither (its lip-sync is the ia2v workflow), so the tier name alone must
   // not switch them on.
-  const isDialogue = req.tier.toLowerCase().includes('dialogue') && req.options.motionEngine !== 'ltx';
+  const isDialogue = req.tier.toLowerCase().includes('dialogue') && req.options.motionEngine !== 'ltx' && req.options.motionEngine !== 'seedance';
   return STEP_TOPOLOGY.filter((s) => {
     if (s.dialogueOnly && !isDialogue) return false;
     if (s.gatedBy && !s.gatedBy(req.options)) return false;
@@ -537,6 +547,55 @@ export function validateLtxRequest(req: OrchestratorRequest): void {
   if (issues.length > 0) throw new PlanValidationError(issues);
 }
 
+/** KIE's integer-second range for Seedance 2 Mini (src/kie/seedance.ts). */
+const SEEDANCE_MIN_S = 4;
+const SEEDANCE_MAX_S = 15;
+
+/** Seedance cross-field rules (Dialogue Premium). A 'seedance' frame is ONE clip: its still, a prompt
+ * that already contains the spoken lines, and a length — no TTS, no narration. An 'ltx' frame is a
+ * narration shot: Qwen-voiced TTS over an LTX-2.3 image-to-video clip sized to that narration. */
+export function validateSeedanceRequest(req: OrchestratorRequest): void {
+  const issues: z.ZodIssue[] = [];
+  const bad = (path: (string | number)[], message: string): void => {
+    issues.push({ code: z.ZodIssueCode.custom, path, message });
+  };
+  const chars = new Set((req.characters ?? []).map((c) => c.id));
+  // Speech is Seedance's, and silence removal cuts the >=0.4 s gaps dialogue needs.
+  if (req.options.removeSilence) bad(['options', 'removeSilence'], "removeSilence is not allowed with motionEngine 'seedance' (it cuts dialogue pauses)");
+  if (req.options.sfx) bad(['options', 'sfx'], "sfx is not allowed with motionEngine 'seedance' (the clips carry their own sound)");
+  const hasNarration = req.frames.some((f) => f.engine === 'ltx');
+  if (hasNarration) {
+    // The narration frames are voiced by the orchestrator: the Qwen clone (or a design) must be named.
+    if (req.options.voiceEngine !== 'qwen') bad(['options', 'voiceEngine'], "narration frames (engine 'ltx') need options.voiceEngine 'qwen'");
+    if (!req.cloneArtifactUrl && !req.voiceInstruct && !req.voiceSpeaker) {
+      bad(['cloneArtifactUrl'], "narration frames (engine 'ltx') need a narrator voice (cloneArtifactUrl, voiceInstruct or voiceSpeaker)");
+    }
+  }
+  req.frames.forEach((f, i) => {
+    const at = ['frames', i];
+    if (!f.motionPrompt) bad([...at, 'motionPrompt'], `frame ${f.frameId}: motionPrompt is required`);
+    else if (f.motionPrompt.length > 20000) bad([...at, 'motionPrompt'], `frame ${f.frameId}: motionPrompt is over KIE's 20000-character limit`);
+    for (const id of f.characters ?? []) {
+      if (!chars.has(id)) bad([...at, 'characters'], `frame ${f.frameId}: unknown character '${id}' (not in request.characters)`);
+    }
+    if (f.engine === 'ltx') {
+      if (f.shotKind !== 'i2v') bad([...at, 'shotKind'], `frame ${f.frameId}: a narration (engine 'ltx') frame is shotKind 'i2v'`);
+      if (!f.narration) bad([...at, 'narration'], `frame ${f.frameId}: a narration (engine 'ltx') frame needs narration`);
+      if (f.audioMode !== 'sfx-under-narration') bad([...at, 'audioMode'], `frame ${f.frameId}: a narration frame is audioMode 'sfx-under-narration' (its clip's sound sits under the voice)`);
+      if (f.dialogue) bad([...at, 'dialogue'], `frame ${f.frameId}: a narration frame has no dialogue field`);
+      if (f.spoken) bad([...at, 'spoken'], `frame ${f.frameId}: a narration frame is voiced by TTS, not by its clip`);
+      return;
+    }
+    if (f.durationS < SEEDANCE_MIN_S || f.durationS > SEEDANCE_MAX_S) {
+      bad([...at, 'durationS'], `frame ${f.frameId}: durationS ${f.durationS} is outside Seedance's ${SEEDANCE_MIN_S}-${SEEDANCE_MAX_S} s`);
+    }
+    if (f.audioMode !== 'sfx-only') bad([...at, 'audioMode'], `frame ${f.frameId}: a seedance frame is audioMode 'sfx-only' (the clip's own audio is the frame's audio)`);
+    if (f.narration) bad([...at, 'narration'], `frame ${f.frameId}: a seedance frame has no narration (its speech is in motionPrompt)`);
+    if (f.dialogue) bad([...at, 'dialogue'], `frame ${f.frameId}: a seedance frame has no dialogue field (its speech is in motionPrompt)`);
+  });
+  if (issues.length > 0) throw new PlanValidationError(issues);
+}
+
 /**
  * Every check that can run WITHOUT touching the DB — zod shape plus the two
  * business rules (referenceImage needs referenceImageUrl per frame, bgm
@@ -578,6 +637,7 @@ export function validateRequest(rawRequest: unknown): { req: OrchestratorRequest
   }
 
   if (req.options.motionEngine === 'ltx') validateLtxRequest(req);
+  if (req.options.motionEngine === 'seedance') validateSeedanceRequest(req);
 
   const resolvedSeqs = resolveStepSet(req);
   const uncatalogued = resolvedSeqs.filter((s) => !catalogEntry(s));

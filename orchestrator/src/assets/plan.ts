@@ -50,6 +50,10 @@ export interface AssetPlan {
   /** The kind that produces each frame's clip, or null when the project has
    * no motion model at all and the tail Ken Burns the still instead. */
   motionKind: AssetKind | null;
+  /** Every kind that can produce a frame's clip. One entry, except a Dialogue Premium request that
+   * mixes engines (`seedance-video` for spoken frames, `comfy-video` for narration). Absent on a
+   * plan persisted before this existed: read it through `motionKindsOf`. */
+  motionKinds?: AssetKind[];
   /** What the compiler tells the SFN tail to do after the per-frame work. */
   tail: TailSteps;
   /**
@@ -98,10 +102,24 @@ export interface TailSteps {
  */
 export function compilePlan(req: OrchestratorRequest): AssetPlan {
   const o = req.options;
+  // LTX and Seedance both build a frame's still from the characters' reference sheets.
+  const characterEngine = o.motionEngine === 'ltx' || o.motionEngine === 'seedance';
   const imageKind: AssetKind =
-    o.referenceImage || (o.motionEngine === 'ltx' && req.frames.some((f) => (f.characters ?? []).length > 0)) ? 'qwen-edit' : 'qwen-image-gen';
+    o.referenceImage || (characterEngine && req.frames.some((f) => (f.characters ?? []).length > 0)) ? 'qwen-edit' : 'qwen-image-gen';
+  // Dialogue Premium mixes engines per frame: narration frames are LTX-2.3 (`comfy-video`, TTS-sized),
+  // every other frame is Seedance. The plan carries whichever kinds the request actually uses.
+  const seedanceMode = o.motionEngine === 'seedance';
+  const narrationFrames = seedanceMode && req.frames.some((f) => f.engine === 'ltx');
+  const spokenFrames = seedanceMode && req.frames.some((f) => f.engine !== 'ltx');
+  const motionKinds: AssetKind[] = seedanceMode
+    ? [...(spokenFrames ? (['seedance-video'] as const) : []), ...(narrationFrames ? (['comfy-video'] as const) : [])]
+    : [];
   const motionKind: AssetKind =
-    o.motionEngine === 'animate' ? 'animate' : o.motionEngine === 'ltx' ? 'comfy-video' : 'wan2-i2v';
+    o.motionEngine === 'animate' ? 'animate'
+      : o.motionEngine === 'ltx' ? 'comfy-video'
+        : seedanceMode ? motionKinds[0] ?? 'seedance-video'
+          : 'wan2-i2v';
+  if (!seedanceMode) motionKinds.push(motionKind);
   // MMAudio listens to generated motion; a Ken Burns move over a still has
   // nothing for it to hear, and narration-basic has no SFX. LTX clips carry
   // their own SFX, so MMAudio never runs for them either.
@@ -113,7 +131,7 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
   // is an EDIT of that reference (two: a side-by-side composite); a frame with
   // none is plain text-to-image. Both image kinds are planned, chained so the
   // final one (`qwen-edit`) always holds the frame's still.
-  const charFrames = motionKind === 'comfy-video' && req.frames.some((f) => (f.characters ?? []).length > 0);
+  const charFrames = motionKinds.some((k) => k === 'comfy-video' || k === 'seedance-video') && req.frames.some((f) => (f.characters ?? []).length > 0);
 
   const requires: Record<string, AssetKind[]> = {
     [imageKind]: [],
@@ -136,18 +154,21 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
     requires['ref2-edit'] = ['ref2-sheet'];
   }
   if (hasDialogue) requires['dialogue-audio'] = ['tts'];
-  if (motionKind) {
+  for (const mk of motionKinds) {
     // Motion needs the still AND the narration — not for the audio, but for
     // its real generated length. builders/i2v.ts sizes the clip to it; the
     // caller's estimate and the real narration routinely diverge and the
     // tail's `-shortest` mux silently clips the difference.
-    requires[motionKind] = [
-      imageKind,
-      'tts',
-      ...(needsLast ? (['comfy-last'] as const) : []),
-      ...(needsRef2 ? (['ref2-edit'] as const) : []),
-      ...(hasDialogue ? (['dialogue-audio'] as const) : []),
-    ];
+    // A Seedance clip speaks for itself: it needs the still and nothing else.
+    requires[mk] = mk === 'seedance-video'
+      ? [imageKind]
+      : [
+          imageKind,
+          'tts',
+          ...(needsLast ? (['comfy-last'] as const) : []),
+          ...(needsRef2 ? (['ref2-edit'] as const) : []),
+          ...(hasDialogue ? (['dialogue-audio'] as const) : []),
+        ];
   }
   // MMAudio runs right after the motion clip, per frame (operator, 2026-10-02).
   if (sfx) requires[sfx] = [motionKind];
@@ -158,7 +179,7 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
   // the way the cohort model has. Every plan now has a clip to render onto —
   // Wan2's, or the `animate` Ken Burns clip (narration-basic explainers).
   const overlay = o.textOverlay ? ('remotion' as const) : undefined;
-  if (overlay) requires[overlay] = [sfx ?? motionKind];
+  if (overlay) requires[overlay] = sfx ? [sfx] : [...motionKinds];
 
   const frameKinds = Object.keys(requires) as AssetKind[];
   const kinds: AssetKind[] = [...frameKinds, 'sfn-tail'];
@@ -170,6 +191,7 @@ export function compilePlan(req: OrchestratorRequest): AssetPlan {
     stages: {},
     imageKind,
     motionKind,
+    motionKinds,
     tail: {
       removeSilence: o.removeSilence,
       burnCaptions: o.burnCaptions,
@@ -264,6 +286,27 @@ export function expectedAssetCount(plan: AssetPlan): number {
 /** The kind whose output is a frame's finished clip, or null when the project
  * has no motion model and the tail animates the still instead. Ordered most-
  * processed first, the same precedence steps/builders/merge.ts applies. */
+/** The kinds that can produce a frame's clip; tolerates a plan persisted before `motionKinds`. */
+export function motionKindsOf(plan: AssetPlan): AssetKind[] {
+  return plan.motionKinds ?? (plan.motionKind ? [plan.motionKind] : []);
+}
+
+/**
+ * THIS frame's clip kind. A mixed (Dialogue Premium) plan has a row for every motion kind on every
+ * frame, and the ones that do not apply complete as `skip:` passthroughs — so the frame's clip is the
+ * row of the most-processed kind that actually produced a url. Falls back to `clipKind` for a plan
+ * with one motion kind.
+ */
+export function clipKindForFrame(plan: AssetPlan, rows: ReadonlyArray<{ kind: string; status: string; assetUrl?: string | null }>): AssetKind | null {
+  const motion = motionKindsOf(plan);
+  if (motion.length <= 1) return clipKind(plan);
+  for (const k of ['remotion', 'mmaudio'] as const) {
+    if (plan.frameKinds.includes(k)) return k;
+  }
+  const real = (k: string) => rows.some((r) => r.kind === k && r.status === 'complete' && !!r.assetUrl && !r.assetUrl.startsWith(SKIP_URL_PREFIX));
+  return motion.find(real) ?? motion[0];
+}
+
 export function clipKind(plan: AssetPlan): AssetKind | null {
   if (!plan.motionKind) return null;
   for (const k of ['remotion', 'mmaudio'] as const) {

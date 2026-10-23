@@ -112,6 +112,9 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
         actionS: frame.actionS,
         lastFramePrompt: frame.lastFramePrompt,
         shotType: frame.shotType,
+        spoken: frame.spoken,
+        // A Premium request mixes engines per frame; a Seedance request's default is Seedance.
+        engine: frame.engine ?? (req.options.motionEngine === 'seedance' ? 'seedance' : undefined),
       };
       // Reference 2 of a refs2 frame is its own still: the row's imagePrompt is
       // that still's prompt, so QA judges and rewrites what was generated.
@@ -135,7 +138,7 @@ export function buildAssetRows(req: OrchestratorRequest, plan: AssetPlan): NewAs
 /** LTX projects with characters: the frame's reference images (possibly none —
  * the key's presence is what switches the image chain). undefined otherwise. */
 function characterRefs(req: OrchestratorRequest, frame: OrchestratorRequest['frames'][number]): string[] | undefined {
-  if (req.options.motionEngine !== 'ltx' || !req.frames.some((f) => (f.characters ?? []).length > 0)) return undefined;
+  if ((req.options.motionEngine !== 'ltx' && req.options.motionEngine !== 'seedance') || !req.frames.some((f) => (f.characters ?? []).length > 0)) return undefined;
   const byId = new Map((req.characters ?? []).map((c) => [c.id, c.referenceImageUrl] as const));
   return (frame.characters ?? []).map((id) => byId.get(id)).filter((u): u is string => !!u);
 }

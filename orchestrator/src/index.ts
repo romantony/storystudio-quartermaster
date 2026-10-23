@@ -81,6 +81,7 @@ async function main(): Promise<void> {
       lambda: { functionName: cfg.remotionLambdaFunctionName, region: cfg.remotionLambdaRegion },
       animateLambda: { functionName: cfg.animateLambdaFunctionName, region: cfg.animateLambdaRegion },
       comfy: cfg.comfyApiKey ? { apiKey: cfg.comfyApiKey } : undefined,
+      kie: cfg.kieApiKey ? { apiKey: cfg.kieApiKey } : undefined,
       r2,
       // The `sfn-tail` agent's transport: starts + polls the assembly tail.
       sfn: cfg.sfnTailStateMachineArn

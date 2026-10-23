@@ -58,6 +58,7 @@ import { padDialogueAudio } from './dialogue-audio-pad';
 import { compositeCharacterRefs, padCharacterRef } from './char-ref-composite';
 import { conformClip, conformClipUrl, conformStill, stillSize } from './conform-media';
 import { H3_FPS, allowedNodeTypes, buildGraph, comfyFormat, h3Frames, runGraph, uploadImage, type ComfyTransport, type ComfyWorkflow } from '../comfy/client';
+import { runSeedance, type KieTransport } from '../kie/seedance';
 import {
   describeTailExecution,
   executionName,
@@ -79,6 +80,7 @@ export interface AssetAgentDeps {
     | 'lambdaRenderRateUsdS'
     | 'animateLambdaRateUsdS'
     | 'comfyRateUsdS'
+    | 'kieSeedanceRateUsdS'
   >;
   publicBaseUrl: string;
   webhookSecret: string;
@@ -92,6 +94,9 @@ export interface AssetAgentDeps {
   /** Comfy Cloud, for the `comfy-video` kind. Without it such a row fails with
    * a clear error rather than hanging. */
   comfy?: ComfyTransport;
+  /** KIE, for the `seedance-video` kind (Seedance 2 Mini). Without it such a row fails with a
+   * clear error rather than hanging. */
+  kie?: KieTransport;
   /** Where a Lambda's output is re-hosted. Remotion Lambda writes to ITS OWN
    * S3 bucket, which QM does not control the retention of — the same class of
    * problem that cost 103/122 shots to expired replicate.delivery links on
@@ -469,6 +474,10 @@ async function invokeLambdaRow(deps: AssetAgentDeps, kind: AssetKind, row: Asset
     await invokeComfyRow(deps, kind, row, payload);
     return;
   }
+  if (kind === 'seedance-video') {
+    await invokeSeedanceRow(deps, kind, row, payload);
+    return;
+  }
 
   if (!deps.lambda) throw new Error(`${kind} is provider:'lambda' but no lambda transport is configured`);
   if (!deps.r2) throw new Error(`${kind} is provider:'lambda' but no r2 transport is configured`);
@@ -582,6 +591,42 @@ async function invokeComfyRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetR
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await applyAssetFailure(deps, row.id, kind, { provider: 'comfy', error: message.slice(0, 500) });
+  }
+}
+
+/** `seedance-video`: one KIE Seedance 2 Mini task from the frame's still, then re-host the clip in
+ * R2 before completing — KIE's output link expires (the 2026-08-17 lesson). The clip carries its own
+ * speech, so `duration_s` is the length asked for, not a TTS length. */
+async function invokeSeedanceRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
+  const spec = assetSpec(kind);
+  if (!deps.kie) throw new Error(`${kind}: no KIE transport configured (KIE_API_KEY)`);
+  if (!deps.r2) throw new Error(`${kind}: no r2 transport is configured`);
+  const p = payload as { firstFrameUrl: string; prompt: string; durationS: number; aspectRatio: Parameters<typeof runSeedance>[1]['aspectRatio']; frameId: string };
+  await markSubmitted(deps.pool, row.id, kind, `kie:${row.id}:${row.attempts + 1}`);
+  const startedAt = Date.now();
+  try {
+    const result = await runSeedance(
+      deps.kie,
+      { prompt: p.prompt, firstFrameUrl: p.firstFrameUrl, durationS: p.durationS, aspectRatio: p.aspectRatio },
+      async (taskId) => {
+        // Record the provider task id for the operator; attempts was already counted.
+        await deps.pool.query(`UPDATE assets SET provider_job_id = $3, updated_at = now() WHERE asset_kind = $2 AND id = $1`, [
+          row.id, kind, `kie:${taskId}`,
+        ]);
+      },
+    );
+    const url = await persistToR2(deps.r2, result.videoUrl, `seedance-video/${row.projectId}/${p.frameId}.mp4`);
+    await recordAssetCost(deps.pool, {
+      assetId: row.id, assetKind: kind, projectId: row.projectId, frameId: row.frameId,
+      endpointId: spec.endpointId, providerJobId: `kie:${result.taskId}`,
+      // Billed per clip-second, so the clip's length is the cost basis, not the wall clock.
+      executionMs: p.durationS * 1000, delayMs: null, workerRateUsdS: deps.cfg.kieSeedanceRateUsdS,
+    });
+    await applyAssetSuccess(deps, row.id, kind, { video: url, duration_s: p.durationS });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log().warn({ assetId: row.id, kind, error: message, ms: Date.now() - startedAt }, 'asset-agent: seedance row failed');
+    await applyAssetFailure(deps, row.id, kind, { provider: 'kie', error: message.slice(0, 500) });
   }
 }
 

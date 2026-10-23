@@ -90,6 +90,9 @@ services:
       # The `comfy-video` agent (LTX-2.3, options.motionEngine 'ltx') calls
       # Comfy Cloud with this subscription key. Set it in the VPS .env only.
       COMFY_API_KEY: ${COMFY_API_KEY:-}
+      # The `seedance-video` agent (Seedance 2 Mini, options.motionEngine 'seedance') calls KIE
+      # with this key. Set it in the VPS .env only.
+      KIE_API_KEY: ${KIE_API_KEY:-}
       # The `sfn-tail` agent starts + polls this state machine (the assembly
       # tail: ECS merge/concat/silence, RunPod captions + BGM, ECS finalize).
       # Empty = no tail. Credentials come from AWS_* above and need

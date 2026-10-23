@@ -150,6 +150,10 @@ export interface FrameJobInput {
   actionS?: number;
   lastFramePrompt?: string;
   shotType?: string;
+  /** Dialogue Premium frames: which engine renders this frame's clip (see agents/planner.ts). */
+  engine?: 'ltx' | 'seedance';
+  /** Seedance frames: the clip's own audio is a character speaking (see agents/planner.ts). */
+  spoken?: boolean;
   /** Dialogue frames: `narration` carries the spoken line; this adds the lead. */
   dialogue?: { speaker: string; line: string; delivery?: string; leadS?: number };
 }

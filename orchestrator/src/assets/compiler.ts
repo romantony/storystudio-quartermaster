@@ -37,7 +37,7 @@ import { extractErrorText } from '../runpod/types';
 import { log } from '../telemetry/log';
 import type { FrameJobInput } from '../steps/builders/types';
 import { assetSpec, type AssetKind } from './kinds';
-import { clipKind, inputsSatisfied, type AssetPlan } from './plan';
+import { clipKindForFrame, inputsSatisfied, type AssetPlan } from './plan';
 import { buildManifest, manifestKey, type ManifestFrame, type TailManifest } from './manifest';
 import type { SfnTailRowInput } from '../steps/builders/sfn-tail';
 import { putJsonToR2, type R2Transport } from '../r2/client';
@@ -212,7 +212,7 @@ export function describeDrop(frameRows: AssetRow[]): string {
 export function manifestFrame(
   plan: AssetPlan,
   frame: { frameId: string; seq: number; rows: AssetRow[] },
-  request: { frames: Array<{ frameId: string; narration?: string; dialogue?: { line: string }; audioMode?: string; shotKind?: string; durationS: number; animateEffect?: string }> },
+  request: { frames: Array<{ frameId: string; narration?: string; dialogue?: { line: string }; audioMode?: string; shotKind?: string; spoken?: boolean; durationS: number; animateEffect?: string }> },
 ): ManifestFrame {
   const url = (kind: AssetKind): string | undefined =>
     frame.rows.find((r) => r.kind === kind && r.status === 'complete')?.assetUrl ?? undefined;
@@ -231,7 +231,7 @@ export function manifestFrame(
   if (!clipAudioOnly && !audioUrl) throw new Error(`frame ${frame.frameId}: no narration audio`);
   if (clipAudioOnly && !plan.motionKind) throw new Error(`frame ${frame.frameId}: sfx-only needs a generated clip`);
 
-  const clip = clipKind(plan);
+  const clip = clipKindForFrame(plan, frame.rows);
   const source = clip ? url(clip) : undefined;
 
   if (clip && !source) throw new Error(`frame ${frame.frameId}: no clip from ${clip}`);
@@ -242,7 +242,7 @@ export function manifestFrame(
     ...(audioUrl ? { audioUrl } : { clipAudioOnly: true }),
     // An sfx-only i2v frame is a line LTX speaks itself: the tail levels it to
     // the narration, where a silent action's ambience sits lower.
-    ...(clipAudioOnly && requested?.shotKind === 'i2v' ? { clipAudioSpoken: true } : {}),
+    ...(clipAudioOnly && (requested?.shotKind === 'i2v' || requested?.spoken === true) ? { clipAudioSpoken: true } : {}),
     // TTS's own reported length — the worker re-probes it anyway, this is for
     // the reader of the manifest.
     durationS: clipAudioOnly ? (requested?.durationS ?? null) : (audioRow?.durationS ?? tts?.durationS ?? requested?.durationS ?? null),
@@ -258,7 +258,7 @@ export function manifestFrame(
     // SFX file (the `sfx_from_video` rule steps/builders/merge.ts applied).
     if (plan.frameKinds.includes('mmaudio')) entry.sfxFromVideo = true;
     // LTX-2.3 generates its own SFX with the clip ('sfx-under-narration').
-    if (plan.motionKind === 'comfy-video') entry.sfxFromVideo = true;
+    if (clip === 'comfy-video') entry.sfxFromVideo = true;
   } else {
     const image = url(plan.imageKind);
     if (!image) throw new Error(`frame ${frame.frameId}: no still to animate`);

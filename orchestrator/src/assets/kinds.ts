@@ -32,6 +32,7 @@ import { buildI2vInput } from '../steps/builders/i2v';
 import { buildSfxInput } from '../steps/builders/sfx';
 import { buildRemotionOverlayInput } from '../steps/builders/remotion-overlay';
 import { buildComfyVideoInput } from '../steps/builders/comfy-video';
+import { buildSeedanceVideoInput } from '../steps/builders/seedance-video';
 import { buildCharRefInput } from '../steps/builders/char-ref';
 import { buildRef2EditInput, buildRef2SheetInput, REF2_EDIT_SEQ, REF2_SHEET_SEQ } from '../steps/builders/ref2';
 import { buildDialogueAudioInput } from '../steps/builders/dialogue-audio';
@@ -53,6 +54,7 @@ export const ASSET_KINDS = [
   'comfy-last',
   'dialogue-audio',
   'comfy-video',
+  'seedance-video',
   'remotion',
   'sfn-tail',
 ] as const;
@@ -361,6 +363,27 @@ export const ASSET_SPECS: Readonly<Record<AssetKind, AssetSpec>> = {
     produces: 'video',
     stages: [],
     build: buildComfyVideoInput,
+  },
+  'seedance-video': {
+    // Seedance 2 Mini on KIE (options.motionEngine 'seedance', Dialogue Premium), in Wan2's place.
+    // Dispatched like `comfy-video`: one in-process call that blocks while KIE renders (minutes for
+    // a 15 s clip with speech), then the clip is re-hosted into R2. The clip carries its own speech,
+    // so nothing here depends on TTS.
+    kind: 'seedance-video',
+    scope: 'frame',
+    provider: 'lambda',
+    gate: null,
+    table: 'asset_seedance_video',
+    // `lambda:` is this registry's marker for an in-process (non-RunPod) kind, as comfy-video's is.
+    endpointId: 'lambda:kie-seedance2mini',
+    // Self-imposed: KIE's rate limit, not a pod count.
+    maxInFlight: 4,
+    timeoutMs: null,
+    cancelOnTimeout: false,
+    legacySeq: 3,
+    produces: 'video',
+    stages: [],
+    build: buildSeedanceVideoInput,
   },
   remotion: {
     // On-screen text for educational/explainer frames, rendered by the

@@ -13,7 +13,7 @@
  * would clip the narration otherwise).
  */
 import { REF2_EDIT_SEQ } from './ref2';
-import type { BuildContext, PayloadBuilder } from './types';
+import { SKIP_URL_PREFIX, type BuildContext, type PayloadBuilder } from './types';
 
 const IMAGE_EDIT_STEP_SEQ = 0;
 const IMAGE_STEP_SEQ = 1;
@@ -39,6 +39,8 @@ export function ltxDurationS(ttsS: number | undefined, estimateS: number, action
 
 export const buildComfyVideoInput: PayloadBuilder = (ctx: BuildContext): Record<string, unknown> => {
   const frame = ctx.frameId ?? ctx.job.frameId;
+  // A Dialogue Premium request mixes engines: a Seedance frame's clip is made by `seedance-video`.
+  if (ctx.job.engine === 'seedance') return { __passthroughUrl: `${SKIP_URL_PREFIX}seedance` };
   const firstImageUrl = ctx.resolvedDeps[IMAGE_EDIT_STEP_SEQ]?.url ?? ctx.resolvedDeps[IMAGE_STEP_SEQ]?.url;
   if (!firstImageUrl) throw new Error(`comfy-video builder: no resolved image URL for frame ${frame}`);
   const kind = ctx.job.shotKind;
