@@ -212,20 +212,23 @@ export function describeDrop(frameRows: AssetRow[]): string {
 export function manifestFrame(
   plan: AssetPlan,
   frame: { frameId: string; seq: number; rows: AssetRow[] },
-  request: { frames: Array<{ frameId: string; clipUrl?: string; narration?: string; dialogue?: { line: string }; audioMode?: string; shotKind?: string; spoken?: boolean; durationS: number; animateEffect?: string }> },
+  request: { frames: Array<{ frameId: string; clipUrl?: string; audioUrl?: string; narration?: string; dialogue?: { line: string }; audioMode?: string; shotKind?: string; spoken?: boolean; durationS: number; animateEffect?: string }> },
 ): ManifestFrame {
   const url = (kind: AssetKind): string | undefined =>
     frame.rows.find((r) => r.kind === kind && r.status === 'complete')?.assetUrl ?? undefined;
 
   const requested = request.frames.find((f) => f.frameId === frame.frameId);
-  // Tail-only frame (`motionEngine: 'ready'`): the caller's finished clip, its own audio is the frame's.
+  // Tail-only frame (`motionEngine: 'ready'`): the caller's finished clip. Either its own audio is the
+  // frame's audio (`clipAudioOnly`), or the narrator's `audioUrl` is laid over it with the clip's own
+  // ambience/SFX under the voice (`sfxFromVideo`, as for an LTX narration frame).
   if (requested?.clipUrl) {
+    const narrated = !!requested.audioUrl;
     return {
       frameId: frame.frameId,
       seq: frame.seq,
       videoUrl: requested.clipUrl,
-      clipAudioOnly: true,
-      ...(requested.spoken ? { clipAudioSpoken: true } : {}),
+      ...(narrated ? { audioUrl: requested.audioUrl, sfxFromVideo: true } : { clipAudioOnly: true }),
+      ...(!narrated && requested.spoken ? { clipAudioSpoken: true } : {}),
       durationS: requested.durationS,
       narration: requested.narration ?? '',
     };

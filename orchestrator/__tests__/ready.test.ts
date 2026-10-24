@@ -23,7 +23,10 @@ describe('ready request validation', () => {
   it.each([
     ['no clipUrl', [frame('f1', { clipUrl: undefined }), frame('f2')], {}, /clipUrl is required/],
     ['one frame', [frame('f1')], {}, /at least two frames/],
-    ['not sfx-only', [frame('f1', { audioMode: 'clip' }), frame('f2')], {}, /sfx-only/],
+    ['audioMode clip', [frame('f1', { audioMode: 'clip' }), frame('f2')], {}, /sfx-only/],
+    ['narration without audioUrl', [frame('f1', { audioMode: 'sfx-under-narration', spoken: false }), frame('f2')], {}, /needs audioUrl/],
+    ['audioUrl on a clip-audio frame', [frame('f1', { audioUrl: 'https://r2.example/v.wav', spoken: false }), frame('f2')], {}, /only for audioMode 'sfx-under-narration'/],
+    ['narrated frame marked spoken', [frame('f1', { audioMode: 'sfx-under-narration', audioUrl: 'https://r2.example/v.wav' }), frame('f2')], {}, /voiced by audioUrl/],
     ['dialogue field', [frame('f1', { dialogue: { speaker: 'a', line: 'hi' } }), frame('f2')], {}, /no dialogue field/],
     ['removeSilence', two, { removeSilence: true }, /removeSilence/],
     ['sfx', two, { sfx: true }, /sfx/],
@@ -34,6 +37,14 @@ describe('ready request validation', () => {
   });
   it('clipUrl is rejected on any other engine', () => {
     expect(() => validateRequest(req(two, { motionEngine: 'wan2' }))).toThrow(/only accepted with motionEngine 'ready'/);
+  });
+  it('audioUrl is rejected on any other engine', () => {
+    const narrated = [frame('f1', { clipUrl: undefined, audioUrl: 'https://r2.example/v.wav', audioMode: 'sfx-under-narration', spoken: false }), frame('f2', { clipUrl: undefined })];
+    expect(() => validateRequest(req(narrated, { motionEngine: 'wan2' }))).toThrow(/audioUrl is only accepted/);
+  });
+  it('accepts a narrated clip alongside spoken and silent ones', () => {
+    const mixed = [frame('f1'), frame('f2', { audioMode: 'sfx-under-narration', audioUrl: 'https://r2.example/v.wav', spoken: false, narration: 'It began in winter.' }), frame('f3', { spoken: false })];
+    expect(validateRequest(req(mixed)).req.frames).toHaveLength(3);
   });
 });
 
@@ -66,6 +77,13 @@ describe('ready plan', () => {
     const f2 = manifestFrame(p, { frameId: 'f2', seq: 1, rows: [] }, r);
     expect(f2.clipAudioOnly).toBe(true);
     expect(f2.clipAudioSpoken).toBeUndefined();
+  });
+  it('a narrated frame carries the narrator track over the clip, its own sound under the voice', () => {
+    const r2 = RequestSchema.parse(req([frame('f1'), frame('f2', { audioMode: 'sfx-under-narration', audioUrl: 'https://r2.example/v.wav', spoken: false, narration: 'It began in winter.' })]));
+    const n = manifestFrame(compilePlan(r2), { frameId: 'f2', seq: 1, rows: [] }, r2);
+    expect(n).toMatchObject({ videoUrl: 'https://r2.example/clips/f2.mp4', audioUrl: 'https://r2.example/v.wav', sfxFromVideo: true, narration: 'It began in winter.' });
+    expect(n.clipAudioOnly).toBeUndefined();
+    expect(n.clipAudioSpoken).toBeUndefined();
   });
   it('the result reports each frame completed with its clip', () => {
     const res = buildAssetResult({

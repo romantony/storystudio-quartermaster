@@ -38,7 +38,9 @@ queued behind background jobs). Each frame carries `clipUrl` (a finished clip wh
 audio), `audioMode: 'sfx-only'`, `spoken` (true = a character speaks in the clip) and `durationS`. The plan holds
 only the project-scoped `sfn-tail` row, QA-exempt: the first compiler tick finds every frame ready, writes the
 manifest (`clipAudioOnly` frames) and arms the tail. BGM, Whisper captions, upscale and burn run exactly as for
-any other project, and the result callback is unchanged. At least two frames; `removeSilence`, `sfx` and
+any other project, and the result callback is unchanged. A narration frame instead sends `audioMode: 'sfx-under-narration'` and
+`audioUrl` (the narrator's finished voice track): the tail lays it over the clip with the clip's own ambience/SFX under the
+voice, and sizes to the audio's real length, so the clip must be at least as long. At least two frames; `removeSilence`, `sfx` and
 `textOverlay` are rejected. Tests: `__tests__/ready.test.ts`.
 
 ## The agents
