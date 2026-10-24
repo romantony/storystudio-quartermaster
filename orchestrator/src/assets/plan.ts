@@ -102,6 +102,23 @@ export interface TailSteps {
  */
 export function compilePlan(req: OrchestratorRequest): AssetPlan {
   const o = req.options;
+  // Tail-only (`motionEngine: 'ready'`): the caller generated every clip. No frame-scoped asset exists,
+  // so every frame is "ready" the moment it is submitted and the compiler arms the tail on its first
+  // tick. Nothing is diffused, so there is nothing for QA to judge.
+  if (o.motionEngine === 'ready') {
+    return {
+      kinds: ['sfn-tail'],
+      frameKinds: [],
+      requires: {},
+      stages: {},
+      imageKind: 'qwen-image-gen',
+      motionKind: null,
+      motionKinds: [],
+      tail: { removeSilence: o.removeSilence, burnCaptions: o.burnCaptions, textOverlay: o.textOverlay, bgm: o.bgm },
+      qaExempt: true,
+      frameCount: req.frames.length,
+    };
+  }
   // LTX and Seedance both build a frame's still from the characters' reference sheets.
   const characterEngine = o.motionEngine === 'ltx' || o.motionEngine === 'seedance';
   const imageKind: AssetKind =

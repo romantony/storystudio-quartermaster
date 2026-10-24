@@ -107,7 +107,9 @@ export function buildAssetResult(facts: AssetResultFacts): QmResult {
       clipUrl:
         urlOf(rows, 'remotion', f.frameId) ??
         urlOf(rows, 'mmaudio', f.frameId) ??
-        realUrlOf(rows, motionKindsOf(plan), f.frameId),
+        realUrlOf(rows, motionKindsOf(plan), f.frameId) ??
+        f.clipUrl ??
+        null,
       // From the tail's own per-frame report. Null until the tail has run
       // (a project that failed before assembly), and null for a frame the
       // tail dropped.

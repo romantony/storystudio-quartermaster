@@ -31,6 +31,16 @@ can work on something is working on it.
    merge/concat/silence, RunPod captions + BGM, ECS upscale/burn/overlay) that
    does all the remaining work and returns the final url.
 
+## Tail-only requests (`options.motionEngine: 'ready'`, 2026-10-24)
+
+The caller generated every clip itself (StoryStudio's Dialogue Premium does it in Convex, so the user is not
+queued behind background jobs). Each frame carries `clipUrl` (a finished clip whose own audio is the frame's
+audio), `audioMode: 'sfx-only'`, `spoken` (true = a character speaks in the clip) and `durationS`. The plan holds
+only the project-scoped `sfn-tail` row, QA-exempt: the first compiler tick finds every frame ready, writes the
+manifest (`clipAudioOnly` frames) and arms the tail. BGM, Whisper captions, upscale and burn run exactly as for
+any other project, and the result callback is unchanged. At least two frames; `removeSilence`, `sfx` and
+`textOverlay` are rejected. Tests: `__tests__/ready.test.ts`.
+
 ## The agents
 
 | Agent | Table | Endpoint | Scope | Gate | Produces |

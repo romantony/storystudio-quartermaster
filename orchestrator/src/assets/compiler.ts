@@ -212,12 +212,24 @@ export function describeDrop(frameRows: AssetRow[]): string {
 export function manifestFrame(
   plan: AssetPlan,
   frame: { frameId: string; seq: number; rows: AssetRow[] },
-  request: { frames: Array<{ frameId: string; narration?: string; dialogue?: { line: string }; audioMode?: string; shotKind?: string; spoken?: boolean; durationS: number; animateEffect?: string }> },
+  request: { frames: Array<{ frameId: string; clipUrl?: string; narration?: string; dialogue?: { line: string }; audioMode?: string; shotKind?: string; spoken?: boolean; durationS: number; animateEffect?: string }> },
 ): ManifestFrame {
   const url = (kind: AssetKind): string | undefined =>
     frame.rows.find((r) => r.kind === kind && r.status === 'complete')?.assetUrl ?? undefined;
 
   const requested = request.frames.find((f) => f.frameId === frame.frameId);
+  // Tail-only frame (`motionEngine: 'ready'`): the caller's finished clip, its own audio is the frame's.
+  if (requested?.clipUrl) {
+    return {
+      frameId: frame.frameId,
+      seq: frame.seq,
+      videoUrl: requested.clipUrl,
+      clipAudioOnly: true,
+      ...(requested.spoken ? { clipAudioSpoken: true } : {}),
+      durationS: requested.durationS,
+      narration: requested.narration ?? '',
+    };
+  }
   const clipAudioOnly = requested?.audioMode === 'sfx-only';
   const tts = frame.rows.find((r) => r.kind === 'tts');
   // A project with dialogue frames pads each line with its lead silence
