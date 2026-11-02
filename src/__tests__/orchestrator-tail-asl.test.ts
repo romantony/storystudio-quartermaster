@@ -13,6 +13,7 @@
 import {
   buildOrchestratorTailDefinition,
   EXECUTION_TIMEOUT_S,
+  FALLBACK_MAX_POLLS,
   MAX_POLLS,
   POLL_INTERVAL_S,
   type Definition,
@@ -29,6 +30,7 @@ const CFG: OrchestratorTailConfig = {
   bucket: 'qm-bucket',
   runpodFunctionArn: 'arn:aws:lambda:us-east-1:1:function:QM-orchestrator-runpod',
   audioEndpointId: '6apg6j7suzuezw',
+  fallbackFunctionArn: 'arn:aws:lambda:us-east-1:1:function:QM-orchestrator-fallback',
 };
 
 const DEF = buildOrchestratorTailDefinition(CFG);
@@ -304,6 +306,13 @@ interface Script {
   /** RunPod statuses returned by successive polls, per layer ('transcribe' | 'bgm'). */
   polls?: Partial<Record<'transcribe' | 'bgm', Array<Record<string, unknown>>>>;
   submitFails?: Array<'transcribe' | 'bgm'>;
+  /** Fallback Lambda behaviour. Default: both succeed first time. */
+  fallback?: {
+    transcribeFails?: boolean;
+    transcribe?: Record<string, unknown>;
+    bgmSubmitFails?: boolean;
+    bgmPolls?: Array<Record<string, unknown>>;
+  };
   assembleFails?: boolean;
   finalizeFails?: boolean;
 }
@@ -312,8 +321,9 @@ function execute(input: any, script: Script = {}) {
   const trace: string[] = [];
   const ecs: Array<{ mode: string; payload: any }> = [];
   const lambdaCalls: any[] = [];
+  const fallbackCalls: any[] = [];
   const jobs: Record<string, 'transcribe' | 'bgm'> = {};
-  const cursor: Record<string, number> = { transcribe: 0, bgm: 0 };
+  const cursor: Record<string, number> = { transcribe: 0, bgm: 0, suno: 0 };
 
   const harness: Harness = {
     trace,
@@ -334,7 +344,23 @@ function execute(input: any, script: Script = {}) {
         }
         throw new Error(`unexpected key ${params.Key}`);
       }
+      if (resource === 'arn:aws:states:::lambda:invoke' && params.FunctionName === CFG.fallbackFunctionArn) {
+        const p = params.Payload;
+        fallbackCalls.push(p);
+        const f = script.fallback ?? {};
+        if (p.action === 'transcribe') {
+          if (f.transcribeFails) throw new Failure('Error', 'whisper-1: HTTP 500');
+          return { Payload: f.transcribe ?? { status: 'COMPLETED', srtUrl: 'https://qm-bucket/fb.srt' } };
+        }
+        if (p.action === 'bgm-submit') {
+          if (f.bgmSubmitFails) throw new Failure('Error', 'suno createTask: code 402 insufficient credits');
+          return { Payload: { taskId: 'suno-task' } };
+        }
+        const q = f.bgmPolls ?? [{ status: 'COMPLETED', audioUrl: 'https://qm-bucket/fb.mp3' }];
+        return { Payload: q[Math.min(cursor.suno++, q.length - 1)] };
+      }
       if (resource === 'arn:aws:states:::lambda:invoke') {
+        if (params.FunctionName !== CFG.runpodFunctionArn) throw new Error(`unexpected function ${params.FunctionName}`);
         lambdaCalls.push(params.Payload);
         const p = params.Payload;
         if (p.action === 'submit') {
@@ -361,7 +387,7 @@ function execute(input: any, script: Script = {}) {
     if (e instanceof Failure) failure = e;
     else throw e;
   }
-  return { output, failure, trace, ecs, lambdaCalls };
+  return { output, failure, trace, ecs, lambdaCalls, fallbackCalls };
 }
 
 describe('the happy path', () => {
@@ -443,31 +469,31 @@ describe('the optional layers', () => {
   });
 
   it('finalizes WITHOUT captions when the transcribe job fails — the video still ships', () => {
-    const r = execute(BASE_INPUT, { polls: { transcribe: [{ status: 'FAILED', error: 'CUDA out of memory' }] } });
+    const r = execute(BASE_INPUT, { polls: { transcribe: [{ status: 'FAILED', error: 'CUDA out of memory' }] }, fallback: { transcribeFails: true, bgmSubmitFails: true } });
     expect(r.failure).toBeUndefined();
     expect(r.ecs[1].payload).toMatchObject({ srtUrl: '', bgmUrl: 'https://r2/b.mp3' });
   });
 
   it.each(['CANCELLED', 'TIMED_OUT'])('treats a %s job as "no layer", not a failed project', (status) => {
-    const r = execute(BASE_INPUT, { polls: { bgm: [{ status }] } });
+    const r = execute(BASE_INPUT, { polls: { bgm: [{ status }] }, fallback: { transcribeFails: true, bgmSubmitFails: true } });
     expect(r.failure).toBeUndefined();
     expect(r.ecs[1].payload.bgmUrl).toBe('');
   });
 
   it('treats COMPLETED-without-a-url as no layer rather than reading a missing field', () => {
-    const r = execute(BASE_INPUT, { polls: { transcribe: [{ status: 'COMPLETED' }] } });
+    const r = execute(BASE_INPUT, { polls: { transcribe: [{ status: 'COMPLETED' }] }, fallback: { transcribeFails: true, bgmSubmitFails: true } });
     expect(r.failure).toBeUndefined();
     expect(r.ecs[1].payload.srtUrl).toBe('');
   });
 
   it('finalizes without the layer when RunPod cannot even be reached', () => {
-    const r = execute(BASE_INPUT, { submitFails: ['transcribe', 'bgm'] });
+    const r = execute(BASE_INPUT, { submitFails: ['transcribe', 'bgm'], fallback: { transcribeFails: true, bgmSubmitFails: true } });
     expect(r.failure).toBeUndefined();
     expect(r.ecs[1].payload).toMatchObject({ srtUrl: '', bgmUrl: '' });
   });
 
   it('gives up polling after the bound instead of holding the execution open forever', () => {
-    const r = execute(BASE_INPUT, { polls: { transcribe: [{ status: 'IN_PROGRESS' }] } });
+    const r = execute(BASE_INPUT, { polls: { transcribe: [{ status: 'IN_PROGRESS' }] }, fallback: { transcribeFails: true, bgmSubmitFails: true } });
     expect(r.failure).toBeUndefined();
     expect(r.ecs[1].payload.srtUrl).toBe('');
     // MAX_POLLS + 1 status calls: the loop counts, then bails.
@@ -475,8 +501,71 @@ describe('the optional layers', () => {
   });
 
   it('runs the two layers independently: one failing does not lose the other', () => {
-    const r = execute(BASE_INPUT, { submitFails: ['bgm'] });
+    const r = execute(BASE_INPUT, { submitFails: ['bgm'], fallback: { transcribeFails: true, bgmSubmitFails: true } });
     expect(r.ecs[1].payload).toMatchObject({ srtUrl: 'https://r2/t.srt', bgmUrl: '' });
+  });
+});
+
+describe('the hosted fallbacks (RunPod failed)', () => {
+  it('does not touch the fallbacks when RunPod delivers both layers', () => {
+    expect(execute(BASE_INPUT).fallbackCalls).toHaveLength(0);
+  });
+
+  it('does not touch the fallbacks for a layer the project did not ask for', () => {
+    const r = execute({ ...BASE_INPUT, options: { removeSilence: false, captions: false, bgm: false, sfx: false } });
+    expect(r.fallbackCalls).toHaveLength(0);
+  });
+
+  it('transcribes with OpenAI when the RunPod transcribe job FAILED, in the project’s language, and ships those captions', () => {
+    const r = execute(BASE_INPUT, { polls: { transcribe: [{ status: 'FAILED', error: 'CUDA out of memory' }] } });
+    expect(r.fallbackCalls).toEqual([{ action: 'transcribe', audioUrl: META.audioUrl, language: 'hi', outputPrefix: 'projects/proj_1/tail/' }]);
+    expect(r.ecs[1].payload).toMatchObject({ srtUrl: 'https://qm-bucket/fb.srt', bgmUrl: 'https://r2/b.mp3' });
+  });
+
+  it.each([
+    ['submit throws', { submitFails: ['transcribe' as const] }],
+    ['COMPLETED without a url', { polls: { transcribe: [{ status: 'COMPLETED' }] } }],
+    ['the poll bound', { polls: { transcribe: [{ status: 'IN_PROGRESS' }] } }],
+    ['TIMED_OUT', { polls: { transcribe: [{ status: 'TIMED_OUT' }] } }],
+  ])('falls back for captions on %s', (_label, script) => {
+    const r = execute(BASE_INPUT, script as Script);
+    expect(r.fallbackCalls.map((c) => c.action)).toEqual(['transcribe']);
+    expect(r.ecs[1].payload.srtUrl).toBe('https://qm-bucket/fb.srt');
+  });
+
+  it('a fallback that returns no srtUrl is still "no captions", not a failed project', () => {
+    const r = execute(BASE_INPUT, { submitFails: ['transcribe'], fallback: { transcribe: { status: 'COMPLETED' } } });
+    expect(r.failure).toBeUndefined();
+    expect(r.ecs[1].payload.srtUrl).toBe('');
+  });
+
+  it('generates BGM with Suno on KIE when RunPod BGM fails, to the assembled length, polling until done', () => {
+    const r = execute(BASE_INPUT, {
+      submitFails: ['bgm'],
+      fallback: { bgmPolls: [{ status: 'IN_PROGRESS' }, { status: 'IN_PROGRESS' }, { status: 'COMPLETED', audioUrl: 'https://qm-bucket/suno.mp3' }] },
+    });
+    expect(r.fallbackCalls[0]).toEqual({ action: 'bgm-submit', prompt: 'soft piano', durationS: 37.4 });
+    expect(r.fallbackCalls.filter((c) => c.action === 'bgm-status')).toHaveLength(3);
+    expect(r.fallbackCalls[1]).toEqual({ action: 'bgm-status', taskId: 'suno-task', durationS: 37.4, outputPrefix: 'projects/proj_1/tail/' });
+    expect(r.ecs[1].payload).toMatchObject({ srtUrl: 'https://r2/t.srt', bgmUrl: 'https://qm-bucket/suno.mp3' });
+  });
+
+  it('a FAILED Suno task means no BGM, not a failed project', () => {
+    const r = execute(BASE_INPUT, { submitFails: ['bgm'], fallback: { bgmPolls: [{ status: 'FAILED', error: 'suno [400] sensitive word' }] } });
+    expect(r.failure).toBeUndefined();
+    expect(r.ecs[1].payload.bgmUrl).toBe('');
+  });
+
+  it('bounds the Suno poll loop too', () => {
+    const r = execute(BASE_INPUT, { submitFails: ['bgm'], fallback: { bgmPolls: [{ status: 'IN_PROGRESS' }] } });
+    expect(r.failure).toBeUndefined();
+    expect(r.ecs[1].payload.bgmUrl).toBe('');
+    expect(r.fallbackCalls.filter((c) => c.action === 'bgm-status')).toHaveLength(FALLBACK_MAX_POLLS + 1);
+  });
+
+  it('both layers falling back at once still finalizes with both', () => {
+    const r = execute(BASE_INPUT, { submitFails: ['transcribe', 'bgm'] });
+    expect(r.ecs[1].payload).toMatchObject({ srtUrl: 'https://qm-bucket/fb.srt', bgmUrl: 'https://qm-bucket/fb.mp3' });
   });
 });
 

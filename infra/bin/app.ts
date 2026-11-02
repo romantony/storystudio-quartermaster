@@ -102,6 +102,8 @@ pipelineStack.addDependency(apiStack);
 new OrchestratorTailStack(app, 'QMOrchestratorTailStack', {
   env,
   runpodKeySecretArn: ctx('RUNPOD_API_KEY_ARN'),
+  openaiKeySecretArn: ctx('OPENAI_API_KEY_ARN'),
+  kieKeySecretArn: ctx('KIE_AI_API_KEY_ARN'),
 });
 
 app.synth();

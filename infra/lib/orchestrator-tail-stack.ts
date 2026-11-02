@@ -41,6 +41,10 @@ import { buildOrchestratorTailDefinition } from './orchestrator-tail';
  */
 export interface OrchestratorTailStackProps extends StackProps {
   runpodKeySecretArn: string;
+  /** OpenAI key — the captions fallback (gpt-transcribe + whisper-1). */
+  openaiKeySecretArn: string;
+  /** KIE key — the BGM fallback (Suno). */
+  kieKeySecretArn: string;
 }
 
 /** Names of the live path's resources this stack reuses. Physical names, read
@@ -150,6 +154,32 @@ export class OrchestratorTailStack extends Stack {
       resources: [props.runpodKeySecretArn],
     }));
 
+    // ── hosted fallbacks for the two optional audio layers (2026-11-01) ──────
+    // Entered only after the RunPod BGM-S2T job for that layer gave nothing:
+    // captions via OpenAI (gpt-transcribe text + whisper-1 word timings), BGM via
+    // Suno on KIE. Writes its SRT / re-hosted mp3 under the project's tail prefix.
+    const fallbackFn = new nodejs.NodejsFunction(this, 'FallbackFunction', {
+      functionName: 'QM-orchestrator-fallback',
+      entry: path.join(__dirname, '../../src/handlers/orchestrator-fallback.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      // A 30-minute assembled WAV (48 kHz stereo, ~350 MB) is read into memory
+      // and downmixed; transcription of its chunks runs in parallel.
+      timeout: Duration.seconds(900),
+      memorySize: 3008,
+      bundling: { minify: true, sourceMap: false, externalModules: [] },
+      environment: {
+        OPENAI_API_KEY_ARN: props.openaiKeySecretArn,
+        KIE_API_KEY_ARN: props.kieKeySecretArn,
+        OUTPUT_BUCKET: OUTPUT_BUCKET_NAME,
+      },
+    });
+    fallbackFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [props.openaiKeySecretArn, props.kieKeySecretArn],
+    }));
+    bucket.grantPut(fallbackFn, 'projects/*');
+
     // ── state machine ────────────────────────────────────────────────────────
     // Dedicated role — not the shared E2E-StepFunction-Role (~15 other
     // pipelines depend on it, and its PassRole list is edited by hand).
@@ -173,6 +203,7 @@ export class OrchestratorTailStack extends Stack {
       resources: [`arn:aws:events:${this.region}:${this.account}:rule/StepFunctionsGetEventsForECSTaskRule`],
     }));
     runpodFn.grantInvoke(sfnRole);
+    fallbackFn.grantInvoke(sfnRole);
     // Reads meta.json / result.json back.
     sfnRole.addToPolicy(new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: [bucket.arnForObjects('projects/*')] }));
 
@@ -185,6 +216,7 @@ export class OrchestratorTailStack extends Stack {
       bucket: OUTPUT_BUCKET_NAME,
       runpodFunctionArn: runpodFn.functionArn,
       audioEndpointId: AUDIO_ENDPOINT_ID,
+      fallbackFunctionArn: fallbackFn.functionArn,
     });
 
     const stateMachine = new sfn.CfnStateMachine(this, 'StateMachine', {

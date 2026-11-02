@@ -11,6 +11,10 @@
  *   GenerateAudioLayers  Parallel, both on the BGM-S2T RunPod endpoint:
  *                          captions  transcribe, word timestamps -> SRT
  *                          bgm       ACE-Step, to the assembled video's length
+ *                        each with a hosted fallback when RunPod fails
+ *                        (QM-orchestrator-fallback, 2026-11-01):
+ *                          captions  OpenAI gpt-transcribe + whisper-1 timings
+ *                          bgm       Suno (instrumental) on KIE
  *   FinalizeVideo  ECS   upscale to 1080p -> burn captions -> overlay BGM
  *   ReadFinalizeResult   S3   result.json
  *
@@ -47,6 +51,8 @@ export interface OrchestratorTailConfig {
   runpodFunctionArn: string;
   /** BGM-S2T — serves both `transcribe` and `bgm`. */
   audioEndpointId: string;
+  /** ARN of the QM-orchestrator-fallback Lambda: OpenAI captions, KIE Suno BGM. */
+  fallbackFunctionArn: string;
 }
 
 type State = Record<string, unknown>;
@@ -66,6 +72,12 @@ export const MAX_POLLS = 90;
 
 /** Total wall clock. Must stay below the orchestrator's 95-minute budget. */
 export const EXECUTION_TIMEOUT_S = 5400;
+
+/** The KIE Suno fallback's own poll bound: ~22 s measured for a 45 s track,
+ * so 10 minutes is ample and still bounded. */
+export const FALLBACK_MAX_POLLS = 60;
+/** OpenAI transcription of up to 30 min of audio, chunked and in parallel. */
+export const FALLBACK_TRANSCRIBE_TIMEOUT_S = 900;
 
 const LAMBDA_RETRY = [{ ErrorEquals: ['States.ALL'], IntervalSeconds: 5, MaxAttempts: 3, BackoffRate: 2 }];
 
@@ -138,13 +150,19 @@ interface BranchSpec {
   /** ... and the name this branch's output carries into PrepareFinalize. */
   outputField: 'srtUrl' | 'bgmUrl';
   comment: string;
+  /** Hosted fallback, entered on every RunPod failure exit instead of Skip.
+   * Its states end in `${prefix}FallbackDone` or the branch's Skip. */
+  fallback?: { startAt: string; states: Record<string, State> };
 }
 
 /**
  * One optional RunPod layer: gate -> submit -> (wait -> status -> check)* -> done.
- * Every exit other than `Done` goes to `Skip`, which emits an EMPTY url — the
- * branch always produces `{ <outputField>: <url or ''> }` so PrepareFinalize can
- * read it unconditionally.
+ * Every RunPod failure exit (submit/status error, FAILED/CANCELLED/TIMED_OUT,
+ * COMPLETED without a url, poll bound) goes to the hosted FALLBACK when the
+ * branch has one, and only from there — or directly, without one — to `Skip`,
+ * which emits an EMPTY url. The gate's "not asked for" exit always goes straight
+ * to Skip. The branch always produces `{ <outputField>: <url or ''> }` so
+ * PrepareFinalize can read it unconditionally.
  */
 function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: string; States: Record<string, State> } {
   const P = b.prefix;
@@ -152,6 +170,7 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
   const statusPath = `$.${P.toLowerCase()}Status`;
   const jobPath = `$.${P.toLowerCase()}Job`;
   const pollPath = `$.${P.toLowerCase()}Poll`;
+  const fail = b.fallback ? b.fallback.startAt : skip;
 
   return {
     StartAt: `${P}Gate`,
@@ -173,7 +192,7 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
         ResultPath: jobPath,
         TimeoutSeconds: 60,
         Retry: LAMBDA_RETRY,
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.${P.toLowerCase()}Error`, Next: skip }],
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.${P.toLowerCase()}Error`, Next: fail }],
         Next: `${P}InitPoll`,
       },
       [`${P}InitPoll`]: { Type: 'Pass', Result: { n: 0 }, ResultPath: pollPath, Next: `${P}Wait` },
@@ -189,7 +208,7 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
         ResultPath: statusPath,
         TimeoutSeconds: 60,
         Retry: LAMBDA_RETRY,
-        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.${P.toLowerCase()}Error`, Next: skip }],
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: `$.${P.toLowerCase()}Error`, Next: fail }],
         Next: `${P}Check`,
       },
       [`${P}Check`]: {
@@ -203,10 +222,10 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
             Next: `${P}Done`,
           },
           // COMPLETED with no url, or any terminal failure: skip the layer.
-          { Variable: `${statusPath}.r.status`, StringEquals: 'COMPLETED', Next: skip },
-          { Variable: `${statusPath}.r.status`, StringEquals: 'FAILED', Next: skip },
-          { Variable: `${statusPath}.r.status`, StringEquals: 'CANCELLED', Next: skip },
-          { Variable: `${statusPath}.r.status`, StringEquals: 'TIMED_OUT', Next: skip },
+          { Variable: `${statusPath}.r.status`, StringEquals: 'COMPLETED', Next: fail },
+          { Variable: `${statusPath}.r.status`, StringEquals: 'FAILED', Next: fail },
+          { Variable: `${statusPath}.r.status`, StringEquals: 'CANCELLED', Next: fail },
+          { Variable: `${statusPath}.r.status`, StringEquals: 'TIMED_OUT', Next: fail },
         ],
         // IN_QUEUE / IN_PROGRESS: count the poll and go round again.
         Default: `${P}Count`,
@@ -219,7 +238,7 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
       },
       [`${P}Limit`]: {
         Type: 'Choice',
-        Choices: [{ Variable: `${pollPath}.n`, NumericGreaterThan: MAX_POLLS, Next: skip }],
+        Choices: [{ Variable: `${pollPath}.n`, NumericGreaterThan: MAX_POLLS, Next: fail }],
         Default: `${P}Wait`,
       },
       [`${P}Done`]: {
@@ -227,10 +246,122 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
         Parameters: { [`${b.outputField}.$`]: `${statusPath}.r.${b.resultField}` },
         End: true,
       },
+      ...(b.fallback?.states ?? {}),
       [skip]: {
         Type: 'Pass',
-        Comment: `${P} is an optional layer: any failure, timeout or absence means none, not a failed project.`,
+        Comment: `${P} is an optional layer: any failure, timeout or absence (RunPod and its fallback) means none, not a failed project.`,
         Parameters: { [b.outputField]: '' },
+        End: true,
+      },
+    },
+  };
+}
+
+/** Captions fallback: one synchronous call (gpt-transcribe text + whisper-1 word
+ * timings, src/handlers/orchestrator-fallback.ts) that writes the SRT itself. */
+function captionFallback(cfg: OrchestratorTailConfig): { startAt: string; states: Record<string, State> } {
+  return {
+    startAt: 'CaptionFallback',
+    states: {
+      CaptionFallback: {
+        Type: 'Task',
+        Resource: 'arn:aws:states:::lambda:invoke',
+        Comment: 'RunPod BGM-S2T gave no captions: OpenAI gpt-transcribe (text) + whisper-1 (word timings).',
+        Parameters: {
+          FunctionName: cfg.fallbackFunctionArn,
+          Payload: {
+            action: 'transcribe',
+            'audioUrl.$': '$.assemble.result.audioUrl',
+            'language.$': '$.language',
+            'outputPrefix.$': '$.outputPrefix',
+          },
+        },
+        ResultSelector: { 'r.$': '$.Payload' },
+        ResultPath: '$.captionFallback',
+        TimeoutSeconds: FALLBACK_TRANSCRIBE_TIMEOUT_S,
+        // Lambda-service hiccups only: the handler retries OpenAI itself, and a
+        // second full transcription of a long video is not worth the wait.
+        Retry: [{ ErrorEquals: ['Lambda.ServiceException', 'Lambda.AWSLambdaException', 'Lambda.SdkClientException', 'Lambda.TooManyRequestsException'], IntervalSeconds: 5, MaxAttempts: 2, BackoffRate: 2 }],
+        Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.captionFallbackError', Next: 'CaptionSkip' }],
+        Next: 'CaptionFallbackCheck',
+      },
+      CaptionFallbackCheck: {
+        Type: 'Choice',
+        Choices: [{ Variable: '$.captionFallback.r.srtUrl', IsPresent: true, Next: 'CaptionFallbackDone' }],
+        Default: 'CaptionSkip',
+      },
+      CaptionFallbackDone: {
+        Type: 'Pass',
+        Parameters: { 'srtUrl.$': '$.captionFallback.r.srtUrl' },
+        End: true,
+      },
+    },
+  };
+}
+
+/** BGM fallback: Suno on KIE, submit -> (wait -> status -> check)*. The status
+ * call re-hosts the finished track in S3 (KIE's links expire). */
+function bgmFallback(cfg: OrchestratorTailConfig): { startAt: string; states: Record<string, State> } {
+  const call = (payload: Record<string, unknown>, resultSelector: Record<string, unknown>, resultPath: string, next: string): State => ({
+    Type: 'Task',
+    Resource: 'arn:aws:states:::lambda:invoke',
+    Parameters: { FunctionName: cfg.fallbackFunctionArn, Payload: payload },
+    ResultSelector: resultSelector,
+    ResultPath: resultPath,
+    TimeoutSeconds: 120,
+    Retry: LAMBDA_RETRY,
+    Catch: [{ ErrorEquals: ['States.ALL'], ResultPath: '$.bgmFallbackError', Next: 'BgmSkip' }],
+    Next: next,
+  });
+  return {
+    startAt: 'BgmFallbackSubmit',
+    states: {
+      BgmFallbackSubmit: {
+        ...call(
+          { action: 'bgm-submit', 'prompt.$': '$.options.bgmPrompt', 'durationS.$': '$.assemble.result.durationSec' },
+          { 'taskId.$': '$.Payload.taskId' },
+          '$.bgmFallbackJob',
+          'BgmFallbackInitPoll',
+        ),
+        Comment: 'RunPod BGM-S2T gave no BGM: Suno (instrumental) on KIE, to the assembled video\'s length.',
+      },
+      BgmFallbackInitPoll: { Type: 'Pass', Result: { n: 0 }, ResultPath: '$.bgmFallbackPoll', Next: 'BgmFallbackWait' },
+      BgmFallbackWait: { Type: 'Wait', Seconds: POLL_INTERVAL_S, Next: 'BgmFallbackStatus' },
+      BgmFallbackStatus: call(
+        { action: 'bgm-status', 'taskId.$': '$.bgmFallbackJob.taskId', 'durationS.$': '$.assemble.result.durationSec', 'outputPrefix.$': '$.outputPrefix' },
+        { 'r.$': '$.Payload' },
+        '$.bgmFallbackStatus',
+        'BgmFallbackCheck',
+      ),
+      BgmFallbackCheck: {
+        Type: 'Choice',
+        Choices: [
+          {
+            And: [
+              { Variable: '$.bgmFallbackStatus.r.status', StringEquals: 'COMPLETED' },
+              { Variable: '$.bgmFallbackStatus.r.audioUrl', IsPresent: true },
+            ],
+            Next: 'BgmFallbackDone',
+          },
+          { Variable: '$.bgmFallbackStatus.r.status', StringEquals: 'COMPLETED', Next: 'BgmSkip' },
+          { Variable: '$.bgmFallbackStatus.r.status', StringEquals: 'FAILED', Next: 'BgmSkip' },
+        ],
+        Default: 'BgmFallbackCount',
+      },
+      BgmFallbackCount: {
+        Type: 'Pass',
+        Parameters: { 'n.$': 'States.MathAdd($.bgmFallbackPoll.n, 1)' },
+        ResultPath: '$.bgmFallbackPoll',
+        Next: 'BgmFallbackLimit',
+      },
+      BgmFallbackLimit: {
+        Type: 'Choice',
+        Choices: [{ Variable: '$.bgmFallbackPoll.n', NumericGreaterThan: FALLBACK_MAX_POLLS, Next: 'BgmSkip' }],
+        Default: 'BgmFallbackWait',
+      },
+      BgmFallbackDone: {
+        Type: 'Pass',
+        Parameters: { 'bgmUrl.$': '$.bgmFallbackStatus.r.audioUrl' },
         End: true,
       },
     },
@@ -257,6 +388,7 @@ export function buildOrchestratorTailDefinition(cfg: OrchestratorTailConfig): De
     },
     resultField: 'srtUrl',
     outputField: 'srtUrl',
+    fallback: captionFallback(cfg),
   });
 
   const bgmBranch = runpodBranch(cfg, {
@@ -277,6 +409,7 @@ export function buildOrchestratorTailDefinition(cfg: OrchestratorTailConfig): De
     },
     resultField: 'audioUrl',
     outputField: 'bgmUrl',
+    fallback: bgmFallback(cfg),
   });
 
   const states: Record<string, State> = {
@@ -302,7 +435,7 @@ export function buildOrchestratorTailDefinition(cfg: OrchestratorTailConfig): De
     ),
     GenerateAudioLayers: {
       Type: 'Parallel',
-      Comment: 'Word-level captions and BGM, in parallel, on the BGM-S2T RunPod endpoint. Optional layers: this state never fails the project.',
+      Comment: 'Word-level captions and BGM, in parallel, on the BGM-S2T RunPod endpoint (fallbacks: OpenAI transcription, KIE Suno). Optional layers: this state never fails the project.',
       Branches: [captionBranch, bgmBranch],
       ResultPath: '$.layers',
       Catch: [
