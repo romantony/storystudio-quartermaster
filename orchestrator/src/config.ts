@@ -279,6 +279,22 @@ const ConfigSchema = z.object({
   kieApiKey: z.string().default(''),
   // KIE bills per clip-second; a placeholder rate so job_costs rows exist.
   kieSeedanceRateUsdS: numeric(0.04).pipe(z.number().nonnegative()),
+  // KIE fallback for the RunPod Qwen image kinds (assets/agent.ts
+  // KIE_QWEN_KINDS): a row RunPod failed or timed out is retried on KIE
+  // Nano Banana 2.1 (nano-banana-2-1, gen + edit). Needs kieApiKey; on by default.
+  kieQwenFallback: bool(true),
+  // Per image: nano-banana-2-1 at 1K = 4 KIE credits = $0.02 (measured 2026-11-01).
+  kieQwenRateUsdImage: numeric(0.02).pipe(z.number().nonnegative()),
+  // Google Gemini TTS fallback for the RunPod `tts` kind (assets/agent.ts
+  // usesGeminiTts): a row RunPod failed or timed out is retried on Gemini,
+  // its voice mapped by gender. Needs geminiApiKey; on by default.
+  geminiApiKey: z.string().default(''),
+  geminiTtsFallback: bool(true),
+  geminiTtsModel: z.string().default('gemini-3.8-flash-lite-tts'),
+  geminiTtsVoiceMale: z.string().default('Enzo'),
+  geminiTtsVoiceFemale: z.string().default('Tova'),
+  // Per second of speech; a placeholder so job_costs rows exist (~25 audio tokens/s).
+  geminiTtsRateUsdS: numeric(0.0005).pipe(z.number().nonnegative()),
 
   // ── R2 persistence for step 16's Lambda output (src/r2/client.ts) ──────
   // Remotion Lambda's own output lives on ITS S3 bucket, not QM's — same
@@ -429,6 +445,14 @@ const ENV_KEYS: Record<keyof z.infer<typeof ConfigSchema>, string> = {
   comfyRateUsdS: 'COMFY_RATE_USD_S',
   kieApiKey: 'KIE_API_KEY',
   kieSeedanceRateUsdS: 'KIE_SEEDANCE_RATE_USD_S',
+  kieQwenFallback: 'KIE_QWEN_FALLBACK',
+  kieQwenRateUsdImage: 'KIE_QWEN_RATE_USD_IMAGE',
+  geminiApiKey: 'GEMINI_API_KEY',
+  geminiTtsFallback: 'GEMINI_TTS_FALLBACK',
+  geminiTtsModel: 'GEMINI_TTS_MODEL',
+  geminiTtsVoiceMale: 'GEMINI_TTS_VOICE_MALE',
+  geminiTtsVoiceFemale: 'GEMINI_TTS_VOICE_FEMALE',
+  geminiTtsRateUsdS: 'GEMINI_TTS_RATE_USD_S',
   r2AccountId: 'R2_ACCOUNT_ID',
   r2Bucket: 'R2_BUCKET_NAME',
   r2PublicUrl: 'R2_PUBLIC_URL',

@@ -59,6 +59,8 @@ import { compositeCharacterRefs, padCharacterRef } from './char-ref-composite';
 import { conformClip, conformClipUrl, conformStill, stillSize } from './conform-media';
 import { H3_FPS, allowedNodeTypes, buildGraph, comfyFormat, h3Frames, runGraph, uploadImage, type ComfyTransport, type ComfyWorkflow } from '../comfy/client';
 import { runSeedance, type KieTransport } from '../kie/seedance';
+import { kieImageRequestFromRunpod, runKieImage } from '../kie/nanobanana';
+import { geminiTtsRequestFromRunpod, runGeminiTts, type GeminiTransport } from '../google/tts';
 import {
   describeTailExecution,
   executionName,
@@ -81,6 +83,12 @@ export interface AssetAgentDeps {
     | 'animateLambdaRateUsdS'
     | 'comfyRateUsdS'
     | 'kieSeedanceRateUsdS'
+    | 'kieQwenFallback'
+    | 'kieQwenRateUsdImage'
+    | 'geminiTtsFallback'
+    | 'geminiTtsVoiceMale'
+    | 'geminiTtsVoiceFemale'
+    | 'geminiTtsRateUsdS'
   >;
   publicBaseUrl: string;
   webhookSecret: string;
@@ -97,6 +105,8 @@ export interface AssetAgentDeps {
   /** KIE, for the `seedance-video` kind (Seedance 2 Mini). Without it such a row fails with a
    * clear error rather than hanging. */
   kie?: KieTransport;
+  /** Google Gemini, for the `tts` kind's hosted fallback (usesGeminiTts). */
+  gemini?: GeminiTransport;
   /** Where a Lambda's output is re-hosted. Remotion Lambda writes to ITS OWN
    * S3 bucket, which QM does not control the retention of — the same class of
    * problem that cost 103/122 shots to expired replicate.delivery links on
@@ -143,6 +153,36 @@ const ENDPOINT_PAUSED_MAX_ATTEMPTS = 8;
  * as orphaned by a dead process. Not a timeout — `remotion` has none by
  * design; this only recovers rows nobody is awaiting any more. */
 const LAMBDA_ORPHAN_RECOVERY_MS = 600_000;
+
+/**
+ * KIE Nano Banana 2.1 fallback (2026-11-01). The RunPod Qwen image kinds: a row whose
+ * last RunPod attempt failed or timed out (it is `pending` again with an error
+ * recorded and at least one attempt spent) is retried on KIE `nano-banana-2-1` instead
+ * of RunPod. A QA rework resets `attempts` to 0 and clears the error, so a
+ * corrected prompt goes back to RunPod first.
+ */
+export const KIE_QWEN_KINDS: ReadonlySet<AssetKind> = new Set(['qwen-image-gen', 'qwen-edit', 'ref2-edit', 'comfy-last']);
+/** provider_job_id prefix that tells reconcile this row is a KIE call, not a RunPod job. */
+export const KIE_QWEN_JOB_PREFIX = 'kie-qwen:';
+
+export function usesKieQwen(deps: Pick<AssetAgentDeps, 'kie' | 'cfg'>, kind: AssetKind, row: Pick<AssetRow, 'attempts' | 'error'>): boolean {
+  return !!deps.kie && deps.cfg.kieQwenFallback && KIE_QWEN_KINDS.has(kind) && row.attempts >= 1 && row.error !== null && row.error !== undefined;
+}
+
+/**
+ * Google Gemini TTS fallback (2026-11-02), same contract as the KIE one above: a
+ * `tts` row whose RunPod attempt failed or timed out is retried on Gemini.
+ */
+export const GEMINI_TTS_JOB_PREFIX = 'gemini-tts:';
+
+export function usesGeminiTts(deps: Pick<AssetAgentDeps, 'gemini' | 'cfg'>, kind: AssetKind, row: Pick<AssetRow, 'attempts' | 'error'>): boolean {
+  return !!deps.gemini && deps.cfg.geminiTtsFallback && kind === 'tts' && row.attempts >= 1 && row.error !== null && row.error !== undefined;
+}
+
+/** Either hosted fallback: the row is rendered in-process, not submitted to RunPod. */
+export function usesHostedFallback(deps: Pick<AssetAgentDeps, 'kie' | 'gemini' | 'cfg'>, kind: AssetKind, row: Pick<AssetRow, 'attempts' | 'error'>): boolean {
+  return usesKieQwen(deps, kind, row) || usesGeminiTts(deps, kind, row);
+}
 
 /** How many generation budgets a job may sit purely QUEUED before it is
  * treated as never going to run. Deliberately large: a deep queue is normal
@@ -630,6 +670,65 @@ async function invokeSeedanceRow(deps: AssetAgentDeps, kind: AssetKind, row: Ass
   }
 }
 
+/** A RunPod Qwen row retried on KIE Nano Banana 2.1 (see KIE_QWEN_KINDS). The RunPod payload is
+ * translated as-is, the still re-hosted in R2 (KIE links expire), then completed through the same
+ * conform-to-frame-size path as a RunPod still. A failure goes through the ordinary retry ceiling. */
+async function invokeKieQwenRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
+  const spec = assetSpec(kind);
+  await markSubmitted(deps.pool, row.id, kind, `${KIE_QWEN_JOB_PREFIX}${row.id}:${row.attempts + 1}`);
+  const startedAt = Date.now();
+  try {
+    if (!deps.kie) throw new Error(`${kind}: no KIE transport configured (KIE_API_KEY)`);
+    if (!deps.r2) throw new Error(`${kind}: no r2 transport to host the KIE still`);
+    const req = kieImageRequestFromRunpod(payload, (row.input as FrameJobInput | null)?.aspectRatio);
+    const result = await runKieImage(deps.kie, req, async (taskId) => {
+      await deps.pool.query(`UPDATE assets SET provider_job_id = $3, updated_at = now() WHERE asset_kind = $2 AND id = $1`, [
+        row.id, kind, `${KIE_QWEN_JOB_PREFIX}${taskId}`,
+      ]);
+    });
+    const url = await persistToR2(deps.r2, result.imageUrl, `stills/${row.projectId}/${row.frameId}-${kind}-kie.png`);
+    await recordAssetCost(deps.pool, {
+      assetId: row.id, assetKind: kind, projectId: row.projectId, frameId: row.frameId,
+      endpointId: spec.endpointId, providerJobId: `${KIE_QWEN_JOB_PREFIX}${result.taskId}`,
+      // Billed per image: one "second" at the per-image rate.
+      executionMs: 1000, delayMs: null, workerRateUsdS: deps.cfg.kieQwenRateUsdImage,
+    });
+    log().info({ assetId: row.id, kind, model: req.model, taskId: result.taskId, ms: Date.now() - startedAt }, 'asset-agent: KIE nano-banana fallback rendered');
+    await completeRunpodAsset(deps, row, kind, { image: url, provider: 'kie', model: req.model });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log().warn({ assetId: row.id, kind, error: message, ms: Date.now() - startedAt }, 'asset-agent: KIE nano-banana fallback failed');
+    await applyAssetFailure(deps, row.id, kind, { provider: 'kie-qwen', error: message.slice(0, 500) });
+  }
+}
+
+/** A RunPod tts row retried on Google Gemini TTS (see usesGeminiTts). Same shape as the KIE
+ * path: the RunPod payload is translated, the WAV hosted in R2, completed as ordinary audio. */
+async function invokeGeminiTtsRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
+  const spec = assetSpec(kind);
+  const jobId = `${GEMINI_TTS_JOB_PREFIX}${row.id}:${row.attempts + 1}`;
+  await markSubmitted(deps.pool, row.id, kind, jobId);
+  const startedAt = Date.now();
+  try {
+    if (!deps.gemini) throw new Error(`${kind}: no Gemini transport configured (GEMINI_API_KEY)`);
+    if (!deps.r2) throw new Error(`${kind}: no r2 transport to host the Gemini audio`);
+    const req = geminiTtsRequestFromRunpod(payload, { male: deps.cfg.geminiTtsVoiceMale, female: deps.cfg.geminiTtsVoiceFemale });
+    const result = await runGeminiTts(deps.gemini, req);
+    const url = await putBytesToR2(deps.r2, `audio/${row.projectId}/${row.frameId}-tts-gemini-${row.attempts + 1}.wav`, result.wav, 'audio/wav');
+    await recordAssetCost(deps.pool, {
+      assetId: row.id, assetKind: kind, projectId: row.projectId, frameId: row.frameId,
+      endpointId: spec.endpointId, providerJobId: jobId,
+      executionMs: Math.round(result.durationS * 1000), delayMs: null, workerRateUsdS: deps.cfg.geminiTtsRateUsdS,
+    });
+    log().info({ assetId: row.id, kind, voice: req.voice, gender: req.gender, durationS: result.durationS, ms: Date.now() - startedAt }, 'asset-agent: Gemini TTS fallback rendered');
+    await completeRunpodAsset(deps, row, kind, { audio: url, duration_s: result.durationS, provider: 'gemini', voice: req.voice });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log().warn({ assetId: row.id, kind, error: message, ms: Date.now() - startedAt }, 'asset-agent: Gemini TTS fallback failed');
+    await applyAssetFailure(deps, row.id, kind, { provider: 'gemini-tts', error: message.slice(0, 500) });
+  }
+}
+
 /** `animate`: one synchronous QM-animate invoke. Same failure contract as
  * Remotion's — an invoke error fails the row through applyAssetFailure. */
 async function invokeAnimateRow(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow, payload: Record<string, unknown>): Promise<void> {
@@ -733,6 +832,22 @@ async function submitOne(deps: AssetAgentDeps, kind: AssetKind, row: AssetRow): 
       await markSubmitted(client, row.id, kind, executionArn);
       await client.query('COMMIT');
       log().info({ assetId: row.id, kind, projectId: row.projectId, executionArn }, 'asset-agent: tail execution started');
+      return true;
+    }
+
+    if (spec.provider === 'runpod' && usesHostedFallback(deps, kind, row)) {
+      // RunPod already failed this row: retry it on KIE. Claim, release the
+      // lock, then render — no row lock is held across the KIE call.
+      await client.query(
+        `UPDATE assets SET status = 'submitted', claimed_at = now(), updated_at = now()
+          WHERE asset_kind = $2 AND id = $1`,
+        [row.id, kind],
+      );
+      await client.query('COMMIT');
+      const target = usesKieQwen(deps, kind, row) ? 'KIE nano-banana-2-1' : 'Google Gemini TTS';
+      log().info({ assetId: row.id, kind, attempts: row.attempts, lastError: row.error }, `asset-agent: RunPod failed this row, retrying on ${target}`);
+      if (usesKieQwen(deps, kind, row)) await invokeKieQwenRow(deps, kind, row, payload);
+      else await invokeGeminiTtsRow(deps, kind, row, payload);
       return true;
     }
 
@@ -907,6 +1022,19 @@ async function reconcile(deps: AssetAgentDeps, kind: AssetKind): Promise<{ compl
       continue;
     }
     if (!row.providerJobId) continue;
+    if (row.providerJobId.startsWith(KIE_QWEN_JOB_PREFIX) || row.providerJobId.startsWith(GEMINI_TTS_JOB_PREFIX)) {
+      // A KIE call is in-process and synchronous, like a Lambda render: never
+      // poll RunPod with its id. Still submitted past the window means the
+      // invoking process died — orphan recovery, same as the lambda branch.
+      const startedAt = row.submittedAt?.getTime() ?? 0;
+      if (Date.now() - startedAt < LAMBDA_ORPHAN_RECOVERY_MS) continue;
+      const outcome = await applyAssetFailure(deps, row.id, kind, {
+        provider: row.providerJobId.startsWith(GEMINI_TTS_JOB_PREFIX) ? 'gemini-tts' : 'kie-qwen',
+        error: 'no completion recorded — the invoking process probably died mid-render',
+      });
+      if (outcome === 'failed') failed += 1;
+      continue;
+    }
     if (spec.provider === 'sfn') {
       const outcome = await reconcileSfnRow(deps, kind, row);
       if (outcome === 'completed') completed += 1;
@@ -1028,9 +1156,16 @@ export async function runAssetAgentTick(deps: AssetAgentDeps, kind: AssetKind): 
     const results = await Promise.all(batch.map((row) => submitOne(deps, kind, row)));
     submitted = results.filter(Boolean).length;
   } else {
-    for (const row of batch) {
+    // RunPod submissions are a fast POST and stay serial. Rows retried on KIE
+    // block for a render (~10-15s), so they run in parallel — during a RunPod
+    // outage that is every row of the kind.
+    const kieRows = batch.filter((row) => spec.provider === 'runpod' && usesHostedFallback(deps, kind, row));
+    const runpodRows = batch.filter((row) => !kieRows.includes(row));
+    const kieDone = Promise.all(kieRows.map((row) => submitOne(deps, kind, row)));
+    for (const row of runpodRows) {
       if (await submitOne(deps, kind, row)) submitted += 1;
     }
+    submitted += (await kieDone).filter(Boolean).length;
   }
 
   if (submitted > 0 || completed > 0 || failed > 0 || timedOut > 0) {

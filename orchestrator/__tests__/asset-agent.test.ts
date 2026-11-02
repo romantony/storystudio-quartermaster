@@ -9,7 +9,7 @@
  * bad row can take anything else down with it.
  */
 import { RunpodClient } from '../src/runpod/client';
-import { runAssetAgentTick, applyAssetSuccess, completeRunpodAsset, assetWebhookToken, resolveHandoffs, type AssetAgentDeps } from '../src/assets/agent';
+import { runAssetAgentTick, usesGeminiTts, applyAssetSuccess, completeRunpodAsset, assetWebhookToken, resolveHandoffs, type AssetAgentDeps } from '../src/assets/agent';
 import { webhookToken } from '../src/agents/generator';
 import { compilePlan } from '../src/assets/plan';
 import { executionName, type SfnImpl, type SfnExecution } from '../src/aws/sfn';
@@ -21,6 +21,7 @@ import * as pipelineRepo from '../src/db/repo/pipeline';
 import type { AssetRow } from '../src/db/repo/assets';
 import * as conform from '../src/assets/conform-media';
 import * as r2Client from '../src/r2/client';
+import { GEMINI_BASE, GEMINI_TTS_DEFAULT_MODEL, geminiTtsRequestFromRunpod, pcmToWav, runGeminiTts, ttsPayloadGender } from '../src/google/tts';
 
 jest.mock('../src/db/repo/assets');
 jest.mock('../src/db/repo/asset-costs');
@@ -44,6 +45,12 @@ const CFG: AssetAgentDeps['cfg'] = {
   kieSeedanceRateUsdS: 0.04,
   comfyRateUsdS: 0.0005,
   animateLambdaRateUsdS: 0.000167,
+  kieQwenFallback: true,
+  kieQwenRateUsdImage: 0.03,
+  geminiTtsFallback: true,
+  geminiTtsVoiceMale: 'Enzo',
+  geminiTtsVoiceFemale: 'Tova',
+  geminiTtsRateUsdS: 0.0005,
 };
 
 const PLAN = compilePlan(
@@ -810,6 +817,283 @@ describe('the lambda-backed remotion agent', () => {
 
     expect(runpodFetch).not.toHaveBeenCalled();
     expect(assetsRepo.failOrRetryAsset).toHaveBeenCalled();
+  });
+});
+
+describe('KIE Nano Banana 2.1 fallback for the RunPod Qwen image kinds (2026-11-01)', () => {
+  const KIE = 'https://api.kie.ai/api/v1/jobs';
+  const R2 = { accountId: 'a', bucket: 'b', publicUrl: 'https://cdn', accessKeyId: 'k', secretAccessKey: 's' };
+  afterEach(() => jest.restoreAllMocks());
+
+  /** One fetch for everything: RunPod (must not be called on the KIE route), KIE create/poll. */
+  function kieFetch(created: Array<Record<string, any>>, state: 'success' | 'fail' = 'success') {
+    return jest.fn(async (url: string, init?: { body?: string }) => {
+      if (url === `${KIE}/createTask`) {
+        created.push(JSON.parse(init!.body!));
+        return fakeRes(200, { code: 200, data: { taskId: 'kie-task-1' } });
+      }
+      if (url.startsWith(`${KIE}/recordInfo`)) {
+        return fakeRes(200, state === 'success'
+          ? { code: 200, data: { state, resultJson: JSON.stringify({ resultUrls: ['https://tempfile.kie/x.png'] }) } }
+          : { code: 200, data: { state, failCode: 500, failMsg: 'internal' } });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+  }
+
+  function kieDeps(fetchImpl: jest.Mock, kind = 'qwen-image-gen') {
+    const runpodFetch = jest.fn();
+    const d = deps(runpodFetch, fakePool({ successRow: { asset_kind: kind, endpoint_id: ASSET_SPECS[kind as 'qwen-edit'].endpointId } }));
+    d.kie = { apiKey: 'kie-key', fetchImpl: fetchImpl as unknown as typeof fetch, sleepImpl: async () => undefined, pollIntervalMs: 1 };
+    d.r2 = R2;
+    jest.spyOn(r2Client, 'persistToR2').mockImplementation(async (_t, _u, key) => `https://cdn/${key}`);
+    jest.spyOn(conform, 'conformStill').mockResolvedValue(null);
+    return { d, runpodFetch };
+  }
+
+  it('sends a FIRST attempt to RunPod as before', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([row()]);
+    const created: Array<Record<string, any>> = [];
+    const { d } = kieDeps(kieFetch(created));
+    const runpodFetch = jest.fn(async () => fakeRes(200, { id: 'rp-1', status: 'IN_QUEUE' }));
+    d.runpod = new RunpodClient(RUNPOD_CFG, { fetchImpl: runpodFetch as unknown as typeof fetch, sleepImpl: async () => undefined });
+    await runAssetAgentTick(d, 'qwen-image-gen');
+    expect(runpodFetch).toHaveBeenCalled();
+    expect(created).toHaveLength(0);
+  });
+
+  it('retries a row RunPod FAILED on KIE nano-banana-2-1, re-hosts it and completes — no RunPod call', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([row({ attempts: 1, error: { status: 'FAILED', error: 'CUDA out of memory' } })]);
+    const created: Array<Record<string, any>> = [];
+    const { d, runpodFetch } = kieDeps(kieFetch(created));
+
+    const summary = await runAssetAgentTick(d, 'qwen-image-gen');
+
+    expect(summary.submitted).toBe(1);
+    expect(runpodFetch).not.toHaveBeenCalled();
+    expect(created).toEqual([{ model: 'nano-banana-2-1', input: { prompt: expect.stringContaining('a lighthouse at dusk'), aspect_ratio: '9:16', resolution: '1K', output_format: 'png' } }]);
+    expect(assetsRepo.markSubmitted).toHaveBeenCalledWith(expect.anything(), 101, 'qwen-image-gen', 'kie-qwen:101:2');
+    expect(r2Client.persistToR2).toHaveBeenCalledWith(R2, 'https://tempfile.kie/x.png', 'stills/proj_1/f1-qwen-image-gen-kie.png');
+    // Conformed to the frame size like any RunPod still.
+    expect(conform.conformStill).toHaveBeenCalledWith('https://cdn/stills/proj_1/f1-qwen-image-gen-kie.png', [720, 1280]);
+    const [, , result] = (assetsRepo.completeAsset as jest.Mock).mock.calls[0];
+    expect(result.assetUrl).toBe('https://cdn/stills/proj_1/f1-qwen-image-gen-kie.png');
+    expect(costsRepo.recordAssetCost).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ providerJobId: 'kie-qwen:kie-task-1', workerRateUsdS: 0.03 }));
+  });
+
+  it('sends an edit kind to nano-banana-2-1 with image_input and the frame’s aspect', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([
+      row({
+        kind: 'qwen-edit', endpointId: ASSET_SPECS['qwen-edit'].endpointId, attempts: 1, error: { error: 'timed out' },
+        input: { frameId: 'f1', imagePrompt: 'put the hat on him', narration: 'n', durationS: 5, aspectRatio: '16:9', referenceImageUrl: 'https://cdn/ref.png' },
+      }),
+    ]);
+    const created: Array<Record<string, any>> = [];
+    const { d } = kieDeps(kieFetch(created), 'qwen-edit');
+
+    await runAssetAgentTick(d, 'qwen-edit');
+
+    expect(created[0]).toEqual({ model: 'nano-banana-2-1', input: { prompt: 'put the hat on him', image_input: ['https://cdn/ref.png'], aspect_ratio: '16:9', resolution: '1K', output_format: 'png' } });
+    expect(assetsRepo.completeAsset).toHaveBeenCalled();
+  });
+
+  it('a failed KIE task goes through the ordinary retry ceiling', async () => {
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([row({ attempts: 1, error: { error: 'x' } })]);
+    const { d } = kieDeps(kieFetch([], 'fail'));
+    await runAssetAgentTick(d, 'qwen-image-gen');
+    expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
+    expect(assetsRepo.failOrRetryAsset).toHaveBeenCalledWith(expect.anything(), 101, 'qwen-image-gen', expect.objectContaining({ provider: 'kie-qwen' }), expect.any(Number));
+  });
+
+  it('stays on RunPod when the fallback is switched off, or for a kind it does not cover', async () => {
+    const created: Array<Record<string, any>> = [];
+    const { d } = kieDeps(kieFetch(created));
+    d.cfg = { ...CFG, kieQwenFallback: false };
+    const runpodFetch = jest.fn(async () => fakeRes(200, { id: 'rp-1', status: 'IN_QUEUE' }));
+    d.runpod = new RunpodClient(RUNPOD_CFG, { fetchImpl: runpodFetch as unknown as typeof fetch, sleepImpl: async () => undefined });
+    (assetsRepo.claimPending as jest.Mock).mockResolvedValue([row({ attempts: 1, error: { error: 'x' } })]);
+    await runAssetAgentTick(d, 'qwen-image-gen');
+    expect(created).toHaveLength(0);
+    expect(runpodFetch).toHaveBeenCalled();
+  });
+
+  it('never polls RunPod with a KIE job id; an orphaned KIE row is requeued after the window', async () => {
+    const { d, runpodFetch } = kieDeps(kieFetch([]));
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ status: 'submitted', providerJobId: 'kie-qwen:kie-task-1', submittedAt: new Date(Date.now() - 60_000), attempts: 2 }),
+    ]);
+    await runAssetAgentTick(d, 'qwen-image-gen');
+    expect(runpodFetch).not.toHaveBeenCalled();
+    expect(assetsRepo.failOrRetryAsset).not.toHaveBeenCalled();
+
+    (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+      row({ status: 'submitted', providerJobId: 'kie-qwen:kie-task-1', submittedAt: new Date(Date.now() - 11 * 60_000), attempts: 2 }),
+    ]);
+    await runAssetAgentTick(d, 'qwen-image-gen');
+    expect(runpodFetch).not.toHaveBeenCalled();
+    expect(assetsRepo.failOrRetryAsset).toHaveBeenCalled();
+  });
+});
+
+describe('Google Gemini TTS fallback for the RunPod tts kind (2026-11-02)', () => {
+  const R2 = { accountId: 'a', bucket: 'b', publicUrl: 'https://cdn', accessKeyId: 'k', secretAccessKey: 's' };
+  const VOICES = { male: 'Enzo', female: 'Tova' };
+  afterEach(() => jest.restoreAllMocks());
+
+  /** 1 s of 24 kHz s16 mono silence as a RIFF WAV, base64 like Gemini returns it. */
+  const wav1s = pcmToWav(Buffer.alloc(48_000), 24_000);
+  const geminiOk = (data: Buffer = wav1s, mimeType = 'audio/wav') =>
+    fakeRes(200, { candidates: [{ content: { parts: [{ inlineData: { mimeType, data: data.toString('base64') } }] } }], usageMetadata: { candidatesTokenCount: 25 } });
+
+  function ttsRow(over: Partial<AssetRow> = {}): AssetRow {
+    return row({
+      kind: 'tts', endpointId: ASSET_SPECS.tts.endpointId, attempts: 1, error: { status: 'FAILED', error: 'worker died' },
+      input: { frameId: 'f1', imagePrompt: 'p', narration: 'Hello there.', durationS: 5, aspectRatio: '16:9', voiceId: 'am_michael' },
+      ...over,
+    });
+  }
+
+  function geminiDeps(fetchImpl: jest.Mock) {
+    const runpodFetch = jest.fn();
+    const d = deps(runpodFetch, fakePool({ successRow: { asset_kind: 'tts', endpoint_id: ASSET_SPECS.tts.endpointId } }));
+    d.gemini = { apiKey: 'g-key', model: 'gemini-3.8-flash-lite-tts', fetchImpl: fetchImpl as unknown as typeof fetch, sleepImpl: async () => undefined };
+    d.r2 = R2;
+    jest.spyOn(r2Client, 'putBytesToR2').mockImplementation(async (_t, key) => `https://cdn/${key}`);
+    return { d, runpodFetch };
+  }
+
+  describe('voice mapping', () => {
+    it('maps Kokoro ids by their gender letter', () => {
+      expect(ttsPayloadGender({ engine: 'kokoro', voice: 'af_heart' })).toBe('female');
+      expect(ttsPayloadGender({ engine: 'kokoro', voice: 'bf_emma' })).toBe('female');
+      expect(ttsPayloadGender({ engine: 'kokoro', voice: 'am_michael' })).toBe('male');
+      expect(ttsPayloadGender({ engine: 'kokoro' })).toBe('male');
+    });
+    it('maps Qwen speakers and a female instruct hint; a clone request defaults to male', () => {
+      expect(ttsPayloadGender({ engine: 'qwen', speaker: 'Vivian' })).toBe('female');
+      expect(ttsPayloadGender({ engine: 'qwen', speaker: 'Ryan' })).toBe('male');
+      expect(ttsPayloadGender({ engine: 'qwen', speaker: 'Ryan', instruct: 'a warm woman, calm' })).toBe('female');
+      expect(ttsPayloadGender({ engine: 'qwen', clone_artifact_url: 'https://x/clone' })).toBe('male');
+    });
+    it('builds the request from the configured voices and rejects empty text', () => {
+      expect(geminiTtsRequestFromRunpod({ engine: 'kokoro', voice: 'af_heart', text: ' hi ' }, VOICES)).toEqual({ text: 'hi', voice: 'Tova', gender: 'female' });
+      expect(() => geminiTtsRequestFromRunpod({ engine: 'kokoro', text: '  ' }, VOICES)).toThrow(/no text/);
+    });
+  });
+
+  describe('runGeminiTts', () => {
+    const req = { text: 'Hello there.', voice: 'Enzo', gender: 'male' as const };
+
+    it('posts the transcript + prebuilt voice and returns the WAV with its duration', async () => {
+      const calls: Array<{ url: string; init: any }> = [];
+      const fetchImpl = jest.fn(async (url: string, init: any) => { calls.push({ url, init }); return geminiOk(); });
+      const out = await runGeminiTts({ apiKey: 'g-key', fetchImpl: fetchImpl as unknown as typeof fetch, sleepImpl: async () => undefined }, req);
+      expect(out.durationS).toBe(1);
+      expect(out.audioTokens).toBe(25);
+      expect(calls[0].url).toBe(`${GEMINI_BASE}/models/${GEMINI_TTS_DEFAULT_MODEL}:generateContent`);
+      expect(calls[0].init.headers['x-goog-api-key']).toBe('g-key');
+      const body = JSON.parse(calls[0].init.body);
+      expect(body.contents[0].parts[0].text).toContain('Hello there.');
+      expect(body.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Enzo');
+    });
+
+    it('wraps raw audio/L16 PCM in a WAV header', async () => {
+      const fetchImpl = jest.fn(async () => geminiOk(Buffer.alloc(48_000), 'audio/L16;rate=24000'));
+      const out = await runGeminiTts({ apiKey: 'k', fetchImpl: fetchImpl as unknown as typeof fetch, sleepImpl: async () => undefined }, req);
+      expect(out.wav.toString('ascii', 0, 4)).toBe('RIFF');
+      expect(out.durationS).toBe(1);
+    });
+
+    it('retries a 429/5xx then succeeds, but fails fast on a 400', async () => {
+      const flaky = jest.fn()
+        .mockResolvedValueOnce(fakeRes(503, { error: 'busy' }))
+        .mockResolvedValueOnce(fakeRes(429, { error: 'slow down' }))
+        .mockResolvedValueOnce(geminiOk());
+      const sleeps: number[] = [];
+      await runGeminiTts({ apiKey: 'k', fetchImpl: flaky as unknown as typeof fetch, sleepImpl: async (ms) => { sleeps.push(ms); } }, req);
+      expect(flaky).toHaveBeenCalledTimes(3);
+      expect(sleeps).toEqual([2_000, 4_000]);
+
+      const bad = jest.fn(async () => fakeRes(400, { error: 'bad voice' }));
+      await expect(runGeminiTts({ apiKey: 'k', fetchImpl: bad as unknown as typeof fetch, sleepImpl: async () => undefined }, req)).rejects.toThrow(/HTTP 400/);
+      expect(bad).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws when the response carries no audio', async () => {
+      const fetchImpl = jest.fn(async () => fakeRes(200, { candidates: [{ finishReason: 'SAFETY', content: { parts: [] } }] }));
+      await expect(runGeminiTts({ apiKey: 'k', fetchImpl: fetchImpl as unknown as typeof fetch, sleepImpl: async () => undefined }, req)).rejects.toThrow(/no audio.*SAFETY/);
+    });
+  });
+
+  describe('agent routing', () => {
+    it('sends a FIRST attempt to RunPod as before', async () => {
+      (assetsRepo.claimPending as jest.Mock).mockResolvedValue([ttsRow({ attempts: 0, error: null })]);
+      const gemini = jest.fn();
+      const { d } = geminiDeps(gemini);
+      const runpodFetch = jest.fn(async () => fakeRes(200, { id: 'rp-1', status: 'IN_QUEUE' }));
+      d.runpod = new RunpodClient(RUNPOD_CFG, { fetchImpl: runpodFetch as unknown as typeof fetch, sleepImpl: async () => undefined });
+      await runAssetAgentTick(d, 'tts');
+      expect(runpodFetch).toHaveBeenCalled();
+      expect(gemini).not.toHaveBeenCalled();
+    });
+
+    it('retries a row RunPod FAILED on Gemini, re-hosts the WAV and completes — no RunPod call', async () => {
+      (assetsRepo.claimPending as jest.Mock).mockResolvedValue([ttsRow({ input: { frameId: 'f1', imagePrompt: 'p', narration: 'Hello there.', durationS: 5, aspectRatio: '16:9', voiceId: 'af_heart' } })]);
+      const bodies: any[] = [];
+      const fetchImpl = jest.fn(async (_u: string, init: any) => { bodies.push(JSON.parse(init.body)); return geminiOk(); });
+      const { d, runpodFetch } = geminiDeps(fetchImpl);
+
+      const summary = await runAssetAgentTick(d, 'tts');
+
+      expect(summary.submitted).toBe(1);
+      expect(runpodFetch).not.toHaveBeenCalled();
+      expect(bodies[0].generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Tova');
+      expect(assetsRepo.markSubmitted).toHaveBeenCalledWith(expect.anything(), 101, 'tts', 'gemini-tts:101:2');
+      expect(r2Client.putBytesToR2).toHaveBeenCalledWith(R2, 'audio/proj_1/f1-tts-gemini-2.wav', expect.any(Buffer), 'audio/wav');
+      expect(assetsRepo.completeAsset).toHaveBeenCalled();
+      expect(costsRepo.recordAssetCost).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        providerJobId: 'gemini-tts:101:2', executionMs: 1000, workerRateUsdS: 0.0005,
+      }));
+    });
+
+    it('a failed Gemini call goes through the ordinary retry ceiling', async () => {
+      (assetsRepo.claimPending as jest.Mock).mockResolvedValue([ttsRow()]);
+      const { d } = geminiDeps(jest.fn(async () => fakeRes(400, { error: 'nope' })));
+      await runAssetAgentTick(d, 'tts');
+      expect(assetsRepo.completeAsset).not.toHaveBeenCalled();
+      expect(assetsRepo.failOrRetryAsset).toHaveBeenCalledWith(expect.anything(), 101, 'tts', expect.objectContaining({ provider: 'gemini-tts' }), expect.any(Number));
+    });
+
+    it('stays on RunPod when switched off, when there is no Gemini key, or for a kind it does not cover', async () => {
+      const failed = { attempts: 1, error: { error: 'x' } };
+      expect(usesGeminiTts({ gemini: { apiKey: 'k' }, cfg: CFG }, 'tts', failed)).toBe(true);
+      expect(usesGeminiTts({ gemini: { apiKey: 'k' }, cfg: { ...CFG, geminiTtsFallback: false } }, 'tts', failed)).toBe(false);
+      expect(usesGeminiTts({ gemini: undefined, cfg: CFG }, 'tts', failed)).toBe(false);
+      expect(usesGeminiTts({ gemini: { apiKey: 'k' }, cfg: CFG }, 'qwen-image-gen', failed)).toBe(false);
+      expect(usesGeminiTts({ gemini: { apiKey: 'k' }, cfg: CFG }, 'tts', { attempts: 0, error: null })).toBe(false);
+    });
+
+    it('a row the compiler reworked as stuck (RunPod never returned FAILED) goes to Gemini next, not back to RunPod', () => {
+      // reworkAsset keeps attempts and records {reason:'stuck'} as the error — exactly the trigger.
+      expect(usesGeminiTts({ gemini: { apiKey: 'k' }, cfg: CFG }, 'tts', { attempts: 1, error: { reason: 'stuck', stalledForMs: 1_229_669 } })).toBe(true);
+    });
+
+    it('never polls RunPod with a Gemini job id; an orphaned Gemini row is failed after the window', async () => {
+      const { d, runpodFetch } = geminiDeps(jest.fn());
+      (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+        ttsRow({ status: 'submitted', providerJobId: 'gemini-tts:101:2', submittedAt: new Date(Date.now() - 60_000), attempts: 2 }),
+      ]);
+      await runAssetAgentTick(d, 'tts');
+      expect(runpodFetch).not.toHaveBeenCalled();
+      expect(assetsRepo.failOrRetryAsset).not.toHaveBeenCalled();
+
+      (assetsRepo.listStaleSubmitted as jest.Mock).mockResolvedValue([
+        ttsRow({ status: 'submitted', providerJobId: 'gemini-tts:101:2', submittedAt: new Date(Date.now() - 11 * 60_000), attempts: 2 }),
+      ]);
+      await runAssetAgentTick(d, 'tts');
+      expect(runpodFetch).not.toHaveBeenCalled();
+      expect(assetsRepo.failOrRetryAsset).toHaveBeenCalledWith(expect.anything(), 101, 'tts', expect.objectContaining({ provider: 'gemini-tts' }), expect.any(Number));
+    });
   });
 });
 

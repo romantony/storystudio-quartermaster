@@ -93,6 +93,18 @@ services:
       # The `seedance-video` agent (Seedance 2 Mini, options.motionEngine 'seedance') calls KIE
       # with this key. Set it in the VPS .env only.
       KIE_API_KEY: ${KIE_API_KEY:-}
+      # Same key: a RunPod Qwen image row (qwen-image-gen / qwen-edit / ref2-edit /
+      # comfy-last) that RunPod failed or timed out is retried on KIE Nano Banana 2.1.
+      KIE_QWEN_FALLBACK: ${KIE_QWEN_FALLBACK:-true}
+      KIE_QWEN_RATE_USD_IMAGE: ${KIE_QWEN_RATE_USD_IMAGE:-0.02}
+      # A RunPod `tts` row (Kokoro / Qwen) that RunPod failed or timed out is
+      # retried on Google Gemini TTS, voice mapped by gender. Key in the VPS .env only.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_TTS_FALLBACK: ${GEMINI_TTS_FALLBACK:-true}
+      GEMINI_TTS_MODEL: ${GEMINI_TTS_MODEL:-gemini-3.8-flash-lite-tts}
+      GEMINI_TTS_VOICE_MALE: ${GEMINI_TTS_VOICE_MALE:-Enzo}
+      GEMINI_TTS_VOICE_FEMALE: ${GEMINI_TTS_VOICE_FEMALE:-Tova}
+      GEMINI_TTS_RATE_USD_S: ${GEMINI_TTS_RATE_USD_S:-0.0005}
       # The `sfn-tail` agent starts + polls this state machine (the assembly
       # tail: ECS merge/concat/silence, RunPod captions + BGM, ECS finalize).
       # Empty = no tail. Credentials come from AWS_* above and need

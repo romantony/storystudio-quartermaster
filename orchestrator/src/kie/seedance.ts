@@ -79,14 +79,14 @@ export function buildSeedanceInput(req: SeedanceRequest): Record<string, unknown
   };
 }
 
-class KieError extends Error {
+export class KieError extends Error {
   constructor(message: string, readonly retryable: boolean) {
     super(message);
     this.name = 'KieError';
   }
 }
 
-async function kieJson(t: KieTransport, url: string, init: RequestInit, what: string): Promise<any> {
+export async function kieJson(t: KieTransport, url: string, init: RequestInit, what: string): Promise<any> {
   const f = t.fetchImpl ?? fetch;
   const res = await f(url, { ...init, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${t.apiKey}`, ...(init.headers ?? {}) } });
   const text = await res.text();
