@@ -47,7 +47,11 @@ export const FLEET: readonly FleetEndpoint[] = [
   { counterKey: "runpod:wan2-i2v", endpointId: "nd7wloyvj09xwy", workers: 6 },
   // Word-level captions (Whisper) + BGM (ACE-Step), called by the SFN tail
   // right after remove-silence.
-  { counterKey: "runpod:bgm-s2t", endpointId: "6apg6j7suzuezw", workers: 3 },
+  // Split 2026-11-03: ACE-Step BGM and Whisper each have their own endpoint
+  // (replacing the combined bgm-s2t `6apg6j7suzuezw`). Worker counts: correct
+  // to the dashboard values.
+  { counterKey: "runpod:bgm-s2t", endpointId: "42yo1xk2qhz133", workers: 2 },
+  { counterKey: "runpod:whisper", endpointId: "v8qn2dp46tp9v3", workers: 1 },
   // MMAudio SFX on its own endpoint again (was pooled onto flux-tts-s2t
   // 2026-09-20).
   { counterKey: "runpod:mm-audio", endpointId: "nzkcsef9t2iv7s", workers: 5 },

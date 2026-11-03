@@ -70,6 +70,7 @@ export const QWEN_IMAGE_GEN = 'runpod:qwen-image-gen';
 export const QWEN_IMAGE_EDIT = 'runpod:qwen-image-edit';
 export const WAN2_I2V = 'runpod:wan2-i2v';
 export const BGM_S2T = 'runpod:bgm-s2t';
+export const WHISPER = 'runpod:whisper';
 export const MULTITALK = 'runpod:multitalk';
 
 export interface FleetEndpoint {
@@ -147,7 +148,11 @@ export const FLEET: FleetEndpoint[] = [
   // volume with flux-tts-s2t (each endpoint loads only its own models).
   // Lowered 4→2 (2026-09-17, re-synced against the dashboard — see
   // FLUX_TTS_S2T's entry above).
-  { counterKey: BGM_S2T,         endpointId: '6apg6j7suzuezw', workers: 2 },
+  // Split 2026-11-03: ACE-Step BGM (42yo1xk2qhz133) and Whisper (v8qn2dp46tp9v3)
+  // each got their own endpoint, replacing combined bgm-s2t 6apg6j7suzuezw.
+  // Worker counts: correct to the dashboard values.
+  { counterKey: BGM_S2T,         endpointId: '42yo1xk2qhz133', workers: 2 },
+  { counterKey: WHISPER,         endpointId: 'v8qn2dp46tp9v3', workers: 1 },
   // MeiGen-MultiTalk (~/multitalk repo) — primary rung for Dialogue Premium
   // monologue/dialogue video-gen (video.dialoguePremium.monologue/.dialogue
   // in background.json); RunComfy InfiniteTalk is the fallback when this

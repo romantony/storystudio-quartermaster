@@ -49,8 +49,10 @@ export interface OrchestratorTailConfig {
   bucket: string;
   /** ARN of the QM-orchestrator-runpod Lambda. */
   runpodFunctionArn: string;
-  /** BGM-S2T — serves both `transcribe` and `bgm`. */
-  audioEndpointId: string;
+  /** Whisper — `transcribe` (word-level captions). */
+  whisperEndpointId: string;
+  /** ACE-Step — `bgm`. */
+  bgmEndpointId: string;
   /** ARN of the QM-orchestrator-fallback Lambda: OpenAI captions, KIE Suno BGM. */
   fallbackFunctionArn: string;
 }
@@ -141,6 +143,8 @@ function readS3Json(cfg: OrchestratorTailConfig, keyExpr: string, resultPath: st
 interface BranchSpec {
   /** State-name prefix, e.g. "Caption". */
   prefix: string;
+  /** RunPod endpoint this layer calls. */
+  endpointId: string;
   /** Choice rule(s) that must hold for this layer to run. */
   gate: State;
   /** The `input` of the RunPod job (JSONPath keys end in `.$`). */
@@ -186,7 +190,7 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
         Resource: 'arn:aws:states:::lambda:invoke',
         Parameters: {
           FunctionName: cfg.runpodFunctionArn,
-          Payload: { action: 'submit', endpointId: cfg.audioEndpointId, input: b.input },
+          Payload: { action: 'submit', endpointId: b.endpointId, input: b.input },
         },
         ResultSelector: { 'jobId.$': '$.Payload.jobId' },
         ResultPath: jobPath,
@@ -202,7 +206,7 @@ function runpodBranch(cfg: OrchestratorTailConfig, b: BranchSpec): { StartAt: st
         Resource: 'arn:aws:states:::lambda:invoke',
         Parameters: {
           FunctionName: cfg.runpodFunctionArn,
-          Payload: { action: 'status', endpointId: cfg.audioEndpointId, 'jobId.$': `${jobPath}.jobId` },
+          Payload: { action: 'status', endpointId: b.endpointId, 'jobId.$': `${jobPath}.jobId` },
         },
         ResultSelector: { 'r.$': '$.Payload' },
         ResultPath: statusPath,
@@ -371,6 +375,7 @@ function bgmFallback(cfg: OrchestratorTailConfig): { startAt: string; states: Re
 export function buildOrchestratorTailDefinition(cfg: OrchestratorTailConfig): Definition {
   const captionBranch = runpodBranch(cfg, {
     prefix: 'Caption',
+    endpointId: cfg.whisperEndpointId,
     comment: 'Word-level captions, only when the project asked for them.',
     gate: { Variable: '$.options.captions', BooleanEquals: true },
     input: {
@@ -393,6 +398,7 @@ export function buildOrchestratorTailDefinition(cfg: OrchestratorTailConfig): De
 
   const bgmBranch = runpodBranch(cfg, {
     prefix: 'Bgm',
+    endpointId: cfg.bgmEndpointId,
     comment: 'Background music, only when the project asked for it and gave a prompt.',
     gate: {
       And: [

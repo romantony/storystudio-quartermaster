@@ -59,8 +59,10 @@ export const STATE_MACHINE_NAME = 'E2E-VideoGenerationPipeline-Orchestrator';
 export const IMAGE_TAG = 'orchestrator-tail';
 const CONTAINER_NAME = 'orchestrator-tail';
 
-/** BGM-S2T: serves both `transcribe` (word-level captions) and `bgm`. */
-const AUDIO_ENDPOINT_ID = '6apg6j7suzuezw';
+/** Whisper (`transcribe` word-level captions) and ACE-Step (`bgm`) — split
+ * endpoints, replacing the old combined BGM-S2T `6apg6j7suzuezw` 2026-11-03. */
+const WHISPER_ENDPOINT_ID = 'v8qn2dp46tp9v3';
+const BGM_ENDPOINT_ID = '42yo1xk2qhz133';
 
 export class OrchestratorTailStack extends Stack {
   constructor(scope: Construct, id: string, props: OrchestratorTailStackProps) {
@@ -215,7 +217,8 @@ export class OrchestratorTailStack extends Stack {
       securityGroupId: sg.securityGroupId,
       bucket: OUTPUT_BUCKET_NAME,
       runpodFunctionArn: runpodFn.functionArn,
-      audioEndpointId: AUDIO_ENDPOINT_ID,
+      whisperEndpointId: WHISPER_ENDPOINT_ID,
+      bgmEndpointId: BGM_ENDPOINT_ID,
       fallbackFunctionArn: fallbackFn.functionArn,
     });
 

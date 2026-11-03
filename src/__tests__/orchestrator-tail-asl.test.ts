@@ -29,7 +29,8 @@ const CFG: OrchestratorTailConfig = {
   securityGroupId: 'sg-1',
   bucket: 'qm-bucket',
   runpodFunctionArn: 'arn:aws:lambda:us-east-1:1:function:QM-orchestrator-runpod',
-  audioEndpointId: '6apg6j7suzuezw',
+  whisperEndpointId: 'v8qn2dp46tp9v3',
+  bgmEndpointId: '42yo1xk2qhz133',
   fallbackFunctionArn: 'arn:aws:lambda:us-east-1:1:function:QM-orchestrator-fallback',
 };
 
@@ -415,7 +416,7 @@ describe('the happy path', () => {
     const submit = r.lambdaCalls.find((c) => c.action === 'submit' && c.input.mode === 'transcribe');
     expect(submit).toEqual({
       action: 'submit',
-      endpointId: '6apg6j7suzuezw',
+      endpointId: 'v8qn2dp46tp9v3',
       input: { mode: 'transcribe', audio_url: META.audioUrl, task: 'transcribe', language: 'hi', return_timestamps: 'word', words_per_group: 1 },
     });
   });
@@ -423,7 +424,7 @@ describe('the happy path', () => {
   it('generates the BGM to the assembled video’s REAL duration, from the project’s prompt', () => {
     const submit = r.lambdaCalls.find((c) => c.action === 'submit' && c.input.mode === 'bgm');
     expect(submit.input).toEqual({ mode: 'bgm', prompt: 'soft piano', duration_s: 37.4 });
-    expect(submit.endpointId).toBe('6apg6j7suzuezw'); // the same endpoint serves both
+    expect(submit.endpointId).toBe('42yo1xk2qhz133');
   });
 
   it('finalizes the assembled video with both layers at 1080p, writing where the state machine reads', () => {
@@ -587,7 +588,7 @@ describe('failures that must fail the execution', () => {
 
 describe('the definition is built from its config', () => {
   it('threads the network and endpoint settings through, with no hard-coded ids', () => {
-    const other = buildOrchestratorTailDefinition({ ...CFG, subnetIds: ['subnet-z'], securityGroupId: 'sg-9', audioEndpointId: 'zzzzzzzzzz', bucket: 'other-bucket' });
+    const other = buildOrchestratorTailDefinition({ ...CFG, subnetIds: ['subnet-z'], securityGroupId: 'sg-9', whisperEndpointId: 'zzzzzzzzzz', bgmEndpointId: 'yyyyyyyyyy', bucket: 'other-bucket' });
     const json = JSON.stringify(other);
     expect(json).toContain('subnet-z');
     expect(json).toContain('sg-9');
